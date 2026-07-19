@@ -1,6 +1,33 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 
+const DEFAULT_ENV_ALLOWLIST = Object.freeze([
+  'CODEX_API_KEY',
+  'CODEX_HOME',
+  'COLORTERM',
+  'HOME',
+  'HTTPS_PROXY',
+  'HTTP_PROXY',
+  'LANG',
+  'LC_ALL',
+  'LC_CTYPE',
+  'LOGNAME',
+  'NO_COLOR',
+  'NO_PROXY',
+  'OPENAI_API_KEY',
+  'PATH',
+  'SHELL',
+  'SSH_AUTH_SOCK',
+  'SSL_CERT_DIR',
+  'SSL_CERT_FILE',
+  'TERM',
+  'TMPDIR',
+  'USER',
+  'https_proxy',
+  'http_proxy',
+  'no_proxy',
+]);
+
 export class CodexExecAdapterError extends Error {
   constructor(code, message, {
     exitCode = null,
@@ -31,7 +58,7 @@ function providerErrorFor(code) {
       code: 'unsupported_capability',
       category: 'provider',
       retryable: false,
-      side_effect_status: 'none',
+      side_effect_status: 'unknown',
       user_message: 'The provider requested an interaction that this transport cannot expose.',
     };
   }
@@ -103,7 +130,7 @@ function requireStringArray(name, values) {
 
 function buildArguments(context, execOptions, resumeOptions) {
   const nativeId = context.lineage.provider_native_id;
-  if (nativeId === null) return ['exec', ...execOptions, '--json', context.input.text];
+  if (nativeId === null) return ['exec', ...execOptions, '--json', '--', context.input.text];
   return [
     'exec',
     ...execOptions,
@@ -111,8 +138,19 @@ function buildArguments(context, execOptions, resumeOptions) {
     ...resumeOptions,
     '--json',
     nativeId,
+    '--',
     context.input.text,
   ];
+}
+
+function selectEnvironment(source, allowlist) {
+  const selected = {};
+  for (const name of allowlist) {
+    if (Object.hasOwn(source, name) && typeof source[name] === 'string') {
+      selected[name] = source[name];
+    }
+  }
+  return selected;
 }
 
 function parseJsonLine(line) {
@@ -153,16 +191,200 @@ function normalizeToolEvent(event, providerNativeId) {
       'Codex emitted a tool item without an ID.',
     );
   }
+  let verb = lifecycle.verb;
+  if (
+    event.type === 'item.completed'
+    && ['failed', 'declined'].includes(event.item.status)
+  ) {
+    verb = event.item.status;
+  }
   return {
     kind: lifecycle.kind,
     provider_native_id: providerNativeId,
     payload: {
       tool_use_id: event.item.id,
       tool_name: specification.name,
-      summary: `${specification.label} ${lifecycle.verb}.`,
+      summary: `${specification.label} ${verb}.`,
       side_effect_status: specification.sideEffect,
     },
   };
+}
+
+function rejectProtocol(message, code = 'provider_protocol_invalid') {
+  throw new CodexExecAdapterError(code, message);
+}
+
+async function acceptThreadStarted(state, event, bindProviderNativeId) {
+  if (state.threadStarted || state.turnStarted) {
+    rejectProtocol('Codex emitted thread.started out of order.');
+  }
+  if (typeof event.thread_id !== 'string' || event.thread_id.length === 0) {
+    rejectProtocol('Codex emitted thread.started without a thread ID.');
+  }
+  if (state.providerNativeId !== null && state.providerNativeId !== event.thread_id) {
+    rejectProtocol(
+      'Codex resumed a different provider lineage.',
+      'provider_context_invalid',
+    );
+  }
+  if (state.providerNativeId === null) {
+    await bindProviderNativeId(event.thread_id);
+    state.providerNativeId = event.thread_id;
+  }
+  state.threadStarted = true;
+  return null;
+}
+
+function acceptTurnStarted(state) {
+  if (!state.threadStarted || state.turnStarted) {
+    rejectProtocol('Codex emitted turn.started out of order.');
+  }
+  state.turnStarted = true;
+  return null;
+}
+
+function acceptAgentMessage(state, event) {
+  const text = event.item.text;
+  if (
+    !state.turnStarted
+    || typeof text !== 'string'
+    || text.length === 0
+    || state.providerNativeId === null
+  ) {
+    rejectProtocol('Codex emitted an invalid agent message.');
+  }
+  state.textSnapshot = state.textSnapshot.length === 0
+    ? text
+    : `${state.textSnapshot}\n\n${text}`;
+  return {
+    kind: 'text_snapshot',
+    provider_native_id: state.providerNativeId,
+    payload: { text: state.textSnapshot, end_offset: state.textSnapshot.length },
+  };
+}
+
+function acceptTurnCompleted(state) {
+  if (!state.turnStarted) rejectProtocol('Codex emitted turn.completed before turn.started.');
+  state.turnCompleted = true;
+  return null;
+}
+
+function acceptProviderItem(state, event) {
+  if (!state.turnStarted || state.providerNativeId === null) {
+    rejectProtocol('Codex emitted a provider item before turn.started.');
+  }
+  const descriptor = normalizeToolEvent(event, state.providerNativeId);
+  if (descriptor) return descriptor;
+  if (['reasoning', 'error', 'agent_message'].includes(event.item?.type)) return null;
+  rejectProtocol('Codex emitted an unsupported item type.');
+}
+
+async function acceptJsonlEvent(state, event, bindProviderNativeId) {
+  if (state.turnCompleted) rejectProtocol('Codex emitted JSONL output after turn completion.');
+  if (event.type === 'thread.started') {
+    return acceptThreadStarted(state, event, bindProviderNativeId);
+  }
+  if (event.type === 'turn.started') return acceptTurnStarted(state);
+  if (event.type === 'item.completed' && event.item?.type === 'agent_message') {
+    return acceptAgentMessage(state, event);
+  }
+  if (event.type === 'turn.completed') return acceptTurnCompleted(state);
+  if (event.type in TOOL_EVENT_KINDS) return acceptProviderItem(state, event);
+  if (event.type === 'turn.failed' || event.type === 'error') {
+    rejectProtocol('Codex reported that execution failed.', 'provider_execution_failed');
+  }
+  if (event.type === 'interaction.requested') {
+    rejectProtocol(
+      'Codex exec JSONL cannot expose this interaction safely.',
+      'provider_interaction_unavailable',
+    );
+  }
+  rejectProtocol('Codex emitted an unsupported JSONL event type.');
+}
+
+function createJsonlNormalizer(context) {
+  const state = {
+    providerNativeId: context.lineage.provider_native_id,
+    threadStarted: false,
+    turnStarted: false,
+    turnCompleted: false,
+    textSnapshot: '',
+  };
+  return Object.freeze({
+    accept: (event) => acceptJsonlEvent(state, event, context.bindProviderNativeId),
+    isComplete: () => state.threadStarted && state.turnStarted && state.turnCompleted,
+  });
+}
+
+function spawnCodexChild({
+  spawnProcess,
+  codexExecutable,
+  args,
+  cwd,
+  env,
+  attempt,
+}) {
+  const child = spawnProcess(codexExecutable, args, {
+    cwd,
+    env,
+    detached: true,
+    shell: false,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (!child || typeof child.once !== 'function') {
+    throw new CodexExecAdapterError(
+      'provider_execution_failed',
+      'Codex process did not expose an event handle.',
+    );
+  }
+  const handle = {
+    attempt: Object.freeze({ ...attempt }),
+    child,
+    processClosed: false,
+    terminationReason: null,
+  };
+  const closed = new Promise((resolve) => {
+    child.once('error', (error) => {
+      handle.processClosed = true;
+      resolve({ exitCode: null, signal: null, spawnError: error });
+    });
+    child.once('close', (exitCode, signal) => {
+      handle.processClosed = true;
+      resolve({ exitCode, signal, spawnError: null });
+    });
+  });
+  if (!Number.isInteger(child.pid) || child.pid < 1 || !child.stdout) {
+    throw new CodexExecAdapterError(
+      'provider_execution_failed',
+      'Codex process did not expose the required process handle.',
+    );
+  }
+  child.stderr?.resume();
+  return { child, closed, handle };
+}
+
+function assertProcessCompletion({ completion, handle, normalizer }) {
+  const { exitCode, signal, spawnError } = completion;
+  if (spawnError) {
+    throw new CodexExecAdapterError(
+      'provider_execution_failed',
+      'Codex process could not be started.',
+    );
+  }
+  if (handle.terminationReason !== null) {
+    throw new CodexExecAdapterError(
+      'provider_attempt_terminated',
+      `Codex process group was terminated for ${handle.terminationReason}.`,
+      { exitCode, signal },
+    );
+  }
+  if (exitCode !== 0 || !normalizer.isComplete()) {
+    throw new CodexExecAdapterError(
+      'provider_execution_failed',
+      'Codex execution did not complete successfully.',
+      { exitCode, signal },
+    );
+  }
 }
 
 export function createCodexExecAdapter({
@@ -173,6 +395,7 @@ export function createCodexExecAdapter({
   resumeOptions = [],
   cwd,
   env = process.env,
+  envAllowlist = DEFAULT_ENV_ALLOWLIST,
 } = {}) {
   if (typeof codexExecutable !== 'string' || codexExecutable.length === 0) {
     throw new TypeError('codexExecutable must be a non-empty string');
@@ -183,6 +406,8 @@ export function createCodexExecAdapter({
   }
   const validatedExecOptions = requireStringArray('execOptions', execOptions);
   const validatedResumeOptions = requireStringArray('resumeOptions', resumeOptions);
+  const validatedEnvAllowlist = requireStringArray('envAllowlist', envAllowlist);
+  const childEnvironment = selectEnvironment(env, validatedEnvAllowlist);
   const activeAttempts = new Map();
 
   async function* execute(context) {
@@ -193,163 +418,25 @@ export function createCodexExecAdapter({
         'A process is already active for this provider attempt.',
       );
     }
-    const child = spawnProcess(
+    const { child, closed, handle } = spawnCodexChild({
+      spawnProcess,
       codexExecutable,
-      buildArguments(context, validatedExecOptions, validatedResumeOptions),
-      {
+      args: buildArguments(context, validatedExecOptions, validatedResumeOptions),
       cwd,
-      env,
-      detached: true,
-      shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      },
-    );
-    if (!Number.isInteger(child.pid) || child.pid < 1 || !child.stdout) {
-      throw new CodexExecAdapterError(
-        'provider_execution_failed',
-        'Codex process did not expose the required process handle.',
-      );
-    }
-    child.stderr?.resume();
-    const handle = {
-      attempt: Object.freeze({ ...context.attempt }),
-      child,
-      processClosed: false,
-      terminationReason: null,
-    };
-    activeAttempts.set(context.attempt.attempt_id, handle);
-    const closed = new Promise((resolve, reject) => {
-      child.once('error', reject);
-      child.once('close', (exitCode, signal) => {
-        handle.processClosed = true;
-        resolve({ exitCode, signal });
-      });
+      env: childEnvironment,
+      attempt: context.attempt,
     });
+    activeAttempts.set(context.attempt.attempt_id, handle);
     const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
-    let providerNativeId = context.lineage.provider_native_id;
-    let threadStarted = false;
-    let turnStarted = false;
-    let turnCompleted = false;
-    let textSnapshot = '';
+    const normalizer = createJsonlNormalizer(context);
 
     try {
       for await (const line of lines) {
         if (line.trim().length === 0) continue;
-        const event = parseJsonLine(line);
-        if (turnCompleted) {
-          throw new CodexExecAdapterError(
-            'provider_protocol_invalid',
-            'Codex emitted JSONL output after turn completion.',
-          );
-        }
-        if (event.type === 'thread.started') {
-          if (threadStarted || turnStarted) {
-            throw new CodexExecAdapterError(
-              'provider_protocol_invalid',
-              'Codex emitted thread.started out of order.',
-            );
-          }
-          if (typeof event.thread_id !== 'string' || event.thread_id.length === 0) {
-            throw new CodexExecAdapterError(
-              'provider_protocol_invalid',
-              'Codex emitted thread.started without a thread ID.',
-            );
-          }
-          if (providerNativeId !== null && providerNativeId !== event.thread_id) {
-            throw new CodexExecAdapterError(
-              'provider_context_invalid',
-              'Codex resumed a different provider lineage.',
-            );
-          }
-          if (providerNativeId === null) {
-            await context.bindProviderNativeId(event.thread_id);
-            providerNativeId = event.thread_id;
-          }
-          threadStarted = true;
-        } else if (event.type === 'turn.started') {
-          if (!threadStarted || turnStarted) {
-            throw new CodexExecAdapterError(
-              'provider_protocol_invalid',
-              'Codex emitted turn.started out of order.',
-            );
-          }
-          turnStarted = true;
-        } else if (event.type === 'item.completed' && event.item?.type === 'agent_message') {
-          const text = event.item.text;
-          if (
-            !turnStarted
-            || typeof text !== 'string'
-            || text.length === 0
-            || providerNativeId === null
-          ) {
-            throw new CodexExecAdapterError(
-              'provider_protocol_invalid',
-              'Codex emitted an invalid agent message.',
-            );
-          }
-          textSnapshot = textSnapshot.length === 0 ? text : `${textSnapshot}\n\n${text}`;
-          yield {
-            kind: 'text_snapshot',
-            provider_native_id: providerNativeId,
-            payload: { text: textSnapshot, end_offset: textSnapshot.length },
-          };
-        } else if (event.type === 'turn.completed') {
-          if (!turnStarted) {
-            throw new CodexExecAdapterError(
-              'provider_protocol_invalid',
-              'Codex emitted turn.completed before turn.started.',
-            );
-          }
-          turnCompleted = true;
-        } else if (event.type in TOOL_EVENT_KINDS && providerNativeId !== null) {
-          if (!turnStarted) {
-            throw new CodexExecAdapterError(
-              'provider_protocol_invalid',
-              'Codex emitted a tool item before turn.started.',
-            );
-          }
-          const toolEvent = normalizeToolEvent(event, providerNativeId);
-          if (toolEvent) {
-            yield toolEvent;
-          } else if (!['reasoning', 'error', 'agent_message'].includes(event.item?.type)) {
-            throw new CodexExecAdapterError(
-              'provider_protocol_invalid',
-              'Codex emitted an unsupported item type.',
-            );
-          }
-        } else if (event.type === 'turn.failed' || event.type === 'error') {
-          throw new CodexExecAdapterError(
-            'provider_execution_failed',
-            'Codex reported that execution failed.',
-          );
-        } else if (event.type === 'interaction.requested') {
-          throw new CodexExecAdapterError(
-            'provider_interaction_unavailable',
-            'Codex exec JSONL cannot expose this interaction safely.',
-          );
-        } else {
-          throw new CodexExecAdapterError(
-            'provider_protocol_invalid',
-            'Codex emitted an unsupported JSONL event type.',
-          );
-        }
+        const descriptor = await normalizer.accept(parseJsonLine(line));
+        if (descriptor) yield descriptor;
       }
-
-      const { exitCode, signal } = await closed;
-      if (handle.terminationReason !== null) {
-        throw new CodexExecAdapterError(
-          'provider_attempt_terminated',
-          `Codex process group was terminated for ${handle.terminationReason}.`,
-          { exitCode, signal },
-        );
-      }
-      if (exitCode !== 0 || !threadStarted || !turnStarted || !turnCompleted) {
-        throw new CodexExecAdapterError(
-          'provider_execution_failed',
-          'Codex execution did not complete successfully.',
-          { exitCode, signal },
-        );
-      }
+      assertProcessCompletion({ completion: await closed, handle, normalizer });
     } catch (error) {
       if (!handle.processClosed && handle.terminationReason === null) {
         try {
@@ -376,8 +463,8 @@ export function createCodexExecAdapter({
       return Object.freeze({ status: 'not_current', reason });
     }
     if (handle.terminationReason === null) {
-      handle.terminationReason = reason;
       await signalProcessGroup(handle.child.pid, 'SIGTERM');
+      handle.terminationReason = reason;
     }
     return Object.freeze({ status: 'signalled', reason: handle.terminationReason });
   }

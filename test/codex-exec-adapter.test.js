@@ -77,15 +77,14 @@ describe('Codex exec provider adapter', () => {
       },
     ]);
 
-    expect(spawnProcess).toHaveBeenCalledWith(
-      'codex',
-      ['exec', '--json', 'Hello Codex'],
-      expect.objectContaining({
-        detached: true,
-        shell: false,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      }),
-    );
+    const [executable, args, options] = spawnProcess.mock.calls[0];
+    expect(executable).toBe('codex');
+    expect(args).toEqual(['exec', '--json', '--', 'Hello Codex']);
+    expect(options).toEqual(expect.objectContaining({
+      detached: true,
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }));
     expect(context.bindProviderNativeId).toHaveBeenCalledTimes(1);
     expect(context.bindProviderNativeId).toHaveBeenCalledWith('codex-thread-1');
     expect(context.bindProviderNativeId.mock.invocationCallOrder[0])
@@ -121,21 +120,19 @@ describe('Codex exec provider adapter', () => {
       },
     ]);
 
-    expect(spawnProcess).toHaveBeenCalledWith(
-      'codex',
-      [
-        'exec',
-        '--sandbox',
-        'read-only',
-        'resume',
-        '--model',
-        'gpt-test',
-        '--json',
-        'codex-thread-1',
-        'Follow up',
-      ],
-      expect.any(Object),
-    );
+    expect(spawnProcess.mock.calls[0][0]).toBe('codex');
+    expect(spawnProcess.mock.calls[0][1]).toEqual([
+      'exec',
+      '--sandbox',
+      'read-only',
+      'resume',
+      '--model',
+      'gpt-test',
+      '--json',
+      'codex-thread-1',
+      '--',
+      'Follow up',
+    ]);
     expect(context.bindProviderNativeId).not.toHaveBeenCalled();
   });
 
@@ -257,6 +254,39 @@ describe('Codex exec provider adapter', () => {
     ]);
   });
 
+  test('preserves failed tool status in the provider-neutral summary', async () => {
+    const child = fakeChild([
+      { type: 'thread.started', thread_id: 'codex-thread-1' },
+      { type: 'turn.started' },
+      {
+        type: 'item.completed',
+        item: {
+          id: 'command-failed',
+          type: 'command_execution',
+          command: 'private command',
+          aggregated_output: 'private failure output',
+          exit_code: 1,
+          status: 'failed',
+        },
+      },
+      { type: 'turn.completed', usage: {} },
+    ]);
+    const adapter = createCodexExecAdapter({ spawnProcess: () => child });
+
+    await expect(collect(adapter.execute(executionContext()))).resolves.toEqual([
+      {
+        kind: 'tool_finished',
+        provider_native_id: 'codex-thread-1',
+        payload: {
+          tool_use_id: 'command-failed',
+          tool_name: 'command',
+          summary: 'Command failed.',
+          side_effect_status: 'unknown',
+        },
+      },
+    ]);
+  });
+
   test.each([
     [
       'turn.failed',
@@ -321,9 +351,75 @@ describe('Codex exec provider adapter', () => {
         code: 'unsupported_capability',
         category: 'provider',
         retryable: false,
-        side_effect_status: 'none',
+        side_effect_status: 'unknown',
         user_message: 'The provider requested an interaction that this transport cannot expose.',
       },
+    });
+  });
+
+  test('separates an option-shaped prompt from Codex CLI arguments', async () => {
+    const child = fakeChild([
+      { type: 'thread.started', thread_id: 'codex-thread-1' },
+      { type: 'turn.started' },
+      { type: 'turn.completed', usage: {} },
+    ]);
+    const spawnProcess = jest.fn(() => child);
+    const adapter = createCodexExecAdapter({ spawnProcess });
+    const context = executionContext({
+      input: {
+        kind: 'text',
+        text: '--dangerously-bypass-approvals-and-sandbox',
+        attachments: [],
+      },
+    });
+
+    await collect(adapter.execute(context));
+
+    expect(spawnProcess.mock.calls[0][1]).toEqual([
+      'exec',
+      '--json',
+      '--',
+      '--dangerously-bypass-approvals-and-sandbox',
+    ]);
+  });
+
+  test('turns an asynchronous spawn ENOENT into a handled provider failure', async () => {
+    const child = new EventEmitter();
+    child.pid = undefined;
+    queueMicrotask(() => {
+      const error = new Error('spawn codex ENOENT');
+      error.code = 'ENOENT';
+      child.emit('error', error);
+    });
+    const adapter = createCodexExecAdapter({ spawnProcess: () => child });
+
+    await expect(collect(adapter.execute(executionContext()))).rejects.toMatchObject({
+      code: 'provider_execution_failed',
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+  });
+
+  test('passes only explicitly allowed environment variables to Codex', async () => {
+    const child = fakeChild([
+      { type: 'thread.started', thread_id: 'codex-thread-1' },
+      { type: 'turn.started' },
+      { type: 'turn.completed', usage: {} },
+    ]);
+    const spawnProcess = jest.fn(() => child);
+    const adapter = createCodexExecAdapter({
+      spawnProcess,
+      env: {
+        HOME: '/safe/home',
+        PATH: '/safe/bin',
+        UNRELATED_SECRET: 'must-not-pass',
+      },
+    });
+
+    await collect(adapter.execute(executionContext()));
+
+    expect(spawnProcess.mock.calls[0][2].env).toEqual({
+      HOME: '/safe/home',
+      PATH: '/safe/bin',
     });
   });
 
@@ -391,4 +487,35 @@ describe('Codex exec provider adapter', () => {
       });
     },
   );
+
+  test('allows termination retry when signalling the process group fails', async () => {
+    const process = controlledChild();
+    const signalProcessGroup = jest.fn()
+      .mockRejectedValueOnce(new Error('EPERM'))
+      .mockResolvedValueOnce(undefined);
+    const context = executionContext({
+      lineage: { provider_native_id: 'codex-thread-1' },
+    });
+    const adapter = createCodexExecAdapter({
+      spawnProcess: () => process.child,
+      signalProcessGroup,
+    });
+    const execution = collect(adapter.execute(context));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    await expect(adapter.terminateAttempt({
+      attempt: context.attempt,
+      reason: 'stop',
+    })).rejects.toThrow('EPERM');
+    await expect(adapter.terminateAttempt({
+      attempt: context.attempt,
+      reason: 'stop',
+    })).resolves.toEqual({ status: 'signalled', reason: 'stop' });
+    expect(signalProcessGroup).toHaveBeenCalledTimes(2);
+
+    process.close();
+    await expect(execution).rejects.toMatchObject({
+      code: 'provider_attempt_terminated',
+    });
+  });
 });

@@ -287,6 +287,7 @@ function transitionInTransaction(database, {
         to_state: toState,
         reason_code: reasonCode ?? `executor_${toState}`,
       },
+      provider_native_id: turn.provider_native_id,
       error: error ?? null,
     },
     occurredAt,

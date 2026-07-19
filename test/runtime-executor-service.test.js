@@ -162,6 +162,11 @@ describe('runtime executor service', () => {
       .toEqual([
         expect.objectContaining({ provider_native_id: 'native-thread-1' }),
       ]);
+    expect(readEvents(database, accepted.turn_id).at(-1)).toMatchObject({
+      kind: 'turn_state_changed',
+      phase: 'completed',
+      provider_native_id: 'native-thread-1',
+    });
 
     database.close();
   });
