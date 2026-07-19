@@ -1,3 +1,36 @@
+import { createDeliveryLaneKey } from './delivery-lane-key.js';
+
+const OUTBOX_TABLE_SCHEMA = `(
+    outbox_id TEXT PRIMARY KEY,
+    delivery_id TEXT NOT NULL UNIQUE,
+    aggregate_type TEXT NOT NULL,
+    aggregate_id TEXT NOT NULL,
+    turn_id TEXT REFERENCES runtime_turns(turn_id),
+    control_id TEXT,
+    lane_key TEXT,
+    predecessor_delivery_id TEXT,
+    aggregate_version INTEGER NOT NULL CHECK (aggregate_version > 0),
+    status TEXT NOT NULL,
+    command_json TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    supersedable INTEGER NOT NULL DEFAULT 0 CHECK (supersedable IN (0, 1)),
+    terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1)),
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    delivery_attempt_id TEXT,
+    delivery_attempt_no INTEGER CHECK (
+      delivery_attempt_no IS NULL OR delivery_attempt_no > 0
+    ),
+    outbox_lease_epoch INTEGER NOT NULL DEFAULT 0 CHECK (outbox_lease_epoch >= 0),
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    last_attempt_at TEXT,
+    next_attempt_at TEXT,
+    last_error_json TEXT,
+    result_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT
+  )`;
+
 const RUNTIME_SCHEMA = `
   CREATE TABLE IF NOT EXISTS runtime_conversations (
     conversation_id TEXT PRIMARY KEY,
@@ -99,18 +132,36 @@ const RUNTIME_SCHEMA = `
     UNIQUE (turn_id, turn_version)
   );
 
-  CREATE TABLE IF NOT EXISTS runtime_outbox (
-    outbox_id TEXT PRIMARY KEY,
-    delivery_id TEXT NOT NULL UNIQUE,
+  CREATE TABLE IF NOT EXISTS runtime_outbox ${OUTBOX_TABLE_SCHEMA};
+
+  CREATE TABLE IF NOT EXISTS runtime_delivery_lanes (
+    lane_key TEXT PRIMARY KEY,
+    turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
     aggregate_type TEXT NOT NULL,
-    aggregate_id TEXT NOT NULL,
-    turn_id TEXT REFERENCES runtime_turns(turn_id),
-    control_id TEXT,
-    aggregate_version INTEGER NOT NULL CHECK (aggregate_version > 0),
-    status TEXT NOT NULL,
-    command_json TEXT NOT NULL,
+    target_json TEXT NOT NULL,
+    mapping_json TEXT NOT NULL,
+    platform_message_id TEXT,
+    applied_platform_version,
+    last_delivery_id TEXT,
+    last_applied_version INTEGER NOT NULL DEFAULT 0 CHECK (last_applied_version >= 0),
+    last_delivered_at TEXT,
     created_at TEXT NOT NULL,
-    UNIQUE (aggregate_type, aggregate_id, aggregate_version)
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_projection_snapshots (
+    projection_id TEXT PRIMARY KEY,
+    lane_key TEXT NOT NULL REFERENCES runtime_delivery_lanes(lane_key),
+    turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),
+    aggregate_version INTEGER NOT NULL CHECK (aggregate_version > 0),
+    event_sequence_through INTEGER NOT NULL CHECK (event_sequence_through > 0),
+    render_model_json TEXT NOT NULL,
+    critical INTEGER NOT NULL CHECK (critical IN (0, 1)),
+    terminal INTEGER NOT NULL CHECK (terminal IN (0, 1)),
+    status TEXT NOT NULL,
+    materialized_outbox_id TEXT REFERENCES runtime_outbox(outbox_id),
+    created_at TEXT NOT NULL,
+    UNIQUE (lane_key, aggregate_version)
   );
 
   CREATE TABLE IF NOT EXISTS runtime_inbound_idempotency (
@@ -139,10 +190,138 @@ const RUNTIME_SCHEMA = `
   );
 `;
 
+const OUTBOX_V2_SCHEMA = `CREATE TABLE runtime_outbox ${OUTBOX_TABLE_SCHEMA};`;
+
+const OUTBOX_COLUMNS = Object.freeze([
+  'outbox_id',
+  'delivery_id',
+  'aggregate_type',
+  'aggregate_id',
+  'turn_id',
+  'control_id',
+  'lane_key',
+  'predecessor_delivery_id',
+  'aggregate_version',
+  'status',
+  'command_json',
+  'priority',
+  'supersedable',
+  'terminal',
+  'attempt_count',
+  'delivery_attempt_id',
+  'delivery_attempt_no',
+  'outbox_lease_epoch',
+  'lease_owner',
+  'lease_expires_at',
+  'last_attempt_at',
+  'next_attempt_at',
+  'last_error_json',
+  'result_json',
+  'created_at',
+  'updated_at',
+]);
+
 function addColumnIfMissing(database, tableName, columnName, definition) {
   const columns = database.prepare(`PRAGMA table_info(${tableName})`).all();
   if (columns.some(({ name }) => name === columnName)) return;
   database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+}
+
+function hasLegacyAggregateVersionConstraint(database) {
+  return database.prepare("PRAGMA index_list('runtime_outbox')").all()
+    .filter(({ unique }) => unique === 1)
+    .some(({ name }) => {
+      const fields = database.prepare(`PRAGMA index_info('${name}')`).all()
+        .map(({ name: fieldName }) => fieldName);
+      return fields.length === 3
+        && fields[0] === 'aggregate_type'
+        && fields[1] === 'aggregate_id'
+        && fields[2] === 'aggregate_version';
+    });
+}
+
+function migrateLegacyOutboxConstraint(database) {
+  if (!hasLegacyAggregateVersionConstraint(database)) return;
+  const migrate = database.transaction(() => {
+    database.exec(`
+      DROP TABLE IF EXISTS runtime_projection_snapshots;
+      DROP TABLE IF EXISTS runtime_delivery_lanes;
+      ALTER TABLE runtime_outbox RENAME TO runtime_outbox_issue07;
+      ${OUTBOX_V2_SCHEMA}
+      INSERT INTO runtime_outbox (${OUTBOX_COLUMNS.join(', ')})
+        SELECT ${OUTBOX_COLUMNS.join(', ')} FROM runtime_outbox_issue07;
+      DROP TABLE runtime_outbox_issue07;
+    `);
+    database.exec(RUNTIME_SCHEMA);
+  });
+  migrate.immediate();
+}
+
+function backfillDeliveryLanes(database) {
+  const rows = database.prepare(`
+    SELECT outbox_id, delivery_id, aggregate_version, status, command_json,
+      result_json, created_at
+    FROM runtime_outbox
+    WHERE lane_key IS NULL AND aggregate_type = 'turn_main'
+    ORDER BY created_at, outbox_id
+  `).all();
+  for (const row of rows) {
+    let command;
+    try {
+      command = JSON.parse(row.command_json);
+    } catch {
+      continue;
+    }
+    if (
+      command.aggregate_type !== 'turn_main'
+      || typeof command.mapping?.turn_id !== 'string'
+      || typeof command.target?.channel !== 'string'
+    ) {
+      continue;
+    }
+    const laneKey = createDeliveryLaneKey(command);
+    let result = null;
+    if (row.result_json !== null) {
+      try {
+        result = JSON.parse(row.result_json);
+      } catch {
+        result = null;
+      }
+    }
+    const delivered = row.status === 'delivered' && result?.status === 'delivered';
+    database.prepare(`
+      INSERT OR IGNORE INTO runtime_delivery_lanes (
+        lane_key, turn_id, aggregate_type, target_json, mapping_json,
+        platform_message_id, applied_platform_version, last_delivery_id,
+        last_applied_version, last_delivered_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      laneKey,
+      command.mapping.turn_id,
+      command.aggregate_type,
+      JSON.stringify(command.target),
+      JSON.stringify(command.mapping),
+      delivered ? result.platform_message_id : null,
+      delivered ? result.applied_platform_version : null,
+      delivered ? row.delivery_id : null,
+      delivered ? row.aggregate_version : 0,
+      delivered ? result.delivered_at : null,
+      row.created_at,
+      result?.result_at ?? row.created_at,
+    );
+    database.prepare(`
+      UPDATE runtime_outbox
+      SET lane_key = ?, predecessor_delivery_id = ?, priority = ?, terminal = ?,
+        updated_at = COALESCE(updated_at, created_at)
+      WHERE outbox_id = ? AND lane_key IS NULL
+    `).run(
+      laneKey,
+      command.predecessor_delivery_id ?? null,
+      command.priority ?? 0,
+      command.render_model?.terminal === true ? 1 : 0,
+      row.outbox_id,
+    );
+  }
 }
 
 export function initializeRuntimePersistence(database) {
@@ -171,9 +350,62 @@ export function initializeRuntimePersistence(database) {
     'provider_native_id_bound_at',
     'TEXT',
   );
+  addColumnIfMissing(
+    database,
+    'runtime_outbox',
+    'attempt_count',
+    'INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0)',
+  );
+  addColumnIfMissing(database, 'runtime_outbox', 'delivery_attempt_id', 'TEXT');
+  addColumnIfMissing(database, 'runtime_outbox', 'lane_key', 'TEXT');
+  addColumnIfMissing(database, 'runtime_outbox', 'predecessor_delivery_id', 'TEXT');
+  addColumnIfMissing(
+    database,
+    'runtime_outbox',
+    'delivery_attempt_no',
+    'INTEGER CHECK (delivery_attempt_no IS NULL OR delivery_attempt_no > 0)',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_outbox',
+    'outbox_lease_epoch',
+    'INTEGER NOT NULL DEFAULT 0 CHECK (outbox_lease_epoch >= 0)',
+  );
+  addColumnIfMissing(database, 'runtime_outbox', 'lease_owner', 'TEXT');
+  addColumnIfMissing(database, 'runtime_outbox', 'lease_expires_at', 'TEXT');
+  addColumnIfMissing(database, 'runtime_outbox', 'last_attempt_at', 'TEXT');
+  addColumnIfMissing(database, 'runtime_outbox', 'next_attempt_at', 'TEXT');
+  addColumnIfMissing(database, 'runtime_outbox', 'last_error_json', 'TEXT');
+  addColumnIfMissing(database, 'runtime_outbox', 'result_json', 'TEXT');
+  addColumnIfMissing(database, 'runtime_outbox', 'updated_at', 'TEXT');
+  addColumnIfMissing(
+    database,
+    'runtime_outbox',
+    'priority',
+    'INTEGER NOT NULL DEFAULT 0',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_outbox',
+    'supersedable',
+    'INTEGER NOT NULL DEFAULT 0 CHECK (supersedable IN (0, 1))',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_outbox',
+    'terminal',
+    'INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1))',
+  );
+  migrateLegacyOutboxConstraint(database);
+  backfillDeliveryLanes(database);
   database.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS runtime_lineages_provider_native_id
       ON runtime_lineages(provider, provider_native_id)
       WHERE provider IS NOT NULL AND provider_native_id IS NOT NULL;
+    DROP INDEX IF EXISTS runtime_outbox_dispatch;
+    CREATE INDEX IF NOT EXISTS runtime_outbox_dispatch
+      ON runtime_outbox(status, next_attempt_at, priority, created_at);
+    CREATE INDEX IF NOT EXISTS runtime_outbox_lane
+      ON runtime_outbox(lane_key, aggregate_version, status);
   `);
 }
