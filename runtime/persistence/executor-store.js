@@ -916,6 +916,110 @@ export function createExecutorStore({
     return claim.immediate();
   }
 
+  function cancelUnsentInteractions(turnContext, turn, cancelledAt) {
+    const rows = database.prepare(`
+      SELECT interaction.request_json, interaction.handoff_version,
+        handoff.record_json AS handoff_json
+      FROM runtime_interactions AS interaction
+      LEFT JOIN runtime_interaction_handoffs AS handoff
+        ON handoff.interaction_id = interaction.interaction_id
+      WHERE interaction.turn_id = ?
+        AND interaction.state IN ('pending', 'answer_committed')
+      ORDER BY interaction.ordinal ASC
+    `).all(turn.turn_id);
+    let currentTurn = turn;
+    for (const row of rows) {
+      const request = JSON.parse(row.request_json);
+      validateInteractionTransition({
+        from: request.state,
+        to: 'cancelled',
+        occurredAt: cancelledAt,
+      });
+      let handoffVersion = row.handoff_version;
+      const updatedRequest = {
+        ...request,
+        state: 'cancelled',
+        version: request.version + 1,
+        terminal_reason: 'parent_stopped',
+      };
+      if (row.handoff_json !== null) {
+        const handoff = JSON.parse(row.handoff_json);
+        validateInteractionHandoffTransition({
+          from: handoff.state,
+          to: 'cancelled',
+          occurredAt: cancelledAt,
+        });
+        const updatedHandoff = {
+          ...handoff,
+          state: 'cancelled',
+          reason_code: 'parent_stopped',
+        };
+        validateInteractionHandoff(updatedHandoff, { occurredAt: cancelledAt });
+        const handoffUpdate = database.prepare(`
+          UPDATE runtime_interaction_handoffs
+          SET state = 'cancelled', record_json = ?, updated_at = ?
+          WHERE handoff_id = ? AND state = 'pending'
+        `).run(
+          JSON.stringify(updatedHandoff),
+          cancelledAt,
+          handoff.handoff_id,
+        );
+        if (handoffUpdate.changes !== 1) {
+          conflict('stale_attempt', 'Turn cancellation lost its pending interaction handoff.');
+        }
+        updatedRequest.handoff_state = 'cancelled';
+        handoffVersion += 1;
+      }
+      validateInteractionRequest(updatedRequest, { occurredAt: cancelledAt });
+      const interactionUpdate = database.prepare(`
+        UPDATE runtime_interactions
+        SET state = 'cancelled', version = ?, handoff_state = ?, handoff_version = ?,
+          request_json = ?, updated_at = ?
+        WHERE interaction_id = ? AND state = ? AND version = ?
+      `).run(
+        updatedRequest.version,
+        updatedRequest.handoff_state,
+        handoffVersion,
+        JSON.stringify(updatedRequest),
+        cancelledAt,
+        request.interaction_id,
+        request.state,
+        request.version,
+      );
+      if (interactionUpdate.changes !== 1) {
+        conflict('stale_attempt', 'Turn cancellation lost its pending interaction fence.');
+      }
+      const event = buildEvent({
+        turn: currentTurn,
+        lastEvent: loadLastEvent(database, currentTurn.turn_id),
+        fence: turnContext.attempt,
+        provider,
+        descriptor: {
+          kind: 'interaction_cancelled',
+          phase: currentTurn.state,
+          payload: {
+            interaction_id: request.interaction_id,
+            ordinal: request.ordinal,
+            interaction_version: updatedRequest.version,
+            handoff_version: handoffVersion,
+          },
+        },
+        occurredAt: cancelledAt,
+        generateId,
+      });
+      commitTurnEvent(database, {
+        turn: currentTurn,
+        event,
+        fence: turnContext.attempt,
+        nextState: currentTurn.state,
+        staleMessage: 'Turn cancellation lost its provider attempt fence.',
+        generateId,
+      });
+      currentTurn = loadTurn(database, currentTurn.turn_id);
+    }
+    return currentTurn;
+  }
+
   function transitionTurn(
     turnContext,
     fromState,
@@ -923,7 +1027,12 @@ export function createExecutorStore({
     { error = null, reasonCode = null } = {},
   ) {
     const transition = database.transaction(() => {
-      assertTurnContextFence(loadTurn(database, turnContext.turn_id), turnContext);
+      let turn = loadTurn(database, turnContext.turn_id);
+      assertTurnContextFence(turn, turnContext);
+      const occurredAt = now();
+      if (toState === 'stopped') {
+        turn = cancelUnsentInteractions(turnContext, turn, occurredAt);
+      }
       return transitionInTransaction(database, {
         turnId: turnContext.turn_id,
         fromState,
@@ -931,7 +1040,7 @@ export function createExecutorStore({
         fence: turnContext.attempt,
         provider,
         serviceInstanceId,
-        occurredAt: now(),
+        occurredAt,
         generateId,
         error,
         reasonCode: reasonCode ?? undefined,

@@ -388,21 +388,27 @@ async function requestToolPermission(executor, toolName, input, sdkContext) {
       permission.reject(error);
     };
     sdkContext?.signal?.addEventListener?.('abort', abort, { once: true });
-    activeTurn.output.push({
-      kind: 'interaction_requested',
-      payload: {
-        provider_interaction_ref: providerInteractionRef,
-        tool_use_id: sdkContext?.toolUseID ?? providerInteractionRef,
-        kind: 'tool_approval',
-        prompt: `Allow Claude to use ${toolName}?`,
-        choices: [
-          { choice_id: 'allow', label: 'Allow' },
-          { choice_id: 'deny', label: 'Deny' },
-        ],
-        authorized_subjects: interactionPolicy.authorized_subjects,
-        allowed_sources: interactionPolicy.allowed_sources,
-      },
-    });
+    const descriptor = {
+      provider_interaction_ref: providerInteractionRef,
+      tool_use_id: sdkContext?.toolUseID ?? providerInteractionRef,
+      kind: 'tool_approval',
+      prompt: `Allow Claude to use ${toolName}?`,
+      choices: [
+        { choice_id: 'allow', label: 'Allow' },
+        { choice_id: 'deny', label: 'Deny' },
+      ],
+      authorized_subjects: interactionPolicy.authorized_subjects,
+      allowed_sources: interactionPolicy.allowed_sources,
+    };
+    let request;
+    try {
+      request = await activeTurn.controls.persistInteraction(descriptor);
+    } catch (error) {
+      activeTurn.pendingPermissions.delete(providerInteractionRef);
+      settleTurn(activeTurn, { error });
+      throw error;
+    }
+    activeTurn.output.push({ type: 'interaction_persisted', request });
     try {
       return await permission.promise;
     } finally {
@@ -624,7 +630,10 @@ export function createClaudeConversationAdapter({
     }
   }
   for (const option of Object.keys(queryOptions.extraArgs ?? {})) {
-    if (CORE_MANAGED_CONTINUITY_ARGUMENTS.has(normalizeCliArgument(option))) {
+    if (
+      /^-(?:r.+|c.+)$/i.test(option)
+      || CORE_MANAGED_CONTINUITY_ARGUMENTS.has(normalizeCliArgument(option))
+    ) {
       throw new TypeError(`queryOptions.extraArgs.${option} is managed by Core lineage authority`);
     }
   }
@@ -635,7 +644,10 @@ export function createClaudeConversationAdapter({
     if (typeof argument !== 'string') {
       throw new TypeError(`queryOptions.executableArgs[${index}] must be a string`);
     }
-    if (CORE_MANAGED_CONTINUITY_ARGUMENTS.has(normalizeCliArgument(argument))) {
+    if (
+      /^-(?:r.+|c.+)$/i.test(argument)
+      || CORE_MANAGED_CONTINUITY_ARGUMENTS.has(normalizeCliArgument(argument))
+    ) {
       throw new TypeError(
         `queryOptions.executableArgs[${index}] is managed by Core lineage authority`,
       );
@@ -684,6 +696,9 @@ export function createClaudeConversationAdapter({
     }
     if (typeof controls.requestPermission !== 'function') {
       throw new TypeError('controls.requestPermission must be a function');
+    }
+    if (controls.interactionPolicy && typeof controls.persistInteraction !== 'function') {
+      throw new TypeError('controls.persistInteraction must be a function for durable interactions');
     }
     let executor = executors.get(context.conversation_id);
     if (executor?.closing) {
@@ -916,36 +931,6 @@ export function createClaudeConversationAdapter({
     }
     const answerDecision = delivery.answer?.value?.decision;
     const allowed = ['allow', 'approve', 'approved', 'yes'].includes(answerDecision);
-    return {
-      status: allowed ? 'accepted' : 'deny',
-      handoff_id: delivery.handoff.handoff_id,
-      provider_attempt_id: delivery.handoff.provider_attempt_id,
-      handoff_attempt_id: delivery.handoff.handoff_attempt_id,
-      handoff_attempt_no: delivery.handoff.handoff_attempt_no,
-      lease_epoch: delivery.handoff.lease_epoch,
-      blocking_interactions_remaining: activeTurn.pendingPermissions.size > 1,
-    };
-  }
-
-  async function commitInteractionAnswer(delivery) {
-    const request = delivery?.request;
-    const executor = executors.get(request?.conversation_id);
-    const activeTurn = executor?.activeTurn;
-    if (
-      !activeTurn
-      || activeTurn.context.turn_id !== request?.turn_id
-      || activeTurn.context.attempt.attempt_id !== delivery?.handoff?.provider_attempt_id
-      || activeTurn.context.attempt.lease_epoch !== delivery?.handoff?.lease_epoch
-    ) {
-      throw new Error('Claude interaction commit does not match the active provider attempt fence.');
-    }
-    const providerInteractionRef = request.runtime_fence?.provider_interaction_ref;
-    const pending = activeTurn.pendingPermissions.get(providerInteractionRef);
-    if (!pending) {
-      throw new Error('Claude interaction commit has no matching pending SDK permission.');
-    }
-    const answerDecision = delivery.answer?.value?.decision;
-    const allowed = ['allow', 'approve', 'approved', 'yes'].includes(answerDecision);
     activeTurn.pendingPermissions.delete(providerInteractionRef);
     pending.permission.resolve(allowed ? {
       behavior: 'allow',
@@ -955,6 +940,15 @@ export function createClaudeConversationAdapter({
       message: 'Permission denied by the authorized user.',
       interrupt: false,
     });
+    return {
+      status: allowed ? 'accepted' : 'deny',
+      handoff_id: delivery.handoff.handoff_id,
+      provider_attempt_id: delivery.handoff.provider_attempt_id,
+      handoff_attempt_id: delivery.handoff.handoff_attempt_id,
+      handoff_attempt_no: delivery.handoff.handoff_attempt_no,
+      lease_epoch: delivery.handoff.lease_epoch,
+      blocking_interactions_remaining: activeTurn.pendingPermissions.size > 0,
+    };
   }
 
   async function evictIdle({ canEvict, maxCount = Number.POSITIVE_INFINITY }) {
@@ -1046,7 +1040,6 @@ export function createClaudeConversationAdapter({
     abort,
     cancel,
     close,
-    commitInteractionAnswer,
     evictIdle,
     execute,
     handleInteractionAnswer,

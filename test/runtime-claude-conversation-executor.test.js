@@ -899,7 +899,19 @@ describe('Claude conversation executor', () => {
     })).toThrow(/managed by Core lineage authority/);
     expect(() => createClaudeConversationAdapter({
       query: () => {},
+      queryOptions: { extraArgs: { '-rforeign-session': null } },
+    })).toThrow(/managed by Core lineage authority/);
+    expect(() => createClaudeConversationAdapter({
+      query: () => {},
       queryOptions: { executableArgs: ['--resume=foreign'] },
+    })).toThrow(/managed by Core lineage authority/);
+    expect(() => createClaudeConversationAdapter({
+      query: () => {},
+      queryOptions: { executableArgs: ['-rforeign-session'] },
+    })).toThrow(/managed by Core lineage authority/);
+    expect(() => createClaudeConversationAdapter({
+      query: () => {},
+      queryOptions: { executableArgs: ['-cforeign-session'] },
     })).toThrow(/managed by Core lineage authority/);
   });
 
@@ -1229,7 +1241,7 @@ describe('Claude conversation executor', () => {
     database.close();
   });
 
-  test('does not release an SDK permission before its durable acknowledgement commits', async () => {
+  test('keeps a sent SDK answer in delivering state when durable acknowledgement fails', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'permission-ack-failure');
     const fake = createPermissionQuery({ sessionId: 'claude-session-permission-ack-failure' });
@@ -1256,7 +1268,16 @@ describe('Claude conversation executor', () => {
     await expect(service.deliverInteractionAnswer(answer.handoff_id)).rejects.toThrow(
       /forced permission acknowledgement failure/,
     );
-    expect(fake.permissionResults).toEqual([]);
+    expect(fake.permissionResults).toEqual([{
+      behavior: 'allow',
+      updatedInput: { command: 'pwd' },
+    }]);
+    expect(database.prepare(`
+      SELECT state, handoff_state FROM runtime_interactions WHERE interaction_id = ?
+    `).get(waiting.request.interaction_id)).toEqual({
+      state: 'answer_delivering',
+      handoff_state: 'delivering',
+    });
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
       .get(accepted.turn_id)).toEqual({ state: 'recovering' });
 
@@ -1361,6 +1382,9 @@ describe('Claude conversation executor', () => {
     });
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
       .get(accepted.turn_id)).toEqual({ state: 'stopped' });
+    expect(database.prepare(`
+      SELECT state FROM runtime_interactions WHERE interaction_id = ?
+    `).get(waiting.request.interaction_id)).toEqual({ state: 'cancelled' });
 
     await service.close();
     database.close();
@@ -1408,6 +1432,9 @@ describe('Claude conversation executor', () => {
     });
 
     const firstWaiting = await service.runNext();
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_interactions WHERE turn_id = ? AND state = 'pending'
+    `).get(accepted.turn_id)).toEqual({ count: 2 });
     const firstAnswer = service.submitInteractionAnswer(
       permissionAnswer(firstWaiting.request, 'parallel-1'),
     );
@@ -1422,6 +1449,43 @@ describe('Claude conversation executor', () => {
     expect(secondHandled.execution).toMatchObject({ status: 'completed' });
 
     await service.close();
+    database.close();
+  });
+
+  test('keeps every parallel SDK permission durable across service shutdown', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'permission-parallel-restart');
+    const fake = createParallelPermissionQuery({
+      sessionId: 'claude-session-permission-parallel-restart',
+    });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-permission-parallel-restart',
+      now: () => '2026-07-19T09:03:50Z',
+      generateId: deterministicIds('permission-parallel-restart'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ status: 'waiting_user' });
+    expect(database.prepare(`
+      SELECT ordinal, state FROM runtime_interactions WHERE turn_id = ? ORDER BY ordinal
+    `).all(accepted.turn_id)).toEqual([
+      { ordinal: 1, state: 'pending' },
+      { ordinal: 2, state: 'pending' },
+    ]);
+
+    await service.close();
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    expect(database.prepare(`
+      SELECT ordinal, state FROM runtime_interactions WHERE turn_id = ? ORDER BY ordinal
+    `).all(accepted.turn_id)).toEqual([
+      { ordinal: 1, state: 'pending' },
+      { ordinal: 2, state: 'pending' },
+    ]);
+
     database.close();
   });
 
