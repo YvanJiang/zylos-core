@@ -1,0 +1,420 @@
+{
+  "fixture_version": "1.0",
+  "contract": "zylos.inbound-envelope",
+  "valid": [
+    {
+      "name": "authenticated_dm_with_attachment",
+      "document": {
+        "contract": "zylos.inbound-envelope",
+        "contract_version": "1.0",
+        "inbound_event_id": "evt-dm-001",
+        "idempotency_key": "zid:v1:inbound:a3b8aa74cbe7496c06d5b831ecbf5d940778fb1890f8b8c0121ad17e0286c917",
+        "trace_id": "trace-dm-001",
+        "occurred_at": "2026-07-19T05:00:00Z",
+        "received_at": "2026-07-19T05:00:01Z",
+        "region": "cn",
+        "tenant_id": "tenant-A",
+        "channel": "feishu",
+        "bot_id": "bot-A",
+        "chat_type": "dm",
+        "chat_id": "chat-dm-A",
+        "native_thread_or_topic_id": null,
+        "message_id": "message-dm-001",
+        "actor": {
+          "type": "user",
+          "actor_id": "user-A",
+          "authenticated": true,
+          "roles": ["member"]
+        },
+        "content": {
+          "kind": "mixed",
+          "text": "Please inspect the attached report.",
+          "attachments": [
+            {
+              "attachment_id": "attachment-001",
+              "media_type": "application/pdf",
+              "name": "report.pdf",
+              "content_ref": "attachment:authorized:001"
+            }
+          ]
+        },
+        "reply": {
+          "root_message_id": null,
+          "parent_message_id": null,
+          "reply_to_message_id": null
+        },
+        "source": {
+          "kind": "platform_original",
+          "source_ref": "diagnostic:feishu-event-001"
+        },
+        "future_optional": {
+          "display_hint": "compact"
+        }
+      }
+    },
+    {
+      "name": "group_main_conversation",
+      "document": {
+        "contract": "zylos.inbound-envelope",
+        "contract_version": "1.0",
+        "inbound_event_id": "evt-group-001",
+        "idempotency_key": "zid:v1:inbound:22489ba9d2c2f7ef3e943ce8995813ed6a8bec3122ad98344ab8a40feb2cc8d8",
+        "trace_id": "trace-group-001",
+        "occurred_at": "2026-07-19T05:01:00Z",
+        "received_at": "2026-07-19T05:01:01Z",
+        "region": "global",
+        "tenant_id": "tenant-B",
+        "channel": "lark",
+        "bot_id": "bot-B",
+        "chat_type": "group",
+        "chat_id": "chat-group-B",
+        "native_thread_or_topic_id": null,
+        "message_id": "message-group-001",
+        "actor": {
+          "type": "user",
+          "actor_id": "user-B",
+          "authenticated": true,
+          "roles": ["member", "group_owner"]
+        },
+        "content": {
+          "kind": "text",
+          "text": "Summarize this group discussion.",
+          "attachments": []
+        },
+        "reply": {
+          "root_message_id": null,
+          "parent_message_id": null,
+          "reply_to_message_id": null
+        },
+        "source": {
+          "kind": "platform_original",
+          "source_ref": null
+        }
+      }
+    },
+    {
+      "name": "native_thread_or_topic",
+      "document": {
+        "contract": "zylos.inbound-envelope",
+        "contract_version": "1.0",
+        "inbound_event_id": "evt-thread-001",
+        "idempotency_key": "zid:v1:inbound:94f4bdacf39ac7e6ba9856a6a4c498d0e5bd68ffb653ffe56d208ab5afd26f50",
+        "trace_id": "trace-thread-001",
+        "occurred_at": "2026-07-19T05:02:00Z",
+        "received_at": "2026-07-19T05:02:01Z",
+        "region": "global",
+        "tenant_id": "tenant-B",
+        "channel": "lark",
+        "bot_id": "bot-B",
+        "chat_type": "thread",
+        "chat_id": "chat-group-B",
+        "native_thread_or_topic_id": "thread-native-001",
+        "message_id": "message-thread-001",
+        "actor": {
+          "type": "user",
+          "actor_id": "user-C",
+          "authenticated": true,
+          "roles": ["member"]
+        },
+        "content": {
+          "kind": "rich_text",
+          "text": "Continue inside the native topic.",
+          "attachments": []
+        },
+        "reply": {
+          "root_message_id": "message-thread-root-001",
+          "parent_message_id": "message-thread-root-001",
+          "reply_to_message_id": null
+        },
+        "source": {
+          "kind": "platform_original",
+          "source_ref": "diagnostic:lark-event-001"
+        }
+      }
+    },
+    {
+      "name": "reply_preserves_group_conversation",
+      "document": {
+        "contract": "zylos.inbound-envelope",
+        "contract_version": "1.0",
+        "inbound_event_id": "evt-reply-001",
+        "idempotency_key": "zid:v1:inbound:c405bb82e87e71153d343192f0e7c93821b3f56db7a068815f3820e5baca7e2a",
+        "trace_id": "trace-reply-001",
+        "occurred_at": "2026-07-19T05:03:00Z",
+        "received_at": "2026-07-19T05:03:01Z",
+        "region": "cn",
+        "tenant_id": "tenant-A",
+        "channel": "feishu",
+        "bot_id": "bot-A",
+        "chat_type": "group",
+        "chat_id": "chat-group-A",
+        "native_thread_or_topic_id": null,
+        "message_id": "message-reply-001",
+        "actor": {
+          "type": "user",
+          "actor_id": "user-D",
+          "authenticated": true,
+          "roles": ["member"]
+        },
+        "content": {
+          "kind": "text",
+          "text": "Follow the lineage mapped from this reply.",
+          "attachments": []
+        },
+        "reply": {
+          "root_message_id": "message-root-001",
+          "parent_message_id": "message-parent-001",
+          "reply_to_message_id": "model-message-001"
+        },
+        "source": {
+          "kind": "platform_original",
+          "source_ref": null
+        }
+      }
+    },
+    {
+      "name": "scheduler_synthetic_conversation",
+      "document": {
+        "contract": "zylos.inbound-envelope",
+        "contract_version": "1.0",
+        "inbound_event_id": "occurrence-2026-07-19",
+        "idempotency_key": "zid:v1:scheduler:689969cbec0b058e06d6b1d02523f7289f681018c87bd5ad37c30d1cf1b1e17e",
+        "trace_id": "trace-scheduler-001",
+        "occurred_at": "2026-07-19T00:00:00Z",
+        "received_at": "2026-07-19T00:00:01Z",
+        "region": "cn",
+        "tenant_id": "tenant-A",
+        "channel": "scheduler",
+        "bot_id": "bot-A",
+        "chat_type": "synthetic",
+        "chat_id": "scheduler:bot-A:task-daily",
+        "native_thread_or_topic_id": null,
+        "message_id": "schedule-message-001",
+        "actor": {
+          "type": "scheduler",
+          "actor_id": "schedule-daily",
+          "authenticated": true,
+          "roles": []
+        },
+        "content": {
+          "kind": "text",
+          "text": "Run daily report.",
+          "attachments": []
+        },
+        "reply": {
+          "root_message_id": null,
+          "parent_message_id": null,
+          "reply_to_message_id": null
+        },
+        "source": {
+          "kind": "scheduler",
+          "source_ref": "schedule:occurrence-2026-07-19"
+        },
+        "schedule": {
+          "schedule_id": "schedule-daily",
+          "task_id": "task-daily",
+          "occurrence_id": "occurrence-2026-07-19",
+          "bound_conversation": true
+        }
+      }
+    },
+    {
+      "name": "legacy_compatibility_fields",
+      "document": {
+        "contract": "zylos.inbound-envelope",
+        "contract_version": "1.0",
+        "inbound_event_id": "legacy-event-042",
+        "idempotency_key": "legacy-c4:legacy-record-042",
+        "trace_id": "trace-legacy-042",
+        "occurred_at": "2026-07-19T05:04:00Z",
+        "received_at": "2026-07-19T05:04:01Z",
+        "region": "cn",
+        "tenant_id": "tenant-A",
+        "channel": "legacy-c4",
+        "bot_id": "bot-A",
+        "chat_type": "group",
+        "chat_id": "chat-group-A",
+        "native_thread_or_topic_id": null,
+        "message_id": "legacy-message-042",
+        "actor": {
+          "type": "system",
+          "actor_id": "legacy-c4-migrator",
+          "authenticated": true,
+          "roles": []
+        },
+        "content": {
+          "kind": "text",
+          "text": "Migrated pending message.",
+          "attachments": []
+        },
+        "reply": {
+          "root_message_id": null,
+          "parent_message_id": null,
+          "reply_to_message_id": null
+        },
+        "source": {
+          "kind": "legacy_compat",
+          "source_ref": "migration:batch-001:record-042"
+        },
+        "legacy": {
+          "legacy_record_id": "legacy-record-042",
+          "legacy_state": "pending",
+          "migration_batch_id": "migration-batch-001"
+        }
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "thread_without_native_topic",
+      "error_code": "validation_error",
+      "document": {
+        "contract": "zylos.inbound-envelope",
+        "contract_version": "1.0",
+        "inbound_event_id": "evt-thread-001",
+        "idempotency_key": "zid:v1:inbound:94f4bdacf39ac7e6ba9856a6a4c498d0e5bd68ffb653ffe56d208ab5afd26f50",
+        "trace_id": "trace-thread-invalid",
+        "occurred_at": "2026-07-19T05:02:00Z",
+        "received_at": "2026-07-19T05:02:01Z",
+        "region": "global",
+        "tenant_id": "tenant-B",
+        "channel": "lark",
+        "bot_id": "bot-B",
+        "chat_type": "thread",
+        "chat_id": "chat-group-B",
+        "native_thread_or_topic_id": null,
+        "message_id": "message-thread-invalid",
+        "actor": { "type": "user", "actor_id": "user-C", "authenticated": true, "roles": ["member"] },
+        "content": { "kind": "text", "text": "Invalid thread.", "attachments": [] },
+        "reply": { "root_message_id": null, "parent_message_id": null, "reply_to_message_id": null },
+        "source": { "kind": "platform_original", "source_ref": null }
+      }
+    },
+    {
+      "name": "scheduler_without_schedule",
+      "error_code": "validation_error",
+      "document": {
+        "contract": "zylos.inbound-envelope",
+        "contract_version": "1.0",
+        "inbound_event_id": "occurrence-2026-07-19",
+        "idempotency_key": "zid:v1:scheduler:689969cbec0b058e06d6b1d02523f7289f681018c87bd5ad37c30d1cf1b1e17e",
+        "trace_id": "trace-scheduler-invalid",
+        "occurred_at": "2026-07-19T00:00:00Z",
+        "received_at": "2026-07-19T00:00:01Z",
+        "region": "cn",
+        "tenant_id": "tenant-A",
+        "channel": "scheduler",
+        "bot_id": "bot-A",
+        "chat_type": "synthetic",
+        "chat_id": "scheduler:bot-A:task-daily",
+        "native_thread_or_topic_id": null,
+        "message_id": "schedule-message-invalid",
+        "actor": { "type": "scheduler", "actor_id": "schedule-daily", "authenticated": true, "roles": [] },
+        "content": { "kind": "text", "text": "Missing schedule.", "attachments": [] },
+        "reply": { "root_message_id": null, "parent_message_id": null, "reply_to_message_id": null },
+        "source": { "kind": "scheduler", "source_ref": null }
+      }
+    },
+    {
+      "name": "scheduler_without_synthetic_identity",
+      "error_code": "validation_error",
+      "document": {
+        "contract": "zylos.inbound-envelope",
+        "contract_version": "1.0",
+        "inbound_event_id": "occurrence-2026-07-19",
+        "idempotency_key": "zid:v1:scheduler:689969cbec0b058e06d6b1d02523f7289f681018c87bd5ad37c30d1cf1b1e17e",
+        "trace_id": "trace-scheduler-nonsynthetic",
+        "occurred_at": "2026-07-19T00:00:00Z",
+        "received_at": "2026-07-19T00:00:01Z",
+        "region": "cn",
+        "tenant_id": "tenant-A",
+        "channel": "scheduler",
+        "bot_id": "bot-A",
+        "chat_type": "group",
+        "chat_id": "chat-group-A",
+        "native_thread_or_topic_id": null,
+        "message_id": "schedule-message-nonsynthetic",
+        "actor": { "type": "scheduler", "actor_id": "schedule-daily", "authenticated": true, "roles": [] },
+        "content": { "kind": "text", "text": "Invalid scheduler identity.", "attachments": [] },
+        "reply": { "root_message_id": null, "parent_message_id": null, "reply_to_message_id": null },
+        "source": { "kind": "scheduler", "source_ref": null },
+        "schedule": { "schedule_id": "schedule-daily", "task_id": "task-daily", "occurrence_id": "occurrence-2026-07-19", "bound_conversation": true }
+      }
+    },
+    {
+      "name": "legacy_source_without_legacy_fields",
+      "error_code": "validation_error",
+      "document": {
+        "contract": "zylos.inbound-envelope",
+        "contract_version": "1.0",
+        "inbound_event_id": "legacy-event-042",
+        "idempotency_key": "legacy-c4:legacy-record-042",
+        "trace_id": "trace-legacy-invalid",
+        "occurred_at": "2026-07-19T05:04:00Z",
+        "received_at": "2026-07-19T05:04:01Z",
+        "region": "cn",
+        "tenant_id": "tenant-A",
+        "channel": "legacy-c4",
+        "bot_id": "bot-A",
+        "chat_type": "group",
+        "chat_id": "chat-group-A",
+        "native_thread_or_topic_id": null,
+        "message_id": "legacy-message-invalid",
+        "actor": { "type": "system", "actor_id": "legacy-c4-migrator", "authenticated": true, "roles": [] },
+        "content": { "kind": "text", "text": "Missing legacy fields.", "attachments": [] },
+        "reply": { "root_message_id": null, "parent_message_id": null, "reply_to_message_id": null },
+        "source": { "kind": "legacy_compat", "source_ref": null }
+      }
+    },
+    {
+      "name": "unknown_authenticated_role",
+      "error_code": "unsupported_capability",
+      "document": {
+        "contract": "zylos.inbound-envelope",
+        "contract_version": "1.0",
+        "inbound_event_id": "evt-dm-001",
+        "idempotency_key": "zid:v1:inbound:a3b8aa74cbe7496c06d5b831ecbf5d940778fb1890f8b8c0121ad17e0286c917",
+        "trace_id": "trace-role-invalid",
+        "occurred_at": "2026-07-19T05:00:00Z",
+        "received_at": "2026-07-19T05:00:01Z",
+        "region": "cn",
+        "tenant_id": "tenant-A",
+        "channel": "feishu",
+        "bot_id": "bot-A",
+        "chat_type": "dm",
+        "chat_id": "chat-dm-A",
+        "native_thread_or_topic_id": null,
+        "message_id": "message-dm-invalid",
+        "actor": { "type": "user", "actor_id": "user-A", "authenticated": true, "roles": ["super_admin"] },
+        "content": { "kind": "text", "text": "Invalid role.", "attachments": [] },
+        "reply": { "root_message_id": null, "parent_message_id": null, "reply_to_message_id": null },
+        "source": { "kind": "platform_original", "source_ref": null }
+      }
+    },
+    {
+      "name": "idempotency_key_does_not_match_identity",
+      "error_code": "idempotency_key_mismatch",
+      "document": {
+        "contract": "zylos.inbound-envelope",
+        "contract_version": "1.0",
+        "inbound_event_id": "evt-dm-001",
+        "idempotency_key": "zid:v1:inbound:0000000000000000000000000000000000000000000000000000000000000000",
+        "trace_id": "trace-key-invalid",
+        "occurred_at": "2026-07-19T05:00:00Z",
+        "received_at": "2026-07-19T05:00:01Z",
+        "region": "cn",
+        "tenant_id": "tenant-A",
+        "channel": "feishu",
+        "bot_id": "bot-A",
+        "chat_type": "dm",
+        "chat_id": "chat-dm-A",
+        "native_thread_or_topic_id": null,
+        "message_id": "message-dm-key-invalid",
+        "actor": { "type": "user", "actor_id": "user-A", "authenticated": true, "roles": ["member"] },
+        "content": { "kind": "text", "text": "Invalid key.", "attachments": [] },
+        "reply": { "root_message_id": null, "parent_message_id": null, "reply_to_message_id": null },
+        "source": { "kind": "platform_original", "source_ref": null }
+      }
+    }
+  ]
+}

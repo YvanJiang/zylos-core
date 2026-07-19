@@ -1,0 +1,295 @@
+{
+  "fixture_version": "1.0",
+  "contract": "zylos.inbound-result",
+  "valid": [
+    {
+      "name": "normal_bound",
+      "document": {
+        "contract": "zylos.inbound-result",
+        "contract_version": "1.0",
+        "trace_id": "trace-result-normal-001",
+        "inbound_event_id": "evt-dm-001",
+        "idempotency_key": "zid:v1:inbound:a3b8aa74cbe7496c06d5b831ecbf5d940778fb1890f8b8c0121ad17e0286c917",
+        "status": "accepted",
+        "conversation_id": "conversation-A",
+        "turn_id": "turn-A",
+        "lineage_id": "lineage-A",
+        "control_id": null,
+        "turn_version": 2,
+        "lineage_resolution_state": "bound",
+        "deduplicated": false,
+        "error": null,
+        "committed_at": "2026-07-19T05:00:02Z"
+      }
+    },
+    {
+      "name": "control",
+      "document": {
+        "contract": "zylos.inbound-result",
+        "contract_version": "1.0",
+        "trace_id": "trace-result-control-001",
+        "inbound_event_id": "evt-control-001",
+        "idempotency_key": "zid:v1:inbound:21a884693619c07321997f6e0de86e50e33547ce3004bb740961235639d1d166",
+        "status": "accepted",
+        "conversation_id": "conversation-A",
+        "turn_id": null,
+        "lineage_id": null,
+        "control_id": "control-stop-001",
+        "turn_version": null,
+        "lineage_resolution_state": "not_applicable",
+        "deduplicated": false,
+        "error": null,
+        "committed_at": "2026-07-19T05:05:02Z"
+      }
+    },
+    {
+      "name": "pending_recovery",
+      "document": {
+        "contract": "zylos.inbound-result",
+        "contract_version": "1.0",
+        "trace_id": "trace-result-recovery-001",
+        "inbound_event_id": "evt-reply-missing-001",
+        "idempotency_key": "zid:v1:inbound:d8f6571fdcf058e7484f987163dd0ac9a7463c694df19a2788cacff8b6842d00",
+        "status": "accepted",
+        "conversation_id": "conversation-A",
+        "turn_id": "turn-recovery-A",
+        "lineage_id": null,
+        "control_id": null,
+        "turn_version": 2,
+        "lineage_resolution_state": "pending_recovery",
+        "deduplicated": false,
+        "error": null,
+        "committed_at": "2026-07-19T05:06:02Z"
+      }
+    },
+    {
+      "name": "queue_full_failed",
+      "document": {
+        "contract": "zylos.inbound-result",
+        "contract_version": "1.0",
+        "trace_id": "trace-result-queue-full-001",
+        "inbound_event_id": "evt-queue-full-001",
+        "idempotency_key": "zid:v1:inbound:3e267b9097466c22fe448ba9c0afe2693a152e1f2d92f00a49cdb160123d7d07",
+        "status": "rejected",
+        "conversation_id": "conversation-A",
+        "turn_id": "turn-queue-full-A",
+        "lineage_id": "lineage-A",
+        "control_id": null,
+        "turn_version": 2,
+        "lineage_resolution_state": "bound",
+        "deduplicated": false,
+        "error": {
+          "code": "queue_full",
+          "category": "capacity",
+          "retryable": true,
+          "side_effect_status": "none",
+          "user_message": "The conversation queue is full.",
+          "occurred_at": "2026-07-19T05:07:01Z"
+        },
+        "committed_at": "2026-07-19T05:07:02Z"
+      }
+    },
+    {
+      "name": "rejection",
+      "document": {
+        "contract": "zylos.inbound-result",
+        "contract_version": "1.0",
+        "trace_id": "trace-result-rejected-001",
+        "inbound_event_id": "evt-unauthenticated-001",
+        "idempotency_key": "zid:v1:inbound:74848179b48c09e90de972979959bf265a04197bf2f7ef4ffeb83b87e2bb5108",
+        "status": "rejected",
+        "conversation_id": null,
+        "turn_id": null,
+        "lineage_id": null,
+        "control_id": null,
+        "turn_version": null,
+        "lineage_resolution_state": "not_applicable",
+        "deduplicated": false,
+        "error": {
+          "code": "unauthenticated",
+          "category": "authentication",
+          "retryable": false,
+          "side_effect_status": "none",
+          "user_message": "The inbound actor could not be authenticated.",
+          "occurred_at": "2026-07-19T05:08:01Z"
+        },
+        "committed_at": null
+      }
+    },
+    {
+      "name": "persisted_non_queue_rejection",
+      "document": {
+        "contract": "zylos.inbound-result",
+        "contract_version": "1.0",
+        "trace_id": "trace-result-forbidden-001",
+        "inbound_event_id": "evt-forbidden-001",
+        "idempotency_key": "zid:v1:inbound:74848179b48c09e90de972979959bf265a04197bf2f7ef4ffeb83b87e2bb5108",
+        "status": "rejected",
+        "conversation_id": "conversation-A",
+        "turn_id": "turn-forbidden-A",
+        "lineage_id": "lineage-A",
+        "control_id": null,
+        "turn_version": 3,
+        "lineage_resolution_state": "bound",
+        "deduplicated": false,
+        "error": {
+          "code": "forbidden",
+          "category": "authorization",
+          "retryable": false,
+          "side_effect_status": "none",
+          "user_message": "The authenticated actor is not authorized for this operation.",
+          "occurred_at": "2026-07-19T05:08:30Z"
+        },
+        "committed_at": "2026-07-19T05:08:31Z"
+      }
+    },
+    {
+      "name": "deduplicated_original_result_replay",
+      "document": {
+        "contract": "zylos.inbound-result",
+        "contract_version": "1.0",
+        "trace_id": "trace-result-normal-replay-002",
+        "inbound_event_id": "evt-dm-001",
+        "idempotency_key": "zid:v1:inbound:a3b8aa74cbe7496c06d5b831ecbf5d940778fb1890f8b8c0121ad17e0286c917",
+        "status": "accepted",
+        "conversation_id": "conversation-A",
+        "turn_id": "turn-A",
+        "lineage_id": "lineage-A",
+        "control_id": null,
+        "turn_version": 2,
+        "lineage_resolution_state": "bound",
+        "deduplicated": true,
+        "error": null,
+        "committed_at": "2026-07-19T05:00:02Z"
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "accepted_with_error",
+      "error_code": "validation_error",
+      "document": {
+        "contract": "zylos.inbound-result",
+        "contract_version": "1.0",
+        "trace_id": "trace-invalid-accepted-error",
+        "inbound_event_id": "evt-dm-001",
+        "idempotency_key": "zid:v1:inbound:a3b8aa74cbe7496c06d5b831ecbf5d940778fb1890f8b8c0121ad17e0286c917",
+        "status": "accepted",
+        "conversation_id": "conversation-A",
+        "turn_id": "turn-A",
+        "lineage_id": "lineage-A",
+        "control_id": null,
+        "turn_version": 2,
+        "lineage_resolution_state": "bound",
+        "deduplicated": false,
+        "error": { "code": "validation_error", "category": "validation", "retryable": false, "side_effect_status": "none", "user_message": "Invalid accepted result.", "occurred_at": "2026-07-19T05:10:00Z" },
+        "committed_at": "2026-07-19T05:10:01Z"
+      }
+    },
+    {
+      "name": "bound_without_lineage",
+      "error_code": "validation_error",
+      "document": {
+        "contract": "zylos.inbound-result",
+        "contract_version": "1.0",
+        "trace_id": "trace-invalid-bound-lineage",
+        "inbound_event_id": "evt-dm-001",
+        "idempotency_key": "zid:v1:inbound:a3b8aa74cbe7496c06d5b831ecbf5d940778fb1890f8b8c0121ad17e0286c917",
+        "status": "accepted",
+        "conversation_id": "conversation-A",
+        "turn_id": "turn-A",
+        "lineage_id": null,
+        "control_id": null,
+        "turn_version": 2,
+        "lineage_resolution_state": "bound",
+        "deduplicated": false,
+        "error": null,
+        "committed_at": "2026-07-19T05:10:01Z"
+      }
+    },
+    {
+      "name": "control_with_turn",
+      "error_code": "validation_error",
+      "document": {
+        "contract": "zylos.inbound-result",
+        "contract_version": "1.0",
+        "trace_id": "trace-invalid-control-turn",
+        "inbound_event_id": "evt-control-001",
+        "idempotency_key": "zid:v1:inbound:21a884693619c07321997f6e0de86e50e33547ce3004bb740961235639d1d166",
+        "status": "accepted",
+        "conversation_id": "conversation-A",
+        "turn_id": "turn-A",
+        "lineage_id": null,
+        "control_id": "control-stop-001",
+        "turn_version": 2,
+        "lineage_resolution_state": "not_applicable",
+        "deduplicated": false,
+        "error": null,
+        "committed_at": "2026-07-19T05:10:01Z"
+      }
+    },
+    {
+      "name": "pending_recovery_with_lineage",
+      "error_code": "validation_error",
+      "document": {
+        "contract": "zylos.inbound-result",
+        "contract_version": "1.0",
+        "trace_id": "trace-invalid-recovery-lineage",
+        "inbound_event_id": "evt-reply-missing-001",
+        "idempotency_key": "zid:v1:inbound:d8f6571fdcf058e7484f987163dd0ac9a7463c694df19a2788cacff8b6842d00",
+        "status": "accepted",
+        "conversation_id": "conversation-A",
+        "turn_id": "turn-recovery-A",
+        "lineage_id": "lineage-A",
+        "control_id": null,
+        "turn_version": 2,
+        "lineage_resolution_state": "pending_recovery",
+        "deduplicated": false,
+        "error": null,
+        "committed_at": "2026-07-19T05:10:01Z"
+      }
+    },
+    {
+      "name": "queue_full_without_persisted_turn",
+      "error_code": "validation_error",
+      "document": {
+        "contract": "zylos.inbound-result",
+        "contract_version": "1.0",
+        "trace_id": "trace-invalid-queue-full",
+        "inbound_event_id": "evt-queue-full-001",
+        "idempotency_key": "zid:v1:inbound:3e267b9097466c22fe448ba9c0afe2693a152e1f2d92f00a49cdb160123d7d07",
+        "status": "rejected",
+        "conversation_id": null,
+        "turn_id": null,
+        "lineage_id": null,
+        "control_id": null,
+        "turn_version": null,
+        "lineage_resolution_state": "not_applicable",
+        "deduplicated": false,
+        "error": { "code": "queue_full", "category": "capacity", "retryable": true, "side_effect_status": "none", "user_message": "The conversation queue is full.", "occurred_at": "2026-07-19T05:10:00Z" },
+        "committed_at": null
+      }
+    },
+    {
+      "name": "rejected_without_error",
+      "error_code": "validation_error",
+      "document": {
+        "contract": "zylos.inbound-result",
+        "contract_version": "1.0",
+        "trace_id": "trace-invalid-rejected-error",
+        "inbound_event_id": "evt-rejected-001",
+        "idempotency_key": "zid:v1:inbound:74848179b48c09e90de972979959bf265a04197bf2f7ef4ffeb83b87e2bb5108",
+        "status": "rejected",
+        "conversation_id": null,
+        "turn_id": null,
+        "lineage_id": null,
+        "control_id": null,
+        "turn_version": null,
+        "lineage_resolution_state": "not_applicable",
+        "deduplicated": false,
+        "error": null,
+        "committed_at": null
+      }
+    }
+  ]
+}
