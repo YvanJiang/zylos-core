@@ -99,6 +99,12 @@ function requireExecutionContext(context) {
     throw new TypeError('bindProviderNativeId must be a function');
   }
   if (
+    context.reportProviderFailure !== undefined
+    && typeof context.reportProviderFailure !== 'function'
+  ) {
+    throw new TypeError('reportProviderFailure must be a function when provided');
+  }
+  if (
     !context.attempt
     || typeof context.attempt.attempt_id !== 'string'
     || context.attempt.attempt_id.length === 0
@@ -278,7 +284,7 @@ export function createCodexAppServerAdapter({
   let nextConnectionNo = 0;
   let nextInteractionNo = 0;
 
-  function failConnection(target, error) {
+  function failConnection(target, error, { terminate = true } = {}) {
     if (target.failed) return;
     target.failed = true;
     const failure = error instanceof CodexAppServerAdapterError
@@ -290,14 +296,45 @@ export function createCodexAppServerAdapter({
       );
     for (const pending of target.pending.values()) pending.reject(failure);
     target.pending.clear();
-    for (const run of activeRuns.values()) {
-      if (run.connection_id === target.connection_id) run.queue.fail(failure);
+    if (terminate && !target.termination_requested) {
+      target.termination_requested = true;
+      try {
+        target.child.kill('SIGTERM');
+      } catch {
+        // The connection is already failed; process termination is best-effort here.
+      }
     }
-    for (const run of startingRuns.values()) {
-      if (run.connection_id === target.connection_id) run.queue.fail(failure);
+    for (const [runKey, run] of activeRuns) {
+      if (run.connection_id !== target.connection_id) continue;
+      try {
+        run.context.reportProviderFailure?.(failure);
+      } catch {
+        // The provider failure remains authoritative even if Core cannot persist recovery.
+      }
+      run.rejectTerminal(failure);
+      run.queue.fail(failure);
+      activeRuns.delete(runKey);
     }
-    for (const group of providerRequests.values()) {
-      if (group.connection_id === target.connection_id) group.rejectResolved(failure);
+    for (const [runKey, run] of startingRuns) {
+      if (run.connection_id !== target.connection_id) continue;
+      try {
+        run.context.reportProviderFailure?.(failure);
+      } catch {
+        // The provider failure remains authoritative even if Core cannot persist recovery.
+      }
+      run.rejectTerminal(failure);
+      run.queue.fail(failure);
+      startingRuns.delete(runKey);
+    }
+    const failedGroups = new Set();
+    for (const [requestKey, group] of providerRequests) {
+      if (group.connection_id !== target.connection_id) continue;
+      failedGroups.add(group);
+      group.rejectResolved(failure);
+      providerRequests.delete(requestKey);
+    }
+    for (const [reference, entry] of pendingInteractions) {
+      if (failedGroups.has(entry.group)) pendingInteractions.delete(reference);
     }
     if (connection === target) connection = null;
   }
@@ -308,6 +345,13 @@ export function createCodexAppServerAdapter({
     if (method === 'serverRequest/resolved') {
       const group = providerRequests.get(`${target.connection_id}:${String(params?.requestId)}`);
       if (!group || group.thread_id !== params?.threadId || group.connection_id !== target.connection_id) {
+        return;
+      }
+      if (!group.response_sent) {
+        failConnection(target, new CodexAppServerAdapterError(
+          'provider_protocol_invalid',
+          'Codex app-server resolved a server request before receiving its answer.',
+        ));
         return;
       }
       group.resolveResolved();
@@ -440,15 +484,25 @@ export function createCodexAppServerAdapter({
     }
     if (method === 'error') {
       activeRuns.delete(runKey);
-      run.queue.fail(new CodexAppServerAdapterError(
+      const failure = new CodexAppServerAdapterError(
         'provider_execution_failed',
         'Codex app-server reported an execution error.',
-      ));
+      );
+      run.rejectTerminal(failure);
+      run.queue.fail(failure);
       return;
     }
     if (method === 'turn/completed') {
-      activeRuns.delete(runKey);
       const status = params.turn?.status;
+      if (!['completed', 'interrupted', 'failed'].includes(status)) {
+        failConnection(target, new CodexAppServerAdapterError(
+          'provider_protocol_invalid',
+          'Codex app-server completed a turn with an invalid terminal status.',
+        ));
+        return;
+      }
+      activeRuns.delete(runKey);
+      run.resolveTerminal(status);
       if (status === 'completed') run.queue.end();
       else run.queue.fail(new CodexAppServerAdapterError(
         'provider_execution_failed',
@@ -536,6 +590,113 @@ export function createCodexAppServerAdapter({
     });
   }
 
+  function mcpFormComponent(params) {
+    if (params.mode !== 'form') {
+      rejectProtocol(
+        'Codex app-server requested an MCP elicitation mode that Core cannot represent safely.',
+        'unsupported_capability',
+      );
+    }
+    const requestedSchema = params.requestedSchema;
+    const properties = requestedSchema?.properties;
+    if (
+      requestedSchema?.type !== 'object'
+      || !properties
+      || typeof properties !== 'object'
+      || Array.isArray(properties)
+      || !Array.isArray(requestedSchema.required)
+    ) {
+      rejectProtocol('Codex app-server requested an invalid MCP form.', 'unsupported_capability');
+    }
+    const entries = Object.entries(properties);
+    if (
+      entries.length !== 1
+      || requestedSchema.required.length !== 1
+      || requestedSchema.required[0] !== entries[0][0]
+    ) {
+      rejectProtocol(
+        'Codex app-server multi-field MCP forms cannot satisfy Core ordered handoff semantics.',
+        'unsupported_capability',
+      );
+    }
+    const [propertyName, propertySchema] = entries[0];
+    if (
+      propertyName.length === 0
+      || !propertySchema
+      || typeof propertySchema !== 'object'
+      || Array.isArray(propertySchema)
+      || propertySchema.type !== 'string'
+    ) {
+      rejectProtocol(
+        'Codex app-server requested an MCP form field that Core cannot represent safely.',
+        'unsupported_capability',
+      );
+    }
+    let values = null;
+    let labels = null;
+    if (Array.isArray(propertySchema.oneOf)) {
+      if (propertySchema.oneOf.some((option) => (
+        !option
+        || typeof option.const !== 'string'
+        || option.const.length === 0
+        || typeof option.title !== 'string'
+        || option.title.trim().length === 0
+      ))) {
+        rejectProtocol('Codex app-server supplied invalid MCP form choices.');
+      }
+      values = propertySchema.oneOf.map((option) => option.const);
+      labels = propertySchema.oneOf.map((option) => option.title);
+    } else if (Array.isArray(propertySchema.enum)) {
+      if (propertySchema.enum.some((value) => typeof value !== 'string' || value.length === 0)) {
+        rejectProtocol('Codex app-server supplied invalid MCP form choices.');
+      }
+      values = [...propertySchema.enum];
+      labels = Array.isArray(propertySchema.enumNames)
+        && propertySchema.enumNames.length === values.length
+        && propertySchema.enumNames.every((label) => (
+          typeof label === 'string' && label.trim().length > 0
+        ))
+        ? [...propertySchema.enumNames]
+        : [...values];
+    }
+    if (values !== null && (values.length === 0 || new Set(values).size !== values.length)) {
+      rejectProtocol('Codex app-server supplied duplicate or empty MCP form choices.');
+    }
+    const minLength = propertySchema.minLength ?? null;
+    const maxLength = propertySchema.maxLength ?? null;
+    if (
+      (minLength !== null && (!Number.isSafeInteger(minLength) || minLength < 0))
+      || (maxLength !== null && (!Number.isSafeInteger(maxLength) || maxLength < 0))
+      || (minLength !== null && maxLength !== null && minLength > maxLength)
+      || (values === null && (minLength === null || minLength < 1))
+      || (values !== null && values.some((value) => (
+        (minLength !== null && value.length < minLength)
+        || (maxLength !== null && value.length > maxLength)
+      )))
+    ) {
+      rejectProtocol(
+        'Codex app-server supplied MCP form constraints that Core cannot represent safely.',
+        'unsupported_capability',
+      );
+    }
+    return {
+      component_key: propertyName,
+      toolUseId: null,
+      kind: values === null ? 'question' : 'choice',
+      prompt: params.message,
+      choices: values === null ? [] : values.map((choiceId, index) => ({
+        choice_id: choiceId,
+        label: labels[index],
+      })),
+      mcp_form: {
+        property_name: propertyName,
+        allowed_values: values,
+        min_length: minLength,
+        max_length: maxLength,
+      },
+    };
+  }
+
   function serverRequestComponents(method, params) {
     if (method === 'item/tool/requestUserInput') return requestUserInputComponents(params);
     if (method === 'item/commandExecution/requestApproval') {
@@ -572,12 +733,7 @@ export function createCodexAppServerAdapter({
       if (typeof params.message !== 'string' || params.message.trim().length === 0) {
         rejectProtocol('Codex app-server requested invalid MCP elicitation.');
       }
-      return [{
-        component_key: 'elicitation',
-        toolUseId: null,
-        kind: params.mode === 'url' ? 'tool_approval' : 'question',
-        prompt: params.message,
-      }];
+      return [mcpFormComponent(params)];
     }
     return null;
   }
@@ -598,6 +754,24 @@ export function createCodexAppServerAdapter({
   }
 
   function handleServerRequest(target, message) {
+    if (!['string', 'number'].includes(typeof message.id)) {
+      sendServerError(target, message.id, 'Invalid app-server request ID.');
+      failConnection(target, new CodexAppServerAdapterError(
+        'provider_protocol_invalid',
+        'Codex app-server emitted an invalid server request ID.',
+      ));
+      return;
+    }
+    const requestId = String(message.id);
+    if (target.server_request_ids.has(requestId)) {
+      sendServerError(target, message.id, 'Duplicate app-server request ID.');
+      failConnection(target, new CodexAppServerAdapterError(
+        'provider_protocol_invalid',
+        'Codex app-server reused a server request ID on the same connection.',
+      ));
+      return;
+    }
+    target.server_request_ids.add(requestId);
     const run = findServerRequestRun(target, message.params);
     const components = serverRequestComponents(message.method, message.params);
     if (!run || run.connection_id !== target.connection_id || !components) {
@@ -608,21 +782,14 @@ export function createCodexAppServerAdapter({
       ));
       return;
     }
-    const requestKey = `${target.connection_id}:${String(message.id)}`;
-    if (providerRequests.has(requestKey)) {
-      sendServerError(target, message.id, 'Duplicate app-server request ID.');
-      run.queue.fail(new CodexAppServerAdapterError(
-        'provider_protocol_invalid',
-        'Codex app-server reused an active request ID.',
-      ));
-      return;
-    }
+    const requestKey = `${target.connection_id}:${requestId}`;
     let resolveResolved;
     let rejectResolved;
     const resolved = new Promise((resolve, reject) => {
       resolveResolved = resolve;
       rejectResolved = reject;
     });
+    resolved.catch(() => {});
     const group = {
       connection_id: target.connection_id,
       request_id: message.id,
@@ -634,6 +801,7 @@ export function createCodexAppServerAdapter({
       run,
       components: new Map(),
       answers: new Map(),
+      mcp_form: components[0]?.mcp_form ?? null,
       response_sent: false,
       resolved,
       resolveResolved,
@@ -742,11 +910,17 @@ export function createCodexAppServerAdapter({
         stdio: ['pipe', 'pipe', 'pipe'],
       }),
       failed: false,
+      termination_requested: false,
       next_request_no: 1,
       pending: new Map(),
+      server_request_ids: new Set(),
     };
     connection = target;
     loadedThreads.clear();
+    target.child.stderr.on('error', (error) => failConnection(target, error));
+    target.child.stderr.resume();
+    target.child.stdin.on('error', (error) => failConnection(target, error));
+    target.child.stdout.on('error', (error) => failConnection(target, error));
     const lines = createInterface({ input: target.child.stdout, crlfDelay: Infinity });
     lines.on('line', (line) => {
       if (target.failed) return;
@@ -757,14 +931,14 @@ export function createCodexAppServerAdapter({
       }
     });
     target.child.once('error', (error) => failConnection(target, error));
-    target.child.once('close', () => failConnection(target));
+    target.child.once('close', () => failConnection(target, undefined, { terminate: false }));
     try {
       await sendRequest(target, 'initialize', {
         clientInfo,
         capabilities: {
           experimentalApi: true,
           requestAttestation: false,
-          mcpServerOpenaiFormElicitation: true,
+          mcpServerOpenaiFormElicitation: false,
         },
       });
       sendNotification(target, 'initialized');
@@ -816,10 +990,20 @@ export function createCodexAppServerAdapter({
     requireExecutionContext(context);
     const target = await ensureConnection();
     const threadId = await loadThread(target, context);
+    let resolveTerminal;
+    let rejectTerminal;
+    const terminal = new Promise((resolve, reject) => {
+      resolveTerminal = resolve;
+      rejectTerminal = reject;
+    });
+    terminal.catch(() => {});
     const run = {
       connection_id: target.connection_id,
       context,
       queue: new AsyncEventQueue(),
+      terminal,
+      resolveTerminal,
+      rejectTerminal,
       thread_id: threadId,
       text_by_item: new Map(),
       text_item_order: [],
@@ -862,6 +1046,14 @@ export function createCodexAppServerAdapter({
       threadId: run.thread_id,
       turnId: run.turn_id,
     });
+    if (reason === 'timeout') {
+      const providerStatus = await run.terminal;
+      return Object.freeze({
+        status: 'provider_stopped',
+        reason,
+        provider_status: providerStatus,
+      });
+    }
     return Object.freeze({ status: 'interrupt_requested', reason });
   }
 
@@ -920,14 +1112,25 @@ export function createCodexAppServerAdapter({
       };
     }
     if (group.method === 'mcpServer/elicitation/request') {
-      if (value?.kind === 'decision') {
-        return {
-          action: value.decision === 'approve' ? 'accept' : 'decline',
-          content: value.decision === 'approve' ? {} : null,
-          _meta: null,
-        };
+      if (!group.mcp_form) {
+        rejectProtocol('The MCP elicitation has no safe provider-neutral form mapping.');
       }
-      return { action: 'accept', content: answerText(value), _meta: null };
+      const answer = answerText(value);
+      if (
+        (group.mcp_form.allowed_values !== null
+          && !group.mcp_form.allowed_values.includes(answer))
+        || (group.mcp_form.min_length !== null
+          && answer.length < group.mcp_form.min_length)
+        || (group.mcp_form.max_length !== null
+          && answer.length > group.mcp_form.max_length)
+      ) {
+        rejectProtocol('The persisted answer does not satisfy the MCP form schema.');
+      }
+      return {
+        action: 'accept',
+        content: { [group.mcp_form.property_name]: answer },
+        _meta: null,
+      };
     }
     rejectProtocol('The provider request cannot accept an interaction answer.');
   }
@@ -984,11 +1187,12 @@ export function createCodexAppServerAdapter({
   async function close() {
     const target = connection;
     if (!target || target.failed) return Object.freeze({ status: 'not_current' });
+    target.termination_requested = true;
     const signalled = target.child.kill('SIGTERM');
     failConnection(target, new CodexAppServerAdapterError(
       'provider_connection_lost',
       'Codex app-server was stopped with its executor service.',
-    ));
+    ), { terminate: false });
     return Object.freeze({ status: signalled === false ? 'not_current' : 'signalled' });
   }
 

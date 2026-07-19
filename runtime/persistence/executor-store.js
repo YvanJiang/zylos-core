@@ -1817,6 +1817,136 @@ export function createExecutorStore({
     return acknowledge.immediate();
   }
 
+  function markWaitingProviderFailure(turnContext, error) {
+    const markFailure = database.transaction(() => {
+      const occurredAt = now();
+      let turn = loadTurn(database, turnContext.turn_id);
+      assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
+      if (turn.state !== 'waiting_user') {
+        return { status: 'not_waiting', turn_id: turn.turn_id, turn_state: turn.state };
+      }
+      const blockingRequests = database.prepare(`
+        SELECT request_json
+        FROM runtime_interactions
+        WHERE turn_id = ? AND state IN (${BLOCKING_INTERACTION_STATES_SQL})
+        ORDER BY ordinal ASC
+      `).all(turn.turn_id).map(({ request_json: requestJson }) => JSON.parse(requestJson));
+      if (
+        blockingRequests.length === 0
+        || blockingRequests.some((request) => request.state !== 'pending')
+      ) {
+        return { status: 'handoff_in_progress', turn_id: turn.turn_id, turn_state: turn.state };
+      }
+      const cancelledInteractionIds = [];
+      for (const request of blockingRequests) {
+        validateInteractionTransition({
+          from: 'pending',
+          to: 'cancelled',
+          occurredAt,
+        });
+        const cancelledRequest = {
+          ...request,
+          state: 'cancelled',
+          version: request.version + 1,
+          handoff_state: 'not_started',
+          terminal_reason: 'provider_connection_lost',
+        };
+        validateInteractionRequest(cancelledRequest, { occurredAt });
+        const updated = database.prepare(`
+          UPDATE runtime_interactions
+          SET state = 'cancelled', version = ?, handoff_state = 'not_started',
+            handoff_version = NULL, request_json = ?, updated_at = ?
+          WHERE interaction_id = ? AND state = 'pending' AND version = ?
+        `).run(
+          cancelledRequest.version,
+          JSON.stringify(cancelledRequest),
+          occurredAt,
+          request.interaction_id,
+          request.version,
+        );
+        if (updated.changes !== 1) {
+          conflict('version_conflict', 'The provider failure lost its interaction fence.');
+        }
+        const cancellationEvent = buildEvent({
+          turn,
+          lastEvent: loadLastEvent(database, turn.turn_id),
+          fence: turnContext.attempt,
+          provider,
+          descriptor: {
+            kind: 'interaction_cancelled',
+            phase: 'waiting_user',
+            provider_native_id: turn.provider_native_id,
+            payload: {
+              interaction_id: request.interaction_id,
+              ordinal: request.ordinal,
+              interaction_version: cancelledRequest.version,
+              handoff_version: null,
+            },
+          },
+          occurredAt,
+          generateId,
+        });
+        commitTurnEvent(database, {
+          turn,
+          event: cancellationEvent,
+          fence: turnContext.attempt,
+          nextState: 'waiting_user',
+          staleMessage: 'The provider failure lost its interaction cancellation fence.',
+          generateId,
+        });
+        cancelledInteractionIds.push(request.interaction_id);
+        turn = loadTurn(database, turn.turn_id);
+      }
+      transitionInTransaction(database, {
+        turnId: turn.turn_id,
+        fromState: 'waiting_user',
+        toState: 'recovering',
+        fence: turnContext.attempt,
+        provider,
+        serviceInstanceId,
+        occurredAt,
+        generateId,
+        reasonCode: 'provider_connection_lost',
+      });
+      const recoveringTurn = loadTurn(database, turn.turn_id);
+      const recoveryEvent = buildEvent({
+        turn: recoveringTurn,
+        lastEvent: loadLastEvent(database, turn.turn_id),
+        fence: turnContext.attempt,
+        provider,
+        descriptor: {
+          kind: 'recovery_started',
+          phase: 'recovering',
+          provider_native_id: recoveringTurn.provider_native_id,
+          payload: {
+            recovery_id: generateId('recovery'),
+            recovery_of_turn_id: recoveringTurn.turn_id,
+            recovery_of_lineage_id: recoveringTurn.lineage_id,
+            side_effect_status: 'unknown',
+          },
+          error,
+        },
+        occurredAt,
+        generateId,
+      });
+      commitTurnEvent(database, {
+        turn: recoveringTurn,
+        event: recoveryEvent,
+        fence: turnContext.attempt,
+        nextState: 'recovering',
+        staleMessage: 'The provider failure lost its recovery fence.',
+        generateId,
+      });
+      return {
+        status: 'recovering',
+        turn_id: turn.turn_id,
+        turn_state: 'recovering',
+        cancelled_interaction_ids: cancelledInteractionIds,
+      };
+    });
+    return markFailure.immediate();
+  }
+
   function markInteractionHandoffDeliveryUnknown(delivery, error) {
     const markUnknown = database.transaction(() => {
       const occurredAt = now();
@@ -1966,6 +2096,7 @@ export function createExecutorStore({
     claimNextQueuedTurn,
     claimInteractionHandoff,
     commitInteractionAnswer,
+    markWaitingProviderFailure,
     markInteractionHandoffDeliveryUnknown,
     expireInteraction,
     listPendingInteractionDeadlines,

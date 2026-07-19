@@ -154,9 +154,13 @@ describe('Codex app-server provider adapter', () => {
       method: 'initialize',
       params: expect.objectContaining({
         clientInfo: expect.objectContaining({ name: 'zylos-core' }),
-        capabilities: expect.objectContaining({ experimentalApi: true }),
+        capabilities: expect.objectContaining({
+          experimentalApi: true,
+          mcpServerOpenaiFormElicitation: false,
+        }),
       }),
     }));
+    expect(server.child.stderr.readableFlowing).toBe(true);
     expect(server.received[1]).toEqual({ method: 'initialized' });
     expect(server.received[2]).toEqual(expect.objectContaining({
       method: 'thread/start',
@@ -417,12 +421,29 @@ describe('Codex app-server provider adapter', () => {
         serverName: 'provider-private',
         mode: 'form',
         message: 'Which environment should the tool use?',
-        requestedSchema: { type: 'object' },
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            environment: {
+              type: 'string',
+              enum: ['staging', 'production'],
+              enumNames: ['Staging', 'Production'],
+            },
+          },
+          required: ['environment'],
+        },
         _meta: null,
       },
-      expected: { kind: 'question', prompt: 'Which environment should the tool use?' },
-      answer: { kind: 'text', text: 'staging' },
-      result: { action: 'accept', content: 'staging', _meta: null },
+      expected: {
+        kind: 'choice',
+        prompt: 'Which environment should the tool use?',
+        choices: [
+          { choice_id: 'staging', label: 'Staging' },
+          { choice_id: 'production', label: 'Production' },
+        ],
+      },
+      answer: { kind: 'choice', choice_id: 'staging' },
+      result: { action: 'accept', content: { environment: 'staging' }, _meta: null },
     },
   ])('maps $label through a fenced provider-neutral interaction', async ({
     method,
@@ -514,6 +535,127 @@ describe('Codex app-server provider adapter', () => {
     });
   });
 
+  test.each([
+    {
+      label: 'multi-field typed form',
+      params: {
+        mode: 'form',
+        message: 'Configure deployment.',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            environment: { type: 'string' },
+            region: { type: 'string' },
+          },
+          required: ['environment', 'region'],
+        },
+        _meta: null,
+      },
+    },
+    {
+      label: 'OpenAI private form',
+      params: {
+        mode: 'openai/form',
+        message: 'Configure deployment.',
+        requestedSchema: {},
+        _meta: null,
+      },
+    },
+    {
+      label: 'URL elicitation',
+      params: {
+        mode: 'url',
+        message: 'Complete authorization.',
+        url: 'https://example.invalid/authorize?opaque=1',
+        elicitationId: 'elicitation-1',
+        _meta: null,
+      },
+    },
+  ])('fails closed for an unsupported MCP $label', async ({ params }) => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          id: 'unsupported-mcp',
+          method: 'mcpServer/elicitation/request',
+          params: { threadId, turnId, serverName: 'private-server', ...params },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(adapter.execute(executionContext())[Symbol.asyncIterator]().next())
+      .rejects.toMatchObject({ providerError: { code: 'unsupported_capability' } });
+    expect(server.received).toContainEqual({
+      id: 'unsupported-mcp',
+      error: { code: -32601, message: 'Invalid app-server request.' },
+    });
+  });
+
+  test('rejects an early provider resolved notification before any answer is sent', async () => {
+    const reportProviderFailure = jest.fn();
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          id: 'early-resolution',
+          method: 'item/fileChange/requestApproval',
+          params: { threadId, turnId, itemId: 'patch-early', startedAtMs: 1 },
+        });
+        send({
+          method: 'serverRequest/resolved',
+          params: { threadId, requestId: 'early-resolution' },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]().next())
+      .rejects.toMatchObject({ providerError: { code: 'side_effect_unknown' } });
+    expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+  });
+
+  test('rejects reuse of a completed server request ID on the same connection', async () => {
+    const reportProviderFailure = jest.fn();
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          id: 'reused-request',
+          method: 'item/fileChange/requestApproval',
+          params: { threadId, turnId, itemId: 'patch-first', startedAtMs: 1 },
+        });
+      },
+      onClientResponse({ message, send }) {
+        send({
+          method: 'serverRequest/resolved',
+          params: { threadId: 'codex-thread-1', requestId: message.id },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const iterator = adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]();
+    const interaction = await iterator.next();
+    await adapter.handleInteractionAnswer(handoffDelivery(
+      interaction.value.payload.provider_interaction_ref,
+      { kind: 'decision', decision: 'approve' },
+    ));
+    const next = iterator.next();
+
+    server.send({
+      id: 'reused-request',
+      method: 'item/fileChange/requestApproval',
+      params: {
+        threadId: 'codex-thread-1',
+        turnId: 'codex-turn-1',
+        itemId: 'patch-second',
+        startedAtMs: 2,
+      },
+    });
+
+    await expect(next).rejects.toMatchObject({
+      providerError: { code: 'side_effect_unknown' },
+    });
+    expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+  });
+
   test('fails an active turn closed when transport becomes uncertain and reloads on reconnect', async () => {
     const firstServer = createFakeAppServer({ afterTurnStart() {} });
     const secondServer = createFakeAppServer();
@@ -558,7 +700,7 @@ describe('Codex app-server provider adapter', () => {
     }));
   });
 
-  test.each(['stop', 'timeout', 'steer'])(
+  test.each(['stop', 'steer'])(
     'interrupts only the current %s fence through app-server without killing the shared process',
     async (reason) => {
       const server = createFakeAppServer({ afterTurnStart() {} });
@@ -591,6 +733,42 @@ describe('Codex app-server provider adapter', () => {
       });
     },
   );
+
+  test('waits for the matching provider completion before confirming a timeout interrupt', async () => {
+    const server = createFakeAppServer({ afterTurnStart() {} });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const context = executionContext({ lineage: { provider_native_id: 'codex-thread-1' } });
+    const waiting = adapter.execute(context)[Symbol.asyncIterator]().next();
+    await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
+    let settled = false;
+    const interruption = adapter.interrupt({
+      turn_id: context.turn_id,
+      attempt: context.attempt,
+      reason: 'timeout',
+    }).then((result) => {
+      settled = true;
+      return result;
+    });
+    await waitFor(() => server.received.some(({ method }) => method === 'turn/interrupt'));
+    expect(settled).toBe(false);
+    const waitingFailure = expect(waiting).rejects.toMatchObject({
+      providerError: { code: 'side_effect_unknown' },
+    });
+
+    server.send({
+      method: 'turn/completed',
+      params: {
+        threadId: 'codex-thread-1',
+        turn: { id: 'codex-turn-1', status: 'interrupted', items: [] },
+      },
+    });
+    await expect(interruption).resolves.toEqual({
+      status: 'provider_stopped',
+      reason: 'timeout',
+      provider_status: 'interrupted',
+    });
+    await waitingFailure;
+  });
 
   test('does not interrupt until the provider confirms turn/started', async () => {
     const server = createFakeAppServer({ autoTurnStarted: false, afterTurnStart() {} });
@@ -652,6 +830,45 @@ describe('Codex app-server provider adapter', () => {
     await expect(adapter.handleInteractionAnswer(delivery)).rejects.toThrow(/runtime fence/);
     expect(server.received).toHaveLength(before);
     await iterator.return();
+  });
+
+  test('reports connection loss with an outstanding interaction and clears stale answer state', async () => {
+    const reportProviderFailure = jest.fn();
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          id: 'lost-interaction',
+          method: 'item/fileChange/requestApproval',
+          params: { threadId, turnId, itemId: 'patch-lost', startedAtMs: 1 },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const iterator = adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]();
+    const interaction = await iterator.next();
+
+    server.child.emit('close', 1, null);
+
+    expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+    await expect(adapter.handleInteractionAnswer(handoffDelivery(
+      interaction.value.payload.provider_interaction_ref,
+      { kind: 'decision', decision: 'approve' },
+    ))).rejects.toThrow(/current provider request/);
+  });
+
+  test('turns stdin stream errors into a fenced connection failure', async () => {
+    const reportProviderFailure = jest.fn();
+    const server = createFakeAppServer({ afterTurnStart() {} });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const waiting = adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]().next();
+    await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
+
+    server.child.stdin.emit('error', new Error('EPIPE'));
+
+    await expect(waiting).rejects.toMatchObject({
+      providerError: { code: 'side_effect_unknown' },
+    });
+    expect(reportProviderFailure).toHaveBeenCalledTimes(1);
   });
 
   test('closes only its supervised app-server child during service shutdown', async () => {

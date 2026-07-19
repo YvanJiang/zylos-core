@@ -491,6 +491,7 @@ describe('runtime interaction order, authorization, and timeout', () => {
     const accepted = acceptQueuedInteractionTurn(database, 'service-timeout');
     const clock = { now: '2026-07-19T07:01:00Z' };
     let providerStopped = false;
+    let interruptObservedProviderStopped;
     let deadlineCallback;
     let deadlineDelay;
     const adapter = {
@@ -511,6 +512,13 @@ describe('runtime interaction order, authorization, and timeout', () => {
         } finally {
           providerStopped = true;
         }
+      },
+      async interrupt({ turn_id: turnId, attempt, reason }) {
+        expect(turnId).toBe(accepted.turn_id);
+        expect(attempt).toMatchObject({ attempt_id: expect.any(String), lease_epoch: 1 });
+        expect(reason).toBe('timeout');
+        interruptObservedProviderStopped = providerStopped;
+        return { status: 'provider_stopped', reason, provider_status: 'interrupted' };
       },
     };
     const service = createExecutorService({
@@ -534,6 +542,7 @@ describe('runtime interaction order, authorization, and timeout', () => {
 
     clock.now = '2026-07-19T07:01:02Z';
     await deadlineCallback();
+    expect(interruptObservedProviderStopped).toBe(false);
     expect(providerStopped).toBe(true);
     expect(database.prepare(`
       SELECT state FROM runtime_turns WHERE turn_id = ?
@@ -549,6 +558,70 @@ describe('runtime interaction order, authorization, and timeout', () => {
       lease_expires_at: null,
     });
     expect(service.snapshot().executors).toEqual([]);
+
+    database.close();
+  });
+
+  test('executor service retains the timeout lease when app-server cannot confirm provider stop', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedInteractionTurn(database, 'service-timeout-uncertain');
+    const clock = { now: '2026-07-19T07:01:00Z' };
+    let providerStopped = false;
+    const adapter = {
+      async *execute() {
+        try {
+          yield {
+            kind: 'interaction_requested',
+            payload: {
+              provider_interaction_ref: 'provider-question-service-timeout-uncertain',
+              tool_use_id: 'tool-use-service-timeout-uncertain',
+              kind: 'question',
+              prompt: 'Will the provider stop be confirmed?',
+              choices: [],
+              authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+              allowed_sources: ['card_action'],
+            },
+          };
+        } finally {
+          providerStopped = true;
+        }
+      },
+      async interrupt() {
+        return { status: 'not_current', reason: 'timeout' };
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-timeout-uncertain',
+      now: () => clock.now,
+      generateId: deterministicIds('service-timeout-uncertain'),
+      interactionTimeoutMs: 1_000,
+      setTimeoutFn: () => ({ unref() {} }),
+      clearTimeoutFn: () => {},
+    });
+    const waiting = await service.runNext();
+    clock.now = '2026-07-19T07:01:02Z';
+
+    await expect(service.expireInteraction({
+      interaction_id: waiting.request.interaction_id,
+      interaction_version: waiting.request.version,
+    })).resolves.toMatchObject({
+      status: 'expired',
+      turn_state: 'timed_out',
+      lease_released: false,
+      provider_stop_status: 'not_current',
+    });
+    expect(providerStopped).toBe(false);
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id
+      FROM runtime_executor_leases
+      WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({
+      lease_owner: 'executor-service-timeout-uncertain',
+      turn_id: accepted.turn_id,
+    });
 
     database.close();
   });

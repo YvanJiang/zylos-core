@@ -26,8 +26,9 @@ The implementation was audited against:
   `0fb559f0f6e231a88ac02ea002d3ecd248e2b515`.
 
 The stdio connection performs `initialize`, waits for its response, and then sends `initialized`.
-It enables `experimentalApi` and `mcpServerOpenaiFormElicitation`, and disables request
-attestation. New lineages use `thread/start`; the returned thread ID is durably bound before
+It enables `experimentalApi`, disables request attestation, and advertises
+`mcpServerOpenaiFormElicitation=false` because Core has no provider-neutral representation for
+that private form. New lineages use `thread/start`; the returned thread ID is durably bound before
 `turn/start`. Persisted lineages use `thread/resume` once per new connection before starting a
 turn.
 
@@ -44,32 +45,40 @@ Private app-server method and item names remain inside the adapter:
 | command/file approval | durable `tool_approval` interaction |
 | permissions approval | durable `permission_approval` interaction |
 | single-question `requestUserInput` | durable `question` or `choice` interaction |
-| MCP elicitation | durable `question` or `tool_approval` interaction |
+| single-field required MCP typed string/enum form | durable `question` or `choice` interaction; accepted content is reconstructed as the schema-keyed object |
 
 Answers are accepted only through Core's durable interaction-answer and handoff records. The
 adapter verifies the current connection, provider request, thread, turn, Core turn, attempt, lease,
-and handoff claim before writing a response. A handoff is acknowledged only after the matching
-`serverRequest/resolved` notification.
+and handoff claim before writing a response. A handoff is acknowledged only after its answer was
+written and the matching `serverRequest/resolved` notification arrives. Server request IDs are
+never reusable within one connection, including after acknowledgement.
 
-Multi-question and secret `requestUserInput` requests, unknown server requests, uncorrelated MCP elicitation,
-duplicate request IDs, unsupported item types, and stale or mismatched traffic fail closed.
-Connection loss after a response may have been sent is recorded as `delivery_unknown` and moves
-the turn to `recovering`; it is never automatically resent.
+Multi-question and secret `requestUserInput` requests, multi-field/non-string/optional MCP typed
+forms, `openai/form`, URL elicitation, unknown server requests, duplicate request IDs, unsupported
+item types, and stale or mismatched traffic fail closed. URL elicitation is rejected because its
+URL can contain credentials and the public interaction contract has no safe reference field.
+Connection loss before an answer cancels still-pending interactions and moves the turn to
+`recovering`. Loss after a response may have been sent is recorded as `delivery_unknown`. Neither
+case is automatically replayed. The supervised child's stderr is drained without persistence and
+stdio errors fail the fenced connection rather than escaping as unhandled stream errors.
 
 ## Control and reconnect
 
 Stop, timeout, and steer share the provider-neutral adapter `interrupt` seam and use
-`turn/interrupt` for the exact current thread/turn/attempt/lease fence. They do not kill the shared
-app-server process and do not discard the persisted lineage. A lost app-server connection fails
-active work with unknown side-effect status. A later safe turn creates a new supervised connection
-and reloads its persisted thread before use; active work is never replayed automatically.
+`turn/interrupt` for the exact current thread/turn/attempt/lease fence. Timeout retains the writer
+lease until the matching provider terminal notification confirms that the turn stopped; missing or
+uncertain confirmation leaves the lease held. Turn interrupts do not kill the shared app-server
+process and do not discard the persisted lineage. A protocol or stdio failure terminates the lost
+shared connection under supervision. A later safe turn creates a new connection and reloads its
+persisted thread before use; active work is never replayed automatically.
 
 ## Verification boundary
 
 Deterministic tests inject the child process and stdio streams and cover handshake ordering,
 single-process multiplexing, thread binding/resume/reconnect, text/tool normalization, every
-supported bidirectional interaction family, provider acknowledgement, interrupt, transport loss,
-and stale request/answer/output fences. The current app-server protocol returns all questions in
+supported bidirectional interaction family, provider acknowledgement and request-ID tombstones,
+confirmed timeout interruption, transport loss, and stale request/answer/output fences. The
+current app-server protocol returns all questions in
 one JSON-RPC response, while Core requires each question to have a unique interaction and forbids
 answering the next blocking ordinal before provider acknowledgement of the previous one. Until the
 interaction authority defines a batch handoff that preserves both rules, multi-question requests

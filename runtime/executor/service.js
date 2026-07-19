@@ -246,6 +246,18 @@ export function createExecutorService({
         bindProviderNativeId: (providerNativeId) => (
           store.bindProviderNativeId(turnContext, providerNativeId)
         ),
+        reportProviderFailure: (providerFailure) => {
+          const outcome = store.markWaitingProviderFailure(
+            turnContext,
+            normalizeProviderError(providerFailure, now()),
+          );
+          if (outcome.status === 'recovering') {
+            activeRuns.delete(turnContext.turn_id);
+            reschedulePendingInteractionDeadlines();
+            refresh();
+          }
+          return outcome;
+        },
         attempt: Object.freeze({ ...turnContext.attempt }),
       }));
     } catch (error) {
@@ -288,6 +300,27 @@ export function createExecutorService({
     if (!timedOutRun || typeof timedOutRun.iterator.return !== 'function') {
       reschedulePendingInteractionDeadlines();
       return { ...result, lease_released: false };
+    }
+    if (typeof adapter.interrupt === 'function') {
+      let interruption;
+      try {
+        interruption = await adapter.interrupt({
+          turn_id: result.turn_id,
+          attempt: result.attempt,
+          reason: 'timeout',
+        });
+      } catch {
+        reschedulePendingInteractionDeadlines();
+        return { ...result, lease_released: false, provider_stop_status: 'uncertain' };
+      }
+      if (interruption?.status !== 'provider_stopped') {
+        reschedulePendingInteractionDeadlines();
+        return {
+          ...result,
+          lease_released: false,
+          provider_stop_status: interruption?.status ?? 'uncertain',
+        };
+      }
     }
     await timedOutRun.iterator.return();
     activeRuns.delete(result.turn_id);

@@ -219,6 +219,72 @@ describe('runtime executor service', () => {
     database.close();
   });
 
+  test('moves a waiting interaction to fenced recovery when its provider transport is lost', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'waiting-transport-loss');
+    let reportProviderFailure;
+    const adapter = {
+      async *execute(context) {
+        reportProviderFailure = context.reportProviderFailure;
+        await context.bindProviderNativeId('native-thread-lost');
+        yield {
+          kind: 'interaction_requested',
+          payload: {
+            provider_interaction_ref: 'provider-interaction-lost',
+            tool_use_id: 'tool-lost',
+            kind: 'tool_approval',
+            prompt: 'Allow the pending provider action?',
+            choices: [],
+            authorized_subjects: context.interaction.authorized_subjects,
+            allowed_sources: context.interaction.allowed_sources,
+          },
+        };
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-waiting-transport-loss',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('waiting-transport-loss'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ status: 'waiting_user' });
+    expect(reportProviderFailure).toEqual(expect.any(Function));
+    expect(reportProviderFailure({
+      providerError: {
+        code: 'side_effect_unknown',
+        category: 'provider',
+        retryable: false,
+        side_effect_status: 'unknown',
+        user_message: 'The app-server connection was lost.',
+      },
+    })).toMatchObject({ status: 'recovering', turn_id: accepted.turn_id });
+
+    const interactionRow = database.prepare(`
+      SELECT state, handoff_state, request_json
+      FROM runtime_interactions
+      WHERE turn_id = ?
+    `).get(accepted.turn_id);
+    expect(interactionRow).toMatchObject({ state: 'cancelled', handoff_state: 'not_started' });
+    expect(JSON.parse(interactionRow.request_json)).toMatchObject({
+      state: 'cancelled',
+      terminal_reason: 'provider_connection_lost',
+    });
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    expect(readEvents(database, accepted.turn_id).slice(-3).map(({ kind, phase }) => ({ kind, phase })))
+      .toEqual([
+        { kind: 'interaction_cancelled', phase: 'waiting_user' },
+        { kind: 'turn_state_changed', phase: 'recovering' },
+        { kind: 'recovery_started', phase: 'recovering' },
+      ]);
+
+    database.close();
+  });
+
   test('rolls back a failed first lineage binding and rejects stale or conflicting bindings', () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'native-binding-fence');
@@ -496,6 +562,7 @@ describe('runtime executor service', () => {
         },
         lineage: { provider_native_id: null },
         bindProviderNativeId: expect.any(Function),
+        reportProviderFailure: expect.any(Function),
         attempt: {
           attempt_id: 'attempt-executor-1',
           attempt_no: 1,
