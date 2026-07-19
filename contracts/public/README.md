@@ -209,8 +209,9 @@ contracts do not maintain a second compatibility path around the public kernel.
   declared tenant/bot/aggregate scope covers the trusted auth context and target. This structural
   check does not authorize a request: Core must still resolve the target's authoritative namespace
   and re-check the current policy, grant, revocation, expiry, capability, and scope in the control
-  transaction. The entire public request, including `reason` and additive extensions, is rejected
-  when it contains credential-shaped values, secret fields, or provider/channel-private payloads.
+  transaction. Every public request and result, including `reason`, errors, and additive
+  extensions, is rejected when it contains credential-shaped values, secret fields, or
+  provider/channel-private payloads.
   A higher result version may advance only from `accepted` to a terminal status; terminal results
   are immutable. Accepted-to-terminal updates preserve the action-specific intent and audit
   identities and cannot regress the accepted target version. Because `zylos.control-result` does

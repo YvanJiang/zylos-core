@@ -657,6 +657,7 @@ function requireResultObject(path, value, options) {
 export function validateControlResult(value, { occurredAt, action: requestedAction } = {}) {
   const options = { occurredAt };
   requireRecord('control result', value, options);
+  validatePublicFixtureSafety(value, options);
   requireFields('control result', value, ['contract', 'contract_version', ...RESULT_FIELDS], options);
   requireOpaqueId('trace_id', value.trace_id, options);
   validateCallerNamespace(value.caller_namespace, options);

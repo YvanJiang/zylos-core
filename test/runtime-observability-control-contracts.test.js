@@ -330,6 +330,14 @@ describe('operations control v1 contracts', () => {
       ambiguousFailedMutation,
       { action: 'reconcile' },
     ).metadata.action).toBe('reconcile');
+
+    const secretError = structuredClone(controlFixture.results.forbidden_policy);
+    secretError.error.user_message = 'Authorization failed: Bearer leaked-secret-token';
+    expect(() => validateControlResult(secretError)).toThrow(ContractKernelError);
+
+    const privateExtension = structuredClone(controlFixture.results.forbidden_policy);
+    privateExtension.provider_payload = { request: 'raw' };
+    expect(() => validateControlResult(privateExtension)).toThrow(ContractKernelError);
   });
 });
 
