@@ -521,6 +521,54 @@ describe('runtime executor service', () => {
     database.close();
   });
 
+  test('releases durable resident capacity after a truly idle executor is evicted', async () => {
+    const database = openTestDatabase();
+    const first = acceptQueuedTurn(database, 'resident-eviction-first');
+    const adapterCalls = [];
+    const adapter = {
+      async *execute(context) {
+        adapterCalls.push(context.turn_id);
+      },
+      async evictIdle({ canEvict }) {
+        return await canEvict(first.conversation_id) ? [first.conversation_id] : [];
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-resident-eviction',
+      now: () => '2026-07-19T07:06:00Z',
+      generateId: deterministicIds('resident-eviction'),
+      maxResidentExecutorsPerBot: 1,
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: first.turn_id,
+    });
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM runtime_executor_residents`)
+      .get().count).toBe(1);
+    await expect(service.evictIdleExecutors()).resolves.toEqual([first.conversation_id]);
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM runtime_executor_residents`)
+      .get().count).toBe(0);
+
+    const secondEnvelope = normalEnvelope('resident-eviction-second');
+    secondEnvelope.chat_id = 'chat-resident-eviction-second';
+    const second = acceptNormalInbound(database, secondEnvelope, {
+      now: () => '2026-07-19T07:06:01Z',
+      generateId: deterministicIds('inbound-resident-eviction-second'),
+    });
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: second.turn_id,
+    });
+    expect(adapterCalls).toEqual([first.turn_id, second.turn_id]);
+
+    await service.close();
+    database.close();
+  });
+
   test('executes one conversation FIFO across lineages without two active turns', async () => {
     const database = openTestDatabase();
     const firstEnvelope = normalEnvelope('fifo-first');

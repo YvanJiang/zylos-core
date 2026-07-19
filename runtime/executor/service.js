@@ -145,7 +145,7 @@ export function createExecutorService({
           if (!controllers) {
             controllers = new Set();
             permissionControllers.set(turnContext.turn_id, controllers);
-            store.transitionTurn(turnContext, 'running', 'waiting_user');
+            persist(() => store.transitionTurn(turnContext, 'running', 'waiting_user'));
           }
           const controller = new AbortController();
           controllers.add(controller);
@@ -176,7 +176,7 @@ export function createExecutorService({
                 !cancelledTurnIds.has(turnContext.turn_id)
                 && !closingPermissionTurnIds.has(turnContext.turn_id)
               ) {
-                store.transitionTurn(turnContext, 'waiting_user', 'running');
+                persist(() => store.transitionTurn(turnContext, 'waiting_user', 'running'));
               }
               closingPermissionTurnIds.delete(turnContext.turn_id);
             }
@@ -231,7 +231,8 @@ export function createExecutorService({
         ? 'stopped'
         : (outcome === 'failed' ? 'failed' : 'completed');
       const failure = outcome === 'failed' || (usesManagedRecords && outcome === null);
-      persist(() => store.transitionTurn(turnContext, 'running', failure ? 'failed' : terminalState, {
+      const { state } = store.assertCurrentFence(turnContext);
+      persist(() => store.transitionTurn(turnContext, state, failure ? 'failed' : terminalState, {
         error: failure ? {
           code: outcome === null ? 'provider_stream_ended' : 'provider_execution_failed',
           category: 'provider',
@@ -343,9 +344,13 @@ export function createExecutorService({
 
   async function evictIdleExecutors() {
     if (typeof adapter.evictIdle !== 'function') return [];
-    return adapter.evictIdle({
+    const evicted = await adapter.evictIdle({
       canEvict: (conversationId) => store.isConversationEvictable(conversationId),
     });
+    for (const conversationId of evicted) {
+      store.releaseExecutorResident(conversationId);
+    }
+    return evicted;
   }
 
   async function close() {

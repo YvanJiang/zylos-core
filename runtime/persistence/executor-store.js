@@ -724,12 +724,33 @@ export function createExecutorStore({
     return blockingTurn === undefined;
   }
 
+  function releaseExecutorResident(conversationId) {
+    if (typeof conversationId !== 'string' || conversationId.length === 0) {
+      throw new TypeError('conversationId must be a non-empty string');
+    }
+    const released = database.prepare(`
+      DELETE FROM runtime_executor_residents
+      WHERE conversation_id = ? AND provider = ?
+        AND NOT EXISTS (
+          SELECT 1
+          FROM runtime_turns
+          WHERE conversation_id = ?
+            AND state IN (
+              'queued', 'starting', 'running', 'waiting_user',
+              'redirecting', 'recovering', 'retrying'
+            )
+        )
+    `).run(conversationId, provider, conversationId);
+    return released.changes === 1;
+  }
+
   return Object.freeze({
     appendAdapterEvent,
     assertCurrentFence,
     bindProviderNativeId,
     claimNextQueuedTurn,
     isConversationEvictable,
+    releaseExecutorResident,
     rebuildExecutorCache,
     reserveNextExecutor,
     transitionTurn,

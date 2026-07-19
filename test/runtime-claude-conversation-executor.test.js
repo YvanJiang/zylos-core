@@ -239,6 +239,39 @@ function createPermissionQuery({ sessionId }) {
   return { permissionRequested, permissionResults, query };
 }
 
+function createCaughtPermissionCancellationQuery({ sessionId }) {
+  const interruptRequested = deferred();
+  const permissionRequested = deferred();
+  function query({ prompt, options }) {
+    const stream = (async function* generateSdkMessages() {
+      for await (const input of prompt) {
+        yield { type: 'system', subtype: 'init', session_id: sessionId };
+        permissionRequested.resolve();
+        try {
+          await options.canUseTool('Bash', { command: 'sleep 10' }, {});
+        } catch {
+          // The real SDK reports callback errors over its control channel and keeps streaming.
+        }
+        await interruptRequested.promise;
+        yield {
+          type: 'result',
+          subtype: 'error_during_execution',
+          session_id: sessionId,
+          errors: [`interrupted ${input.message.content}`],
+        };
+        yield idleSession(sessionId);
+      }
+    }());
+    stream.interrupt = async () => {
+      interruptRequested.resolve();
+      return { still_queued: [] };
+    };
+    stream.close = () => interruptRequested.resolve();
+    return stream;
+  }
+  return { permissionRequested, query };
+}
+
 function createBackgroundQuery({ sessionId }) {
   const backgroundFinished = deferred();
   const notificationConsumed = deferred();
@@ -854,6 +887,40 @@ describe('Claude conversation executor', () => {
     database.close();
   });
 
+  test('preserves provider authority when a permission-state projection cannot persist', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'permission-projection-failure');
+    database.exec(`
+      CREATE TRIGGER fail_permission_projection
+      BEFORE INSERT ON runtime_projection_snapshots
+      WHEN NEW.critical = 1 AND NEW.terminal = 0
+      BEGIN
+        SELECT RAISE(ABORT, 'forced permission projection failure');
+      END;
+    `);
+    const fake = createPermissionQuery({ sessionId: 'claude-session-permission-projection' });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-permission-projection',
+      now: () => '2026-07-19T09:03:30Z',
+      generateId: deterministicIds('permission-projection'),
+      permissionHandler: async () => ({ behavior: 'allow' }),
+    });
+
+    const run = service.runNext();
+    await fake.permissionRequested.promise;
+    await expect(run).rejects.toThrow(/forced permission projection failure/);
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'running' });
+    expect(database.prepare(`SELECT status FROM runtime_turn_queue WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ status: 'claimed' });
+
+    await service.close();
+    database.close();
+  });
+
   test('cancels a waiting permission even when the application callback does not settle', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'permission-cancel');
@@ -866,6 +933,36 @@ describe('Claude conversation executor', () => {
       serviceInstanceId: 'executor-service-permission-cancel',
       now: () => '2026-07-19T09:03:30Z',
       generateId: deterministicIds('permission-cancel'),
+      permissionHandler: () => neverSettles.promise,
+    });
+
+    const run = service.runNext();
+    await fake.permissionRequested.promise;
+    await expect(service.cancel(accepted.conversation_id)).resolves.toMatchObject({
+      status: 'cancellation_requested',
+    });
+    await expect(run).resolves.toMatchObject({ status: 'stopped' });
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'stopped' });
+
+    await service.close();
+    database.close();
+  });
+
+  test('terminalizes an SDK-caught permission cancellation from the durable waiting state', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'permission-cancel-caught');
+    const fake = createCaughtPermissionCancellationQuery({
+      sessionId: 'claude-session-permission-cancel-caught',
+    });
+    const neverSettles = deferred();
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-permission-cancel-caught',
+      now: () => '2026-07-19T09:03:45Z',
+      generateId: deterministicIds('permission-cancel-caught'),
       permissionHandler: () => neverSettles.promise,
     });
 
