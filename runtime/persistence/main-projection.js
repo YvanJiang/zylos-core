@@ -51,9 +51,9 @@ export function initializeMainProjection(database, command) {
   }
   database.prepare(`
     INSERT INTO runtime_delivery_lanes (
-      lane_key, turn_id, aggregate_type, delivery_mode, target_json, mapping_json,
-      created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      lane_key, turn_id, aggregate_type, lane_identity_version, delivery_mode,
+      target_json, mapping_json, created_at, updated_at
+    ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
   `).run(
     laneKey,
     command.mapping.turn_id,

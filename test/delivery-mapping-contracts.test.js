@@ -658,6 +658,18 @@ describe('delivery/mapping cross-repository fixtures', () => {
     expect(fixture.command_vectors.some(
       ({ name, valid }) => name === 'v1_0_non_thread_compatible' && valid,
     )).toBe(true);
+    expect(fixture.command_vectors.some(({ name, valid, document }) => (
+      name === 'v1_1_non_thread_explicit_null_anchors'
+      && valid
+      && document.target.native_thread_root_message_id === null
+      && document.target.native_thread_reply_target_message_id === null
+    ))).toBe(true);
+    expect(fixture.command_vectors.filter(({ valid }) => !valid).map(({ name }) => name))
+      .toEqual(expect.arrayContaining([
+        'v1_0_thread_create_requires_v1_1',
+        'v1_0_thread_send_text_requires_v1_1',
+        'v1_0_thread_send_fallback_requires_v1_1',
+      ]));
     expect(fixture.command_vectors.filter(({ valid }) => !valid).map(({ expected_error_code }) =>
       expected_error_code)).toEqual(expect.arrayContaining([
       'unsupported_capability',

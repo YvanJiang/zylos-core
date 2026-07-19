@@ -151,7 +151,8 @@ ID. Renderers may not substitute the thread ID, query a latest message, or fall 
 chat. Core derives both delivery anchors during authenticated inbound acceptance, persists them in
 the initial lane/outbox transaction, and reuses the durable lane target for update, text
 acknowledgement, and final fallback. Any target identity change is a `version_conflict`; delivery
-results cannot rewrite the lane target.
+results cannot rewrite the lane target. Runtime schema initialization rekeys a pre-1.1 native-thread
+lane once so its v1.0 conversation identity is fenced before an exact `update_main` can resume.
 
 The validator also validates the provider-neutral render model, recomputes the delivery
 idempotency key, and enforces the operation matrix:

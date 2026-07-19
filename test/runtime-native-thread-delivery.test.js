@@ -6,15 +6,20 @@ import { afterEach, describe, expect, test } from '@jest/globals';
 import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/index.js';
 
 import {
+  canonicalizeJson,
   ContractKernelError,
   validateDeliveryCommand,
 } from '../contracts/public/index.js';
 import { createOutboxService } from '../runtime/delivery/outbox-service.js';
+import {
+  createDeliveryLaneKeyFromIdentity,
+} from '../runtime/persistence/delivery-lane-key.js';
 import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
 import {
   initializeMainProjection,
   stageMainProjection,
 } from '../runtime/persistence/main-projection.js';
+import { initializeRuntimePersistence } from '../runtime/persistence/schema.js';
 import { deliveredResult } from './helpers/delivered-result.js';
 
 const inboundFixture = JSON.parse(fs.readFileSync(
@@ -170,6 +175,126 @@ afterEach(() => {
 });
 
 describe('native-thread delivery authority', () => {
+  test('fences v1.0 native-thread conversation identity in the lane key', () => {
+    const target = nativeThreadEnvelope();
+    const legacyTarget = {
+      region: target.region,
+      tenant_id: target.tenant_id,
+      channel: target.channel,
+      bot_id: target.bot_id,
+      chat_type: target.chat_type,
+      chat_id: target.chat_id,
+      native_thread_or_topic_id: target.native_thread_or_topic_id,
+    };
+    const laneIdentity = {
+      target: legacyTarget,
+      turnId: 'turn-v1-thread-update',
+      aggregateType: 'turn_main',
+    };
+
+    expect(createDeliveryLaneKeyFromIdentity(laneIdentity)).not.toBe(
+      createDeliveryLaneKeyFromIdentity({
+        ...laneIdentity,
+        target: {
+          ...legacyTarget,
+          native_thread_or_topic_id: 'native-thread-tampered',
+        },
+      }),
+    );
+  });
+
+  test('rekeys a persisted v1.0 native-thread lane once before enforcing its identity', () => {
+    const database = openTestDatabase();
+    const databasePath = database.name;
+    const accepted = acceptNormalInbound(
+      database,
+      nativeThreadEnvelope(),
+      acceptanceOptions('legacy-thread-rekey'),
+    );
+    const command = readInitialCommand(database, accepted.turn_id);
+    const legacyTarget = structuredClone(command.target);
+    delete legacyTarget.native_thread_root_message_id;
+    delete legacyTarget.native_thread_reply_target_message_id;
+    const legacyCommand = {
+      ...command,
+      contract_version: '1.0',
+      target: legacyTarget,
+      operation: 'update_main',
+      target_platform_message_id: 'platform-main-existing',
+      predecessor_delivery_id: 'delivery-main-existing',
+      expected_platform_version: 1,
+    };
+    expect(validateDeliveryCommand(legacyCommand).forwarded).toEqual(legacyCommand);
+    const legacyLaneKey = canonicalizeJson([
+      legacyTarget.channel,
+      legacyTarget.tenant_id,
+      legacyTarget.bot_id,
+      legacyTarget.chat_id,
+      accepted.turn_id,
+      legacyCommand.aggregate_type,
+    ]);
+
+    database.pragma('foreign_keys = OFF');
+    database.prepare(`
+      UPDATE runtime_delivery_lanes
+      SET lane_key = ?, target_json = ?, lane_identity_version = 0
+      WHERE turn_id = ?
+    `).run(legacyLaneKey, JSON.stringify(legacyTarget), accepted.turn_id);
+    database.prepare(`
+      UPDATE runtime_outbox
+      SET lane_key = ?, command_json = ?
+      WHERE turn_id = ?
+    `).run(legacyLaneKey, JSON.stringify(legacyCommand), accepted.turn_id);
+    database.prepare(`
+      UPDATE runtime_projection_snapshots SET lane_key = ? WHERE turn_id = ?
+    `).run(legacyLaneKey, accepted.turn_id);
+    database.pragma('foreign_keys = ON');
+    database.close();
+
+    const restarted = new Database(databasePath);
+    initializeRuntimePersistence(restarted);
+    const migratedLane = readLane(restarted, accepted.turn_id);
+    expect(migratedLane.lane_key).toBe(createDeliveryLaneKeyFromIdentity({
+      target: legacyTarget,
+      turnId: accepted.turn_id,
+      aggregateType: legacyCommand.aggregate_type,
+    }));
+    expect(migratedLane.lane_key).not.toBe(legacyLaneKey);
+    expect(restarted.prepare(`
+      SELECT COUNT(*) AS count
+      FROM runtime_outbox
+      WHERE turn_id = ? AND lane_key = ?
+    `).get(accepted.turn_id, migratedLane.lane_key).count).toBeGreaterThan(0);
+    expect(restarted.prepare(`
+      SELECT COUNT(*) AS count
+      FROM runtime_projection_snapshots
+      WHERE turn_id = ? AND lane_key = ?
+    `).get(accepted.turn_id, migratedLane.lane_key).count).toBeGreaterThan(0);
+
+    const tamperedTarget = {
+      ...legacyTarget,
+      native_thread_or_topic_id: 'native-thread-tampered-after-migration',
+    };
+    restarted.prepare(`
+      UPDATE runtime_delivery_lanes SET target_json = ? WHERE turn_id = ?
+    `).run(JSON.stringify(tamperedTarget), accepted.turn_id);
+    restarted.prepare(`
+      UPDATE runtime_outbox SET command_json = ? WHERE turn_id = ?
+    `).run(JSON.stringify({
+      ...legacyCommand,
+      target: tamperedTarget,
+    }), accepted.turn_id);
+    const outbox = createOutboxService({
+      database: restarted,
+      serviceInstanceId: 'delivery-service-legacy-thread-rekey',
+      now: () => '2026-07-19T13:00:01Z',
+      generateId: deterministicIds('delivery-legacy-thread-rekey'),
+    });
+    expectContractFailure(() => outbox.claimNext(), 'version_conflict');
+
+    restarted.close();
+  });
+
   test('persists authenticated inbound anchors and reuses them after restart for update and fallback', () => {
     const database = openTestDatabase();
     const databasePath = database.name;
@@ -304,10 +429,14 @@ describe('native-thread delivery authority', () => {
 
   test('reuses the durable reply target for the initial text acknowledgement', () => {
     const database = openTestDatabase();
+    const databasePath = database.name;
     const envelope = nativeThreadEnvelope();
     acceptNormalInbound(database, envelope, acceptanceOptions('text-ack'));
+    database.close();
+
+    const restarted = new Database(databasePath);
     const outbox = createOutboxService({
-      database,
+      database: restarted,
       serviceInstanceId: 'delivery-service-thread-text-ack',
       now: () => '2026-07-19T13:00:01Z',
       generateId: deterministicIds('delivery-text-ack'),
@@ -330,7 +459,7 @@ describe('native-thread delivery authority', () => {
       .not.toBe(text.target.native_thread_or_topic_id);
     expect(text.target.native_thread_reply_target_message_id).not.toBe(text.target.chat_id);
 
-    database.close();
+    restarted.close();
   });
 
   test('preserves persisted v1.0 non-thread lanes for update and text acknowledgement', () => {

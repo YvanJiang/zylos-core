@@ -9,16 +9,17 @@ export function createDeliveryLaneKeyFromIdentity({ target, turnId, aggregateTyp
     turnId,
     aggregateType,
   ];
-  if (
-    target.chat_type === 'thread'
-    && Object.hasOwn(target, 'native_thread_root_message_id')
-    && Object.hasOwn(target, 'native_thread_reply_target_message_id')
-  ) {
-    identity.push(
-      target.native_thread_or_topic_id,
-      target.native_thread_root_message_id,
-      target.native_thread_reply_target_message_id,
-    );
+  if (target.chat_type === 'thread') {
+    identity.push(target.native_thread_or_topic_id);
+    if (
+      Object.hasOwn(target, 'native_thread_root_message_id')
+      && Object.hasOwn(target, 'native_thread_reply_target_message_id')
+    ) {
+      identity.push(
+        target.native_thread_root_message_id,
+        target.native_thread_reply_target_message_id,
+      );
+    }
   }
   return canonicalizeJson(identity);
 }
