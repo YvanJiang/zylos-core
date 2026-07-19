@@ -54,6 +54,7 @@ export function createExecutorService({
   cancelResidentHeartbeat = clearInterval,
   permissionHandler = null,
   interactionTimeoutMs,
+  providerStopTimeoutMs = 10_000,
   maxResidentExecutorsPerBot = 20,
   setTimeoutFn = setTimeout,
   clearTimeoutFn = clearTimeout,
@@ -76,6 +77,9 @@ export function createExecutorService({
   }
   if (permissionHandler !== null && typeof permissionHandler !== 'function') {
     throw new TypeError('permissionHandler must be a function or null');
+  }
+  if (!Number.isFinite(providerStopTimeoutMs) || providerStopTimeoutMs <= 0) {
+    throw new TypeError('providerStopTimeoutMs must be a positive finite number');
   }
   if (!Number.isFinite(residentLeaseDurationMs) || residentLeaseDurationMs <= 0) {
     throw new TypeError('residentLeaseDurationMs must be a positive finite number');
@@ -368,6 +372,12 @@ export function createExecutorService({
 
   async function handleRunFailure(activeRun, error) {
     const { turnContext } = activeRun;
+    if (activeRun.stopCommitted) {
+      activeRun.durableSettled = true;
+      cleanupActiveRun(activeRun);
+      refresh();
+      return resultFor(activeRun, 'stopped');
+    }
     if (activeRun.providerFailureOutcome?.status === 'recovering') {
       return retainRecoveringRun(activeRun);
     }
@@ -439,6 +449,12 @@ export function createExecutorService({
   }
 
   async function finishRun(activeRun) {
+    if (activeRun.stopCommitted) {
+      activeRun.durableSettled = true;
+      cleanupActiveRun(activeRun);
+      refresh();
+      return resultFor(activeRun, 'stopped');
+    }
     activeRun.ensureProviderStarted();
     await awaitCancellationSettlement(activeRun.turnContext.turn_id);
     if (uncertainTurnIds.has(activeRun.turnContext.turn_id)) {
@@ -488,6 +504,14 @@ export function createExecutorService({
     try {
       while (true) {
         const next = await activeRun.iterator.next();
+        if (activeRun.stopCommitted) {
+          if (next.done) return await finishRun(activeRun);
+          persist(() => store.recordProviderEventDiagnostic(
+            activeRun.turnContext,
+            next.value,
+          ));
+          continue;
+        }
         if (activeRun.providerFailureOutcome?.status === 'recovering') {
           return retainRecoveringRun(activeRun);
         }
@@ -694,6 +718,7 @@ export function createExecutorService({
       timedOutExpiration: null,
       turnContext,
       usesManagedRecords: false,
+      stopCommitted: false,
     };
     activeRunSettlements.add(settlement);
     activeRuns.set(turnContext.turn_id, activeRun);
@@ -726,6 +751,16 @@ export function createExecutorService({
         }),
         lineage: Object.freeze({ ...turnContext.lineage }),
         bindProviderNativeId(providerNativeId) {
+          if (activeRun.stopCommitted) {
+            persist(() => store.recordProviderEventDiagnostic(
+              turnContext,
+              {
+                kind: 'provider_native_id',
+                payload: { provider_native_id: providerNativeId },
+              },
+            ));
+            return { status: 'stale_attempt' };
+          }
           const binding = persist(() => store.bindProviderNativeId(
             turnContext,
             providerNativeId,
@@ -734,6 +769,16 @@ export function createExecutorService({
           return binding;
         },
         reportProviderState(providerState) {
+          if (activeRun.stopCommitted) {
+            persist(() => store.recordProviderEventDiagnostic(
+              turnContext,
+              {
+                kind: 'provider_state',
+                payload: { state: providerState?.state ?? 'unknown' },
+              },
+            ));
+            return { status: 'stale_attempt' };
+          }
           if (
             !providerState
             || providerState.state !== 'started'
@@ -745,6 +790,16 @@ export function createExecutorService({
           return activeRun.ensureProviderStarted();
         },
         reportProviderFailure(providerFailure) {
+          if (activeRun.stopCommitted) {
+            persist(() => store.recordProviderEventDiagnostic(
+              turnContext,
+              {
+                kind: 'provider_failure',
+                payload: { status: 'arrived_after_stop' },
+              },
+            ));
+            return { status: 'stale_attempt' };
+          }
           if (activeRun.durableSettled) {
             throw new Error('Provider failure arrived after the executor run settled.');
           }
@@ -850,6 +905,107 @@ export function createExecutorService({
     };
   }
 
+  async function stop(request) {
+    // Commit the provider-neutral terminal winner before asking an adapter to
+    // terminate private provider work; subsequent provider output is fenced.
+    const result = persist(() => store.stopConversation(request));
+    refresh();
+    reschedulePendingInteractionDeadlines();
+    if (result.deduplicated || result.active_turn === null) return result;
+
+    const activeRun = activeRuns.get(result.active_turn.turn_id);
+    const turnContext = activeRun?.turnContext ?? {
+      conversation_id: result.conversation_id,
+      turn_id: result.active_turn.turn_id,
+      attempt: result.active_turn.attempt,
+    };
+    if (activeRun) activeRun.stopCommitted = true;
+    closingPermissionTurnIds.add(turnContext.turn_id);
+    for (const controller of permissionControllers.get(turnContext.turn_id) ?? []) {
+      controller.abort();
+    }
+    let providerStopStatus = 'confirmed';
+    let isolationProven = false;
+    try {
+      if (typeof adapter.cancel !== 'function') {
+        throw new TypeError('adapter.cancel must be a function to stop an active turn');
+      }
+      await adapter.cancel(turnContext);
+    } catch {
+      providerStopStatus = 'uncertain';
+      if (typeof adapter.abort === 'function') {
+        try {
+          await adapter.abort(turnContext);
+          providerStopStatus = 'isolated';
+          isolationProven = true;
+        } catch {
+          isolationProven = false;
+        }
+      }
+    }
+    if (!isolationProven && providerStopStatus === 'confirmed') {
+      if (activeRun?.pauseKind === 'interaction') {
+        activeRun.pauseKind = null;
+        advanceRun(activeRun).catch(() => {});
+      }
+      if (!activeRun) {
+        isolationProven = true;
+      } else {
+        let timeoutHandle;
+        const settled = await Promise.race([
+          activeRun.settlement.then(() => true),
+          new Promise((resolve) => {
+            timeoutHandle = setTimeoutFn(() => resolve(false), providerStopTimeoutMs);
+          }),
+        ]);
+        if (settled && timeoutHandle !== undefined) clearTimeoutFn(timeoutHandle);
+        isolationProven = settled;
+        if (!settled) {
+          providerStopStatus = 'terminal_unconfirmed';
+          if (typeof adapter.abort === 'function') {
+            try {
+              await adapter.abort(turnContext);
+              activeRun.durableSettled = true;
+              cleanupActiveRun(activeRun);
+              providerStopStatus = 'isolated';
+              isolationProven = true;
+            } catch {
+              isolationProven = false;
+            }
+          }
+        }
+      }
+    }
+    if (isolationProven && providerStopStatus === 'isolated' && activeRun && !activeRun.settled) {
+      activeRun.durableSettled = true;
+      cleanupActiveRun(activeRun);
+    }
+    if (!isolationProven) {
+      const incident = persist(() => store.markProviderStopUnknown(
+        {
+          turn_id: result.active_turn.turn_id,
+          attempt: result.active_turn.attempt,
+        },
+        providerStopStatus,
+      ));
+      refresh();
+      return {
+        ...result,
+        lease_released: false,
+        provider_stop_status: providerStopStatus,
+        incident,
+      };
+    }
+    const leaseReleased = persist(() => store.releaseStoppedExecutorLease(result));
+    if (activeRun) releaseAbsentResident(activeRun.turnContext);
+    refresh();
+    return {
+      ...result,
+      lease_released: leaseReleased,
+      provider_stop_status: providerStopStatus,
+    };
+  }
+
   async function evictIdleExecutors() {
     if (typeof adapter.evictIdle !== 'function') return [];
     const evicted = await adapter.evictIdle({
@@ -887,7 +1043,10 @@ export function createExecutorService({
     const timedOutRun = activeRuns.get(result.turn_id);
     if (timedOutRun) timedOutRun.timedOutExpiration = result;
     if (!timedOutRun || typeof timedOutRun.iterator.return !== 'function') {
-      store.markTimedOutProviderStopUnknown(result, 'not_current');
+      store.markProviderStopUnknown({
+        turn_id: result.turn_id,
+        attempt: result.attempt,
+      }, 'not_current');
       reschedulePendingInteractionDeadlines();
       return {
         ...result,
@@ -904,12 +1063,18 @@ export function createExecutorService({
           reason: 'timeout',
         });
       } catch {
-        store.markTimedOutProviderStopUnknown(result, 'uncertain');
+        store.markProviderStopUnknown({
+          turn_id: result.turn_id,
+          attempt: result.attempt,
+        }, 'uncertain');
         reschedulePendingInteractionDeadlines();
         return { ...result, lease_released: false, provider_stop_status: 'uncertain' };
       }
       if (interruption?.status !== 'provider_stopped') {
-        store.markTimedOutProviderStopUnknown(result, interruption?.status ?? 'uncertain');
+        store.markProviderStopUnknown({
+          turn_id: result.turn_id,
+          attempt: result.attempt,
+        }, interruption?.status ?? 'uncertain');
         reschedulePendingInteractionDeadlines();
         return {
           ...result,
@@ -958,6 +1123,24 @@ export function createExecutorService({
     return { ...result, lease_released: leaseReleased };
   }
 
+  function recordLateInteractionAcknowledgement(activeRun, delivery, status) {
+    persist(() => store.recordProviderEventDiagnostic(
+      activeRun.turnContext,
+      {
+        kind: 'interaction_handoff_acknowledgement',
+        payload: {
+          handoff_id: delivery.handoff.handoff_id,
+          status,
+        },
+      },
+    ));
+    return {
+      status: 'stale_acknowledgement',
+      turn_id: delivery.request.turn_id,
+      turn_state: 'stopped',
+    };
+  }
+
   async function executeInteractionDelivery(handoffId) {
     if (typeof adapter.handleInteractionAnswer !== 'function') {
       throw new TypeError('adapter.handleInteractionAnswer must be a function');
@@ -970,6 +1153,13 @@ export function createExecutorService({
         Object.freeze(delivery),
       );
     } catch (error) {
+      if (activeRun?.stopCommitted) {
+        return recordLateInteractionAcknowledgement(
+          activeRun,
+          delivery,
+          'handler_failed_after_stop',
+        );
+      }
       if (provider === 'codex' && isExplicitProviderError(error)) {
         const providerError = normalizeProviderError(error, now());
         if (providerError.side_effect_status === 'unknown') {
@@ -1028,6 +1218,13 @@ export function createExecutorService({
       reschedulePendingInteractionDeadlines();
       if (recovery.deliveryUnknown) error.deliveryUnknown = recovery.deliveryUnknown;
       throw error;
+    }
+    if (activeRun?.stopCommitted) {
+      return recordLateInteractionAcknowledgement(
+        activeRun,
+        delivery,
+        handlerAcknowledgement?.status ?? 'unknown',
+      );
     }
     const managedPermissions = permissionControllers.get(delivery.request.turn_id)?.size ?? 0;
     let acknowledgement;
@@ -1272,6 +1469,7 @@ export function createExecutorService({
     runNext,
     snapshot,
     start,
+    stop,
     submitInteractionAnswer,
   });
 }
