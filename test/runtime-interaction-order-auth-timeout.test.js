@@ -688,6 +688,20 @@ describe('runtime interaction order, authorization, and timeout', () => {
       lease_owner: 'executor-service-timeout-no-writer',
       turn_id: request.turn_id,
     });
+    expect(database.prepare(`
+      SELECT provider_stop_status, side_effect_status, disposition
+      FROM runtime_provider_stop_incidents
+      WHERE turn_id = ?
+    `).get(request.turn_id)).toEqual({
+      provider_stop_status: 'not_current',
+      side_effect_status: 'unknown',
+      disposition: 'manual_recovery_required',
+    });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM runtime_outbox
+      WHERE aggregate_type = 'text_notice' AND aggregate_id LIKE ?
+    `).get(`${request.turn_id}-provider-stop-%`)).toEqual({ count: 1 });
 
     database.close();
   });

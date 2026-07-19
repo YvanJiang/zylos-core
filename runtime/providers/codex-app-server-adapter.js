@@ -320,6 +320,7 @@ export function createCodexAppServerAdapter({
     for (const [reference, entry] of pendingInteractions) {
       if (discardedGroups.has(entry.group)) pendingInteractions.delete(reference);
     }
+    return discardedGroups.size;
   }
 
   function failConnection(target, error, { terminate = true } = {}) {
@@ -374,7 +375,6 @@ export function createCodexAppServerAdapter({
     for (const [reference, entry] of pendingInteractions) {
       if (failedGroups.has(entry.group)) pendingInteractions.delete(reference);
     }
-    if (connection === target) connection = null;
   }
 
   function handleNotification(target, message) {
@@ -419,7 +419,7 @@ export function createCodexAppServerAdapter({
         || typeof params.delta !== 'string'
         || params.delta.length === 0
       ) {
-        run.queue.fail(new CodexAppServerAdapterError(
+        failConnection(target, new CodexAppServerAdapterError(
           'provider_protocol_invalid',
           'Codex app-server emitted an invalid agent message delta.',
         ));
@@ -447,7 +447,7 @@ export function createCodexAppServerAdapter({
       const specification = TOOL_ITEMS[item?.type];
       if (specification) {
         if (typeof item.id !== 'string' || item.id.length === 0) {
-          run.queue.fail(new CodexAppServerAdapterError(
+          failConnection(target, new CodexAppServerAdapterError(
             'provider_protocol_invalid',
             'Codex app-server emitted a tool item without an ID.',
           ));
@@ -456,7 +456,7 @@ export function createCodexAppServerAdapter({
         run.tool_items.set(item.id, specification);
         run.queue.push(toolDescriptor(run, item.id, specification, 'tool_started', 'started'));
       } else if (!IGNORED_ITEM_TYPES.has(item?.type)) {
-        run.queue.fail(new CodexAppServerAdapterError(
+        failConnection(target, new CodexAppServerAdapterError(
           'unsupported_capability',
           'Codex app-server emitted an unsupported item type.',
         ));
@@ -470,7 +470,7 @@ export function createCodexAppServerAdapter({
     ) {
       const specification = run.tool_items.get(params.itemId);
       if (!specification) {
-        run.queue.fail(new CodexAppServerAdapterError(
+        failConnection(target, new CodexAppServerAdapterError(
           'provider_protocol_invalid',
           'Codex app-server emitted tool progress before tool start.',
         ));
@@ -488,7 +488,7 @@ export function createCodexAppServerAdapter({
           || typeof item.text !== 'string'
           || item.text.length === 0
         ) {
-          run.queue.fail(new CodexAppServerAdapterError(
+          failConnection(target, new CodexAppServerAdapterError(
             'provider_protocol_invalid',
             'Codex app-server emitted an invalid completed agent message.',
           ));
@@ -507,7 +507,7 @@ export function createCodexAppServerAdapter({
       const specification = TOOL_ITEMS[item?.type];
       if (specification) {
         if (run.tool_items.get(item.id) !== specification) {
-          run.queue.fail(new CodexAppServerAdapterError(
+          failConnection(target, new CodexAppServerAdapterError(
             'provider_protocol_invalid',
             'Codex app-server completed a tool that was not started.',
           ));
@@ -517,7 +517,7 @@ export function createCodexAppServerAdapter({
         run.queue.push(toolDescriptor(run, item.id, specification, 'tool_finished', verb));
         run.tool_items.delete(item.id);
       } else if (!IGNORED_ITEM_TYPES.has(item?.type)) {
-        run.queue.fail(new CodexAppServerAdapterError(
+        failConnection(target, new CodexAppServerAdapterError(
           'unsupported_capability',
           'Codex app-server completed an unsupported item type.',
         ));
@@ -525,13 +525,11 @@ export function createCodexAppServerAdapter({
       return;
     }
     if (method === 'error') {
-      activeRuns.delete(runKey);
       const failure = new CodexAppServerAdapterError(
         'provider_execution_failed',
         'Codex app-server reported an execution error.',
       );
-      run.rejectTerminal(failure);
-      run.queue.fail(failure);
+      failConnection(target, failure);
       return;
     }
     if (method === 'turn/completed') {
@@ -543,19 +541,24 @@ export function createCodexAppServerAdapter({
         ));
         return;
       }
-      activeRuns.delete(runKey);
       run.terminal_status = status;
       terminalRuns.set(coreAttemptKey(run.context.turn_id, run.context.attempt), run);
-      discardProviderRequestsForRun(run, new CodexAppServerAdapterError(
+      const failure = new CodexAppServerAdapterError(
         'provider_execution_failed',
         `Codex app-server completed the turn with status ${String(status)}.`,
-      ));
+      );
+      const discardedRequestCount = discardProviderRequestsForRun(run, failure);
+      const completionIsInvalid = status !== 'completed' || discardedRequestCount > 0;
+      const failureOutcome = discardedRequestCount > 0
+        ? run.context.reportProviderFailure?.(failure)
+        : null;
+      if (failureOutcome?.status === 'recovering') {
+        terminalRuns.delete(coreAttemptKey(run.context.turn_id, run.context.attempt));
+      }
+      activeRuns.delete(runKey);
       run.resolveTerminal(status);
-      if (status === 'completed') run.queue.end();
-      else run.queue.fail(new CodexAppServerAdapterError(
-        'provider_execution_failed',
-        `Codex app-server completed the turn with status ${String(status)}.`,
-      ));
+      if (completionIsInvalid) run.queue.fail(failure);
+      else run.queue.end();
     }
   }
 
@@ -597,6 +600,12 @@ export function createCodexAppServerAdapter({
   }
 
   function requestUserInputComponents(params) {
+    if (params.autoResolutionMs !== null && params.autoResolutionMs !== undefined) {
+      rejectProtocol(
+        'Codex app-server requested an auto-resolving question without a durable Core deadline mapping.',
+        'unsupported_capability',
+      );
+    }
     if (!Array.isArray(params.questions) || params.questions.length !== 1) {
       rejectProtocol(
         'Codex app-server multi-question input cannot satisfy Core ordered handoff semantics.',
@@ -612,7 +621,8 @@ export function createCodexAppServerAdapter({
         || questionIds.has(question.id)
         || typeof question.question !== 'string'
         || question.question.trim().length === 0
-        || question.isSecret === true
+        || typeof question.isOther !== 'boolean'
+        || question.isSecret !== false
       ) {
         rejectProtocol('Codex app-server requested unsupported or invalid user input.');
       }
@@ -628,12 +638,21 @@ export function createCodexAppServerAdapter({
       if (new Set(choices.map(({ choice_id: choiceId }) => choiceId)).size !== choices.length) {
         rejectProtocol('Codex app-server supplied duplicate choices.');
       }
+      if (choices.length > 0 && question.isOther) {
+        rejectProtocol(
+          'Codex app-server requested a choice plus free-form input that Core cannot represent.',
+          'unsupported_capability',
+        );
+      }
       return {
         component_key: question.id,
         toolUseId: params.itemId,
         kind: choices.length > 0 ? 'choice' : 'question',
         prompt: question.question,
         choices,
+        answer_constraint: choices.length > 0
+          ? { kind: 'choice', allowed_values: choices.map(({ choice_id: choiceId }) => choiceId) }
+          : { kind: 'text', allowed_values: null },
       };
     });
   }
@@ -825,7 +844,7 @@ export function createCodexAppServerAdapter({
     const components = serverRequestComponents(message.method, message.params);
     if (!run || run.connection_id !== target.connection_id || !components) {
       sendServerError(target, message.id, 'Unsupported or stale app-server request.');
-      if (run) run.queue.fail(new CodexAppServerAdapterError(
+      if (run) failConnection(target, new CodexAppServerAdapterError(
         'unsupported_capability',
         'Codex app-server requested an unsupported capability.',
       ));
@@ -850,6 +869,9 @@ export function createCodexAppServerAdapter({
       run,
       components: new Map(),
       answers: new Map(),
+      answer_constraints: new Map(components.map((component) => (
+        [component.component_key, component.answer_constraint ?? null]
+      ))),
       mcp_form: components[0]?.mcp_form ?? null,
       response_sent: false,
       resolved,
@@ -879,7 +901,7 @@ export function createCodexAppServerAdapter({
       } catch (error) {
         sendServerError(target, message.id, 'Invalid app-server request.');
         const run = findServerRequestRun(target, message.params);
-        if (run) run.queue.fail(error);
+        if (run) failConnection(target, error);
       }
       return;
     }
@@ -950,6 +972,10 @@ export function createCodexAppServerAdapter({
 
   async function createConnection() {
     nextConnectionNo += 1;
+    let resolveClosed;
+    const closed = new Promise((resolve) => {
+      resolveClosed = resolve;
+    });
     const target = {
       connection_id: `codex-app-server-${nextConnectionNo}`,
       child: spawnProcess(codexExecutable, ['app-server', '--stdio'], {
@@ -959,6 +985,9 @@ export function createCodexAppServerAdapter({
         stdio: ['pipe', 'pipe', 'pipe'],
       }),
       failed: false,
+      closed,
+      closed_observed: false,
+      resolveClosed,
       termination_requested: false,
       next_request_no: 1,
       pending: new Map(),
@@ -980,7 +1009,14 @@ export function createCodexAppServerAdapter({
       }
     });
     target.child.once('error', (error) => failConnection(target, error));
-    target.child.once('close', () => failConnection(target, undefined, { terminate: false }));
+    target.child.once('close', () => {
+      if (!target.closed_observed) {
+        target.closed_observed = true;
+        target.resolveClosed();
+      }
+      failConnection(target, undefined, { terminate: false });
+      if (connection === target) connection = null;
+    });
     try {
       await sendRequest(target, 'initialize', {
         clientInfo,
@@ -1001,6 +1037,11 @@ export function createCodexAppServerAdapter({
   async function ensureConnection() {
     if (connecting) return connecting;
     if (connection && !connection.failed) return connection;
+    if (connection?.failed) {
+      const failedConnection = connection;
+      await failedConnection.closed;
+      if (connection === failedConnection) connection = null;
+    }
     if (!connecting) {
       connecting = createConnection().finally(() => {
         connecting = null;
@@ -1082,8 +1123,8 @@ export function createCodexAppServerAdapter({
     }
   }
 
-  function waitForTerminalConfirmation(run) {
-    return new Promise((resolve) => {
+  function waitForInterruptConfirmation(work) {
+    return new Promise((resolve, reject) => {
       let settled = false;
       const timer = setTimeoutFn(() => {
         if (settled) return;
@@ -1091,18 +1132,18 @@ export function createCodexAppServerAdapter({
         resolve(null);
       }, interruptConfirmationTimeoutMs);
       timer?.unref?.();
-      run.terminal.then(
-        (providerStatus) => {
+      work.then(
+        (result) => {
           if (settled) return;
           settled = true;
           clearTimeoutFn(timer);
-          resolve(providerStatus);
+          resolve(result);
         },
-        () => {
+        (error) => {
           if (settled) return;
           settled = true;
           clearTimeoutFn(timer);
-          resolve(null);
+          reject(error);
         },
       );
     });
@@ -1129,19 +1170,26 @@ export function createCodexAppServerAdapter({
       }
       return Object.freeze({ status: 'not_current', reason });
     }
-    await sendRequest(connection, 'turn/interrupt', {
-      threadId: run.thread_id,
-      turnId: run.turn_id,
-    });
+    const target = connection;
+    const result = await waitForInterruptConfirmation((async () => {
+      await sendRequest(target, 'turn/interrupt', {
+        threadId: run.thread_id,
+        turnId: run.turn_id,
+      });
+      return reason === 'timeout' ? run.terminal : 'interrupt_requested';
+    })());
+    if (result === null) {
+      failConnection(target, new CodexAppServerAdapterError(
+        'provider_connection_lost',
+        'Codex app-server did not confirm the interrupt before its deadline.',
+      ));
+      return Object.freeze({ status: 'uncertain', reason });
+    }
     if (reason === 'timeout') {
-      const providerStatus = await waitForTerminalConfirmation(run);
-      if (providerStatus === null) {
-        return Object.freeze({ status: 'uncertain', reason });
-      }
       return Object.freeze({
         status: 'provider_stopped',
         reason,
-        provider_status: providerStatus,
+        provider_status: result,
       });
     }
     return Object.freeze({ status: 'interrupt_requested', reason });
@@ -1179,15 +1227,36 @@ export function createCodexAppServerAdapter({
     return permissions;
   }
 
-  function buildProviderResponse(group) {
+  function requestUserInputAnswer(value, constraint) {
+    if (constraint?.kind === 'text') {
+      if (value?.kind !== 'text' || typeof value.text !== 'string' || value.text.length === 0) {
+        rejectProtocol('The persisted answer must be free-form text for this provider question.');
+      }
+      return value.text;
+    }
+    if (
+      constraint?.kind !== 'choice'
+      || value?.kind !== 'choice'
+      || typeof value.choice_id !== 'string'
+      || !constraint.allowed_values.includes(value.choice_id)
+    ) {
+      rejectProtocol('The persisted answer is not one of the provider question choices.');
+    }
+    return value.choice_id;
+  }
+
+  function buildProviderResponse(group, answers = group.answers) {
     if (group.method === 'item/tool/requestUserInput') {
       return {
-        answers: Object.fromEntries([...group.answers.entries()].map(([key, value]) => (
-          [key, { answers: [answerText(value)] }]
+        answers: Object.fromEntries([...answers.entries()].map(([key, value]) => (
+          [key, { answers: [requestUserInputAnswer(
+            value,
+            group.answer_constraints.get(key),
+          )] }]
         ))),
       };
     }
-    const value = group.answers.values().next().value;
+    const value = answers.values().next().value;
     if (
       group.method === 'item/commandExecution/requestApproval'
       || group.method === 'item/fileChange/requestApproval'
@@ -1204,6 +1273,12 @@ export function createCodexAppServerAdapter({
     if (group.method === 'mcpServer/elicitation/request') {
       if (!group.mcp_form) {
         rejectProtocol('The MCP elicitation has no safe provider-neutral form mapping.');
+      }
+      if (
+        (group.mcp_form.allowed_values === null && value?.kind !== 'text')
+        || (group.mcp_form.allowed_values !== null && value?.kind !== 'choice')
+      ) {
+        rejectProtocol('The persisted answer kind does not match the MCP form schema.');
       }
       const answer = answerText(value);
       if (
@@ -1263,9 +1338,12 @@ export function createCodexAppServerAdapter({
     if (group.answers.has(entry.component_key)) {
       rejectProtocol('The provider interaction component was already answered.');
     }
+    const candidateAnswers = new Map(group.answers);
+    candidateAnswers.set(entry.component_key, structuredClone(delivery.answer.value));
+    const providerResponse = buildProviderResponse(group, candidateAnswers);
     group.answers.set(entry.component_key, structuredClone(delivery.answer.value));
     group.response_sent = true;
-    sendServerResponse(target, group.request_id, buildProviderResponse(group));
+    sendServerResponse(target, group.request_id, providerResponse);
     await group.resolved;
     providerRequests.delete(group.request_key);
     for (const [reference, component] of pendingInteractions) {

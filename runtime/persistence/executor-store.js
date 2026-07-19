@@ -25,8 +25,8 @@ import { initializeRuntimePersistence } from './schema.js';
 
 const CANONICAL_TRANSITIONS = Object.freeze({
   queued: ['starting'],
-  starting: ['running', 'failed'],
-  running: ['waiting_user', 'completed', 'failed'],
+  starting: ['running', 'recovering', 'failed'],
+  running: ['waiting_user', 'recovering', 'completed', 'failed'],
   waiting_user: ['running', 'recovering', 'timed_out'],
   recovering: [],
 });
@@ -1956,13 +1956,63 @@ export function createExecutorStore({
     return acknowledge.immediate();
   }
 
-  function markWaitingProviderFailure(turnContext, error) {
+  function markProviderFailure(turnContext, error) {
     const markFailure = database.transaction(() => {
       const occurredAt = now();
       let turn = loadTurn(database, turnContext.turn_id);
       assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
+      if (['starting', 'running'].includes(turn.state)) {
+        const fromState = turn.state;
+        transitionInTransaction(database, {
+          turnId: turn.turn_id,
+          fromState,
+          toState: 'recovering',
+          fence: turnContext.attempt,
+          provider,
+          serviceInstanceId,
+          occurredAt,
+          generateId,
+          reasonCode: 'provider_connection_lost',
+        });
+        const recoveringTurn = loadTurn(database, turn.turn_id);
+        const recoveryEvent = buildEvent({
+          turn: recoveringTurn,
+          lastEvent: loadLastEvent(database, turn.turn_id),
+          fence: turnContext.attempt,
+          provider,
+          descriptor: {
+            kind: 'recovery_started',
+            phase: 'recovering',
+            provider_native_id: recoveringTurn.provider_native_id,
+            payload: {
+              recovery_id: generateId('recovery'),
+              recovery_of_turn_id: recoveringTurn.turn_id,
+              recovery_of_lineage_id: recoveringTurn.lineage_id,
+              side_effect_status: 'unknown',
+            },
+            error,
+          },
+          occurredAt,
+          generateId,
+        });
+        commitTurnEvent(database, {
+          turn: recoveringTurn,
+          event: recoveryEvent,
+          fence: turnContext.attempt,
+          nextState: 'recovering',
+          staleMessage: 'The provider failure lost its recovery fence.',
+          generateId,
+        });
+        return {
+          status: 'recovering',
+          turn_id: turn.turn_id,
+          turn_state: 'recovering',
+          previous_turn_state: fromState,
+          cancelled_interaction_ids: [],
+        };
+      }
       if (turn.state !== 'waiting_user') {
-        return { status: 'not_waiting', turn_id: turn.turn_id, turn_state: turn.state };
+        return { status: 'not_active', turn_id: turn.turn_id, turn_state: turn.state };
       }
       const blockingRequests = database.prepare(`
         SELECT request_json
@@ -2235,7 +2285,7 @@ export function createExecutorStore({
     claimNextQueuedTurn,
     claimInteractionHandoff,
     commitInteractionAnswer,
-    markWaitingProviderFailure,
+    markProviderFailure,
     markInteractionHandoffDeliveryUnknown,
     markTimedOutProviderStopUnknown,
     expireInteraction,

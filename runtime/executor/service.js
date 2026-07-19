@@ -166,6 +166,22 @@ export function createExecutorService({
     };
   }
 
+  async function retainRecoveringRun(activeRun) {
+    try {
+      await activeRun.iterator.return?.();
+    } catch {
+      // The durable recovering state and retained lease remain authoritative.
+    }
+    activeRuns.delete(activeRun.turnContext.turn_id);
+    refresh();
+    return {
+      status: 'recovering',
+      conversation_id: activeRun.turnContext.conversation_id,
+      turn_id: activeRun.turnContext.turn_id,
+      ...activeRun.turnContext.attempt,
+    };
+  }
+
   async function advanceRun(activeRun) {
     while (true) {
       let next;
@@ -173,6 +189,9 @@ export function createExecutorService({
         next = await activeRun.iterator.next();
       } catch (error) {
         if (isExplicitProviderError(error)) {
+          if (activeRun.providerFailureOutcome()?.status === 'recovering') {
+            return retainRecoveringRun(activeRun);
+          }
           return failTurn(
             activeRun.turnContext,
             error,
@@ -180,6 +199,9 @@ export function createExecutorService({
           );
         }
         throw error;
+      }
+      if (activeRun.providerFailureOutcome()?.status === 'recovering') {
+        return retainRecoveringRun(activeRun);
       }
       const reportedProviderFailure = activeRun.providerFailure();
       if (reportedProviderFailure !== null) {
@@ -252,6 +274,7 @@ export function createExecutorService({
     refresh();
     let providerStarted = false;
     let reportedProviderFailure = null;
+    let providerFailureOutcome = null;
     let currentProviderNativeId = turnContext.lineage.provider_native_id;
     const ensureProviderStarted = () => {
       if (providerStarted) return { status: 'already_started' };
@@ -294,10 +317,11 @@ export function createExecutorService({
         reportProviderFailure: (providerFailure) => {
           const normalizedFailure = normalizeProviderError(providerFailure, now());
           reportedProviderFailure = normalizedFailure;
-          const outcome = store.markWaitingProviderFailure(
+          const outcome = store.markProviderFailure(
             turnContext,
             normalizedFailure,
           );
+          providerFailureOutcome = outcome;
           if (outcome.status === 'recovering') {
             activeRuns.delete(turnContext.turn_id);
             reschedulePendingInteractionDeadlines();
@@ -321,6 +345,7 @@ export function createExecutorService({
       iterator: events[Symbol.asyncIterator](),
       ensureProviderStarted,
       providerFailure: () => reportedProviderFailure,
+      providerFailureOutcome: () => providerFailureOutcome,
       providerStarted: () => providerStarted,
     };
     activeRuns.set(turnContext.turn_id, activeRun);
@@ -350,8 +375,13 @@ export function createExecutorService({
 
     const timedOutRun = activeRuns.get(result.turn_id);
     if (!timedOutRun || typeof timedOutRun.iterator.return !== 'function') {
+      store.markTimedOutProviderStopUnknown(result, 'not_current');
       reschedulePendingInteractionDeadlines();
-      return { ...result, lease_released: false };
+      return {
+        ...result,
+        lease_released: false,
+        provider_stop_status: 'not_current',
+      };
     }
     if (typeof adapter.interrupt === 'function') {
       let interruption;

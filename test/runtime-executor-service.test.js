@@ -337,7 +337,7 @@ describe('runtime executor service', () => {
     });
 
     await expect(service.runNext()).resolves.toMatchObject({
-      status: 'failed',
+      status: 'recovering',
       turn_id: accepted.turn_id,
     });
     expect(database.prepare(`
@@ -345,7 +345,80 @@ describe('runtime executor service', () => {
     `).get(accepted.turn_id)).toEqual({ count: 0 });
     expect(database.prepare(`
       SELECT state FROM runtime_turns WHERE turn_id = ?
-    `).get(accepted.turn_id)).toEqual({ state: 'failed' });
+    `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id
+      FROM runtime_executor_leases
+      WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({
+      lease_owner: 'executor-service-interaction-transport-race',
+      turn_id: accepted.turn_id,
+    });
+
+    database.close();
+  });
+
+  test('retains the writer lease when a started provider loses an uncertain transport', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'running-transport-loss');
+    const providerFailure = Object.assign(new Error('private connection failure'), {
+      providerError: {
+        code: 'side_effect_unknown',
+        category: 'provider',
+        retryable: false,
+        side_effect_status: 'unknown',
+        user_message: 'The app-server connection was lost.',
+      },
+    });
+    const adapter = {
+      execute(context) {
+        return {
+          [Symbol.asyncIterator]() { return this; },
+          async next() {
+            context.reportProviderState({ state: 'started', provider_native_id: null });
+            context.reportProviderFailure(providerFailure);
+            throw providerFailure;
+          },
+          async return() { return { done: true, value: undefined }; },
+        };
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-running-transport-loss',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('running-transport-loss'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'recovering',
+      turn_id: accepted.turn_id,
+    });
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id, attempt_id
+      FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual(expect.objectContaining({
+      lease_owner: 'executor-service-running-transport-loss',
+      turn_id: accepted.turn_id,
+      attempt_id: expect.any(String),
+    }));
+    expect(readEvents(database, accepted.turn_id).slice(-2)).toEqual([
+      expect.objectContaining({
+        kind: 'turn_state_changed',
+        phase: 'recovering',
+        payload: expect.objectContaining({ reason_code: 'provider_connection_lost' }),
+      }),
+      expect.objectContaining({
+        kind: 'recovery_started',
+        phase: 'recovering',
+        error: expect.objectContaining({ side_effect_status: 'unknown' }),
+      }),
+    ]);
 
     database.close();
   });

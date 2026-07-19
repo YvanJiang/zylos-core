@@ -5,7 +5,12 @@ import { describe, expect, jest, test } from '@jest/globals';
 
 import { createCodexAppServerAdapter } from '../runtime/providers/codex-app-server-adapter.js';
 
-function createFakeAppServer({ afterTurnStart, autoTurnStarted = true, onClientResponse } = {}) {
+function createFakeAppServer({
+  afterTurnStart,
+  autoTurnStarted = true,
+  onClientResponse,
+  respondToInterrupt = true,
+} = {}) {
   const child = new EventEmitter();
   child.pid = 4102;
   child.stdin = new PassThrough();
@@ -65,7 +70,7 @@ function createFakeAppServer({ afterTurnStart, autoTurnStarted = true, onClientR
           }
         });
       } else if (message.method === 'turn/interrupt') {
-        send({ id: message.id, result: {} });
+        if (respondToInterrupt) send({ id: message.id, result: {} });
       } else if (Object.hasOwn(message, 'id') && Object.hasOwn(message, 'result')) {
         onClientResponse?.({ message, send });
       }
@@ -313,6 +318,44 @@ describe('Codex app-server provider adapter', () => {
     expect(JSON.stringify(server.received)).not.toContain('exec --json');
   });
 
+  test('fails the supervised connection closed for an unsupported running item', async () => {
+    const reportProviderFailure = jest.fn();
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'item/started',
+          params: {
+            threadId,
+            turnId,
+            startedAtMs: 1,
+            item: { type: 'futurePrivateWriter', id: 'private-writer-1' },
+          },
+        });
+      },
+    });
+    const replacementServer = createFakeAppServer();
+    const spawnProcess = jest.fn()
+      .mockImplementationOnce(() => server.child)
+      .mockImplementationOnce(() => replacementServer.child);
+    const adapter = createCodexAppServerAdapter({ spawnProcess });
+
+    await expect(adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]().next())
+      .rejects.toMatchObject({ providerError: { code: 'unsupported_capability' } });
+    expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+
+    const replacement = collect(adapter.execute(executionContext({
+      turn_id: 'turn-after-retirement',
+      lineage: { provider_native_id: 'codex-thread-1' },
+      attempt: { attempt_id: 'attempt-after-retirement', attempt_no: 1, lease_epoch: 4 },
+    })));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(spawnProcess).toHaveBeenCalledTimes(1);
+    server.child.emit('close', 1, null);
+    await expect(replacement).resolves.toEqual([]);
+    expect(spawnProcess).toHaveBeenCalledTimes(2);
+  });
+
   test('durably hands off requestUserInput and acknowledges only after provider resolution', async () => {
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
@@ -540,6 +583,147 @@ describe('Codex app-server provider adapter', () => {
     });
   });
 
+  test('fails closed when requestUserInput combines fixed choices with an Other answer', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          id: 'choice-with-other',
+          method: 'item/tool/requestUserInput',
+          params: {
+            threadId,
+            turnId,
+            itemId: 'tool-choice-with-other',
+            autoResolutionMs: null,
+            questions: [{
+              id: 'environment',
+              header: 'Environment',
+              question: 'Choose an environment.',
+              isOther: true,
+              isSecret: false,
+              options: [{ label: 'Staging', description: 'Use staging.' }],
+            }],
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(adapter.execute(executionContext())[Symbol.asyncIterator]().next())
+      .rejects.toMatchObject({ providerError: { code: 'unsupported_capability' } });
+    expect(server.received).toContainEqual({
+      id: 'choice-with-other',
+      error: { code: -32601, message: 'Invalid app-server request.' },
+    });
+  });
+
+  test.each([
+    ['missing', undefined],
+    ['null', null],
+    ['string', 'false'],
+  ])('fails closed when requestUserInput isSecret is %s', async (_label, isSecret) => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        const question = {
+          id: 'unsafe-secret-shape',
+          header: 'Input',
+          question: 'Provide input.',
+          isOther: false,
+          options: null,
+        };
+        if (isSecret !== undefined) question.isSecret = isSecret;
+        send({
+          id: 'unsafe-secret-request',
+          method: 'item/tool/requestUserInput',
+          params: {
+            threadId,
+            turnId,
+            itemId: 'tool-unsafe-secret',
+            autoResolutionMs: null,
+            questions: [question],
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(adapter.execute(executionContext())[Symbol.asyncIterator]().next())
+      .rejects.toMatchObject({ providerError: { code: 'side_effect_unknown' } });
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
+  test('fails closed when requestUserInput has a provider-side auto-resolution deadline', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          id: 'auto-resolving-request',
+          method: 'item/tool/requestUserInput',
+          params: {
+            threadId,
+            turnId,
+            itemId: 'tool-auto-resolving',
+            autoResolutionMs: 60_000,
+            questions: [{
+              id: 'auto-resolving-question',
+              header: 'Input',
+              question: 'Provide input.',
+              isOther: false,
+              isSecret: false,
+              options: null,
+            }],
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(adapter.execute(executionContext())[Symbol.asyncIterator]().next())
+      .rejects.toMatchObject({ providerError: { code: 'unsupported_capability' } });
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
+  test.each([
+    ['free-form text', { kind: 'text', text: 'Staging' }],
+    ['an unknown choice', { kind: 'choice', choice_id: 'Unknown' }],
+  ])('rejects %s before answering a fixed requestUserInput choice', async (_label, answer) => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          id: 'fixed-choice-request',
+          method: 'item/tool/requestUserInput',
+          params: {
+            threadId,
+            turnId,
+            itemId: 'tool-fixed-choice',
+            autoResolutionMs: null,
+            questions: [{
+              id: 'environment',
+              header: 'Environment',
+              question: 'Choose an environment.',
+              isOther: false,
+              isSecret: false,
+              options: [
+                { label: 'Staging', description: 'Use staging.' },
+                { label: 'Production', description: 'Use production.' },
+              ],
+            }],
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const iterator = adapter.execute(executionContext())[Symbol.asyncIterator]();
+    const interaction = await iterator.next();
+
+    await expect(adapter.handleInteractionAnswer(handoffDelivery(
+      interaction.value.payload.provider_interaction_ref,
+      answer,
+    ))).rejects.toMatchObject({ providerError: { code: 'side_effect_unknown' } });
+    expect(server.received.filter(({ id, result }) => (
+      id === 'fixed-choice-request' && result !== undefined
+    ))).toHaveLength(0);
+    await iterator.return();
+  });
+
   test.each([
     {
       label: 'multi-field typed form',
@@ -720,6 +904,67 @@ describe('Codex app-server provider adapter', () => {
     }));
   });
 
+  test.each([
+    ['error', {
+      method: 'error',
+      params: {
+        threadId: 'codex-thread-1',
+        turnId: 'codex-turn-1',
+        error: { message: 'private provider error' },
+      },
+    }],
+    ['failed terminal', {
+      method: 'turn/completed',
+      params: {
+        threadId: 'codex-thread-1',
+        turn: { id: 'codex-turn-1', status: 'failed', items: [] },
+      },
+    }],
+    ['interrupted terminal', {
+      method: 'turn/completed',
+      params: {
+        threadId: 'codex-thread-1',
+        turn: { id: 'codex-turn-1', status: 'interrupted', items: [] },
+      },
+    }],
+    ['completed terminal with an outstanding request', {
+      method: 'turn/completed',
+      params: {
+        threadId: 'codex-thread-1',
+        turn: { id: 'codex-turn-1', status: 'completed', items: [] },
+      },
+    }],
+  ])('reports a fenced provider failure for a waiting interaction on %s', async (_label, terminal) => {
+    const reportProviderFailure = jest.fn();
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          id: 'waiting-terminal-request',
+          method: 'item/fileChange/requestApproval',
+          params: { threadId, turnId, itemId: 'waiting-patch', startedAtMs: 1 },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const iterator = adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]();
+    await expect(iterator.next()).resolves.toMatchObject({
+      done: false,
+      value: { kind: 'interaction_requested' },
+    });
+
+    server.send(terminal);
+    await waitFor(() => reportProviderFailure.mock.calls.length === 1);
+    expect(reportProviderFailure).toHaveBeenCalledWith(expect.objectContaining({
+      providerError: expect.objectContaining({
+        code: 'side_effect_unknown',
+        side_effect_status: 'unknown',
+      }),
+    }));
+    await expect(iterator.next()).rejects.toMatchObject({
+      providerError: { code: 'side_effect_unknown' },
+    });
+  });
+
   test.each(['stop', 'steer'])(
     'interrupts only the current %s fence through app-server without killing the shared process',
     async (reason) => {
@@ -792,7 +1037,7 @@ describe('Codex app-server provider adapter', () => {
 
   test('bounds timeout stop confirmation when app-server never emits a terminal notification', async () => {
     let confirmTimeout;
-    const server = createFakeAppServer({ afterTurnStart() {} });
+    const server = createFakeAppServer({ afterTurnStart() {}, respondToInterrupt: false });
     const adapter = createCodexAppServerAdapter({
       spawnProcess: () => server.child,
       interruptConfirmationTimeoutMs: 250,

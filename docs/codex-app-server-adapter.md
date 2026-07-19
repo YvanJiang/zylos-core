@@ -45,7 +45,7 @@ Private app-server method and item names remain inside the adapter:
 | failed/interrupted turn, error notification, or lost connection | typed provider failure; Core authors the canonical failure or recovery state |
 | command/file approval | durable `tool_approval` interaction |
 | permissions approval | durable `permission_approval` interaction |
-| single-question `requestUserInput` | durable `question` or `choice` interaction |
+| single-question `requestUserInput` | durable `question` or fixed `choice` interaction with answer constraints preserved |
 | single-field required MCP typed string/enum form | durable `question` or `choice` interaction; accepted content is reconstructed as the schema-keyed object |
 
 Answers are accepted only through Core's durable interaction-answer and handoff records. The
@@ -54,7 +54,9 @@ and handoff claim before writing a response. A handoff is acknowledged only afte
 written and the matching `serverRequest/resolved` notification arrives. Server request IDs are
 never reusable within one connection, including after acknowledgement.
 
-Multi-question and secret `requestUserInput` requests, multi-field/non-string/optional/formatted
+Multi-question, secret, provider-auto-resolving, and fixed-choice-plus-Other `requestUserInput`
+requests,
+multi-field/non-string/optional/formatted
 MCP typed forms, `openai/form`, URL elicitation, unknown server requests, duplicate request IDs,
 unsupported item types, and stale or mismatched traffic fail closed. Formatted MCP strings are
 rejected because the provider-neutral answer contract cannot preserve or validate the fixed-version
@@ -64,8 +66,12 @@ Connection loss before an answer cancels still-pending interactions and moves th
 `recovering`. Loss after a response may have been sent is recorded as `delivery_unknown`. Neither
 case is automatically replayed. A provider-failure latch rejects an interaction descriptor that
 was already removed from the connection but had not yet crossed Core's durable interaction
-transaction. The supervised child's stderr is drained without persistence and stdio errors fail
-the fenced connection rather than escaping as unhandled stream errors.
+transaction. Fenced provider error or terminal notifications also drive that durable failure path
+when Core is suspended in `waiting_user`; a completed turn with an outstanding server request is
+treated as an invalid terminal rather than stranding its interaction. The supervised child's stderr
+is drained without persistence and stdio errors fail the fenced connection rather than escaping as
+unhandled stream errors. Fatal run-scoped protocol/capability failures retire the shared connection;
+a replacement connection is not started until the prior child emits `close`.
 
 ## Control and reconnect
 
@@ -77,8 +83,10 @@ interrupt lookup. Confirmation is bounded to five seconds; missing or uncertain 
 leaves the lease held, persists a `side_effect_unknown` provider-stop incident, and enqueues a
 high-priority manual-recovery notice. Turn interrupts do not kill the shared app-server process and
 do not discard the persisted lineage. A protocol or stdio failure terminates the lost shared
-connection under supervision. A later safe turn creates a new connection and reloads its persisted
-thread before use; active work is never replayed automatically.
+connection under supervision. Uncertain running work enters `recovering` with its writer lease held,
+rather than `failed` with an immediately reusable lease. After the retired child is confirmed closed,
+a later safe turn creates a new connection and reloads its persisted thread before use; active work
+is never replayed automatically.
 
 ## Verification boundary
 
