@@ -143,13 +143,62 @@ function activeRunKey(threadId, turnId) {
 }
 
 const TOOL_ITEMS = Object.freeze({
-  commandExecution: Object.freeze({ name: 'command', label: 'Command', sideEffect: 'unknown' }),
-  fileChange: Object.freeze({ name: 'file_change', label: 'File change', sideEffect: 'unknown' }),
-  mcpToolCall: Object.freeze({ name: 'external_tool', label: 'External tool', sideEffect: 'unknown' }),
-  dynamicToolCall: Object.freeze({ name: 'external_tool', label: 'External tool', sideEffect: 'unknown' }),
-  collabAgentToolCall: Object.freeze({ name: 'collaboration', label: 'Collaboration', sideEffect: 'unknown' }),
-  webSearch: Object.freeze({ name: 'web_search', label: 'Web search', sideEffect: 'none' }),
-  imageGeneration: Object.freeze({ name: 'image_generation', label: 'Image generation', sideEffect: 'unknown' }),
+  commandExecution: Object.freeze({
+    name: 'command',
+    label: 'Command',
+    sideEffect: 'unknown',
+    progressMethods: Object.freeze(['item/commandExecution/outputDelta']),
+    statusMode: 'enum',
+    terminalStatuses: Object.freeze(['completed', 'failed', 'declined']),
+  }),
+  fileChange: Object.freeze({
+    name: 'file_change',
+    label: 'File change',
+    sideEffect: 'unknown',
+    progressMethods: Object.freeze(['item/fileChange/outputDelta']),
+    statusMode: 'enum',
+    terminalStatuses: Object.freeze(['completed', 'failed', 'declined']),
+  }),
+  mcpToolCall: Object.freeze({
+    name: 'external_tool',
+    label: 'External tool',
+    sideEffect: 'unknown',
+    progressMethods: Object.freeze(['item/mcpToolCall/progress']),
+    statusMode: 'enum',
+    terminalStatuses: Object.freeze(['completed', 'failed']),
+  }),
+  dynamicToolCall: Object.freeze({
+    name: 'external_tool',
+    label: 'External tool',
+    sideEffect: 'unknown',
+    progressMethods: Object.freeze([]),
+    statusMode: 'enum',
+    terminalStatuses: Object.freeze(['completed', 'failed']),
+  }),
+  collabAgentToolCall: Object.freeze({
+    name: 'collaboration',
+    label: 'Collaboration',
+    sideEffect: 'unknown',
+    progressMethods: Object.freeze([]),
+    statusMode: 'enum',
+    terminalStatuses: Object.freeze(['completed', 'failed']),
+  }),
+  webSearch: Object.freeze({
+    name: 'web_search',
+    label: 'Web search',
+    sideEffect: 'none',
+    progressMethods: Object.freeze([]),
+    statusMode: 'absent',
+    terminalStatuses: null,
+  }),
+  imageGeneration: Object.freeze({
+    name: 'image_generation',
+    label: 'Image generation',
+    sideEffect: 'unknown',
+    progressMethods: Object.freeze([]),
+    statusMode: 'opaque',
+    terminalStatuses: null,
+  }),
 });
 
 const IGNORED_ITEM_TYPES = Object.freeze(new Set([
@@ -165,6 +214,115 @@ const IGNORED_ITEM_TYPES = Object.freeze(new Set([
   'subAgentActivity',
   'userMessage',
 ]));
+
+const IGNORED_SCOPED_NOTIFICATIONS = Object.freeze(new Set([
+  'item/fileChange/patchUpdated',
+  'item/plan/delta',
+  'item/reasoning/summaryPartAdded',
+  'item/reasoning/summaryTextDelta',
+  'item/reasoning/textDelta',
+  'thread/compacted',
+  'turn/diff/updated',
+  'turn/plan/updated',
+]));
+
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasOnlyKeys(value, allowedKeys) {
+  return isRecord(value) && Object.keys(value).every((key) => allowedKeys.has(key));
+}
+
+function isNullableString(value) {
+  return value === null || typeof value === 'string';
+}
+
+function isNullableStringArray(value) {
+  return value === null || (
+    Array.isArray(value)
+    && value.every((entry) => typeof entry === 'string' && entry.length > 0)
+  );
+}
+
+function isPermissionPath(value) {
+  if (!isRecord(value) || typeof value.type !== 'string') return false;
+  if (value.type === 'path') {
+    return hasOnlyKeys(value, new Set(['path', 'type']))
+      && typeof value.path === 'string'
+      && value.path.length > 0;
+  }
+  if (value.type === 'glob_pattern') {
+    return hasOnlyKeys(value, new Set(['pattern', 'type']))
+      && typeof value.pattern === 'string'
+      && value.pattern.length > 0;
+  }
+  if (value.type !== 'special' || !hasOnlyKeys(value, new Set(['type', 'value']))) return false;
+  const special = value.value;
+  if (!isRecord(special) || typeof special.kind !== 'string') return false;
+  if (['root', 'minimal', 'tmpdir', 'slash_tmp'].includes(special.kind)) {
+    return hasOnlyKeys(special, new Set(['kind']));
+  }
+  if (special.kind === 'project_roots') {
+    return hasOnlyKeys(special, new Set(['kind', 'subpath']))
+      && (special.subpath === undefined || isNullableString(special.subpath));
+  }
+  if (special.kind === 'unknown') {
+    return hasOnlyKeys(special, new Set(['kind', 'path', 'subpath']))
+      && typeof special.path === 'string'
+      && special.path.length > 0
+      && (special.subpath === undefined || isNullableString(special.subpath));
+  }
+  return false;
+}
+
+function isPermissionProfile(value) {
+  if (
+    !hasOnlyKeys(value, new Set(['fileSystem', 'network']))
+    || !Object.hasOwn(value, 'fileSystem')
+    || !Object.hasOwn(value, 'network')
+  ) {
+    return false;
+  }
+  const network = value.network;
+  if (
+    network !== undefined
+    && network !== null
+    && (!hasOnlyKeys(network, new Set(['enabled']))
+      || !Object.hasOwn(network, 'enabled')
+      || (network.enabled !== null
+        && typeof network.enabled !== 'boolean'))
+  ) {
+    return false;
+  }
+  const fileSystem = value.fileSystem;
+  if (fileSystem === undefined || fileSystem === null) return true;
+  if (!hasOnlyKeys(
+    fileSystem,
+    new Set(['entries', 'globScanMaxDepth', 'read', 'write']),
+  ) || !Object.hasOwn(fileSystem, 'read') || !Object.hasOwn(fileSystem, 'write')) {
+    return false;
+  }
+  if (
+    fileSystem.entries !== undefined
+    && fileSystem.entries !== null
+    && (!Array.isArray(fileSystem.entries) || fileSystem.entries.some((entry) => (
+      !hasOnlyKeys(entry, new Set(['access', 'path']))
+      || !['read', 'write', 'deny'].includes(entry.access)
+      || !isPermissionPath(entry.path)
+    )))
+  ) {
+    return false;
+  }
+  if (
+    fileSystem.globScanMaxDepth !== undefined
+    && fileSystem.globScanMaxDepth !== null
+    && (!Number.isSafeInteger(fileSystem.globScanMaxDepth) || fileSystem.globScanMaxDepth < 1)
+  ) {
+    return false;
+  }
+  return isNullableStringArray(fileSystem.read) && isNullableStringArray(fileSystem.write);
+}
 
 function toolDescriptor(run, itemId, specification, kind, verb) {
   return {
@@ -301,6 +459,7 @@ export function createCodexAppServerAdapter({
   const loadedThreads = new Set();
   const activeRuns = new Map();
   const startingRuns = new Map();
+  const inFlightTurnStarts = new Set();
   const terminalRuns = new Map();
   const providerRequests = new Map();
   const pendingInteractions = new Map();
@@ -365,6 +524,17 @@ export function createCodexAppServerAdapter({
       run.queue.fail(failure);
       startingRuns.delete(runKey);
     }
+    for (const run of inFlightTurnStarts) {
+      if (run.connection_id !== target.connection_id) continue;
+      try {
+        run.context.reportProviderFailure?.(failure);
+      } catch {
+        // The provider failure remains authoritative even if Core cannot persist recovery.
+      }
+      run.rejectTerminal(failure);
+      run.queue.fail(failure);
+      inFlightTurnStarts.delete(run);
+    }
     const failedGroups = new Set();
     for (const [requestKey, group] of providerRequests) {
       if (group.connection_id !== target.connection_id) continue;
@@ -383,6 +553,10 @@ export function createCodexAppServerAdapter({
     if (method === 'serverRequest/resolved') {
       const group = providerRequests.get(`${target.connection_id}:${String(params?.requestId)}`);
       if (!group || group.thread_id !== params?.threadId || group.connection_id !== target.connection_id) {
+        failConnection(target, new CodexAppServerAdapterError(
+          'provider_protocol_invalid',
+          'Codex app-server resolved a stale or mismatched server request.',
+        ));
         return;
       }
       if (!group.response_sent) {
@@ -401,7 +575,13 @@ export function createCodexAppServerAdapter({
     const runKey = activeRunKey(threadId, turnId);
     if (method === 'turn/started') {
       const startingRun = startingRuns.get(runKey);
-      if (!startingRun || startingRun.connection_id !== target.connection_id) return;
+      if (!startingRun || startingRun.connection_id !== target.connection_id) {
+        failConnection(target, new CodexAppServerAdapterError(
+          'provider_protocol_invalid',
+          'Codex app-server started a stale or mismatched turn.',
+        ));
+        return;
+      }
       startingRun.context.reportProviderState({
         state: 'started',
         provider_native_id: startingRun.thread_id,
@@ -411,7 +591,14 @@ export function createCodexAppServerAdapter({
       return;
     }
     const run = activeRuns.get(runKey);
-    if (!run || run.connection_id !== target.connection_id) return;
+    if (!run || run.connection_id !== target.connection_id) {
+      failConnection(target, new CodexAppServerAdapterError(
+        'provider_protocol_invalid',
+        'Codex app-server emitted a stale or mismatched turn notification.',
+      ));
+      return;
+    }
+    if (IGNORED_SCOPED_NOTIFICATIONS.has(method)) return;
     if (method === 'item/agentMessage/delta') {
       if (
         typeof params.itemId !== 'string'
@@ -446,14 +633,27 @@ export function createCodexAppServerAdapter({
       const item = params.item;
       const specification = TOOL_ITEMS[item?.type];
       if (specification) {
-        if (typeof item.id !== 'string' || item.id.length === 0) {
+        const invalidStartStatus = specification.statusMode === 'enum'
+          ? item.status !== 'inProgress'
+          : specification.statusMode === 'absent'
+            ? item.status !== undefined
+            : typeof item.status !== 'string' || item.status.length === 0;
+        if (
+          typeof item.id !== 'string'
+          || item.id.length === 0
+          || run.tool_items.has(item.id)
+          || invalidStartStatus
+        ) {
           failConnection(target, new CodexAppServerAdapterError(
             'provider_protocol_invalid',
-            'Codex app-server emitted a tool item without an ID.',
+            'Codex app-server emitted an invalid or duplicate tool start.',
           ));
           return;
         }
-        run.tool_items.set(item.id, specification);
+        run.tool_items.set(item.id, {
+          item: structuredClone(item),
+          specification,
+        });
         run.queue.push(toolDescriptor(run, item.id, specification, 'tool_started', 'started'));
       } else if (!IGNORED_ITEM_TYPES.has(item?.type)) {
         failConnection(target, new CodexAppServerAdapterError(
@@ -468,15 +668,21 @@ export function createCodexAppServerAdapter({
       || method === 'item/fileChange/outputDelta'
       || method === 'item/mcpToolCall/progress'
     ) {
-      const specification = run.tool_items.get(params.itemId);
-      if (!specification) {
+      const tool = run.tool_items.get(params.itemId);
+      if (!tool || !tool.specification.progressMethods.includes(method)) {
         failConnection(target, new CodexAppServerAdapterError(
           'provider_protocol_invalid',
-          'Codex app-server emitted tool progress before tool start.',
+          'Codex app-server emitted mismatched tool progress.',
         ));
         return;
       }
-      run.queue.push(toolDescriptor(run, params.itemId, specification, 'tool_progress', 'running'));
+      run.queue.push(toolDescriptor(
+        run,
+        params.itemId,
+        tool.specification,
+        'tool_progress',
+        'running',
+      ));
       return;
     }
     if (method === 'item/completed') {
@@ -506,14 +712,27 @@ export function createCodexAppServerAdapter({
       }
       const specification = TOOL_ITEMS[item?.type];
       if (specification) {
-        if (run.tool_items.get(item.id) !== specification) {
+        const tool = run.tool_items.get(item.id);
+        if (tool?.specification !== specification) {
           failConnection(target, new CodexAppServerAdapterError(
             'provider_protocol_invalid',
             'Codex app-server completed a tool that was not started.',
           ));
           return;
         }
-        const verb = ['failed', 'declined'].includes(item.status) ? item.status : 'completed';
+        const invalidTerminalStatus = specification.statusMode === 'enum'
+          ? !specification.terminalStatuses.includes(item.status)
+          : specification.statusMode === 'absent'
+            ? item.status !== undefined
+            : typeof item.status !== 'string' || item.status.length === 0;
+        if (invalidTerminalStatus) {
+          failConnection(target, new CodexAppServerAdapterError(
+            'provider_protocol_invalid',
+            'Codex app-server completed a tool with an invalid terminal status.',
+          ));
+          return;
+        }
+        const verb = specification.statusMode === 'enum' ? item.status : 'finished';
         run.queue.push(toolDescriptor(run, item.id, specification, 'tool_finished', verb));
         run.tool_items.delete(item.id);
       } else if (!IGNORED_ITEM_TYPES.has(item?.type)) {
@@ -541,6 +760,13 @@ export function createCodexAppServerAdapter({
         ));
         return;
       }
+      if (status === 'completed' && run.tool_items.size > 0) {
+        failConnection(target, new CodexAppServerAdapterError(
+          'provider_protocol_invalid',
+          'Codex app-server completed a turn with unfinished tools.',
+        ));
+        return;
+      }
       run.terminal_status = status;
       terminalRuns.set(coreAttemptKey(run.context.turn_id, run.context.attempt), run);
       const failure = new CodexAppServerAdapterError(
@@ -559,14 +785,20 @@ export function createCodexAppServerAdapter({
       run.resolveTerminal(status);
       if (completionIsInvalid) run.queue.fail(failure);
       else run.queue.end();
+      return;
     }
+    failConnection(target, new CodexAppServerAdapterError(
+      'unsupported_capability',
+      'Codex app-server emitted an unsupported scoped notification.',
+    ));
   }
 
-  function findServerRequestRun(target, params) {
+  function findServerRequestRun(target, method, params) {
     if (typeof params?.threadId !== 'string' || params.threadId.length === 0) return null;
     if (typeof params.turnId === 'string' && params.turnId.length > 0) {
       return activeRuns.get(activeRunKey(params.threadId, params.turnId)) ?? null;
     }
+    if (method !== 'mcpServer/elicitation/request' || params.turnId !== null) return null;
     const matches = [...activeRuns.values()].filter((run) => (
       run.connection_id === target.connection_id && run.thread_id === params.threadId
     ));
@@ -599,8 +831,122 @@ export function createCodexAppServerAdapter({
     };
   }
 
+  function boundedApprovalPrompt(parts) {
+    const prompt = parts.filter((part) => part !== null).join('\n');
+    if (prompt.trim().length === 0 || prompt.length > 8_000) {
+      rejectProtocol(
+        'Codex app-server requested approval details that cannot be displayed safely.',
+        'unsupported_capability',
+      );
+    }
+    return prompt;
+  }
+
+  function requireStartedTool(run, itemId, type) {
+    const tool = run.tool_items.get(itemId);
+    if (!tool || tool.item.type !== type) {
+      rejectProtocol('Codex app-server approval does not match a current tool item.');
+    }
+    return tool.item;
+  }
+
+  function commandApprovalPrompt(run, params) {
+    const item = requireStartedTool(run, params.itemId, 'commandExecution');
+    if (
+      typeof item.command !== 'string'
+      || item.command.length === 0
+      || typeof item.cwd !== 'string'
+      || item.cwd.length === 0
+      || (params.command !== undefined
+        && params.command !== null
+        && params.command !== item.command)
+      || (params.cwd !== undefined && params.cwd !== null && params.cwd !== item.cwd)
+      || (params.additionalPermissions !== undefined
+        && params.additionalPermissions !== null
+        && !isPermissionProfile(params.additionalPermissions))
+      || (params.networkApprovalContext !== undefined
+        && params.networkApprovalContext !== null
+        && (!hasOnlyKeys(params.networkApprovalContext, new Set(['host', 'protocol']))
+          || typeof params.networkApprovalContext.host !== 'string'
+          || params.networkApprovalContext.host.length === 0
+          || !['http', 'https', 'socks5Tcp', 'socks5Udp']
+            .includes(params.networkApprovalContext.protocol)))
+    ) {
+      rejectProtocol('Codex app-server requested an invalid command approval.');
+    }
+    return boundedApprovalPrompt([
+      typeof params.reason === 'string' && params.reason.trim().length > 0 ? params.reason : null,
+      `Command: ${item.command}`,
+      `Working directory: ${item.cwd}`,
+      `Environment: ${params.environmentId ?? 'default'}`,
+      params.networkApprovalContext == null
+        ? null
+        : `Network target: ${params.networkApprovalContext.protocol}://${params.networkApprovalContext.host}`,
+      params.additionalPermissions == null
+        ? null
+        : `Additional permissions: ${JSON.stringify(params.additionalPermissions)}`,
+    ]);
+  }
+
+  function fileChangeKind(change) {
+    if (!hasOnlyKeys(change.kind, new Set(['type', 'move_path']))) return null;
+    if (['add', 'delete'].includes(change.kind.type)) {
+      return Object.keys(change.kind).length === 1 ? change.kind.type : null;
+    }
+    if (
+      change.kind.type === 'update'
+      && Object.hasOwn(change.kind, 'move_path')
+      && isNullableString(change.kind.move_path)
+    ) {
+      return change.kind.move_path === null
+        ? 'update'
+        : `update -> ${change.kind.move_path}`;
+    }
+    return null;
+  }
+
+  function fileApprovalPrompt(run, params) {
+    const item = requireStartedTool(run, params.itemId, 'fileChange');
+    if (!Array.isArray(item.changes) || item.changes.length === 0) {
+      rejectProtocol('Codex app-server requested file approval without changes.');
+    }
+    const changes = item.changes.map((change) => {
+      const kind = isRecord(change) ? fileChangeKind(change) : null;
+      if (
+        kind === null
+        || !hasOnlyKeys(change, new Set(['diff', 'kind', 'path']))
+        || typeof change.path !== 'string'
+        || change.path.length === 0
+        || typeof change.diff !== 'string'
+      ) {
+        rejectProtocol('Codex app-server requested approval for invalid file changes.');
+      }
+      return `File ${kind}: ${change.path}\nDiff:\n${change.diff}`;
+    });
+    if (params.grantRoot !== undefined && !isNullableString(params.grantRoot)) {
+      rejectProtocol('Codex app-server requested an invalid file grant root.');
+    }
+    return boundedApprovalPrompt([
+      typeof params.reason === 'string' && params.reason.trim().length > 0 ? params.reason : null,
+      ...changes,
+      params.grantRoot == null ? null : `Requested write root: ${params.grantRoot}`,
+    ]);
+  }
+
+  function permissionApprovalPrompt(params) {
+    return boundedApprovalPrompt([
+      typeof params.reason === 'string' && params.reason.trim().length > 0 ? params.reason : null,
+      `Working directory: ${params.cwd}`,
+      `Environment: ${params.environmentId ?? 'default'}`,
+      `Requested permissions: ${JSON.stringify(params.permissions)}`,
+    ]);
+  }
+
   function requestUserInputComponents(params) {
-    if (params.autoResolutionMs !== null && params.autoResolutionMs !== undefined) {
+    if (typeof params.itemId !== 'string' || params.itemId.length === 0) {
+      rejectProtocol('Codex app-server requested user input without an item ID.');
+    }
+    if (!Object.hasOwn(params, 'autoResolutionMs') || params.autoResolutionMs !== null) {
       rejectProtocol(
         'Codex app-server requested an auto-resolving question without a durable Core deadline mapping.',
         'unsupported_capability',
@@ -619,18 +965,25 @@ export function createCodexAppServerAdapter({
         || typeof question.id !== 'string'
         || question.id.length === 0
         || questionIds.has(question.id)
+        || typeof question.header !== 'string'
         || typeof question.question !== 'string'
         || question.question.trim().length === 0
         || typeof question.isOther !== 'boolean'
         || question.isSecret !== false
+        || !Object.hasOwn(question, 'options')
+        || (question.options !== null && !Array.isArray(question.options))
       ) {
         rejectProtocol('Codex app-server requested unsupported or invalid user input.');
       }
       questionIds.add(question.id);
       const options = question.options ?? [];
-      if (!Array.isArray(options)) rejectProtocol('Codex app-server supplied invalid choices.');
       const choices = options.map((option) => {
-        if (!option || typeof option.label !== 'string' || option.label.trim().length === 0) {
+        if (
+          !option
+          || typeof option.label !== 'string'
+          || option.label.trim().length === 0
+          || typeof option.description !== 'string'
+        ) {
           rejectProtocol('Codex app-server supplied an invalid choice.');
         }
         return { choice_id: option.label, label: option.label };
@@ -667,11 +1020,13 @@ export function createCodexAppServerAdapter({
     const requestedSchema = params.requestedSchema;
     const properties = requestedSchema?.properties;
     if (
-      requestedSchema?.type !== 'object'
+      !hasOnlyKeys(requestedSchema, new Set(['$schema', 'properties', 'required', 'type']))
+      || requestedSchema?.type !== 'object'
       || !properties
       || typeof properties !== 'object'
       || Array.isArray(properties)
       || !Array.isArray(requestedSchema.required)
+      || (requestedSchema.$schema !== undefined && !isNullableString(requestedSchema.$schema))
     ) {
       rejectProtocol('Codex app-server requested an invalid MCP form.', 'unsupported_capability');
     }
@@ -693,7 +1048,24 @@ export function createCodexAppServerAdapter({
       || typeof propertySchema !== 'object'
       || Array.isArray(propertySchema)
       || propertySchema.type !== 'string'
-      || propertySchema.format !== undefined
+      || !hasOnlyKeys(propertySchema, new Set([
+        'default',
+        'description',
+        'enum',
+        'enumNames',
+        'format',
+        'maxLength',
+        'minLength',
+        'oneOf',
+        'title',
+        'type',
+      ]))
+      || (propertySchema.format !== undefined && propertySchema.format !== null)
+      || (propertySchema.description !== undefined && !isNullableString(propertySchema.description))
+      || (propertySchema.title !== undefined && !isNullableString(propertySchema.title))
+      || (propertySchema.default !== undefined && !isNullableString(propertySchema.default))
+      || (propertySchema.enum !== undefined && propertySchema.oneOf !== undefined)
+      || (propertySchema.enumNames !== undefined && propertySchema.enum === undefined)
     ) {
       rejectProtocol(
         'Codex app-server requested an MCP form field that Core cannot represent safely.',
@@ -704,7 +1076,7 @@ export function createCodexAppServerAdapter({
     let labels = null;
     if (Array.isArray(propertySchema.oneOf)) {
       if (propertySchema.oneOf.some((option) => (
-        !option
+        !hasOnlyKeys(option, new Set(['const', 'title']))
         || typeof option.const !== 'string'
         || option.const.length === 0
         || typeof option.title !== 'string'
@@ -719,13 +1091,22 @@ export function createCodexAppServerAdapter({
         rejectProtocol('Codex app-server supplied invalid MCP form choices.');
       }
       values = [...propertySchema.enum];
+      if (
+        propertySchema.enumNames !== undefined
+        && propertySchema.enumNames !== null
+        && (!Array.isArray(propertySchema.enumNames)
+          || propertySchema.enumNames.length !== values.length
+          || propertySchema.enumNames.some((label) => (
+            typeof label !== 'string' || label.trim().length === 0
+          )))
+      ) {
+        rejectProtocol('Codex app-server supplied invalid MCP form choice labels.');
+      }
       labels = Array.isArray(propertySchema.enumNames)
-        && propertySchema.enumNames.length === values.length
-        && propertySchema.enumNames.every((label) => (
-          typeof label === 'string' && label.trim().length > 0
-        ))
         ? [...propertySchema.enumNames]
         : [...values];
+    } else if (propertySchema.oneOf !== undefined || propertySchema.enum !== undefined) {
+      rejectProtocol('Codex app-server supplied invalid MCP form choices.');
     }
     if (values !== null && (values.length === 0 || new Set(values).size !== values.length)) {
       rejectProtocol('Codex app-server supplied duplicate or empty MCP form choices.');
@@ -741,6 +1122,11 @@ export function createCodexAppServerAdapter({
         (minLength !== null && value.length < minLength)
         || (maxLength !== null && value.length > maxLength)
       )))
+      || (propertySchema.default !== undefined
+        && propertySchema.default !== null
+        && ((values !== null && !values.includes(propertySchema.default))
+          || (minLength !== null && propertySchema.default.length < minLength)
+          || (maxLength !== null && propertySchema.default.length > maxLength)))
     ) {
       rejectProtocol(
         'Codex app-server supplied MCP form constraints that Core cannot represent safely.',
@@ -765,36 +1151,67 @@ export function createCodexAppServerAdapter({
     };
   }
 
-  function serverRequestComponents(method, params) {
+  function serverRequestComponents(method, params, run) {
     if (method === 'item/tool/requestUserInput') return requestUserInputComponents(params);
     if (method === 'item/commandExecution/requestApproval') {
+      if (
+        typeof params.itemId !== 'string'
+        || params.itemId.length === 0
+        || !Number.isSafeInteger(params.startedAtMs)
+        || !Object.hasOwn(params, 'environmentId')
+        || !isNullableString(params.environmentId)
+        || (params.reason !== undefined && !isNullableString(params.reason))
+        || (params.availableDecisions !== undefined
+          && params.availableDecisions !== null
+          && (!Array.isArray(params.availableDecisions)
+            || !params.availableDecisions.includes('accept')
+            || !params.availableDecisions.includes('decline')))
+      ) {
+        rejectProtocol('Codex app-server requested invalid command approval.');
+      }
       return [{
         component_key: 'approval',
         toolUseId: params.itemId,
         kind: 'tool_approval',
-        prompt: typeof params.reason === 'string' && params.reason.trim().length > 0
-          ? params.reason
-          : 'Allow Codex to run the requested command?',
+        prompt: commandApprovalPrompt(run, params),
       }];
     }
     if (method === 'item/fileChange/requestApproval') {
+      if (
+        typeof params.itemId !== 'string'
+        || params.itemId.length === 0
+        || !Number.isSafeInteger(params.startedAtMs)
+        || (params.reason !== undefined && !isNullableString(params.reason))
+      ) {
+        rejectProtocol('Codex app-server requested invalid file approval.');
+      }
       return [{
         component_key: 'approval',
         toolUseId: params.itemId,
         kind: 'tool_approval',
-        prompt: typeof params.reason === 'string' && params.reason.trim().length > 0
-          ? params.reason
-          : 'Allow Codex to apply the requested file changes?',
+        prompt: fileApprovalPrompt(run, params),
       }];
     }
     if (method === 'item/permissions/requestApproval') {
+      if (
+        typeof params.itemId !== 'string'
+        || params.itemId.length === 0
+        || !Number.isSafeInteger(params.startedAtMs)
+        || typeof params.cwd !== 'string'
+        || !path.isAbsolute(params.cwd)
+        || !Object.hasOwn(params, 'environmentId')
+        || !isNullableString(params.environmentId)
+        || !Object.hasOwn(params, 'reason')
+        || !isNullableString(params.reason)
+        || !isPermissionProfile(params.permissions)
+      ) {
+        rejectProtocol('Codex app-server requested invalid permissions approval.');
+      }
       return [{
         component_key: 'approval',
         toolUseId: params.itemId,
         kind: 'permission_approval',
-        prompt: typeof params.reason === 'string' && params.reason.trim().length > 0
-          ? params.reason
-          : 'Allow Codex to use the requested permissions for this turn?',
+        prompt: permissionApprovalPrompt(params),
       }];
     }
     if (method === 'mcpServer/elicitation/request') {
@@ -810,15 +1227,33 @@ export function createCodexAppServerAdapter({
     if (target.failed || connection !== target) {
       rejectProtocol('Codex app-server connection is not current.');
     }
-    target.child.stdin.write(`${JSON.stringify({ id, result })}\n`);
+    try {
+      target.child.stdin.write(`${JSON.stringify({ id, result })}\n`);
+    } catch (error) {
+      const failure = new CodexAppServerAdapterError(
+        'provider_connection_lost',
+        'Could not send the interaction answer to Codex app-server.',
+        { cause: error },
+      );
+      failConnection(target, failure);
+      throw failure;
+    }
   }
 
   function sendServerError(target, id, message) {
     if (target.failed) return;
-    target.child.stdin.write(`${JSON.stringify({
-      id,
-      error: { code: -32601, message },
-    })}\n`);
+    try {
+      target.child.stdin.write(`${JSON.stringify({
+        id,
+        error: { code: -32601, message },
+      })}\n`);
+    } catch (error) {
+      failConnection(target, new CodexAppServerAdapterError(
+        'provider_connection_lost',
+        'Could not reject an invalid Codex app-server request.',
+        { cause: error },
+      ));
+    }
   }
 
   function handleServerRequest(target, message) {
@@ -840,11 +1275,19 @@ export function createCodexAppServerAdapter({
       return;
     }
     target.server_request_ids.add(requestId);
-    const run = findServerRequestRun(target, message.params);
-    const components = serverRequestComponents(message.method, message.params);
-    if (!run || run.connection_id !== target.connection_id || !components) {
+    const run = findServerRequestRun(target, message.method, message.params);
+    if (!run || run.connection_id !== target.connection_id) {
       sendServerError(target, message.id, 'Unsupported or stale app-server request.');
-      if (run) failConnection(target, new CodexAppServerAdapterError(
+      failConnection(target, new CodexAppServerAdapterError(
+        'provider_protocol_invalid',
+        'Codex app-server emitted a stale or mismatched server request.',
+      ));
+      return;
+    }
+    const components = serverRequestComponents(message.method, message.params, run);
+    if (!components) {
+      sendServerError(target, message.id, 'Unsupported or stale app-server request.');
+      failConnection(target, new CodexAppServerAdapterError(
         'unsupported_capability',
         'Codex app-server requested an unsupported capability.',
       ));
@@ -900,8 +1343,7 @@ export function createCodexAppServerAdapter({
         handleServerRequest(target, message);
       } catch (error) {
         sendServerError(target, message.id, 'Invalid app-server request.');
-        const run = findServerRequestRun(target, message.params);
-        if (run) failConnection(target, error);
+        failConnection(target, error);
       }
       return;
     }
@@ -1101,19 +1543,27 @@ export function createCodexAppServerAdapter({
       turn_id: null,
       terminal_status: null,
     };
-    const result = await sendRequest(target, 'turn/start', {
-      threadId,
-      input: [{ type: 'text', text: context.input.text }],
-    }, {
-      onResult: (response) => {
-        run.turn_id = requireTurnResult(response);
-        startingRuns.set(activeRunKey(threadId, run.turn_id), run);
-      },
-    });
-    requireTurnResult(result);
+    inFlightTurnStarts.add(run);
+    try {
+      const result = await sendRequest(target, 'turn/start', {
+        threadId,
+        input: [{ type: 'text', text: context.input.text }],
+      }, {
+        onResult: (response) => {
+          run.turn_id = requireTurnResult(response);
+          inFlightTurnStarts.delete(run);
+          startingRuns.set(activeRunKey(threadId, run.turn_id), run);
+        },
+      });
+      requireTurnResult(result);
+    } catch (error) {
+      inFlightTurnStarts.delete(run);
+      throw error;
+    }
     try {
       yield* run.queue;
     } finally {
+      inFlightTurnStarts.delete(run);
       if (run.turn_id !== null) {
         const runKey = activeRunKey(threadId, run.turn_id);
         startingRuns.delete(runKey);

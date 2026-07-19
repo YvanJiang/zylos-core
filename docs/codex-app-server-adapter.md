@@ -40,11 +40,11 @@ Private app-server method and item names remain inside the adapter:
 |---|---|
 | fenced `turn/started` | provider-neutral started signal; Core atomically authors `starting -> running` with `provider_started` |
 | `item/agentMessage/delta` and completed agent message | `text_delta` and `text_snapshot` |
-| command, file, MCP, dynamic, collaboration, web, and image tool lifecycle | `tool_started`, `tool_progress`, `tool_finished` |
+| command, file, MCP, dynamic, collaboration, web, and image tool lifecycle | `tool_started`, `tool_progress`, `tool_finished`; item IDs, progress methods, and fixed-version statuses are fenced by tool type |
 | completed turn | adapter iterator completion; Core authors the canonical completed state |
 | failed/interrupted turn, error notification, or lost connection | typed provider failure; Core authors the canonical failure or recovery state |
-| command/file approval | durable `tool_approval` interaction |
-| permissions approval | durable `permission_approval` interaction |
+| command/file approval | durable `tool_approval` interaction with bounded command/cwd or path/diff/grant details |
+| permissions approval | durable `permission_approval` interaction with bounded cwd/environment/permission scope |
 | single-question `requestUserInput` | durable `question` or fixed `choice` interaction with answer constraints preserved |
 | single-field required MCP typed string/enum form | durable `question` or `choice` interaction; accepted content is reconstructed as the schema-keyed object |
 
@@ -58,17 +58,23 @@ Multi-question, secret, provider-auto-resolving, and fixed-choice-plus-Other `re
 requests,
 multi-field/non-string/optional/formatted
 MCP typed forms, `openai/form`, URL elicitation, unknown server requests, duplicate request IDs,
-unsupported item types, and stale or mismatched traffic fail closed. Formatted MCP strings are
-rejected because the provider-neutral answer contract cannot preserve or validate the fixed-version
+unsupported item or notification types, incomplete fixed-version request shapes, duplicate or
+unfinished tool lifecycles, cross-tool progress, unrenderable approval details, and stale or
+mismatched traffic fail closed. Image-generation status is opaque in the fixed-version protocol;
+the adapter maps only the notification-proven lifecycle and reports `finished` without inventing a
+success outcome. Formatted MCP strings and unrecognized MCP schema constraints are rejected because
+the provider-neutral answer contract cannot preserve or validate the fixed-version
 `email|uri|date|date-time` constraint. URL elicitation is rejected because its URL can contain
 credentials and the public interaction contract has no safe reference field.
-Connection loss before an answer cancels still-pending interactions and moves the turn to
-`recovering`. Loss after a response may have been sent is recorded as `delivery_unknown`. Neither
-case is automatically replayed. A provider-failure latch rejects an interaction descriptor that
-was already removed from the connection but had not yet crossed Core's durable interaction
-transaction. Fenced provider error or terminal notifications also drive that durable failure path
-when Core is suspended in `waiting_user`; a completed turn with an outstanding server request is
-treated as an invalid terminal rather than stranding its interaction. The supervised child's stderr
+Connection loss before an answer cancels still-pending interactions; a committed handoff whose send
+has not started is atomically cancelled with its interaction, audit, projection, and outbox state.
+Both paths move the turn to `recovering`. Loss after a response may have been sent is recorded as
+`delivery_unknown`. Neither case is automatically replayed. The provider-failure latch covers both
+durable-interaction persistence and the window after `turn/start` is written but before its response
+arrives, so an uncertain writer lease is retained. Fenced provider error or terminal notifications
+also drive that durable failure path when Core is suspended in `waiting_user`; a completed turn with
+an outstanding server request or unfinished tool is treated as invalid/uncertain rather than
+success. The supervised child's stderr
 is drained without persistence and stdio errors fail the fenced connection rather than escaping as
 unhandled stream errors. Fatal run-scoped protocol/capability failures retire the shared connection;
 a replacement connection is not started until the prior child emits `close`.

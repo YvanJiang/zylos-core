@@ -628,6 +628,121 @@ describe('runtime interaction happy path', () => {
     database.close();
   });
 
+  test('cancels a committed unsent handoff when the provider is no longer waiting', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'app-server-unsent-answer-cancel');
+    let reportProviderFailure;
+    const handlerCalls = [];
+    const adapter = {
+      async *execute(context) {
+        reportProviderFailure = context.reportProviderFailure;
+        yield {
+          kind: 'interaction_requested',
+          payload: {
+            provider_interaction_ref: 'provider-unsent-answer-cancel',
+            tool_use_id: 'tool-unsent-answer-cancel',
+            kind: 'tool_approval',
+            prompt: 'Allow the action?',
+            choices: [],
+            authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+            allowed_sources: ['main_card_reply', 'card_action'],
+          },
+        };
+      },
+      async handleInteractionAnswer(delivery) {
+        handlerCalls.push(delivery);
+        throw new Error('cancelled handoff must never reach the provider');
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-app-server-unsent-answer-cancel',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('app-server-unsent-answer-cancel'),
+    });
+    const waiting = await service.runNext();
+    const committed = service.submitInteractionAnswer(
+      interactionAnswer(waiting.request, 'app-server-unsent-answer-cancel'),
+    );
+    expect(reportProviderFailure({
+      providerError: {
+        code: 'side_effect_unknown',
+        category: 'provider',
+        retryable: false,
+        side_effect_status: 'unknown',
+        user_message: 'The app-server is no longer waiting for this answer.',
+      },
+    })).toMatchObject({
+      status: 'recovering',
+      cancelled_interaction_ids: [waiting.request.interaction_id],
+      cancelled_handoff_ids: [committed.handoff_id],
+    });
+
+    const authority = database.prepare(`
+      SELECT interaction.state, interaction.handoff_state, interaction.handoff_version,
+        interaction.request_json, handoff.state AS durable_handoff_state, handoff.record_json
+      FROM runtime_interactions AS interaction
+      JOIN runtime_interaction_handoffs AS handoff
+        ON handoff.interaction_id = interaction.interaction_id
+      WHERE interaction.interaction_id = ?
+    `).get(waiting.request.interaction_id);
+    expect(authority).toMatchObject({
+      state: 'cancelled',
+      handoff_state: 'cancelled',
+      handoff_version: 2,
+      durable_handoff_state: 'cancelled',
+    });
+    expect(JSON.parse(authority.request_json)).toMatchObject({
+      state: 'cancelled',
+      handoff_state: 'cancelled',
+      terminal_reason: 'provider_connection_lost',
+    });
+    expect(JSON.parse(authority.record_json)).toMatchObject({
+      state: 'cancelled',
+      last_send_started_at: null,
+      reason_code: 'provider_connection_lost',
+      side_effect_status: 'none',
+    });
+    expect(database.prepare(`
+      SELECT outcome, acknowledgement_json
+      FROM runtime_interaction_audit
+      WHERE handoff_id = ?
+    `).get(committed.handoff_id)).toMatchObject({
+      outcome: 'cancelled',
+      acknowledgement_json: expect.any(String),
+    });
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    expect(readEvents(database, accepted.turn_id).slice(-3).map(({ kind, phase }) => ({ kind, phase })))
+      .toEqual([
+        { kind: 'interaction_cancelled', phase: 'waiting_user' },
+        { kind: 'turn_state_changed', phase: 'recovering' },
+        { kind: 'recovery_started', phase: 'recovering' },
+      ]);
+    const recoveryProjection = database.prepare(`
+      SELECT status, render_model_json
+      FROM runtime_projection_snapshots
+      WHERE turn_id = ?
+      ORDER BY aggregate_version DESC
+      LIMIT 1
+    `).get(accepted.turn_id);
+    expect(recoveryProjection.status).toBe('staged');
+    expect(JSON.parse(recoveryProjection.render_model_json)).toMatchObject({
+      phase: 'recovering',
+    });
+    expect(database.prepare(`
+      SELECT status FROM runtime_outbox WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ status: 'pending' });
+    await expect(service.deliverInteractionAnswer(committed.handoff_id))
+      .rejects.toMatchObject({ code: 'illegal_transition' });
+    expect(handlerCalls).toEqual([]);
+
+    database.close();
+  });
+
   test('rejects an unauthorized provider answer before creating its durable handoff', () => {
     const database = openTestDatabase();
     const { accepted, store, turnContext } = createRunningTurn(

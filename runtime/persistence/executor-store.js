@@ -2014,47 +2014,139 @@ export function createExecutorStore({
       if (turn.state !== 'waiting_user') {
         return { status: 'not_active', turn_id: turn.turn_id, turn_state: turn.state };
       }
-      const blockingRequests = database.prepare(`
-        SELECT request_json
-        FROM runtime_interactions
-        WHERE turn_id = ? AND state IN (${BLOCKING_INTERACTION_STATES_SQL})
-        ORDER BY ordinal ASC
-      `).all(turn.turn_id).map(({ request_json: requestJson }) => JSON.parse(requestJson));
-      if (
-        blockingRequests.length === 0
-        || blockingRequests.some((request) => request.state !== 'pending')
-      ) {
+      const blockingEntries = database.prepare(`
+        SELECT interaction.request_json, handoff.record_json AS handoff_json
+        FROM runtime_interactions AS interaction
+        LEFT JOIN runtime_interaction_handoffs AS handoff
+          ON handoff.interaction_id = interaction.interaction_id
+        WHERE interaction.turn_id = ?
+          AND interaction.state IN (${BLOCKING_INTERACTION_STATES_SQL})
+        ORDER BY interaction.ordinal ASC
+      `).all(turn.turn_id).map(({ request_json: requestJson, handoff_json: handoffJson }) => ({
+        request: JSON.parse(requestJson),
+        handoff: handoffJson === null ? null : JSON.parse(handoffJson),
+      }));
+      if (blockingEntries.length === 0) {
         return { status: 'handoff_in_progress', turn_id: turn.turn_id, turn_state: turn.state };
       }
+      for (const { request, handoff } of blockingEntries) {
+        const pendingRequest = request.state === 'pending' && handoff === null;
+        const committedUnsentHandoff = request.state === 'answer_committed'
+          && request.handoff_state === 'pending'
+          && handoff?.state === 'pending'
+          && handoff.last_send_started_at === null;
+        if (!pendingRequest && !committedUnsentHandoff) {
+          return { status: 'handoff_in_progress', turn_id: turn.turn_id, turn_state: turn.state };
+        }
+        if (
+          handoff !== null
+          && (handoff.provider_attempt_id !== turnContext.attempt.attempt_id
+            || handoff.lease_epoch !== turnContext.attempt.lease_epoch)
+        ) {
+          conflict('stale_attempt', 'The unsent interaction handoff lost its provider failure fence.');
+        }
+      }
       const cancelledInteractionIds = [];
-      for (const request of blockingRequests) {
+      const cancelledHandoffIds = [];
+      for (const { request, handoff } of blockingEntries) {
         validateInteractionTransition({
-          from: 'pending',
+          from: request.state,
           to: 'cancelled',
+          sendStarted: false,
           occurredAt,
         });
+        if (handoff !== null) {
+          validateInteractionHandoffTransition({
+            from: 'pending',
+            to: 'cancelled',
+            sendStarted: false,
+            occurredAt,
+          });
+        }
+        const handoffVersion = handoff === null ? null : 2;
         const cancelledRequest = {
           ...request,
           state: 'cancelled',
           version: request.version + 1,
-          handoff_state: 'not_started',
+          handoff_state: handoff === null ? 'not_started' : 'cancelled',
           terminal_reason: 'provider_connection_lost',
         };
         validateInteractionRequest(cancelledRequest, { occurredAt });
-        const updated = database.prepare(`
-          UPDATE runtime_interactions
-          SET state = 'cancelled', version = ?, handoff_state = 'not_started',
-            handoff_version = NULL, request_json = ?, updated_at = ?
-          WHERE interaction_id = ? AND state = 'pending' AND version = ?
-        `).run(
-          cancelledRequest.version,
-          JSON.stringify(cancelledRequest),
-          occurredAt,
-          request.interaction_id,
-          request.version,
-        );
+        const updated = handoff === null
+          ? database.prepare(`
+            UPDATE runtime_interactions
+            SET state = 'cancelled', version = ?, handoff_state = 'not_started',
+              handoff_version = NULL, request_json = ?, updated_at = ?
+            WHERE interaction_id = ? AND state = 'pending' AND version = ?
+          `).run(
+            cancelledRequest.version,
+            JSON.stringify(cancelledRequest),
+            occurredAt,
+            request.interaction_id,
+            request.version,
+          )
+          : database.prepare(`
+            UPDATE runtime_interactions
+            SET state = 'cancelled', version = ?, handoff_state = 'cancelled',
+              handoff_version = 2, request_json = ?, updated_at = ?
+            WHERE interaction_id = ? AND state = 'answer_committed' AND version = ?
+              AND handoff_state = 'pending' AND handoff_version = 1
+          `).run(
+            cancelledRequest.version,
+            JSON.stringify(cancelledRequest),
+            occurredAt,
+            request.interaction_id,
+            request.version,
+          );
         if (updated.changes !== 1) {
           conflict('version_conflict', 'The provider failure lost its interaction fence.');
+        }
+        if (handoff !== null) {
+          const cancelledHandoff = {
+            ...handoff,
+            state: 'cancelled',
+            reason_code: 'provider_connection_lost',
+            error: null,
+            side_effect_status: 'none',
+          };
+          validateInteractionHandoff(cancelledHandoff, { occurredAt });
+          const handoffUpdate = database.prepare(`
+            UPDATE runtime_interaction_handoffs
+            SET state = 'cancelled', record_json = ?, updated_at = ?
+            WHERE handoff_id = ? AND state = 'pending'
+              AND handoff_attempt_id IS NULL AND handoff_attempt_no IS NULL
+              AND provider_attempt_id = ? AND lease_epoch = ?
+          `).run(
+            JSON.stringify(cancelledHandoff),
+            occurredAt,
+            handoff.handoff_id,
+            handoff.provider_attempt_id,
+            handoff.lease_epoch,
+          );
+          if (handoffUpdate.changes !== 1) {
+            conflict('version_conflict', 'The provider failure lost its unsent handoff fence.');
+          }
+          const auditId = generateId('audit');
+          database.prepare(`
+            INSERT INTO runtime_interaction_audit (
+              audit_id, interaction_id, handoff_id, outcome, provider_attempt_id,
+              lease_epoch, acknowledgement_json, created_at
+            ) VALUES (?, ?, ?, 'cancelled', ?, ?, ?, ?)
+          `).run(
+            auditId,
+            request.interaction_id,
+            handoff.handoff_id,
+            handoff.provider_attempt_id,
+            handoff.lease_epoch,
+            JSON.stringify({
+              status: 'cancelled',
+              reason_code: 'provider_connection_lost',
+              provider_attempt_id: handoff.provider_attempt_id,
+              lease_epoch: handoff.lease_epoch,
+            }),
+            occurredAt,
+          );
+          cancelledHandoffIds.push(handoff.handoff_id);
         }
         const cancellationEvent = buildEvent({
           turn,
@@ -2069,7 +2161,7 @@ export function createExecutorStore({
               interaction_id: request.interaction_id,
               ordinal: request.ordinal,
               interaction_version: cancelledRequest.version,
-              handoff_version: null,
+              handoff_version: handoffVersion,
             },
           },
           occurredAt,
@@ -2131,6 +2223,7 @@ export function createExecutorStore({
         turn_id: turn.turn_id,
         turn_state: 'recovering',
         cancelled_interaction_ids: cancelledInteractionIds,
+        cancelled_handoff_ids: cancelledHandoffIds,
       };
     });
     return markFailure.immediate();

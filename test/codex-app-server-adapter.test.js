@@ -10,6 +10,7 @@ function createFakeAppServer({
   autoTurnStarted = true,
   onClientResponse,
   respondToInterrupt = true,
+  respondToTurnStart = true,
 } = {}) {
   const child = new EventEmitter();
   child.pid = 4102;
@@ -41,6 +42,7 @@ function createFakeAppServer({
       } else if (message.method === 'thread/resume') {
         send({ id: message.id, result: { thread: { id: message.params.threadId } } });
       } else if (message.method === 'turn/start') {
+        if (!respondToTurnStart) continue;
         turnNumber += 1;
         const turnId = `codex-turn-${turnNumber}`;
         send({
@@ -113,6 +115,13 @@ async function waitFor(predicate) {
   throw new Error('Timed out waiting for fake app-server traffic.');
 }
 
+async function nextInteraction(iterator) {
+  while (true) {
+    const next = await iterator.next();
+    if (next.done || next.value?.kind === 'interaction_requested') return next;
+  }
+}
+
 function handoffDelivery(providerInteractionRef, value, {
   handoffId = 'handoff-1',
   handoffAttemptId = 'handoff-attempt-1',
@@ -136,6 +145,27 @@ function handoffDelivery(providerInteractionRef, value, {
       lease_epoch: 3,
     },
   };
+}
+
+function sendStartedFileChange({ send, threadId, turnId }, itemId) {
+  send({
+    method: 'item/started',
+    params: {
+      threadId,
+      turnId,
+      startedAtMs: 1,
+      item: {
+        type: 'fileChange',
+        id: itemId,
+        status: 'inProgress',
+        changes: [{
+          path: `/workspace/${itemId}.txt`,
+          kind: { type: 'update', move_path: null },
+          diff: '+provider requested change',
+        }],
+      },
+    },
+  });
 }
 
 describe('Codex app-server provider adapter', () => {
@@ -227,6 +257,21 @@ describe('Codex app-server provider adapter', () => {
     expect(server.received.filter(({ method }) => method === 'turn/start')).toHaveLength(2);
   });
 
+  test('reports recovery when transport is lost after turn/start write but before its response', async () => {
+    const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
+    const server = createFakeAppServer({ respondToTurnStart: false });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const waiting = adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]().next();
+    await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
+
+    server.child.emit('close', 1, null);
+
+    await expect(waiting).rejects.toMatchObject({
+      providerError: { code: 'side_effect_unknown', side_effect_status: 'unknown' },
+    });
+    expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+  });
+
   test('normalizes text and tool notifications without exposing app-server method names', async () => {
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
@@ -240,7 +285,12 @@ describe('Codex app-server provider adapter', () => {
             threadId,
             turnId,
             startedAtMs: 1,
-            item: { type: 'commandExecution', id: 'command-1', command: 'private' },
+            item: {
+              type: 'commandExecution',
+              id: 'command-1',
+              command: 'private',
+              status: 'inProgress',
+            },
           },
         });
         send({
@@ -356,6 +406,214 @@ describe('Codex app-server provider adapter', () => {
     expect(spawnProcess).toHaveBeenCalledTimes(2);
   });
 
+  test.each([
+    ['duplicate tool start', ({ send, threadId, turnId }) => {
+      const notification = {
+        method: 'item/started',
+        params: {
+          threadId,
+          turnId,
+          startedAtMs: 1,
+          item: { type: 'commandExecution', id: 'duplicate-tool', status: 'inProgress' },
+        },
+      };
+      send(notification);
+      send(notification);
+    }],
+    ['unknown tool terminal status', ({ send, threadId, turnId }) => {
+      send({
+        method: 'item/started',
+        params: {
+          threadId,
+          turnId,
+          startedAtMs: 1,
+          item: { type: 'commandExecution', id: 'unknown-status', status: 'inProgress' },
+        },
+      });
+      send({
+        method: 'item/completed',
+        params: {
+          threadId,
+          turnId,
+          completedAtMs: 2,
+          item: { type: 'commandExecution', id: 'unknown-status', status: 'futureStatus' },
+        },
+      });
+    }],
+    ['missing tool terminal status', ({ send, threadId, turnId }) => {
+      send({
+        method: 'item/started',
+        params: {
+          threadId,
+          turnId,
+          startedAtMs: 1,
+          item: { type: 'commandExecution', id: 'missing-status', status: 'inProgress' },
+        },
+      });
+      send({
+        method: 'item/completed',
+        params: {
+          threadId,
+          turnId,
+          completedAtMs: 2,
+          item: { type: 'commandExecution', id: 'missing-status' },
+        },
+      });
+    }],
+    ['completed turn with an unfinished tool', ({ send, threadId, turnId }) => {
+      send({
+        method: 'item/started',
+        params: {
+          threadId,
+          turnId,
+          startedAtMs: 1,
+          item: { type: 'commandExecution', id: 'unfinished-tool', status: 'inProgress' },
+        },
+      });
+      send({
+        method: 'turn/completed',
+        params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
+      });
+    }],
+  ])('fails the connection closed for %s', async (_label, afterTurnStart) => {
+    const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
+    const server = createFakeAppServer({ afterTurnStart });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(adapter.execute(executionContext({ reportProviderFailure }))))
+      .rejects.toMatchObject({ providerError: { side_effect_status: 'unknown' } });
+    expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
+  test('rejects a progress method that does not match the active tool type', async () => {
+    const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'item/started',
+          params: {
+            threadId,
+            turnId,
+            startedAtMs: 1,
+            item: { type: 'commandExecution', id: 'command-cross-progress', status: 'inProgress' },
+          },
+        });
+        send({
+          method: 'item/fileChange/outputDelta',
+          params: { threadId, turnId, itemId: 'command-cross-progress', delta: 'wrong method' },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(adapter.execute(executionContext({ reportProviderFailure }))))
+      .rejects.toMatchObject({ providerError: { side_effect_status: 'unknown' } });
+    expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
+  test('normalizes image generation completion without interpreting its opaque status as success', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'item/started',
+          params: {
+            threadId,
+            turnId,
+            startedAtMs: 1,
+            item: { type: 'imageGeneration', id: 'image-1', status: 'inProgress' },
+          },
+        });
+        send({
+          method: 'item/completed',
+          params: {
+            threadId,
+            turnId,
+            completedAtMs: 2,
+            item: {
+              type: 'imageGeneration',
+              id: 'image-1',
+              status: 'completed',
+              result: 'private result',
+              revisedPrompt: null,
+            },
+          },
+        });
+        send({
+          method: 'turn/completed',
+          params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(adapter.execute(executionContext()))).resolves.toEqual([
+      expect.objectContaining({
+        kind: 'tool_started',
+        payload: expect.objectContaining({ summary: 'Image generation started.' }),
+      }),
+      expect.objectContaining({
+        kind: 'tool_finished',
+        payload: expect.objectContaining({ summary: 'Image generation finished.' }),
+      }),
+    ]);
+  });
+
+  test('fails the connection closed for an unknown notification scoped to the current turn', async () => {
+    const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'future/privateNotification',
+          params: { threadId, turnId, privateState: 'unknown' },
+        });
+        send({
+          method: 'turn/completed',
+          params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(adapter.execute(executionContext({ reportProviderFailure }))))
+      .rejects.toMatchObject({ providerError: { code: 'unsupported_capability' } });
+    expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
+  test.each([
+    ['wrong thread', { threadId: 'wrong-thread', turnId: 'codex-turn-1', itemId: 'patch-1', startedAtMs: 1 }],
+    ['wrong turn', { threadId: 'codex-thread-1', turnId: 'wrong-turn', itemId: 'patch-1', startedAtMs: 1 }],
+    ['missing turn', { threadId: 'codex-thread-1', itemId: 'patch-1', startedAtMs: 1 }],
+    ['missing params', undefined],
+  ])('retires the shared connection for a stale server request with %s', async (_label, params) => {
+    const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          id: 'stale-request',
+          method: 'item/fileChange/requestApproval',
+          ...(params === undefined ? {} : { params }),
+        });
+        send({
+          method: 'turn/completed',
+          params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(adapter.execute(executionContext({ reportProviderFailure }))))
+      .rejects.toMatchObject({ providerError: { side_effect_status: 'unknown' } });
+    expect(server.received).toContainEqual({
+      id: 'stale-request',
+      error: { code: -32601, message: 'Unsupported or stale app-server request.' },
+    });
+    expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
   test('durably hands off requestUserInput and acknowledges only after provider resolution', async () => {
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
@@ -427,8 +685,18 @@ describe('Codex app-server provider adapter', () => {
     {
       label: 'command approval',
       method: 'item/commandExecution/requestApproval',
-      params: { itemId: 'command-1', startedAtMs: 1, reason: 'Network access is required.' },
-      expected: { kind: 'tool_approval', prompt: 'Network access is required.' },
+      params: {
+        itemId: 'command-1',
+        startedAtMs: 1,
+        environmentId: null,
+        reason: 'Network access is required.',
+        command: 'npm test',
+        cwd: '/workspace',
+      },
+      expected: {
+        kind: 'tool_approval',
+        prompt: expect.stringMatching(/Command: npm test\nWorking directory: \/workspace/),
+      },
       answer: { kind: 'decision', decision: 'approve' },
       result: { decision: 'accept' },
     },
@@ -438,7 +706,7 @@ describe('Codex app-server provider adapter', () => {
       params: { itemId: 'patch-1', startedAtMs: 1, reason: null },
       expected: {
         kind: 'tool_approval',
-        prompt: 'Allow Codex to apply the requested file changes?',
+        prompt: expect.stringMatching(/File update: \/workspace\/file\.txt\nDiff:\n\+safe change/),
       },
       answer: { kind: 'decision', decision: 'deny' },
       result: { decision: 'decline' },
@@ -454,7 +722,10 @@ describe('Codex app-server provider adapter', () => {
         cwd: '/workspace',
         permissions: { network: null, fileSystem: { read: ['/external'], write: [] } },
       },
-      expected: { kind: 'permission_approval', prompt: 'Read an external directory?' },
+      expected: {
+        kind: 'permission_approval',
+        prompt: expect.stringMatching(/Working directory: \/workspace[\s\S]*Requested permissions:.*"\/external"/),
+      },
       answer: { kind: 'decision', decision: 'approve' },
       result: {
         permissions: { fileSystem: { read: ['/external'], write: [] } },
@@ -502,6 +773,43 @@ describe('Codex app-server provider adapter', () => {
   }) => {
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
+        if (method === 'item/commandExecution/requestApproval') {
+          send({
+            method: 'item/started',
+            params: {
+              threadId,
+              turnId,
+              startedAtMs: 1,
+              item: {
+                type: 'commandExecution',
+                id: params.itemId,
+                command: params.command,
+                cwd: params.cwd,
+                status: 'inProgress',
+              },
+            },
+          });
+        }
+        if (method === 'item/fileChange/requestApproval') {
+          send({
+            method: 'item/started',
+            params: {
+              threadId,
+              turnId,
+              startedAtMs: 1,
+              item: {
+                type: 'fileChange',
+                id: params.itemId,
+                status: 'inProgress',
+                changes: [{
+                  path: '/workspace/file.txt',
+                  kind: { type: 'update', move_path: null },
+                  diff: '+safe change',
+                }],
+              },
+            },
+          });
+        }
         send({
           id: 'provider-request-1',
           method,
@@ -518,7 +826,8 @@ describe('Codex app-server provider adapter', () => {
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     const iterator = adapter.execute(executionContext())[Symbol.asyncIterator]();
 
-    const interaction = await iterator.next();
+    let interaction = await iterator.next();
+    while (interaction.value?.kind !== 'interaction_requested') interaction = await iterator.next();
 
     expect(interaction.value).toEqual({
       kind: 'interaction_requested',
@@ -527,6 +836,7 @@ describe('Codex app-server provider adapter', () => {
         ...expected,
       }),
     });
+    expect(JSON.stringify(interaction.value)).not.toMatch(/requestApproval|requestUserInput/);
     await expect(adapter.handleInteractionAnswer(handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
       answer,
@@ -682,6 +992,136 @@ describe('Codex app-server provider adapter', () => {
   });
 
   test.each([
+    {
+      label: 'requestUserInput missing itemId',
+      method: 'item/tool/requestUserInput',
+      params: {
+        autoResolutionMs: null,
+        questions: [{
+          id: 'question-1',
+          header: 'Input',
+          question: 'Provide input.',
+          isOther: false,
+          isSecret: false,
+          options: null,
+        }],
+      },
+    },
+    {
+      label: 'requestUserInput missing autoResolutionMs',
+      method: 'item/tool/requestUserInput',
+      params: {
+        itemId: 'tool-auto-resolution-missing',
+        questions: [{
+          id: 'question-1',
+          header: 'Input',
+          question: 'Provide input.',
+          isOther: false,
+          isSecret: false,
+          options: null,
+        }],
+      },
+    },
+    {
+      label: 'requestUserInput missing options',
+      method: 'item/tool/requestUserInput',
+      params: {
+        itemId: 'tool-options-missing',
+        autoResolutionMs: null,
+        questions: [{
+          id: 'question-1',
+          header: 'Input',
+          question: 'Provide input.',
+          isOther: false,
+          isSecret: false,
+        }],
+      },
+    },
+    {
+      label: 'file approval empty itemId',
+      method: 'item/fileChange/requestApproval',
+      params: { itemId: '', startedAtMs: 1, reason: null },
+    },
+    {
+      label: 'command approval missing startedAtMs',
+      method: 'item/commandExecution/requestApproval',
+      params: { itemId: 'command-malformed', environmentId: null, reason: null },
+    },
+    {
+      label: 'command approval missing environmentId',
+      method: 'item/commandExecution/requestApproval',
+      params: { itemId: 'command-environment-missing', startedAtMs: 1, reason: null },
+    },
+    {
+      label: 'permission approval malformed permissions',
+      method: 'item/permissions/requestApproval',
+      params: {
+        itemId: 'permission-malformed',
+        startedAtMs: 1,
+        cwd: '/workspace',
+        environmentId: null,
+        reason: null,
+        permissions: { network: 'all', fileSystem: null },
+      },
+    },
+    {
+      label: 'permission approval missing required environment and reason',
+      method: 'item/permissions/requestApproval',
+      params: {
+        itemId: 'permission-required-missing',
+        startedAtMs: 1,
+        cwd: '/workspace',
+        permissions: { network: null, fileSystem: null },
+      },
+    },
+    {
+      label: 'permission approval missing profile keys',
+      method: 'item/permissions/requestApproval',
+      params: {
+        itemId: 'permission-profile-missing',
+        startedAtMs: 1,
+        cwd: '/workspace',
+        environmentId: null,
+        reason: null,
+        permissions: {},
+      },
+    },
+    {
+      label: 'permission approval missing nested profile fields',
+      method: 'item/permissions/requestApproval',
+      params: {
+        itemId: 'permission-nested-missing',
+        startedAtMs: 1,
+        cwd: '/workspace',
+        environmentId: null,
+        reason: null,
+        permissions: { network: {}, fileSystem: {} },
+      },
+    },
+  ])('fails closed for $label', async ({ method, params }) => {
+    const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          id: 'malformed-provider-request',
+          method,
+          params: { threadId, turnId, ...params },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]().next())
+      .rejects.toMatchObject({ providerError: { side_effect_status: 'unknown' } });
+    expect(server.received).toContainEqual({
+      id: 'malformed-provider-request',
+      error: { code: -32601, message: 'Invalid app-server request.' },
+    });
+    expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
+  test.each([
     ['free-form text', { kind: 'text', text: 'Staging' }],
     ['an unknown choice', { kind: 'choice', choice_id: 'Unknown' }],
   ])('rejects %s before answering a fixed requestUserInput choice', async (_label, answer) => {
@@ -775,7 +1215,42 @@ describe('Codex app-server provider adapter', () => {
         _meta: null,
       },
     },
+    {
+      label: 'unmapped string pattern',
+      params: {
+        mode: 'form',
+        message: 'Provide a production target.',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            environment: { type: 'string', minLength: 1, pattern: '^prod$' },
+          },
+          required: ['environment'],
+        },
+        _meta: null,
+      },
+    },
+    {
+      label: 'conflicting enum and oneOf choices',
+      params: {
+        mode: 'form',
+        message: 'Choose an environment.',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            environment: {
+              type: 'string',
+              enum: ['staging'],
+              oneOf: [{ const: 'production', title: 'Production' }],
+            },
+          },
+          required: ['environment'],
+        },
+        _meta: null,
+      },
+    },
   ])('fails closed for an unsupported MCP $label', async ({ params }) => {
+    const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
         send({
@@ -787,18 +1262,21 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
 
-    await expect(adapter.execute(executionContext())[Symbol.asyncIterator]().next())
+    await expect(adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]().next())
       .rejects.toMatchObject({ providerError: { code: 'unsupported_capability' } });
     expect(server.received).toContainEqual({
       id: 'unsupported-mcp',
       error: { code: -32601, message: 'Invalid app-server request.' },
     });
+    expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
   });
 
   test('rejects an early provider resolved notification before any answer is sent', async () => {
     const reportProviderFailure = jest.fn();
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
+        sendStartedFileChange({ send, threadId, turnId }, 'patch-early');
         send({
           id: 'early-resolution',
           method: 'item/fileChange/requestApproval',
@@ -812,7 +1290,9 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
 
-    await expect(adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]().next())
+    await expect(nextInteraction(
+      adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator](),
+    ))
       .rejects.toMatchObject({ providerError: { code: 'side_effect_unknown' } });
     expect(reportProviderFailure).toHaveBeenCalledTimes(1);
   });
@@ -821,6 +1301,7 @@ describe('Codex app-server provider adapter', () => {
     const reportProviderFailure = jest.fn();
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
+        sendStartedFileChange({ send, threadId, turnId }, 'patch-first');
         send({
           id: 'reused-request',
           method: 'item/fileChange/requestApproval',
@@ -836,7 +1317,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     const iterator = adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]();
-    const interaction = await iterator.next();
+    const interaction = await nextInteraction(iterator);
     await adapter.handleInteractionAnswer(handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
       { kind: 'decision', decision: 'approve' },
@@ -938,6 +1419,7 @@ describe('Codex app-server provider adapter', () => {
     const reportProviderFailure = jest.fn();
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
+        sendStartedFileChange({ send, threadId, turnId }, 'waiting-patch');
         send({
           id: 'waiting-terminal-request',
           method: 'item/fileChange/requestApproval',
@@ -947,7 +1429,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     const iterator = adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]();
-    await expect(iterator.next()).resolves.toMatchObject({
+    await expect(nextInteraction(iterator)).resolves.toMatchObject({
       done: false,
       value: { kind: 'interaction_requested' },
     });
@@ -1080,6 +1562,7 @@ describe('Codex app-server provider adapter', () => {
   test('uses a fenced terminal tombstone when completion wins the timeout interrupt race', async () => {
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
+        sendStartedFileChange({ send, threadId, turnId }, 'patch-timeout-race');
         send({
           id: 'timeout-race-request',
           method: 'item/fileChange/requestApproval',
@@ -1090,7 +1573,7 @@ describe('Codex app-server provider adapter', () => {
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     const context = executionContext({ lineage: { provider_native_id: 'codex-thread-1' } });
     const iterator = adapter.execute(context)[Symbol.asyncIterator]();
-    await iterator.next();
+    await nextInteraction(iterator);
 
     server.send({
       method: 'turn/completed',
@@ -1153,6 +1636,7 @@ describe('Codex app-server provider adapter', () => {
   test('rejects stale interaction answers before writing to the provider connection', async () => {
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
+        sendStartedFileChange({ send, threadId, turnId }, 'patch-1');
         send({
           id: 91,
           method: 'item/fileChange/requestApproval',
@@ -1162,7 +1646,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     const iterator = adapter.execute(executionContext())[Symbol.asyncIterator]();
-    const interaction = await iterator.next();
+    const interaction = await nextInteraction(iterator);
     const delivery = handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
       { kind: 'decision', decision: 'approve' },
@@ -1175,10 +1659,40 @@ describe('Codex app-server provider adapter', () => {
     await iterator.return();
   });
 
+  test('turns a synchronous provider-answer write failure into a fenced unknown delivery', async () => {
+    const reportProviderFailure = jest.fn(() => ({ status: 'handoff_in_progress' }));
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        sendStartedFileChange({ send, threadId, turnId }, 'patch-write-failure');
+        send({
+          id: 'throwing-answer-write',
+          method: 'item/fileChange/requestApproval',
+          params: { threadId, turnId, itemId: 'patch-write-failure', startedAtMs: 1 },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const iterator = adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]();
+    const interaction = await nextInteraction(iterator);
+    server.child.stdin.write = jest.fn(() => {
+      throw new Error('forced synchronous EPIPE');
+    });
+
+    await expect(adapter.handleInteractionAnswer(handoffDelivery(
+      interaction.value.payload.provider_interaction_ref,
+      { kind: 'decision', decision: 'approve' },
+    ))).rejects.toMatchObject({
+      providerError: { code: 'side_effect_unknown', side_effect_status: 'unknown' },
+    });
+    expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
   test('reports connection loss with an outstanding interaction and clears stale answer state', async () => {
     const reportProviderFailure = jest.fn();
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
+        sendStartedFileChange({ send, threadId, turnId }, 'patch-lost');
         send({
           id: 'lost-interaction',
           method: 'item/fileChange/requestApproval',
@@ -1188,7 +1702,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     const iterator = adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]();
-    const interaction = await iterator.next();
+    const interaction = await nextInteraction(iterator);
 
     server.child.emit('close', 1, null);
 
