@@ -122,6 +122,7 @@ const ACTION_DEFINITIONS = deepFreeze({
   reconcile: {
     capability: 'service.reconcile',
     mutable: true,
+    result_identity_fields: ['intent_id'],
     targets: {
       service: { fields: ['service_instance_id'], identity_field: 'service_instance_id' },
     },
@@ -752,8 +753,11 @@ export function resolveControlResultUpdate(currentValue, nextValue, { action } =
     || current.trace_id !== next.trace_id
     || !runtimeContractsEqual(current.target, next.target)
     || current.previous_target_version !== next.previous_target_version
+    || current.audit_id !== next.audit_id
     || current.accepted_at !== next.accepted_at
     || currentValidation.metadata.action !== nextValidation.metadata.action
+    || !(ACTION_DEFINITIONS[currentValidation.metadata.action]?.result_identity_fields ?? [])
+      .every((field) => runtimeContractsEqual(current.result?.[field], next.result?.[field]))
   ) {
     rejectRuntimeContract(
       'validation_error',
@@ -762,6 +766,19 @@ export function resolveControlResultUpdate(currentValue, nextValue, { action } =
     );
   }
   if (next.control_result_version > current.control_result_version) {
+    if (
+      current.target_version !== null
+      && (next.target_version === null || next.target_version < current.target_version)
+    ) {
+      rejectRuntimeContract(
+        'version_conflict',
+        'Control result updates must not regress the accepted target version.',
+        {
+          category: 'conflict',
+          occurredAt: next.completed_at ?? next.accepted_at,
+        },
+      );
+    }
     if (current.status !== 'accepted' || next.status === 'accepted') {
       rejectRuntimeContract(
         'version_conflict',

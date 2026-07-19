@@ -85,6 +85,12 @@ describe('observability snapshot v1 contract', () => {
     expect(() => validateObservabilitySnapshot(authoritativePid)).toThrow(ContractKernelError);
   });
 
+  test('rejects credential-shaped content from public audit summaries', () => {
+    const secretAudit = structuredClone(observabilityFixture.cases.complete);
+    secretAudit.audit_summary.items[0].authorization = 'Bearer leaked-token';
+    expect(() => validateObservabilitySnapshot(secretAudit)).toThrow(ContractKernelError);
+  });
+
   test('replaces snapshots by service instance/version and rejects a conflicting equal version', () => {
     expect(resolveObservabilitySnapshotUpdate(
       observabilityFixture.cases.complete,
@@ -242,6 +248,27 @@ describe('operations control v1 contracts', () => {
       rewrittenTerminal,
     )).toThrow(ContractKernelError);
 
+    const changedIntent = structuredClone(controlFixture.results.reconcile_completed);
+    changedIntent.result.intent_id = 'reconciliation-intent-other';
+    expect(() => resolveControlResultUpdate(
+      controlFixture.results.reconcile_accepted,
+      changedIntent,
+    )).toThrow(ContractKernelError);
+
+    const changedAudit = structuredClone(controlFixture.results.reconcile_completed);
+    changedAudit.audit_id = 'audit-reconcile-other';
+    expect(() => resolveControlResultUpdate(
+      controlFixture.results.reconcile_accepted,
+      changedAudit,
+    )).toThrow(ContractKernelError);
+
+    const regressedTargetVersion = structuredClone(controlFixture.results.reconcile_completed);
+    regressedTargetVersion.target_version = 12;
+    expect(() => resolveControlResultUpdate(
+      controlFixture.results.reconcile_accepted,
+      regressedTargetVersion,
+    )).toThrow(ContractKernelError);
+
     const conflict = structuredClone(controlFixture.results.reconcile_accepted);
     conflict.target_version = 99;
     expect(() => resolveControlResultUpdate(
@@ -333,6 +360,16 @@ describe('Dashboard to Luna runtime projection v1 contract', () => {
     const impliedControlLeak = structuredClone(projectionFixture.cases.initial_full);
     impliedControlLeak.capabilities.supported_fields = ['control', 'core_endpoint'];
     expect(() => validateDashboardRuntimeProjection(impliedControlLeak))
+      .toThrow(ContractKernelError);
+
+    const coreEndpointLeak = structuredClone(projectionFixture.cases.initial_full);
+    coreEndpointLeak.capabilities.core_endpoint = 'https://core.internal/control';
+    expect(() => validateDashboardRuntimeProjection(coreEndpointLeak))
+      .toThrow(ContractKernelError);
+
+    const credentialLeak = structuredClone(projectionFixture.cases.initial_full);
+    credentialLeak.capabilities.authorization = 'Bearer leaked-token';
+    expect(() => validateDashboardRuntimeProjection(credentialLeak))
       .toThrow(ContractKernelError);
   });
 

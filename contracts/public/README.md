@@ -199,7 +199,9 @@ contracts do not maintain a second compatibility path around the public kernel.
   can never masquerade as an empty successful collection. `resolveObservabilitySnapshotUpdate`
   applies the `(core_service_instance_id, snapshot_version)` replacement rules. PID, PGID, and
   process start time are present only inside a required `runtime_identity` object with
-  `diagnostic_only=true`.
+  `diagnostic_only=true`. The full snapshot, including audit summaries, errors, and extensions,
+  is rejected if it contains credential-shaped values, secret fields, or channel/provider-private
+  payloads.
 - `validateControlRequest`, `validateControlResult`, and the two control schema descriptors
   define the registered caller namespace, transport-injected actor/auth context, versioned
   capability grants and scopes, discriminated action targets, mutation CAS, and asynchronous
@@ -210,7 +212,9 @@ contracts do not maintain a second compatibility path around the public kernel.
   transaction. The entire public request, including `reason` and additive extensions, is rejected
   when it contains credential-shaped values, secret fields, or provider/channel-private payloads.
   A higher result version may advance only from `accepted` to a terminal status; terminal results
-  are immutable. Because `zylos.control-result` does not carry
+  are immutable. Accepted-to-terminal updates preserve the action-specific intent and audit
+  identities and cannot regress the accepted target version. Because `zylos.control-result` does
+  not carry
   a duplicate top-level action field, consumers pass the correlated request action as
   `validateControlResult(value, { action })` when target/result shape alone is ambiguous, and pass
   the same context to `resolveControlResultUpdate`; the returned `metadata.action` is diagnostic
@@ -220,8 +224,9 @@ contracts do not maintain a second compatibility path around the public kernel.
   first payloads, Dashboard instance replacement, sequence duplicates/obsolescence/gaps, and
   full resynchronization. Projection capabilities must state `control=false` and
   `core_direct_access=false`; `supported_fields` is restricted to the schema's declared
-  presentation allowlist and cannot advertise control or Core endpoints. Luna is a read-only
-  Dashboard consumer.
+  presentation allowlist and cannot advertise control or Core endpoints. Additive capability
+  metadata must remain presentation-only, and the full projection is subject to the same public
+  secret/private-payload scan. Luna is a read-only Dashboard consumer.
 
 The golden fixtures are `fixtures/observability-v1.json`, `fixtures/control-v1.json`, and
 `fixtures/dashboard-runtime-projection-v1.json`. They cover degraded visibility, answer handoff

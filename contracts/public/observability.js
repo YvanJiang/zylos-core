@@ -1,4 +1,5 @@
 import { SIDE_EFFECT_STATUSES } from './constants.js';
+import { validatePublicFixtureSafety } from './validation.js';
 import {
   deepFreeze,
   finishRuntimeContract,
@@ -364,6 +365,7 @@ function validateAuditSummary(path, value, options) {
 export function validateObservabilitySnapshot(value, { occurredAt } = {}) {
   const options = { occurredAt };
   requireRecord('snapshot', value, options);
+  validatePublicFixtureSafety(value, options);
   requireFields('snapshot', value, ['contract', 'contract_version', ...SNAPSHOT_FIELDS], options);
   requireOpaqueId('snapshot_id', value.snapshot_id, options);
   requireOpaqueId('core_service_instance_id', value.core_service_instance_id, options);

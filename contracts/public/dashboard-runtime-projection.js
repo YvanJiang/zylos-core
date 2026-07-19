@@ -1,4 +1,6 @@
 import { SIDE_EFFECT_STATUSES } from './constants.js';
+import { isPlainJsonObject } from './scalars.js';
+import { validatePublicFixtureSafety } from './validation.js';
 import {
   deepFreeze,
   finishRuntimeContract,
@@ -45,6 +47,20 @@ const PROJECTION_SUPPORTED_FIELDS = Object.freeze([
   'wait_reason',
   'side_effect_status',
 ]);
+
+const CAPABILITY_FIELDS = Object.freeze([
+  'supported_fields',
+  'supported_states',
+  'control',
+  'core_direct_access',
+]);
+
+const CAPABILITY_ACCESS_FIELD_PATTERN = new RegExp(
+  '(?:^|_)(?:admin|command|control|core|direct_access|endpoint|mutation|write)(?:_|$)',
+);
+const PRESENTATION_FIELD_PATTERN = new RegExp(
+  '(?:^|_)(?:color|display|hint|icon|label|mode|presentation|rendering)(?:_|$)',
+);
 
 const PROJECTION_FIELD_RULES = deepFreeze({
   projection_id: { required: true, kind: 'opaque_id' },
@@ -138,13 +154,74 @@ function requireUniqueStrings(path, value, options) {
   });
 }
 
+function normalizeCapabilityFieldName(fieldName) {
+  return fieldName
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[^A-Za-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .toLowerCase();
+}
+
+function rejectCapabilityAccessField(path, fieldName, options) {
+  const normalized = normalizeCapabilityFieldName(fieldName);
+  if (CAPABILITY_ACCESS_FIELD_PATTERN.test(normalized)) {
+    rejectRuntimeContract(
+      'unsupported_capability',
+      `${path}.${fieldName} cannot advertise control or direct Core access.`,
+      options,
+    );
+  }
+  return normalized;
+}
+
+function validatePresentationValue(path, value, options) {
+  if (isPlainJsonObject(value)) {
+    validatePresentationMetadata(path, value, options);
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => (
+      validatePresentationValue(`${path}[${index}]`, entry, options)
+    ));
+    return;
+  }
+  if (value !== null && typeof value === 'object') {
+    rejectRuntimeContract(
+      'validation_error',
+      `${path} must contain only JSON presentation metadata.`,
+      options,
+    );
+  }
+}
+
+function validatePresentationMetadata(path, value, options) {
+  requireRecord(path, value, options);
+  for (const [fieldName, fieldValue] of Object.entries(value)) {
+    const childPath = `${path}.${fieldName}`;
+    const normalized = rejectCapabilityAccessField(path, fieldName, options);
+    if (!PRESENTATION_FIELD_PATTERN.test(normalized)) {
+      rejectRuntimeContract(
+        'unsupported_capability',
+        `${childPath} is not presentation-only capability metadata.`,
+        options,
+      );
+    }
+    validatePresentationValue(childPath, fieldValue, options);
+  }
+}
+
+function validateCapabilityExtensions(value, options) {
+  const knownFields = new Set(CAPABILITY_FIELDS);
+  for (const [fieldName, fieldValue] of Object.entries(value)) {
+    if (knownFields.has(fieldName)) continue;
+    rejectCapabilityAccessField('capabilities', fieldName, options);
+    validatePresentationMetadata(`capabilities.${fieldName}`, fieldValue, options);
+  }
+}
+
 function validateCapabilities(value, options) {
-  requireFields('capabilities', value, [
-    'supported_fields',
-    'supported_states',
-    'control',
-    'core_direct_access',
-  ], options);
+  requireFields('capabilities', value, CAPABILITY_FIELDS, options);
+  validateCapabilityExtensions(value, options);
   requireUniqueStrings('capabilities.supported_fields', value.supported_fields, options);
   value.supported_fields.forEach((field, index) => requireEnum(
     `capabilities.supported_fields[${index}]`,
@@ -182,6 +259,7 @@ function validateCapabilities(value, options) {
 export function validateDashboardRuntimeProjection(value, { occurredAt } = {}) {
   const options = { occurredAt };
   requireRecord('runtime projection', value, options);
+  validatePublicFixtureSafety(value, options);
   requireFields(
     'runtime projection',
     value,
