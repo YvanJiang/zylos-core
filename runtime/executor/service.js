@@ -891,16 +891,20 @@ export function createExecutorService({
       try {
         clearAllInteractionDeadlines();
         const shutdownFailures = [];
+        const providerClosing = (async () => {
+          if (typeof adapter.close !== 'function') return [];
+          return await adapter.close() ?? [];
+        })().then(
+          (closedConversationIds) => ({ closedConversationIds, error: null }),
+          (error) => ({
+            closedConversationIds: error.closedConversationIds ?? [],
+            error,
+          }),
+        );
         await Promise.allSettled([...interactionDeliverySettlements]);
-        let closedConversationIds = [];
-        try {
-          if (typeof adapter.close === 'function') {
-            closedConversationIds = await adapter.close() ?? [];
-          }
-        } catch (error) {
-          shutdownFailures.push(error);
-          closedConversationIds = error.closedConversationIds ?? [];
-        }
+        const providerCloseResult = await providerClosing;
+        const { closedConversationIds } = providerCloseResult;
+        if (providerCloseResult.error) shutdownFailures.push(providerCloseResult.error);
         const closedConversationIdSet = new Set(closedConversationIds);
         const skippedSettlements = new Set();
         const pendingRecoveryTurnIds = new Set();

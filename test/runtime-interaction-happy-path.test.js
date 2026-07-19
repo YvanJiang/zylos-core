@@ -770,6 +770,85 @@ describe('runtime interaction happy path', () => {
     database.close();
   });
 
+  test('closes the provider after acknowledgement without waiting for resumed execution', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'service-ack-close-race');
+    let releaseResumedExecution;
+    let resumedExecutionStarted;
+    const resumedExecutionStartedPromise = new Promise((resolve) => {
+      resumedExecutionStarted = resolve;
+    });
+    const resumedExecutionGate = new Promise((resolve) => {
+      releaseResumedExecution = resolve;
+    });
+    let closeCalls = 0;
+    const adapter = {
+      async *execute() {
+        yield {
+          kind: 'interaction_requested',
+          payload: {
+            provider_interaction_ref: 'provider-ack-close-race',
+            tool_use_id: 'tool-ack-close-race',
+            kind: 'tool_approval',
+            prompt: 'Allow the provider close race?',
+            choices: [],
+            authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+            allowed_sources: ['card_action'],
+          },
+        };
+        resumedExecutionStarted();
+        await resumedExecutionGate;
+        yield {
+          kind: 'text_snapshot',
+          payload: { text: 'Resumed execution closed.', end_offset: 25 },
+          provider_native_id: null,
+        };
+      },
+      async handleInteractionAnswer(delivery) {
+        return {
+          status: 'accepted',
+          handoff_id: delivery.handoff.handoff_id,
+          provider_attempt_id: delivery.handoff.provider_attempt_id,
+          handoff_attempt_id: delivery.handoff.handoff_attempt_id,
+          handoff_attempt_no: delivery.handoff.handoff_attempt_no,
+          lease_epoch: delivery.handoff.lease_epoch,
+        };
+      },
+      async close() {
+        closeCalls += 1;
+        releaseResumedExecution();
+        return [accepted.conversation_id];
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-ack-close-race',
+      now: () => '2026-07-19T07:02:04Z',
+      generateId: deterministicIds('ack-close-race'),
+    });
+    const waiting = await service.runNext();
+    const answer = service.submitInteractionAnswer(
+      interactionAnswer(waiting.request, 'ack-close-race'),
+    );
+    const delivery = service.deliverInteractionAnswer(answer.handoff_id);
+    await resumedExecutionStartedPromise;
+
+    const closing = service.close();
+    await new Promise((resolve) => setImmediate(resolve));
+    const closeCallsBeforeManualRelease = closeCalls;
+    if (closeCalls === 0) releaseResumedExecution();
+    await expect(delivery).resolves.toMatchObject({
+      acknowledgement: { status: 'accepted', resumed: true },
+      execution: { status: 'completed' },
+    });
+    await expect(closing).resolves.toBeUndefined();
+    expect(closeCallsBeforeManualRelease).toBe(1);
+
+    database.close();
+  });
+
   test('does not advance an unanswered interaction while closing the service', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'service-close-waiting');
