@@ -578,11 +578,51 @@ export function createExecutorService({
       Object.freeze(delivery),
     );
     const managedPermissions = permissionControllers.get(delivery.request.turn_id)?.size ?? 0;
-    const acknowledgement = store.acknowledgeInteractionHandoff(handlerAcknowledgement, {
-      holdForPermission: managedPermissions > 0
-        || handlerAcknowledgement.blocking_interactions_remaining === true,
-    });
     const activeRun = activeRuns.get(delivery.request.turn_id);
+    let acknowledgement;
+    try {
+      acknowledgement = store.acknowledgeInteractionHandoff(handlerAcknowledgement, {
+        holdForPermission: managedPermissions > 0
+          || handlerAcknowledgement.blocking_interactions_remaining === true,
+      });
+    } catch (error) {
+      if (activeRun && !activeRun.durableSettled) {
+        try {
+          transitionToRecovery(activeRun, 'interaction_ack_persistence_failed');
+        } catch (recoveryFailure) {
+          error.recoveryFailure = recoveryFailure;
+        }
+        if (typeof adapter.abort === 'function') {
+          try {
+            await adapter.abort(activeRun.turnContext);
+          } catch (abortFailure) {
+            error.abortFailure = abortFailure;
+          }
+        }
+      }
+      throw error;
+    }
+    if (typeof adapter.commitInteractionAnswer === 'function') {
+      try {
+        await adapter.commitInteractionAnswer(Object.freeze(delivery));
+      } catch (error) {
+        if (activeRun && !activeRun.durableSettled) {
+          try {
+            transitionToRecovery(activeRun, 'interaction_commit_uncertain');
+          } catch (recoveryFailure) {
+            error.recoveryFailure = recoveryFailure;
+          }
+          if (typeof adapter.abort === 'function') {
+            try {
+              await adapter.abort(activeRun.turnContext);
+            } catch (abortFailure) {
+              error.abortFailure = abortFailure;
+            }
+          }
+        }
+        throw error;
+      }
+    }
     const shouldAdvance = acknowledgement.resumed
       || handlerAcknowledgement.blocking_interactions_remaining === true;
     if (activeRun && shouldAdvance) activeRun.pauseKind = null;
@@ -617,10 +657,13 @@ export function createExecutorService({
           store.releaseExecutorResident(conversationId);
           endedResidentFences.delete(conversationId);
         }
+        if (closeError) {
+          lifecycle = 'close_failed';
+          throw closeError;
+        }
         lifecycle = 'closed';
-        if (closeError) throw closeError;
       } finally {
-        if (residentHeartbeat !== null) {
+        if (lifecycle === 'closed' && residentHeartbeat !== null) {
           cancelResidentHeartbeat(residentHeartbeat);
           residentHeartbeat = null;
         }

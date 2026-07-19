@@ -606,7 +606,9 @@ function createCloseAwareQuery({ sessionId }) {
 }
 
 function createCloseFailingQuery({ sessionId }) {
+  let calls = 0;
   function query({ prompt }) {
+    calls += 1;
     const stream = (async function* generateSdkMessages() {
       for await (const input of prompt) {
         yield { type: 'system', subtype: 'init', session_id: sessionId };
@@ -618,7 +620,7 @@ function createCloseFailingQuery({ sessionId }) {
     stream.close = () => { throw new Error('forced query close failure'); };
     return stream;
   }
-  return { query };
+  return { get calls() { return calls; }, query };
 }
 
 function createQueuedReceiptQuery({ cancelResult = true, sessionId }) {
@@ -885,6 +887,14 @@ describe('Claude conversation executor', () => {
       query: () => {},
       queryOptions: { extraArgs: { continue: null } },
     })).toThrow(/managed by Core lineage authority/);
+    expect(() => createClaudeConversationAdapter({
+      query: () => {},
+      queryOptions: { extraArgs: { 'resume=foreign': null } },
+    })).toThrow(/managed by Core lineage authority/);
+    expect(() => createClaudeConversationAdapter({
+      query: () => {},
+      queryOptions: { executableArgs: ['--resume=foreign'] },
+    })).toThrow(/managed by Core lineage authority/);
   });
 
   test('removes static tokens when native credentials are detected', async () => {
@@ -892,13 +902,17 @@ describe('Claude conversation executor', () => {
     const accepted = acceptQueuedTurn(database, 'native-auth-env');
     const nativeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-native-auth-'));
     temporaryDirectories.push(nativeHome);
-    fs.mkdirSync(path.join(nativeHome, '.claude'));
-    fs.writeFileSync(path.join(nativeHome, '.claude', '.credentials.json'), '{}');
     const fake = createFakeQuery({ sessionId: 'claude-session-native-auth-env' });
+    let detectedExecutable;
     const service = createExecutorService({
       database,
       adapter: createClaudeConversationAdapter({
         query: fake.query,
+        resolveClaudeExecutable: () => '/sdk/bundled/claude',
+        detectNativeAuthentication(environment, { executable }) {
+          detectedExecutable = executable;
+          return true;
+        },
         queryOptions: {
           env: {
             HOME: nativeHome,
@@ -916,6 +930,7 @@ describe('Claude conversation executor', () => {
 
     await expect(service.runNext()).resolves.toMatchObject({ turn_id: accepted.turn_id });
     expect(fake.calls[0].options.env).toEqual({ HOME: nativeHome, PATH: '/test/bin' });
+    expect(detectedExecutable).toBe('/sdk/bundled/claude');
     await service.close();
     database.close();
   });
@@ -925,12 +940,15 @@ describe('Claude conversation executor', () => {
     const accepted = acceptQueuedTurn(database, 'native-auth-keychain');
     const fake = createFakeQuery({ sessionId: 'claude-session-native-auth-keychain' });
     let detectedEnvironment;
+    let detectedExecutable;
     const service = createExecutorService({
       database,
       adapter: createClaudeConversationAdapter({
         query: fake.query,
-        detectNativeAuthentication(environment) {
+        resolveClaudeExecutable: () => '/sdk/bundled/claude',
+        detectNativeAuthentication(environment, { executable }) {
           detectedEnvironment = environment;
+          detectedExecutable = executable;
           return true;
         },
         queryOptions: {
@@ -954,6 +972,7 @@ describe('Claude conversation executor', () => {
       PATH: '/test/bin',
     });
     expect(detectedEnvironment.DATABASE_PASSWORD).toBeUndefined();
+    expect(detectedExecutable).toBe('/sdk/bundled/claude');
     await service.close();
     database.close();
   });
@@ -1200,6 +1219,42 @@ describe('Claude conversation executor', () => {
         'interaction_answered',
       ]));
 
+    await service.close();
+    database.close();
+  });
+
+  test('does not release an SDK permission before its durable acknowledgement commits', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'permission-ack-failure');
+    const fake = createPermissionQuery({ sessionId: 'claude-session-permission-ack-failure' });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-permission-ack-failure',
+      now: () => '2026-07-19T09:03:15Z',
+      generateId: deterministicIds('permission-ack-failure'),
+    });
+
+    const waiting = await service.runNext();
+    const answer = service.submitInteractionAnswer(
+      permissionAnswer(waiting.request, 'ack-failure'),
+    );
+    database.exec(`
+      CREATE TRIGGER fail_permission_ack_audit
+      BEFORE INSERT ON runtime_interaction_audit
+      BEGIN
+        SELECT RAISE(ABORT, 'forced permission acknowledgement failure');
+      END;
+    `);
+    await expect(service.deliverInteractionAnswer(answer.handoff_id)).rejects.toThrow(
+      /forced permission acknowledgement failure/,
+    );
+    expect(fake.permissionResults).toEqual([]);
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'recovering' });
+
+    database.exec(`DROP TRIGGER fail_permission_ack_audit`);
     await service.close();
     database.close();
   });
@@ -2134,13 +2189,17 @@ describe('Claude conversation executor', () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'close-failure-resident');
     const fake = createCloseFailingQuery({ sessionId: 'claude-session-close-failure' });
+    const adapter = createClaudeConversationAdapter({ query: fake.query });
+    let heartbeatCancelled = false;
     const service = createExecutorService({
       database,
-      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      adapter,
       provider: 'claude',
       serviceInstanceId: 'executor-service-close-failure',
       now: () => '2026-07-19T09:14:30Z',
       generateId: deterministicIds('close-failure'),
+      scheduleResidentHeartbeat: () => ({ unref() {} }),
+      cancelResidentHeartbeat() { heartbeatCancelled = true; },
     });
 
     await expect(service.runNext()).resolves.toMatchObject({ turn_id: accepted.turn_id });
@@ -2152,6 +2211,8 @@ describe('Claude conversation executor', () => {
       conversation_id: accepted.conversation_id,
       owner_service_instance_id: 'executor-service-close-failure',
     }]);
+    expect(adapter.hasResident(accepted.conversation_id)).toBe(true);
+    expect(heartbeatCancelled).toBe(false);
 
     database.close();
   });
@@ -2252,9 +2313,43 @@ describe('Claude conversation executor', () => {
     await new Promise((resolve) => setImmediate(resolve));
     const switching = consume('turn-close-race-2', 'lineage-close-race-2');
     await closeStarted.promise;
-    await adapter.close();
+    const closing = adapter.close();
     releaseClose.resolve();
+    await closing;
     await expect(switching).rejects.toThrow(/closing|closed/);
     expect(queryCalls).toBe(1);
+  });
+
+  test('retains a closing tombstone when a lineage query cannot be closed', async () => {
+    const fake = createCloseFailingQuery({ sessionId: 'claude-session-lineage-close-failure' });
+    const adapter = createClaudeConversationAdapter({ query: fake.query });
+    const controls = { requestPermission: async () => ({ behavior: 'deny' }) };
+    const context = (turnId, lineageId) => ({
+      conversation_id: 'conversation-lineage-close-failure',
+      turn_id: turnId,
+      lineage_id: lineageId,
+      provider_native_id: null,
+      trace_id: `trace-${turnId}`,
+      input: { text: turnId },
+      attempt: { attempt_id: `attempt-${turnId}`, attempt_no: 1, lease_epoch: 1 },
+    });
+    const consume = async (turnId, lineageId) => {
+      for await (const record of adapter.execute(context(turnId, lineageId), controls)) {
+        if (record.type === 'provider_native_id') record.acknowledge();
+      }
+    };
+
+    await consume('turn-lineage-close-failure-1', 'lineage-close-failure-1');
+    await new Promise((resolve) => setImmediate(resolve));
+    await expect(consume(
+      'turn-lineage-close-failure-2',
+      'lineage-close-failure-2',
+    )).rejects.toThrow(/forced query close failure/);
+    expect(adapter.hasResident('conversation-lineage-close-failure')).toBe(true);
+    await expect(consume(
+      'turn-lineage-close-failure-3',
+      'lineage-close-failure-3',
+    )).rejects.toThrow(/close_failed/);
+    expect(fake.calls).toBe(1);
   });
 });

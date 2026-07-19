@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import fs from 'node:fs';
-import path from 'node:path';
+import { createRequire } from 'node:module';
 
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
 
@@ -31,6 +30,16 @@ const CORE_MANAGED_CONTINUITY_OPTIONS = Object.freeze([
   'resumeSessionAt',
   'sessionId',
 ]);
+const require = createRequire(import.meta.url);
+const CORE_MANAGED_CONTINUITY_ARGUMENTS = Object.freeze(new Set([
+  'c',
+  'continue',
+  'fork-session',
+  'r',
+  'resume',
+  'resume-session-at',
+  'session-id',
+]));
 
 function selectEnvironment(environment, allowlist = DEFAULT_ENVIRONMENT_ALLOWLIST) {
   const selected = {};
@@ -40,16 +49,33 @@ function selectEnvironment(environment, allowlist = DEFAULT_ENVIRONMENT_ALLOWLIS
   return selected;
 }
 
-function defaultDetectNativeAuthentication(environment, queryOptions) {
-  const configDirectory = environment.CLAUDE_CONFIG_DIR
-    ?? (environment.HOME ? path.join(environment.HOME, '.claude') : null);
-  if (
-    configDirectory !== null
-    && fs.existsSync(path.join(configDirectory, '.credentials.json'))
-  ) {
-    return true;
+function normalizeCliArgument(argument) {
+  return argument
+    .replace(/([a-z])([A-Z])/g, '$1-$2')
+    .replace(/^-+/, '')
+    .replaceAll('_', '-')
+    .split('=', 1)[0]
+    .toLowerCase();
+}
+
+function defaultResolveClaudeExecutable(queryOptions) {
+  if (typeof queryOptions.pathToClaudeCodeExecutable === 'string') {
+    return queryOptions.pathToClaudeCodeExecutable;
   }
-  const executable = queryOptions.pathToClaudeCodeExecutable ?? 'claude';
+  const musl = process.platform === 'linux'
+    && !process.report?.getReport?.()?.header?.glibcVersionRuntime;
+  const platformPackage = `@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}${
+    musl ? '-musl' : ''
+  }`;
+  const executableName = process.platform === 'win32' ? 'claude.exe' : 'claude';
+  try {
+    return require.resolve(`${platformPackage}/${executableName}`);
+  } catch {
+    return 'claude';
+  }
+}
+
+function defaultDetectNativeAuthentication(environment, { executable }) {
   const authEnvironment = { ...environment };
   delete authEnvironment.ANTHROPIC_API_KEY;
   delete authEnvironment.ANTHROPIC_AUTH_TOKEN;
@@ -450,6 +476,7 @@ function createResidentExecutor({
     backgroundTaskIds: new Set(),
     conversationId,
     closing: false,
+    closePromise: null,
     ended: false,
     input: null,
     outputPump: null,
@@ -572,6 +599,7 @@ export function createClaudeConversationAdapter({
   environmentAllowlist = DEFAULT_ENVIRONMENT_ALLOWLIST,
   resolveEnvironment = defaultResolveEnvironment,
   detectNativeAuthentication = defaultDetectNativeAuthentication,
+  resolveClaudeExecutable = defaultResolveClaudeExecutable,
 }) {
   if (typeof query !== 'function') throw new TypeError('query must be a function');
   if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs < 0) {
@@ -587,21 +615,30 @@ export function createClaudeConversationAdapter({
   if (typeof detectNativeAuthentication !== 'function') {
     throw new TypeError('detectNativeAuthentication must be a function');
   }
+  if (typeof resolveClaudeExecutable !== 'function') {
+    throw new TypeError('resolveClaudeExecutable must be a function');
+  }
   for (const option of CORE_MANAGED_CONTINUITY_OPTIONS) {
     if (queryOptions[option] !== undefined) {
       throw new TypeError(`queryOptions.${option} is managed by Core lineage authority`);
     }
   }
   for (const option of Object.keys(queryOptions.extraArgs ?? {})) {
-    const normalized = option
-      .replace(/([a-z])([A-Z])/g, '$1-$2')
-      .replace(/^-+/, '')
-      .replaceAll('_', '-')
-      .toLowerCase();
-    if (['continue', 'fork-session', 'resume', 'resume-session-at', 'session-id'].includes(
-      normalized,
-    )) {
+    if (CORE_MANAGED_CONTINUITY_ARGUMENTS.has(normalizeCliArgument(option))) {
       throw new TypeError(`queryOptions.extraArgs.${option} is managed by Core lineage authority`);
+    }
+  }
+  if (queryOptions.executableArgs !== undefined && !Array.isArray(queryOptions.executableArgs)) {
+    throw new TypeError('queryOptions.executableArgs must be an array');
+  }
+  for (const [index, argument] of (queryOptions.executableArgs ?? []).entries()) {
+    if (typeof argument !== 'string') {
+      throw new TypeError(`queryOptions.executableArgs[${index}] must be a string`);
+    }
+    if (CORE_MANAGED_CONTINUITY_ARGUMENTS.has(normalizeCliArgument(argument))) {
+      throw new TypeError(
+        `queryOptions.executableArgs[${index}] is managed by Core lineage authority`,
+      );
     }
   }
   if (!Array.isArray(environmentAllowlist) || environmentAllowlist.some(
@@ -620,8 +657,14 @@ export function createClaudeConversationAdapter({
     'ANTHROPIC_AUTH_TOKEN',
     'CLAUDE_CODE_OAUTH_TOKEN',
   ].some((key) => typeof frozenEnvironment[key] === 'string');
+  const claudeExecutable = resolveClaudeExecutable(queryOptions);
+  if (typeof claudeExecutable !== 'string' || claudeExecutable.length === 0) {
+    throw new TypeError('resolveClaudeExecutable must return a non-empty string');
+  }
   const nativeAuthentication = hasStaticAuthentication
-    && detectNativeAuthentication(detectionEnvironment, queryOptions);
+    && detectNativeAuthentication(detectionEnvironment, Object.freeze({
+      executable: claudeExecutable,
+    }));
   const resolvedEnvironment = resolveEnvironment(frozenEnvironment, Object.freeze({
     nativeAuthentication,
   }));
@@ -643,8 +686,16 @@ export function createClaudeConversationAdapter({
       throw new TypeError('controls.requestPermission must be a function');
     }
     let executor = executors.get(context.conversation_id);
+    if (executor?.closing) {
+      throw new Error('The Claude conversation query is closing or failed to close.');
+    }
     if (executor?.ended) {
-      await closeExecutor(executor);
+      try {
+        await closeExecutor(executor);
+      } catch (error) {
+        lifecycle = 'close_failed';
+        throw error;
+      }
       if (lifecycle !== 'open') {
         throw new Error(`Claude conversation adapter is ${lifecycle}.`);
       }
@@ -657,10 +708,17 @@ export function createClaudeConversationAdapter({
         throw new Error(`Claude conversation adapter is ${lifecycle}.`);
       }
       if (executors.get(context.conversation_id) === executor) {
-        executors.delete(context.conversation_id);
-        await closeExecutor(executor);
+        try {
+          await closeExecutor(executor);
+        } catch (error) {
+          lifecycle = 'close_failed';
+          throw error;
+        }
         if (lifecycle !== 'open') {
           throw new Error(`Claude conversation adapter is ${lifecycle}.`);
+        }
+        if (executors.get(context.conversation_id) === executor) {
+          executors.delete(context.conversation_id);
         }
       }
       executor = null;
@@ -803,11 +861,15 @@ export function createClaudeConversationAdapter({
   }
 
   async function closeExecutor(executor) {
+    if (executor.closePromise) return executor.closePromise;
     executor.closing = true;
-    executor.input.close();
-    rejectPendingPermissions(executor, new Error('Claude provider query closed.'));
-    await executor.query?.close?.();
-    if (executor.outputPump) await executor.outputPump;
+    executor.closePromise = (async () => {
+      executor.input.close();
+      rejectPendingPermissions(executor, new Error('Claude provider query closed.'));
+      await executor.query?.close?.();
+      if (executor.outputPump) await executor.outputPump;
+    })();
+    return executor.closePromise;
   }
 
   async function abort(context) {
@@ -824,8 +886,15 @@ export function createClaudeConversationAdapter({
       executor.input.remove(({ turn: queuedTurn }) => queuedTurn === turn);
       settleTurn(turn, { error: new Error('Claude provider query was isolated.') });
     }
-    executors.delete(context.conversation_id);
-    await closeExecutor(executor);
+    try {
+      await closeExecutor(executor);
+    } catch (error) {
+      lifecycle = 'close_failed';
+      throw error;
+    }
+    if (executors.get(context.conversation_id) === executor) {
+      executors.delete(context.conversation_id);
+    }
   }
 
   async function handleInteractionAnswer(delivery) {
@@ -847,6 +916,37 @@ export function createClaudeConversationAdapter({
     }
     const answerDecision = delivery.answer?.value?.decision;
     const allowed = ['allow', 'approve', 'approved', 'yes'].includes(answerDecision);
+    return {
+      status: allowed ? 'accepted' : 'deny',
+      handoff_id: delivery.handoff.handoff_id,
+      provider_attempt_id: delivery.handoff.provider_attempt_id,
+      handoff_attempt_id: delivery.handoff.handoff_attempt_id,
+      handoff_attempt_no: delivery.handoff.handoff_attempt_no,
+      lease_epoch: delivery.handoff.lease_epoch,
+      blocking_interactions_remaining: activeTurn.pendingPermissions.size > 1,
+    };
+  }
+
+  async function commitInteractionAnswer(delivery) {
+    const request = delivery?.request;
+    const executor = executors.get(request?.conversation_id);
+    const activeTurn = executor?.activeTurn;
+    if (
+      !activeTurn
+      || activeTurn.context.turn_id !== request?.turn_id
+      || activeTurn.context.attempt.attempt_id !== delivery?.handoff?.provider_attempt_id
+      || activeTurn.context.attempt.lease_epoch !== delivery?.handoff?.lease_epoch
+    ) {
+      throw new Error('Claude interaction commit does not match the active provider attempt fence.');
+    }
+    const providerInteractionRef = request.runtime_fence?.provider_interaction_ref;
+    const pending = activeTurn.pendingPermissions.get(providerInteractionRef);
+    if (!pending) {
+      throw new Error('Claude interaction commit has no matching pending SDK permission.');
+    }
+    const answerDecision = delivery.answer?.value?.decision;
+    const allowed = ['allow', 'approve', 'approved', 'yes'].includes(answerDecision);
+    activeTurn.pendingPermissions.delete(providerInteractionRef);
     pending.permission.resolve(allowed ? {
       behavior: 'allow',
       updatedInput: pending.input,
@@ -855,16 +955,6 @@ export function createClaudeConversationAdapter({
       message: 'Permission denied by the authorized user.',
       interrupt: false,
     });
-    activeTurn.pendingPermissions.delete(providerInteractionRef);
-    return {
-      status: allowed ? 'accepted' : 'deny',
-      handoff_id: delivery.handoff.handoff_id,
-      provider_attempt_id: delivery.handoff.provider_attempt_id,
-      handoff_attempt_id: delivery.handoff.handoff_attempt_id,
-      handoff_attempt_no: delivery.handoff.handoff_attempt_no,
-      lease_epoch: delivery.handoff.lease_epoch,
-      blocking_interactions_remaining: activeTurn.pendingPermissions.size > 0,
-    };
   }
 
   async function evictIdle({ canEvict, maxCount = Number.POSITIVE_INFINITY }) {
@@ -908,8 +998,13 @@ export function createClaudeConversationAdapter({
       ) {
         continue;
       }
-      executors.delete(conversationId);
-      await closeExecutor(executor);
+      try {
+        await closeExecutor(executor);
+      } catch (error) {
+        lifecycle = 'close_failed';
+        throw error;
+      }
+      if (executors.get(conversationId) === executor) executors.delete(conversationId);
       evicted.push(conversationId);
     }
     return evicted;
@@ -944,14 +1039,14 @@ export function createClaudeConversationAdapter({
   }
 
   function hasResident(conversationId) {
-    const executor = executors.get(conversationId);
-    return Boolean(executor && !executor.ended);
+    return executors.has(conversationId);
   }
 
   return Object.freeze({
     abort,
     cancel,
     close,
+    commitInteractionAnswer,
     evictIdle,
     execute,
     handleInteractionAnswer,
