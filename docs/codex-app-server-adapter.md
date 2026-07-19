@@ -5,7 +5,7 @@ It does not change the provider-neutral Core contracts or the migration consensu
 
 ## Transport boundary
 
-Each executor-service adapter instance supervises one `codex app-server --stdio` child and
+Each executor-service adapter instance supervises one `codex app-server --stdio` process group and
 multiplexes logical conversation executors over its newline-delimited bidirectional protocol.
 The child, connection, in-memory thread, request IDs, and active turn handles are not durable
 authority. Core's persisted lineage, turn, attempt, lease, interaction, and handoff records remain
@@ -76,8 +76,11 @@ also drive that durable failure path when Core is suspended in `waiting_user`; a
 an outstanding server request or unfinished tool is treated as invalid/uncertain rather than
 success. The supervised child's stderr
 is drained without persistence and stdio errors fail the fenced connection rather than escaping as
-unhandled stream errors. Fatal run-scoped protocol/capability failures retire the shared connection;
-a replacement connection is not started until the prior child emits `close`.
+unhandled stream errors. Fatal run-scoped protocol/capability failures retire the shared connection.
+On POSIX, the app-server leader is launched in a detached process group; loss of protocol control
+signals that exact group with `SIGTERM`, escalates to `SIGKILL`, and waits for both leader `close`
+and process-group disappearance. A replacement connection is not started while any member of the
+prior group can still be observed.
 
 ## Control and reconnect
 
@@ -90,9 +93,10 @@ leaves the lease held, persists a `side_effect_unknown` provider-stop incident, 
 high-priority manual-recovery notice. Turn interrupts do not kill the shared app-server process and
 do not discard the persisted lineage. A protocol or stdio failure terminates the lost shared
 connection under supervision. Uncertain running work enters `recovering` with its writer lease held,
-rather than `failed` with an immediately reusable lease. After the retired child is confirmed closed,
-a later safe turn creates a new connection and reloads its persisted thread before use; active work
-is never replayed automatically.
+rather than `failed` with an immediately reusable lease. Process exit proves isolation only after
+the supervised group is gone; an iterator return or app-server leader exit alone cannot release
+Codex authority. After the retired process group is confirmed gone, a later safe turn creates a new
+connection and reloads its persisted thread before use; active work is never replayed automatically.
 
 ## Verification boundary
 
@@ -100,7 +104,8 @@ Deterministic tests inject the child process and stdio streams and cover handsha
 single-process multiplexing, thread binding/resume/reconnect, provider-start and text/tool
 normalization, every supported bidirectional interaction family, provider acknowledgement and
 request-ID tombstones, bounded and confirmed timeout interruption, terminal race tombstones,
-transport loss, and stale request/answer/output fences. The
+transport loss, stale request/answer/output fences, process-group escalation, and the rule that
+neither a surviving group nor an iterator return can release recovering authority. The
 current app-server protocol returns all questions in
 one JSON-RPC response, while Core requires each question to have a unique interaction and forbids
 answering the next blocking ordinal before provider acknowledgement of the previous one. Until the
