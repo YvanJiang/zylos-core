@@ -2,9 +2,9 @@ import {
   admitNormalizedEvent,
   createNormalizedEventStreamState,
   TERMINAL_TURN_STATES,
-  validateDeliveryCommand,
   validateNormalizedEvent,
 } from '../../contracts/public/index.js';
+import { stageMainProjection } from './main-projection.js';
 import { initializeRuntimePersistence } from './schema.js';
 
 const CANONICAL_TRANSITIONS = Object.freeze({
@@ -137,77 +137,7 @@ function buildEvent({
   return event;
 }
 
-function projectRenderModel(renderModel, event) {
-  let text = renderModel.text;
-  if (event.kind === 'text_snapshot') {
-    text = event.payload.text;
-  } else if (event.kind === 'text_delta') {
-    const currentText = event.payload.start_offset === 0 ? '' : (renderModel.text ?? '');
-    text = `${currentText.slice(0, event.payload.start_offset)}${event.payload.text}`;
-  }
-  return {
-    ...renderModel,
-    phase: event.phase,
-    text,
-    error: event.error,
-    terminal: TERMINAL_TURN_STATES.includes(event.phase),
-  };
-}
-
-function projectPendingDelivery(database, turn, event) {
-  const pending = database.prepare(`
-    SELECT outbox_id, aggregate_version, command_json
-    FROM runtime_outbox
-    WHERE turn_id = ?
-      AND aggregate_type = 'turn_main'
-      AND status = 'pending'
-    ORDER BY aggregate_version DESC
-    LIMIT 1
-  `).get(turn.turn_id);
-  if (!pending) {
-    conflict(
-      'outbox_not_pending',
-      `Turn ${turn.turn_id} has no pending main delivery to project.`,
-    );
-  }
-  const currentCommand = JSON.parse(pending.command_json);
-  if (
-    currentCommand.contract !== 'zylos.delivery-command'
-    || currentCommand.aggregate_type !== 'turn_main'
-    || currentCommand.aggregate_id !== turn.turn_id
-    || currentCommand.operation !== 'create_main'
-  ) {
-    conflict(
-      'outbox_contract_mismatch',
-      `Turn ${turn.turn_id} has an incompatible pending main delivery.`,
-    );
-  }
-  const projectedCommand = {
-    ...currentCommand,
-    aggregate_version: event.turn_version,
-    event_sequence_through: event.event_sequence,
-    render_model: projectRenderModel(currentCommand.render_model, event),
-  };
-  validateDeliveryCommand(projectedCommand);
-  const projected = database.prepare(`
-    UPDATE runtime_outbox
-    SET aggregate_version = ?, command_json = ?
-    WHERE outbox_id = ?
-      AND aggregate_type = 'turn_main'
-      AND status = 'pending'
-      AND aggregate_version = ?
-  `).run(
-    event.turn_version,
-    JSON.stringify(projectedCommand),
-    pending.outbox_id,
-    pending.aggregate_version,
-  );
-  if (projected.changes !== 1) {
-    conflict('outbox_version_conflict', 'The pending main delivery changed concurrently.');
-  }
-}
-
-function persistEvent(database, turn, event) {
+function persistEvent(database, turn, event, generateId) {
   const streamState = loadStreamState(database, turn.turn_id);
   admitNormalizedEvent(streamState, event);
   database.prepare(`
@@ -222,7 +152,7 @@ function persistEvent(database, turn, event) {
     JSON.stringify(event),
     event.persisted_at,
   );
-  projectPendingDelivery(database, turn, event);
+  stageMainProjection(database, turn, event, { generateId });
 }
 
 function commitTurnEvent(database, {
@@ -231,6 +161,7 @@ function commitTurnEvent(database, {
   fence,
   nextState,
   staleMessage,
+  generateId,
 }) {
   const updated = database.prepare(`
     UPDATE runtime_turns
@@ -248,7 +179,7 @@ function commitTurnEvent(database, {
     fence.lease_epoch,
   );
   if (updated.changes !== 1) conflict('stale_attempt', staleMessage);
-  persistEvent(database, turn, event);
+  persistEvent(database, turn, event, generateId);
 }
 
 function transitionInTransaction(database, {
@@ -299,6 +230,7 @@ function transitionInTransaction(database, {
     fence,
     nextState: toState,
     staleMessage: 'The canonical turn transition lost its attempt fence.',
+    generateId,
   });
   if (TERMINAL_TURN_STATES.includes(toState)) {
     const completedQueueEntry = database.prepare(`
@@ -544,6 +476,7 @@ export function createExecutorStore({
         fence: turnContext.attempt,
         nextState: 'running',
         staleMessage: 'The adapter event lost its provider attempt fence.',
+        generateId,
       });
       return event;
     });
