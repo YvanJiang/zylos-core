@@ -201,6 +201,24 @@ describe('native-thread delivery authority', () => {
         },
       }),
     );
+    expect(createDeliveryLaneKeyFromIdentity(laneIdentity)).not.toBe(
+      createDeliveryLaneKeyFromIdentity({
+        ...laneIdentity,
+        target: { ...legacyTarget, region: 'region-tampered' },
+      }),
+    );
+    const nonThreadTarget = {
+      ...legacyTarget,
+      chat_type: 'group',
+      native_thread_or_topic_id: null,
+    };
+    expect(createDeliveryLaneKeyFromIdentity({
+      ...laneIdentity,
+      target: nonThreadTarget,
+    })).not.toBe(createDeliveryLaneKeyFromIdentity({
+      ...laneIdentity,
+      target: { ...nonThreadTarget, chat_type: 'synthetic' },
+    }));
   });
 
   test('rekeys a persisted v1.0 native-thread lane once before enforcing its identity', () => {

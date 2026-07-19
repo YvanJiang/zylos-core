@@ -3,8 +3,10 @@ import { canonicalizeJson } from '../../contracts/public/index.js';
 export function createDeliveryLaneKeyFromIdentity({ target, turnId, aggregateType }) {
   const identity = [
     target.channel,
+    target.region,
     target.tenant_id,
     target.bot_id,
+    target.chat_type,
     target.chat_id,
     turnId,
     aggregateType,
