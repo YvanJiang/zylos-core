@@ -36,6 +36,25 @@ export const DELIVERY_OPERATIONS = Object.freeze([
   'send_fallback',
 ]);
 
+export const DELIVERY_COMMAND_VERSIONS = Object.freeze(['1.0', '1.1']);
+export const DELIVERY_COMMAND_CURRENT_VERSION = '1.1';
+
+export const DELIVERY_TARGET_FIELDS_V1_0 = Object.freeze([
+  'region',
+  'tenant_id',
+  'channel',
+  'bot_id',
+  'chat_type',
+  'chat_id',
+  'native_thread_or_topic_id',
+]);
+
+export const DELIVERY_TARGET_FIELDS_V1_1 = Object.freeze([
+  ...DELIVERY_TARGET_FIELDS_V1_0,
+  'native_thread_root_message_id',
+  'native_thread_reply_target_message_id',
+]);
+
 export const DELIVERY_RESULT_STATUSES = Object.freeze([
   'delivered',
   'retryable_failure',

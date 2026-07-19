@@ -6,6 +6,7 @@ import {
   createContractError,
   createIdempotencyKey,
   createPayloadHash,
+  DELIVERY_COMMAND_CURRENT_VERSION,
   resolveIdempotencyReplay,
   validateDeliveryCommand,
   validateInboundEnvelope,
@@ -130,10 +131,16 @@ function buildInitialDeliveryCommand({
     chat_type: envelope.chat_type,
     chat_id: envelope.chat_id,
     native_thread_or_topic_id: envelope.native_thread_or_topic_id,
+    native_thread_root_message_id: envelope.chat_type === 'thread'
+      ? envelope.reply.root_message_id
+      : null,
+    native_thread_reply_target_message_id: envelope.chat_type === 'thread'
+      ? envelope.message_id
+      : null,
   };
   return {
     contract: 'zylos.delivery-command',
-    contract_version: '1.0',
+    contract_version: DELIVERY_COMMAND_CURRENT_VERSION,
     outbox_id: outboxId,
     delivery_id: deliveryId,
     trace_id: traceId,
@@ -246,6 +253,14 @@ export function acceptNormalInbound(
     throw new TypeError('initialDeliveryOperation must be create_main or send_text');
   }
   const validated = validateInboundEnvelope(envelope);
+  if (!validated.forwarded.actor.authenticated) {
+    throw new ContractKernelError(createContractError({
+      code: 'unauthenticated',
+      category: 'authentication',
+      userMessage: 'Inbound delivery facts must come from authenticated channel ingress.',
+      occurredAt: envelope.received_at,
+    }));
+  }
   const payloadHash = createPayloadHash(envelope, {
     scope: 'inbound',
     knownFields: INBOUND_ENVELOPE_KNOWN_FIELDS,
