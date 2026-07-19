@@ -83,6 +83,19 @@ export function createExecutorService({
     deadlineTimers.set(request.interaction_id, timer);
   }
 
+  function reschedulePendingInteractionDeadlines() {
+    const deadlines = store.listPendingInteractionDeadlines();
+    const scheduledInteractionIds = new Set(
+      deadlines.map(({ interaction_id: interactionId }) => interactionId),
+    );
+    for (const interactionId of deadlineTimers.keys()) {
+      if (!scheduledInteractionIds.has(interactionId)) {
+        clearInteractionDeadline(interactionId);
+      }
+    }
+    for (const deadline of deadlines) scheduleInteractionDeadline(deadline);
+  }
+
   function refresh() {
     executors = store.rebuildExecutorCache();
   }
@@ -99,9 +112,7 @@ export function createExecutorService({
 
   function start() {
     refresh();
-    for (const deadline of store.listPendingInteractionDeadlines()) {
-      scheduleInteractionDeadline(deadline);
-    }
+    reschedulePendingInteractionDeadlines();
     started = true;
     return snapshot();
   }
@@ -123,7 +134,7 @@ export function createExecutorService({
       const event = next.value;
       if (event?.kind === 'interaction_requested') {
         const request = store.requestInteraction(activeRun.turnContext, event.payload);
-        scheduleInteractionDeadline(request);
+        reschedulePendingInteractionDeadlines();
         refresh();
         return {
           status: 'waiting_user',
@@ -181,6 +192,7 @@ export function createExecutorService({
     ) {
       clearInteractionDeadline(result.interaction_id);
     }
+    reschedulePendingInteractionDeadlines();
     return result;
   }
 
@@ -188,18 +200,21 @@ export function createExecutorService({
     const result = store.expireInteraction(expiration);
     if (result.status !== 'expired' || result.turn_state !== 'timed_out') {
       if (result.status === 'not_pending') clearInteractionDeadline(result.interaction_id);
+      reschedulePendingInteractionDeadlines();
       return result;
     }
     clearInteractionDeadline(result.interaction_id);
 
     const timedOutRun = activeRuns.get(result.turn_id);
     if (!timedOutRun || typeof timedOutRun.iterator.return !== 'function') {
+      reschedulePendingInteractionDeadlines();
       return { ...result, lease_released: false };
     }
     await timedOutRun.iterator.return();
     activeRuns.delete(result.turn_id);
     const leaseReleased = store.releaseTimedOutExecutorLease(result);
     refresh();
+    reschedulePendingInteractionDeadlines();
     return { ...result, lease_released: leaseReleased };
   }
 
@@ -212,6 +227,7 @@ export function createExecutorService({
       Object.freeze(delivery),
     );
     const acknowledgement = store.acknowledgeInteractionHandoff(handlerAcknowledgement);
+    reschedulePendingInteractionDeadlines();
     const activeRun = activeRuns.get(delivery.request.turn_id);
     const execution = acknowledgement.resumed && activeRun
       ? await advanceRun(activeRun)

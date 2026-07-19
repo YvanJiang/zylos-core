@@ -357,16 +357,13 @@ export function createExecutorStore({
   initializeRuntimePersistence(database);
 
   function rejectedInteractionAnswerResult(answer, persistenceError) {
-    try {
-      validateInteractionAnswer(answer, { occurredAt: now() });
-    } catch {
-      throw persistenceError;
-    }
-    const interaction = database.prepare(`
-      SELECT request_json
-      FROM runtime_interactions
-      WHERE interaction_id = ?
-    `).get(answer.interaction_id);
+    const interaction = typeof answer?.interaction_id === 'string'
+      ? database.prepare(`
+        SELECT request_json
+        FROM runtime_interactions
+        WHERE interaction_id = ?
+      `).get(answer.interaction_id)
+      : null;
     const request = interaction ? JSON.parse(interaction.request_json) : null;
     const turn = request?.turn_id === null || request === null
       ? null
@@ -389,10 +386,10 @@ export function createExecutorStore({
     const result = {
       contract: 'zylos.interaction-answer-result',
       contract_version: '1.0',
-      trace_id: answer.trace_id,
-      interaction_id: answer.interaction_id,
-      answer_id: answer.answer_id,
-      idempotency_key: answer.idempotency_key,
+      trace_id: answer?.trace_id ?? null,
+      interaction_id: answer?.interaction_id ?? null,
+      answer_id: answer?.answer_id ?? null,
+      idempotency_key: answer?.idempotency_key ?? null,
       status: ANSWER_CONFLICT_CODES.has(code) ? 'conflict' : 'rejected',
       interaction_state: request?.state ?? null,
       interaction_version: request?.version ?? null,
@@ -410,7 +407,11 @@ export function createExecutorStore({
       received_at: null,
       committed_at: null,
     };
-    validateInteractionAnswerResult(result, { occurredAt: rejectedAt });
+    try {
+      validateInteractionAnswerResult(result, { occurredAt: rejectedAt });
+    } catch {
+      throw persistenceError;
+    }
     return result;
   }
 
@@ -444,10 +445,19 @@ export function createExecutorStore({
 
   function listPendingInteractionDeadlines() {
     return database.prepare(`
-      SELECT request_json
-      FROM runtime_interactions
-      WHERE state = 'pending'
-      ORDER BY json_extract(request_json, '$.expires_at'), interaction_id
+      SELECT candidate.request_json
+      FROM runtime_interactions AS candidate
+      WHERE candidate.state = 'pending'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM runtime_interactions AS blocker
+          WHERE blocker.turn_id = candidate.turn_id
+            AND blocker.ordinal < candidate.ordinal
+            AND blocker.state IN (
+              'pending', 'answer_committed', 'answer_delivering', 'delivery_unknown'
+            )
+        )
+      ORDER BY json_extract(candidate.request_json, '$.expires_at'), candidate.interaction_id
     `).all().map(({ request_json: requestJson }) => {
       const request = JSON.parse(requestJson);
       return {
@@ -1177,6 +1187,24 @@ export function createExecutorStore({
           interaction_id: request.interaction_id,
           interaction_version: request.version,
           expires_at: request.expires_at,
+          turn_id: request.turn_id,
+        };
+      }
+
+      const blockingInteraction = database.prepare(`
+        SELECT interaction_id
+        FROM runtime_interactions
+        WHERE turn_id = ?
+          AND state IN ('pending', 'answer_committed', 'answer_delivering', 'delivery_unknown')
+        ORDER BY ordinal ASC
+        LIMIT 1
+      `).get(request.turn_id);
+      if (blockingInteraction?.interaction_id !== request.interaction_id) {
+        return {
+          status: 'not_current',
+          interaction_id: request.interaction_id,
+          interaction_version: request.version,
+          blocking_interaction_id: blockingInteraction?.interaction_id ?? null,
           turn_id: request.turn_id,
         };
       }

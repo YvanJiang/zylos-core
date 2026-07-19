@@ -136,14 +136,19 @@ describe('runtime interaction order, authorization, and timeout', () => {
       error: { code: 'interaction_actor_forbidden' },
     });
 
-    expect(() => store.commitInteractionAnswer(interactionAnswer(request, 'unauthenticated', {
+    expect(store.commitInteractionAnswer(interactionAnswer(request, 'unauthenticated', {
       actor: {
         type: 'user',
         actor_id: 'user-123',
         authenticated: false,
         roles: ['member'],
       },
-    }))).toThrow(expect.objectContaining({ code: 'validation_error' }));
+    }))).toMatchObject({
+      status: 'rejected',
+      interaction_state: 'pending',
+      interaction_version: request.version,
+      error: { code: 'validation_error' },
+    });
 
     const disallowedSource = mainCardReply(request, 'disallowed-source');
     expect(store.commitInteractionAnswer(disallowedSource)).toMatchObject({
@@ -393,6 +398,48 @@ describe('runtime interaction order, authorization, and timeout', () => {
     expect(database.prepare(`
       SELECT state, turn_version FROM runtime_turns WHERE turn_id = ?
     `).get(request.turn_id)).toEqual(turnBefore);
+
+    database.close();
+  });
+
+  test('does not let a later ordinal timeout strand an earlier committed handoff', () => {
+    const database = openTestDatabase();
+    const { clock, store, turnContext } = createRunningTurn(database, 'timeout-order-race');
+    const first = requestInteraction(store, turnContext, 'timeout-order-first');
+    const second = requestInteraction(store, turnContext, 'timeout-order-second');
+    expect(store.listPendingInteractionDeadlines()).toEqual([{
+      interaction_id: first.interaction_id,
+      interaction_version: first.version,
+      expires_at: first.expires_at,
+    }]);
+    const committed = store.commitInteractionAnswer(interactionAnswer(first, 'timeout-order'));
+    expect(store.listPendingInteractionDeadlines()).toEqual([]);
+
+    clock.now = '2026-07-19T07:12:01Z';
+    expect(store.expireInteraction({
+      interaction_id: second.interaction_id,
+      interaction_version: second.version,
+    })).toMatchObject({
+      status: 'not_current',
+      interaction_id: second.interaction_id,
+      interaction_version: second.version,
+      blocking_interaction_id: first.interaction_id,
+    });
+    expect(readInteraction(database, first.interaction_id)).toMatchObject({
+      state: 'answer_committed',
+      version: first.version + 1,
+      handoff_state: 'pending',
+    });
+    expect(readInteraction(database, second.interaction_id)).toMatchObject({
+      state: 'pending',
+      version: second.version,
+    });
+    expect(database.prepare(`
+      SELECT state FROM runtime_interaction_handoffs WHERE handoff_id = ?
+    `).get(committed.handoff_id)).toEqual({ state: 'pending' });
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(second.turn_id)).toEqual({ state: 'waiting_user' });
 
     database.close();
   });
