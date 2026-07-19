@@ -634,6 +634,112 @@ describe('runtime interaction happy path', () => {
     database.close();
   });
 
+  test('does not advance an unanswered interaction while closing the service', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'service-close-waiting');
+    let advancedPastQuestion = false;
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute() {
+          yield {
+            kind: 'interaction_requested',
+            payload: {
+              provider_interaction_ref: 'provider-question-service-close',
+              tool_use_id: 'tool-use-service-close',
+              kind: 'tool_approval',
+              prompt: 'Allow the requested workspace write?',
+              choices: [],
+              authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+              allowed_sources: ['main_card_reply', 'card_action'],
+            },
+          };
+          advancedPastQuestion = true;
+          yield {
+            kind: 'text_snapshot',
+            payload: { text: 'must not run', end_offset: 12 },
+            provider_native_id: null,
+          };
+        },
+      },
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-close-waiting',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('service-close-waiting'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ status: 'waiting_user' });
+    await expect(service.close()).resolves.toBeUndefined();
+    expect(advancedPastQuestion).toBe(false);
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'waiting_user' });
+
+    database.close();
+  });
+
+  test('holds an answered interaction until a parallel permission callback settles', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'service-permission-interleave');
+    let resolvePermission;
+    const permission = new Promise((resolve) => { resolvePermission = resolve; });
+    const adapter = {
+      async *execute(context, controls) {
+        const permissionResult = controls.requestPermission(
+          { tool_name: 'Write', input: { path: '/workspace/file' } },
+        );
+        yield {
+          kind: 'interaction_requested',
+          payload: {
+            provider_interaction_ref: 'provider-question-permission-interleave',
+            tool_use_id: 'tool-use-permission-interleave',
+            kind: 'tool_approval',
+            prompt: 'Confirm the second blocking interaction.',
+            choices: [],
+            authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+            allowed_sources: ['main_card_reply', 'card_action'],
+          },
+        };
+        await permissionResult;
+      },
+      async handleInteractionAnswer(delivery) {
+        return {
+          status: 'accepted',
+          handoff_id: delivery.handoff.handoff_id,
+          provider_attempt_id: delivery.handoff.provider_attempt_id,
+          handoff_attempt_id: delivery.handoff.handoff_attempt_id,
+          handoff_attempt_no: delivery.handoff.handoff_attempt_no,
+          lease_epoch: delivery.handoff.lease_epoch,
+        };
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-permission-interleave',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('permission-interleave'),
+      permissionHandler: () => permission,
+    });
+
+    const waiting = await service.runNext();
+    const answerResult = service.submitInteractionAnswer(
+      interactionAnswer(waiting.request, 'permission-interleave'),
+    );
+    const handled = await service.deliverInteractionAnswer(answerResult.handoff_id);
+    expect(handled).toMatchObject({
+      acknowledgement: { resumed: false, turn_state: 'waiting_user' },
+      execution: null,
+    });
+    resolvePermission({ behavior: 'allow' });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'completed' });
+
+    await service.close();
+    database.close();
+  });
+
   test('rolls back the complete request transaction when its user projection cannot persist', () => {
     const database = openTestDatabase();
     const { accepted, store, turnContext } = createRunningTurn(database, 'request-rollback');

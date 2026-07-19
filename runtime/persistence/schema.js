@@ -109,6 +109,9 @@ const RUNTIME_SCHEMA = `
     conversation_id TEXT PRIMARY KEY REFERENCES runtime_conversations(conversation_id),
     bot_id TEXT NOT NULL,
     provider TEXT NOT NULL CHECK (provider IN ('claude', 'codex')),
+    owner_service_instance_id TEXT,
+    owner_epoch INTEGER NOT NULL DEFAULT 0 CHECK (owner_epoch >= 0),
+    owner_expires_at TEXT,
     admitted_at TEXT NOT NULL,
     last_used_at TEXT NOT NULL
   );
@@ -419,6 +422,14 @@ export function initializeRuntimePersistence(database) {
     'TEXT',
   );
   addColumnIfMissing(database, 'runtime_turn_queue', 'wait_reason', 'TEXT');
+  addColumnIfMissing(database, 'runtime_executor_residents', 'owner_service_instance_id', 'TEXT');
+  addColumnIfMissing(
+    database,
+    'runtime_executor_residents',
+    'owner_epoch',
+    'INTEGER NOT NULL DEFAULT 0 CHECK (owner_epoch >= 0)',
+  );
+  addColumnIfMissing(database, 'runtime_executor_residents', 'owner_expires_at', 'TEXT');
   addColumnIfMissing(
     database,
     'runtime_outbox',

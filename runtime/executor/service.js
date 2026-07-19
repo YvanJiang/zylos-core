@@ -92,6 +92,7 @@ export function createExecutorService({
   }
 
   function start() {
+    store.reconcileExpiredResidents();
     refresh();
     started = true;
     return snapshot();
@@ -127,6 +128,15 @@ export function createExecutorService({
       activeRun.settled = true;
       activeRunSettlements.delete(activeRun.settlement);
       activeRun.resolveSettlement();
+    }
+  }
+
+  function releaseAbsentResident(conversationId) {
+    if (
+      typeof adapter.hasResident === 'function'
+      && !adapter.hasResident(conversationId)
+    ) {
+      store.releaseExecutorResident(conversationId);
     }
   }
 
@@ -182,12 +192,7 @@ export function createExecutorService({
     activeRun.durableSettled = true;
     refresh();
     cleanupActiveRun(activeRun);
-    if (
-      typeof adapter.hasResident === 'function'
-      && !adapter.hasResident(turnContext.conversation_id)
-    ) {
-      store.releaseExecutorResident(turnContext.conversation_id);
-    }
+    releaseAbsentResident(turnContext.conversation_id);
     return resultFor(activeRun, terminalState);
   }
 
@@ -221,6 +226,7 @@ export function createExecutorService({
     activeRun.durableSettled = true;
     refresh();
     cleanupActiveRun(activeRun);
+    releaseAbsentResident(activeRun.turnContext.conversation_id);
     return resultFor(activeRun, failure ? 'failed' : terminalState);
   }
 
@@ -235,6 +241,7 @@ export function createExecutorService({
             activeRun.turnContext,
             record.payload,
           ));
+          activeRun.pauseKind = 'interaction';
           refresh();
           return resultFor(activeRun, 'waiting_user', { request });
         }
@@ -282,6 +289,12 @@ export function createExecutorService({
   function createPermissionControls(activeRun, adapterContext) {
     const { turnContext } = activeRun;
     return Object.freeze({
+      interactionPolicy: Object.freeze({
+        allowed_sources: Object.freeze(['main_card_reply', 'card_action']),
+        authorized_subjects: Object.freeze(
+          turnContext.interaction_authority.map((subject) => Object.freeze({ ...subject })),
+        ),
+      }),
       async requestPermission(request, { signal } = {}) {
         if (permissionHandler === null) {
           return Object.freeze({
@@ -325,7 +338,11 @@ export function createExecutorService({
               !cancelledTurnIds.has(turnContext.turn_id)
               && !closingPermissionTurnIds.has(turnContext.turn_id)
             ) {
-              persist(() => store.transitionTurn(turnContext, 'waiting_user', 'running'));
+              const resumed = persist(() => store.resumeTurnAfterPermission(turnContext));
+              if (resumed.resumed && activeRun.pauseKind === 'interaction') {
+                activeRun.pauseKind = null;
+                queueMicrotask(() => advanceRun(activeRun).catch(() => {}));
+              }
             }
             closingPermissionTurnIds.delete(turnContext.turn_id);
           }
@@ -343,13 +360,17 @@ export function createExecutorService({
       throw new Error(`Executor service is ${lifecycle}; it cannot claim another turn.`);
     }
     if (!started) start();
-    let reservation = store.reserveNextExecutor({ maxResidentExecutorsPerBot });
+    let reservation = store.reserveNextExecutor({
+      maxResidentExecutorsPerBot,
+      markCapacityWait: false,
+    });
     if (reservation.status === 'idle') return reservation;
     if (reservation.status === 'capacity_wait') {
-      const evicted = await evictIdleExecutors();
-      if (evicted.length > 0) {
-        reservation = store.reserveNextExecutor({ maxResidentExecutorsPerBot });
+      await evictIdleExecutors();
+      if (lifecycle !== 'open') {
+        throw new Error(`Executor service is ${lifecycle}; it cannot claim another turn.`);
       }
+      reservation = store.reserveNextExecutor({ maxResidentExecutorsPerBot });
     }
     if (reservation.status === 'capacity_wait') {
       refresh();
@@ -371,6 +392,7 @@ export function createExecutorService({
       durableSettled: false,
       iterator: null,
       outcome: null,
+      pauseKind: null,
       resolveSettlement,
       settled: false,
       settlement,
@@ -438,7 +460,13 @@ export function createExecutorService({
         uncertainTurnIds.add(turnContext.turn_id);
         cancellation.status = 'uncertain';
         cancellation.resolve();
-        if (typeof adapter.abort === 'function') await adapter.abort(turnContext);
+        if (typeof adapter.abort === 'function') {
+          try {
+            await adapter.abort(turnContext);
+          } catch (abortFailure) {
+            error.abortFailure = abortFailure;
+          }
+        }
       } else {
         cancellation.status = 'failed';
         cancellation.resolve();
@@ -447,11 +475,18 @@ export function createExecutorService({
     }
     cancellation.status = 'confirmed';
     cancellation.resolve();
+    const activeRun = activeRuns.get(turnContext.turn_id);
+    let execution = null;
+    if (activeRun?.pauseKind === 'interaction') {
+      activeRun.pauseKind = null;
+      execution = await advanceRun(activeRun);
+    }
     return {
       status: 'cancellation_requested',
       conversation_id: turnContext.conversation_id,
       turn_id: turnContext.turn_id,
       ...turnContext.attempt,
+      ...(execution ? { execution } : {}),
     };
   }
 
@@ -478,8 +513,12 @@ export function createExecutorService({
     const handlerAcknowledgement = await adapter.handleInteractionAnswer(
       Object.freeze(delivery),
     );
-    const acknowledgement = store.acknowledgeInteractionHandoff(handlerAcknowledgement);
+    const pendingPermissions = permissionControllers.get(delivery.request.turn_id)?.size ?? 0;
+    const acknowledgement = store.acknowledgeInteractionHandoff(handlerAcknowledgement, {
+      holdForPermission: pendingPermissions > 0,
+    });
     const activeRun = activeRuns.get(delivery.request.turn_id);
+    if (acknowledgement.resumed && activeRun) activeRun.pauseKind = null;
     const execution = acknowledgement.resumed && activeRun
       ? await advanceRun(activeRun)
       : null;
@@ -498,9 +537,14 @@ export function createExecutorService({
         }
       } catch (error) {
         closeError = error;
+        closedConversationIds = error.closedConversationIds ?? [];
       }
       for (const activeRun of activeRuns.values()) {
-        if (!activeRun.advancing && activeRun.iterator) advanceRun(activeRun);
+        if (activeRun.pauseKind === 'interaction') {
+          cleanupActiveRun(activeRun);
+        } else if (!activeRun.advancing && activeRun.iterator) {
+          advanceRun(activeRun);
+        }
       }
       await Promise.allSettled([...activeRunSettlements]);
       for (const conversationId of closedConversationIds) {

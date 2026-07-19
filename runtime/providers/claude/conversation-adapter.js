@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
 
@@ -7,6 +9,7 @@ const DEFAULT_ENVIRONMENT_ALLOWLIST = Object.freeze([
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_BASE_URL',
   'CLAUDE_CODE_OAUTH_TOKEN',
+  'CLAUDE_CONFIG_DIR',
   'HOME',
   'HTTP_PROXY',
   'HTTPS_PROXY',
@@ -20,6 +23,13 @@ const DEFAULT_ENVIRONMENT_ALLOWLIST = Object.freeze([
   'TMPDIR',
   'USER',
 ]);
+const CORE_MANAGED_CONTINUITY_OPTIONS = Object.freeze([
+  'continue',
+  'forkSession',
+  'resume',
+  'resumeSessionAt',
+  'sessionId',
+]);
 
 function selectEnvironment(environment, allowlist = DEFAULT_ENVIRONMENT_ALLOWLIST) {
   const selected = {};
@@ -27,6 +37,20 @@ function selectEnvironment(environment, allowlist = DEFAULT_ENVIRONMENT_ALLOWLIS
     if (typeof environment[key] === 'string') selected[key] = environment[key];
   }
   return selected;
+}
+
+function defaultResolveEnvironment(environment) {
+  const resolved = { ...environment };
+  const configDirectory = environment.CLAUDE_CONFIG_DIR
+    ?? (environment.HOME ? path.join(environment.HOME, '.claude') : null);
+  const hasNativeCredentials = configDirectory !== null
+    && fs.existsSync(path.join(configDirectory, '.credentials.json'));
+  if (hasNativeCredentials) {
+    delete resolved.ANTHROPIC_API_KEY;
+    delete resolved.ANTHROPIC_AUTH_TOKEN;
+    delete resolved.CLAUDE_CODE_OAUTH_TOKEN;
+  }
+  return resolved;
 }
 
 function createDeferred() {
@@ -274,6 +298,19 @@ function settleUnfinishedTurns(executor, options = {}) {
   }
 }
 
+function rejectPendingPermissions(executor, error) {
+  const turns = new Set([executor.providerTurn, executor.activeTurn]);
+  for (const turn of turns) {
+    rejectTurnPermissions(turn, error);
+  }
+}
+
+function rejectTurnPermissions(turn, error) {
+  for (const { permission } of turn?.pendingPermissions?.values() ?? []) {
+    permission.reject(error);
+  }
+}
+
 async function requestToolPermission(executor, toolName, input, sdkContext) {
   const activeTurn = executor.providerTurn;
   if (!activeTurn || activeTurn.resultSeen) {
@@ -282,6 +319,45 @@ async function requestToolPermission(executor, toolName, input, sdkContext) {
       message: 'The provider attempt is no longer active.',
       interrupt: true,
     };
+  }
+  const interactionPolicy = activeTurn.controls.interactionPolicy;
+  if (interactionPolicy) {
+    const providerInteractionRef = sdkContext?.requestId
+      ?? sdkContext?.toolUseID
+      ?? `${activeTurn.messageUuid}:permission:${activeTurn.pendingPermissions.size + 1}`;
+    const permission = createDeferred();
+    activeTurn.pendingPermissions.set(providerInteractionRef, {
+      input,
+      permission,
+      toolName,
+    });
+    const abort = () => {
+      const error = new Error('Claude permission interaction was cancelled.');
+      error.name = 'AbortError';
+      permission.reject(error);
+    };
+    sdkContext?.signal?.addEventListener?.('abort', abort, { once: true });
+    activeTurn.output.push({
+      kind: 'interaction_requested',
+      payload: {
+        provider_interaction_ref: providerInteractionRef,
+        tool_use_id: sdkContext?.toolUseID ?? providerInteractionRef,
+        kind: 'tool_approval',
+        prompt: `Allow Claude to use ${toolName}?`,
+        choices: [
+          { choice_id: 'allow', label: 'Allow' },
+          { choice_id: 'deny', label: 'Deny' },
+        ],
+        authorized_subjects: interactionPolicy.authorized_subjects,
+        allowed_sources: interactionPolicy.allowed_sources,
+      },
+    });
+    try {
+      return await permission.promise;
+    } finally {
+      sdkContext?.signal?.removeEventListener?.('abort', abort);
+      activeTurn.pendingPermissions.delete(providerInteractionRef);
+    }
   }
   let decision;
   try {
@@ -431,11 +507,13 @@ function createResidentExecutor({
           }
         }
       } catch (error) {
+        rejectPendingPermissions(executor, error);
         settleUnfinishedTurns(executor, { error });
         executor.activeTurn = null;
         executor.providerTurn = null;
         executor.notifySwitchable();
       } finally {
+        rejectPendingPermissions(executor, new Error('Claude provider query ended.'));
         settleUnfinishedTurns(executor);
         executor.activeTurn = null;
         executor.providerTurn = null;
@@ -455,6 +533,7 @@ export function createClaudeConversationAdapter({
   now = () => Date.now(),
   generateMessageUuid = randomUUID,
   environmentAllowlist = DEFAULT_ENVIRONMENT_ALLOWLIST,
+  resolveEnvironment = defaultResolveEnvironment,
 }) {
   if (typeof query !== 'function') throw new TypeError('query must be a function');
   if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs < 0) {
@@ -464,19 +543,35 @@ export function createClaudeConversationAdapter({
   if (typeof generateMessageUuid !== 'function') {
     throw new TypeError('generateMessageUuid must be a function');
   }
+  if (typeof resolveEnvironment !== 'function') {
+    throw new TypeError('resolveEnvironment must be a function');
+  }
+  for (const option of CORE_MANAGED_CONTINUITY_OPTIONS) {
+    if (queryOptions[option] !== undefined) {
+      throw new TypeError(`queryOptions.${option} is managed by Core lineage authority`);
+    }
+  }
   if (!Array.isArray(environmentAllowlist) || environmentAllowlist.some(
     (key) => typeof key !== 'string' || key.length === 0,
   )) {
     throw new TypeError('environmentAllowlist must contain non-empty strings');
   }
   const environment = queryOptions.env ?? process.env;
+  const resolvedEnvironment = resolveEnvironment(Object.freeze({ ...environment }));
+  if (!resolvedEnvironment || typeof resolvedEnvironment !== 'object') {
+    throw new TypeError('resolveEnvironment must return an environment object');
+  }
   const safeQueryOptions = {
     ...queryOptions,
-    env: selectEnvironment(environment, environmentAllowlist),
+    env: selectEnvironment(resolvedEnvironment, environmentAllowlist),
   };
   const executors = new Map();
+  let lifecycle = 'open';
 
   async function* execute(context, controls = {}) {
+    if (lifecycle !== 'open') {
+      throw new Error(`Claude conversation adapter is ${lifecycle}.`);
+    }
     if (typeof controls.requestPermission !== 'function') {
       throw new TypeError('controls.requestPermission must be a function');
     }
@@ -488,6 +583,9 @@ export function createClaudeConversationAdapter({
     }
     if (executor && executor.lineageId !== context.lineage_id) {
       await executor.waitUntilSwitchable();
+      if (lifecycle !== 'open') {
+        throw new Error(`Claude conversation adapter is ${lifecycle}.`);
+      }
       if (executors.get(context.conversation_id) === executor) {
         executors.delete(context.conversation_id);
         await closeExecutor(executor);
@@ -526,6 +624,7 @@ export function createClaudeConversationAdapter({
       context,
       messageUuid,
       output,
+      pendingPermissions: new Map(),
       resultSeen: false,
       text: '',
       toolNames: new Map(),
@@ -582,6 +681,8 @@ export function createClaudeConversationAdapter({
       error.cancellationUncertain = true;
       throw error;
     }
+    const cancelledPermission = new Error('Claude permission interaction was cancelled.');
+    cancelledPermission.name = 'AbortError';
     if (receipt?.still_queued?.includes(activeTurn.messageUuid)) {
       if (typeof executor.query.cancelAsyncMessage !== 'function') {
         activeTurn.cancelRequested = false;
@@ -611,15 +712,19 @@ export function createClaudeConversationAdapter({
         error.cancellationUncertain = true;
         throw error;
       }
+      rejectTurnPermissions(activeTurn, cancelledPermission);
       settleTurn(activeTurn, { outcome: 'cancelled' });
       if (executor.activeTurn === activeTurn) executor.activeTurn = null;
       executor.lastUsedAt = now();
       executor.notifySwitchable();
+    } else {
+      rejectTurnPermissions(activeTurn, cancelledPermission);
     }
   }
 
   async function closeExecutor(executor) {
     executor.input.close();
+    rejectPendingPermissions(executor, new Error('Claude provider query closed.'));
     await executor.query?.close?.();
     if (executor.outputPump) await executor.outputPump;
   }
@@ -634,9 +739,49 @@ export function createClaudeConversationAdapter({
     if (!turn && residentTurns.length > 0) {
       throw new Error('Claude abort does not match the active provider attempt fence.');
     }
-    if (turn) executor.input.remove(({ turn: queuedTurn }) => queuedTurn === turn);
+    if (turn) {
+      executor.input.remove(({ turn: queuedTurn }) => queuedTurn === turn);
+      settleTurn(turn, { error: new Error('Claude provider query was isolated.') });
+    }
     executors.delete(context.conversation_id);
     await closeExecutor(executor);
+  }
+
+  async function handleInteractionAnswer(delivery) {
+    const request = delivery?.request;
+    const executor = executors.get(request?.conversation_id);
+    const activeTurn = executor?.activeTurn;
+    if (
+      !activeTurn
+      || activeTurn.context.turn_id !== request?.turn_id
+      || activeTurn.context.attempt.attempt_id !== delivery?.handoff?.provider_attempt_id
+      || activeTurn.context.attempt.lease_epoch !== delivery?.handoff?.lease_epoch
+    ) {
+      throw new Error('Claude interaction answer does not match the active provider attempt fence.');
+    }
+    const providerInteractionRef = request.runtime_fence?.provider_interaction_ref;
+    const pending = activeTurn.pendingPermissions.get(providerInteractionRef);
+    if (!pending) {
+      throw new Error('Claude interaction answer has no matching pending SDK permission.');
+    }
+    const answerDecision = delivery.answer?.value?.decision;
+    const allowed = ['allow', 'approve', 'approved', 'yes'].includes(answerDecision);
+    pending.permission.resolve(allowed ? {
+      behavior: 'allow',
+      updatedInput: pending.input,
+    } : {
+      behavior: 'deny',
+      message: 'Permission denied by the authorized user.',
+      interrupt: false,
+    });
+    return {
+      status: allowed ? 'accepted' : 'deny',
+      handoff_id: delivery.handoff.handoff_id,
+      provider_attempt_id: delivery.handoff.provider_attempt_id,
+      handoff_attempt_id: delivery.handoff.handoff_attempt_id,
+      handoff_attempt_no: delivery.handoff.handoff_attempt_no,
+      lease_epoch: delivery.handoff.lease_epoch,
+    };
   }
 
   async function evictIdle({ canEvict }) {
@@ -681,17 +826,44 @@ export function createClaudeConversationAdapter({
   }
 
   async function close() {
-    const conversationIds = [...executors.keys()];
-    await Promise.allSettled(
-      [...executors.values()].map((executor) => closeExecutor(executor)),
+    if (lifecycle === 'closed') return [];
+    lifecycle = 'closing';
+    const entries = [...executors.entries()];
+    const results = await Promise.allSettled(
+      entries.map(([, executor]) => closeExecutor(executor)),
     );
-    executors.clear();
-    return conversationIds;
+    const closedConversationIds = [];
+    const failures = [];
+    for (const [index, result] of results.entries()) {
+      const [conversationId, executor] = entries[index];
+      if (result.status === 'fulfilled') {
+        if (executors.get(conversationId) === executor) executors.delete(conversationId);
+        closedConversationIds.push(conversationId);
+      } else {
+        failures.push(result.reason);
+      }
+    }
+    if (failures.length > 0) {
+      lifecycle = 'close_failed';
+      const error = new AggregateError(failures, 'One or more Claude queries failed to close.');
+      error.closedConversationIds = closedConversationIds;
+      throw error;
+    }
+    lifecycle = 'closed';
+    return closedConversationIds;
   }
 
   function hasResident(conversationId) {
     return executors.has(conversationId);
   }
 
-  return Object.freeze({ abort, cancel, close, evictIdle, execute, hasResident });
+  return Object.freeze({
+    abort,
+    cancel,
+    close,
+    evictIdle,
+    execute,
+    handleInteractionAnswer,
+    hasResident,
+  });
 }

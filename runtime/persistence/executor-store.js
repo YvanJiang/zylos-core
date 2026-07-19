@@ -410,11 +410,45 @@ export function createExecutorStore({
   }
 
   function isResidentConversation(conversationId) {
-    return Boolean(database.prepare(`
-      SELECT 1
+    return database.prepare(`
+      SELECT owner_service_instance_id, owner_epoch, owner_expires_at
       FROM runtime_executor_residents
       WHERE conversation_id = ? AND provider = 'claude'
-    `).get(conversationId));
+    `).get(conversationId) ?? null;
+  }
+
+  function residentOwnerExpiresAt(ownedAt) {
+    const timestamp = Date.parse(ownedAt);
+    if (!Number.isFinite(timestamp)) {
+      throw new TypeError('now must return an ISO timestamp for resident ownership');
+    }
+    return new Date(timestamp + leaseDurationMs).toISOString();
+  }
+
+  function reconcileExpiredResidents() {
+    if (provider !== 'claude') return 0;
+    const reconciledAt = now();
+    const released = database.prepare(`
+      DELETE FROM runtime_executor_residents
+      WHERE provider = 'claude'
+        AND (
+          owner_service_instance_id IS NULL
+          OR (
+            owner_service_instance_id != ?
+            AND (owner_expires_at IS NULL OR owner_expires_at <= ?)
+          )
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM runtime_turns
+          WHERE runtime_turns.conversation_id = runtime_executor_residents.conversation_id
+            AND state IN (
+              'queued', 'starting', 'running', 'waiting_user',
+              'redirecting', 'recovering', 'retrying'
+            )
+        )
+    `).run(serviceInstanceId, reconciledAt);
+    return released.changes;
   }
 
   function residentCountForBot(botId) {
@@ -425,8 +459,9 @@ export function createExecutorStore({
     `).get(botId).count;
   }
 
-  function reserveNextExecutor({ maxResidentExecutorsPerBot }) {
+  function reserveNextExecutor({ maxResidentExecutorsPerBot, markCapacityWait = true }) {
     const reserve = database.transaction(() => {
+      reconcileExpiredResidents();
       const candidates = listClaimableQueuedTurns();
       if (candidates.length === 0) return { status: 'idle' };
       if (provider !== 'claude') {
@@ -436,42 +471,110 @@ export function createExecutorStore({
         };
       }
 
-      let selected = candidates.find(
-        (candidate) => isResidentConversation(candidate.conversation_id),
-      );
+      let selected = candidates.find((candidate) => {
+        const resident = isResidentConversation(candidate.conversation_id);
+        return resident?.owner_service_instance_id === serviceInstanceId;
+      });
+      if (!selected) {
+        const takeoverAt = now();
+        for (const candidate of candidates) {
+          const resident = isResidentConversation(candidate.conversation_id);
+          if (!resident || (resident.owner_expires_at && resident.owner_expires_at > takeoverAt)) {
+            continue;
+          }
+          const taken = database.prepare(`
+            UPDATE runtime_executor_residents
+            SET owner_service_instance_id = ?, owner_epoch = owner_epoch + 1,
+              owner_expires_at = ?, last_used_at = ?
+            WHERE conversation_id = ? AND provider = 'claude'
+              AND owner_epoch = ?
+              AND (owner_expires_at IS NULL OR owner_expires_at <= ?)
+          `).run(
+            serviceInstanceId,
+            residentOwnerExpiresAt(takeoverAt),
+            takeoverAt,
+            candidate.conversation_id,
+            resident.owner_epoch,
+            takeoverAt,
+          );
+          if (taken.changes === 1) {
+            selected = candidate;
+            break;
+          }
+        }
+      }
       if (!selected) {
         for (const candidate of candidates) {
+          if (isResidentConversation(candidate.conversation_id)) continue;
           if (residentCountForBot(candidate.bot_id) >= maxResidentExecutorsPerBot) continue;
           const admittedAt = now();
           database.prepare(`
             INSERT INTO runtime_executor_residents (
-              conversation_id, bot_id, provider, admitted_at, last_used_at
-            ) VALUES (?, ?, 'claude', ?, ?)
-          `).run(candidate.conversation_id, candidate.bot_id, admittedAt, admittedAt);
+              conversation_id, bot_id, provider, owner_service_instance_id,
+              owner_epoch, owner_expires_at, admitted_at, last_used_at
+            ) VALUES (?, ?, 'claude', ?, 1, ?, ?, ?)
+          `).run(
+            candidate.conversation_id,
+            candidate.bot_id,
+            serviceInstanceId,
+            residentOwnerExpiresAt(admittedAt),
+            admittedAt,
+            admittedAt,
+          );
           selected = candidate;
           break;
         }
-      } else {
+      }
+      if (selected) {
+        const usedAt = now();
         database.prepare(`
           UPDATE runtime_executor_residents
-          SET last_used_at = ?
+          SET last_used_at = ?, owner_expires_at = ?
           WHERE conversation_id = ? AND provider = 'claude'
-        `).run(now(), selected.conversation_id);
+            AND owner_service_instance_id = ?
+        `).run(
+          usedAt,
+          residentOwnerExpiresAt(usedAt),
+          selected.conversation_id,
+          serviceInstanceId,
+        );
       }
 
       const waits = [];
+      const blocked = [];
       for (const candidate of candidates) {
         if (candidate.conversation_id === selected?.conversation_id) continue;
-        if (isResidentConversation(candidate.conversation_id)) continue;
+        const resident = isResidentConversation(candidate.conversation_id);
+        if (resident?.owner_service_instance_id === serviceInstanceId) continue;
+        if (resident) {
+          blocked.push(candidate);
+          if (markCapacityWait || selected) {
+            const wait = markCapacityWaitInTransaction(candidate.turn_id, now());
+            if (wait) waits.push(wait);
+          }
+          continue;
+        }
         if (residentCountForBot(candidate.bot_id) < maxResidentExecutorsPerBot) continue;
-        const wait = markCapacityWaitInTransaction(candidate.turn_id, now());
-        if (wait) waits.push(wait);
+        blocked.push(candidate);
+        if (markCapacityWait || selected) {
+          const wait = markCapacityWaitInTransaction(candidate.turn_id, now());
+          if (wait) waits.push(wait);
+        }
       }
 
       if (selected) {
         return { status: 'ready', conversation_id: selected.conversation_id };
       }
-      return waits.length > 0 ? { status: 'capacity_wait', ...waits[0] } : { status: 'idle' };
+      if (waits.length > 0) return { status: 'capacity_wait', ...waits[0] };
+      if (blocked.length > 0) {
+        return {
+          status: 'capacity_wait',
+          conversation_id: blocked[0].conversation_id,
+          turn_id: blocked[0].turn_id,
+          wait_reason: 'executor_capacity',
+        };
+      }
+      return { status: 'idle' };
     });
     return reserve.immediate();
   }
@@ -580,6 +683,9 @@ export function createExecutorStore({
         provider_native_id: current.provider_native_id,
         trace_id: envelope.trace_id,
         input: envelope.content,
+        interaction_authority: envelope.actor?.authenticated === true
+          ? [{ type: 'actor', actor_id: envelope.actor.actor_id }]
+          : [],
         attempt: fence,
       };
     });
@@ -739,6 +845,7 @@ export function createExecutorStore({
     const released = database.prepare(`
       DELETE FROM runtime_executor_residents
       WHERE conversation_id = ? AND provider = ?
+        AND (owner_service_instance_id = ? OR owner_service_instance_id IS NULL)
         AND NOT EXISTS (
           SELECT 1
           FROM runtime_turns
@@ -748,7 +855,7 @@ export function createExecutorStore({
               'redirecting', 'recovering', 'retrying'
             )
         )
-    `).run(conversationId, provider, conversationId);
+    `).run(conversationId, provider, serviceInstanceId, conversationId);
     return released.changes === 1;
   }
 
@@ -1153,7 +1260,7 @@ export function createExecutorStore({
     return claim.immediate();
   }
 
-  function acknowledgeInteractionHandoff(acknowledgement) {
+  function acknowledgeInteractionHandoff(acknowledgement, { holdForPermission = false } = {}) {
     const acknowledge = database.transaction(() => {
       const acknowledgedAt = now();
       if (!['accepted', 'deny'].includes(acknowledgement?.status)) {
@@ -1262,15 +1369,16 @@ export function createExecutorStore({
         acknowledgedAt,
       );
 
-      const hasNextBlocking = database.prepare(`
+      const hasNextBlockingInteraction = database.prepare(`
         SELECT 1
         FROM runtime_interactions
         WHERE turn_id = ? AND interaction_id != ?
           AND state IN ('pending', 'answer_committed', 'answer_delivering', 'delivery_unknown')
         LIMIT 1
       `).get(turn.turn_id, request.interaction_id) !== undefined;
+      const remainsBlocked = hasNextBlockingInteraction || holdForPermission;
       let currentTurn = turn;
-      if (!hasNextBlocking) {
+      if (!remainsBlocked) {
         transitionInTransaction(database, {
           turnId: turn.turn_id,
           fromState: 'waiting_user',
@@ -1291,7 +1399,7 @@ export function createExecutorStore({
         provider,
         descriptor: {
           kind: 'interaction_answered',
-          phase: hasNextBlocking ? 'waiting_user' : 'running',
+          phase: remainsBlocked ? 'waiting_user' : 'running',
           payload: {
             interaction_id: request.interaction_id,
             ordinal: request.ordinal,
@@ -1308,7 +1416,7 @@ export function createExecutorStore({
         turn: currentTurn,
         event,
         fence,
-        nextState: hasNextBlocking ? 'waiting_user' : 'running',
+        nextState: remainsBlocked ? 'waiting_user' : 'running',
         staleMessage: 'The handler acknowledgement lost its provider attempt fence.',
         generateId,
       });
@@ -1317,12 +1425,45 @@ export function createExecutorStore({
         interaction_id: request.interaction_id,
         handoff_id: handoff.handoff_id,
         audit_id: auditId,
-        resumed: !hasNextBlocking,
-        turn_state: hasNextBlocking ? 'waiting_user' : 'running',
+        resumed: !remainsBlocked,
+        turn_state: remainsBlocked ? 'waiting_user' : 'running',
         turn_version: event.turn_version,
       };
     });
     return acknowledge.immediate();
+  }
+
+  function resumeTurnAfterPermission(turnContext) {
+    const resume = database.transaction(() => {
+      const turn = loadTurn(database, turnContext.turn_id);
+      assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
+      if (turn.state !== 'waiting_user') {
+        return { resumed: turn.state === 'running', turn_state: turn.state };
+      }
+      const hasBlockingInteraction = database.prepare(`
+        SELECT 1
+        FROM runtime_interactions
+        WHERE turn_id = ?
+          AND state IN ('pending', 'answer_committed', 'answer_delivering', 'delivery_unknown')
+        LIMIT 1
+      `).get(turn.turn_id) !== undefined;
+      if (hasBlockingInteraction) {
+        return { resumed: false, turn_state: 'waiting_user' };
+      }
+      transitionInTransaction(database, {
+        turnId: turn.turn_id,
+        fromState: 'waiting_user',
+        toState: 'running',
+        fence: turnContext.attempt,
+        provider,
+        serviceInstanceId,
+        occurredAt: now(),
+        generateId,
+        reasonCode: 'permission_resolved',
+      });
+      return { resumed: true, turn_state: 'running' };
+    });
+    return resume.immediate();
   }
 
   return Object.freeze({
@@ -1335,8 +1476,10 @@ export function createExecutorStore({
     commitInteractionAnswer,
     isConversationEvictable,
     releaseExecutorResident,
+    reconcileExpiredResidents,
     rebuildExecutorCache,
     requestInteraction,
+    resumeTurnAfterPermission,
     reserveNextExecutor,
     transitionTurn,
   });

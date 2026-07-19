@@ -58,6 +58,36 @@ function acceptQueuedTurn(database, suffix) {
   });
 }
 
+function permissionAnswer(request, suffix, decision = 'approve') {
+  const sourceEventId = `permission-action-${suffix}`;
+  return {
+    contract: 'zylos.interaction-answer',
+    contract_version: '1.0',
+    trace_id: `trace-permission-answer-${suffix}`,
+    interaction_id: request.interaction_id,
+    interaction_version: request.version,
+    answer_id: `permission-answer-${suffix}`,
+    source_event_or_action_id: sourceEventId,
+    actor: { type: 'user', actor_id: 'user-A', authenticated: true, roles: ['member'] },
+    source_context: {
+      region: 'cn',
+      tenant_id: 'tenant-A',
+      channel: 'feishu',
+      bot_id: 'bot-A',
+      chat_id: 'chat-dm-A',
+      native_thread_or_topic_id: null,
+      platform_message_or_action_id: sourceEventId,
+    },
+    source: 'card_action',
+    value: { kind: 'decision', decision },
+    answered_at: '2026-07-19T09:03:00Z',
+    idempotency_key: createIdempotencyKey('interaction', {
+      interaction_id: request.interaction_id,
+      source_event_or_action_id: sourceEventId,
+    }),
+  };
+}
+
 function createFakeQuery({ sessionId, beforeFirstOutput }) {
   const calls = [];
   const inputs = [];
@@ -575,6 +605,22 @@ function createCloseAwareQuery({ sessionId }) {
   return { query, turnStarted };
 }
 
+function createCloseFailingQuery({ sessionId }) {
+  function query({ prompt }) {
+    const stream = (async function* generateSdkMessages() {
+      for await (const input of prompt) {
+        yield { type: 'system', subtype: 'init', session_id: sessionId };
+        yield { type: 'result', subtype: 'success', session_id: sessionId, result: input.message.content };
+        yield idleSession(sessionId);
+      }
+    }());
+    stream.interrupt = async () => ({ still_queued: [] });
+    stream.close = () => { throw new Error('forced query close failure'); };
+    return stream;
+  }
+  return { query };
+}
+
 function createQueuedReceiptQuery({ cancelResult = true, sessionId }) {
   const cancelled = deferred();
   const inputConsumed = deferred();
@@ -826,6 +872,46 @@ afterEach(() => {
 });
 
 describe('Claude conversation executor', () => {
+  test('rejects caller-controlled SDK continuity options', () => {
+    expect(() => createClaudeConversationAdapter({
+      query: () => {},
+      queryOptions: { resume: 'caller-owned-session' },
+    })).toThrow(/managed by Core lineage authority/);
+  });
+
+  test('removes static tokens when native credentials are detected', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'native-auth-env');
+    const nativeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-native-auth-'));
+    temporaryDirectories.push(nativeHome);
+    fs.mkdirSync(path.join(nativeHome, '.claude'));
+    fs.writeFileSync(path.join(nativeHome, '.claude', '.credentials.json'), '{}');
+    const fake = createFakeQuery({ sessionId: 'claude-session-native-auth-env' });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({
+        query: fake.query,
+        queryOptions: {
+          env: {
+            HOME: nativeHome,
+            PATH: '/test/bin',
+            ANTHROPIC_API_KEY: 'stale-static-key',
+            CLAUDE_CODE_OAUTH_TOKEN: 'stale-static-token',
+          },
+        },
+      }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-native-auth-env',
+      now: () => '2026-07-19T09:00:30Z',
+      generateId: deterministicIds('native-auth-env'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ turn_id: accepted.turn_id });
+    expect(fake.calls[0].options.env).toEqual({ HOME: nativeHome, PATH: '/test/bin' });
+    await service.close();
+    database.close();
+  });
+
   test('keeps one SDK query across turns and binds its first session ID before output', async () => {
     const database = openTestDatabase();
     const first = acceptQueuedTurn(database, 'first');
@@ -1031,8 +1117,6 @@ describe('Claude conversation executor', () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'permission');
     const fake = createPermissionQuery({ sessionId: 'claude-session-permission' });
-    const permissionDecision = deferred();
-    const permissionRequests = [];
     const service = createExecutorService({
       database,
       adapter: createClaudeConversationAdapter({ query: fake.query }),
@@ -1040,44 +1124,35 @@ describe('Claude conversation executor', () => {
       serviceInstanceId: 'executor-service-permission',
       now: () => '2026-07-19T09:03:00Z',
       generateId: deterministicIds('permission'),
-      async permissionHandler(request, context) {
-        permissionRequests.push({ context, request });
-        return permissionDecision.promise;
-      },
     });
 
-    const run = service.runNext();
-    await fake.permissionRequested.promise;
+    const waiting = await service.runNext();
+    expect(waiting).toMatchObject({
+      status: 'waiting_user',
+      request: {
+        kind: 'tool_approval',
+        runtime_fence: expect.objectContaining({ provider_interaction_ref: expect.any(String) }),
+      },
+    });
     expect(database.prepare(`
       SELECT state FROM runtime_turns WHERE turn_id = ?
     `).get(accepted.turn_id).state).toBe('waiting_user');
     await expect(service.evictIdleExecutors()).resolves.toEqual([]);
-    permissionDecision.resolve({
-      behavior: 'allow',
-      updated_input: { command: 'pwd' },
-    });
-
-    await expect(run).resolves.toMatchObject({
-      status: 'completed',
-      turn_id: accepted.turn_id,
-    });
-    expect(permissionRequests).toEqual([{
-      request: {
-        tool_name: 'Bash',
-        input: { command: 'pwd' },
-      },
-      context: expect.objectContaining({
-        conversation_id: accepted.conversation_id,
-        turn_id: accepted.turn_id,
-        attempt: expect.objectContaining({ attempt_no: 1 }),
-      }),
-    }]);
+    const answer = service.submitInteractionAnswer(
+      permissionAnswer(waiting.request, 'durable-happy'),
+    );
+    const handled = await service.deliverInteractionAnswer(answer.handoff_id);
+    expect(handled.execution).toMatchObject({ status: 'completed', turn_id: accepted.turn_id });
     expect(fake.permissionResults).toEqual([{
       behavior: 'allow',
       updatedInput: { command: 'pwd' },
     }]);
-    expect(readEvents(database, accepted.turn_id).map((event) => event.phase))
-      .toEqual(expect.arrayContaining(['waiting_user', 'running', 'completed']));
+    expect(readEvents(database, accepted.turn_id).map((event) => event.kind))
+      .toEqual(expect.arrayContaining([
+        'interaction_requested',
+        'interaction_answer_committed',
+        'interaction_answered',
+      ]));
 
     await service.close();
     database.close();
@@ -1104,7 +1179,6 @@ describe('Claude conversation executor', () => {
       serviceInstanceId: 'executor-service-permission-projection',
       now: () => '2026-07-19T09:03:30Z',
       generateId: deterministicIds('permission-projection'),
-      permissionHandler: async () => ({ behavior: 'allow' }),
     });
 
     const run = service.runNext();
@@ -1123,7 +1197,6 @@ describe('Claude conversation executor', () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'permission-cancel');
     const fake = createPermissionQuery({ sessionId: 'claude-session-permission-cancel' });
-    const neverSettles = deferred();
     const service = createExecutorService({
       database,
       adapter: createClaudeConversationAdapter({ query: fake.query }),
@@ -1131,15 +1204,14 @@ describe('Claude conversation executor', () => {
       serviceInstanceId: 'executor-service-permission-cancel',
       now: () => '2026-07-19T09:03:30Z',
       generateId: deterministicIds('permission-cancel'),
-      permissionHandler: () => neverSettles.promise,
     });
 
-    const run = service.runNext();
-    await fake.permissionRequested.promise;
+    const waiting = await service.runNext();
+    expect(waiting).toMatchObject({ status: 'waiting_user' });
     await expect(service.cancel(accepted.conversation_id)).resolves.toMatchObject({
       status: 'cancellation_requested',
+      execution: { status: 'stopped' },
     });
-    await expect(run).resolves.toMatchObject({ status: 'stopped' });
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
       .get(accepted.turn_id)).toEqual({ state: 'stopped' });
 
@@ -1153,7 +1225,6 @@ describe('Claude conversation executor', () => {
     const fake = createCaughtPermissionCancellationQuery({
       sessionId: 'claude-session-permission-cancel-caught',
     });
-    const neverSettles = deferred();
     const service = createExecutorService({
       database,
       adapter: createClaudeConversationAdapter({ query: fake.query }),
@@ -1161,15 +1232,14 @@ describe('Claude conversation executor', () => {
       serviceInstanceId: 'executor-service-permission-cancel-caught',
       now: () => '2026-07-19T09:03:45Z',
       generateId: deterministicIds('permission-cancel-caught'),
-      permissionHandler: () => neverSettles.promise,
     });
 
-    const run = service.runNext();
-    await fake.permissionRequested.promise;
+    const waiting = await service.runNext();
+    expect(waiting).toMatchObject({ status: 'waiting_user' });
     await expect(service.cancel(accepted.conversation_id)).resolves.toMatchObject({
       status: 'cancellation_requested',
+      execution: { status: 'stopped' },
     });
-    await expect(run).resolves.toMatchObject({ status: 'stopped' });
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
       .get(accepted.turn_id)).toEqual({ state: 'stopped' });
 
@@ -1181,9 +1251,6 @@ describe('Claude conversation executor', () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'permission-parallel');
     const fake = createParallelPermissionQuery({ sessionId: 'claude-session-permission-parallel' });
-    const decisions = [deferred(), deferred()];
-    const bothRequested = deferred();
-    let requestCount = 0;
     const service = createExecutorService({
       database,
       adapter: createClaudeConversationAdapter({ query: fake.query }),
@@ -1191,22 +1258,21 @@ describe('Claude conversation executor', () => {
       serviceInstanceId: 'executor-service-permission-parallel',
       now: () => '2026-07-19T09:03:45Z',
       generateId: deterministicIds('permission-parallel'),
-      permissionHandler() {
-        const decision = decisions[requestCount];
-        requestCount += 1;
-        if (requestCount === 2) bothRequested.resolve();
-        return decision.promise;
-      },
     });
 
-    const run = service.runNext();
-    await bothRequested.promise;
-    decisions[0].resolve({ behavior: 'allow' });
-    await Promise.resolve();
+    const firstWaiting = await service.runNext();
+    const firstAnswer = service.submitInteractionAnswer(
+      permissionAnswer(firstWaiting.request, 'parallel-1'),
+    );
+    const firstHandled = await service.deliverInteractionAnswer(firstAnswer.handoff_id);
+    expect(firstHandled.execution).toMatchObject({ status: 'waiting_user' });
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
       .get(accepted.turn_id)).toEqual({ state: 'waiting_user' });
-    decisions[1].resolve({ behavior: 'allow' });
-    await expect(run).resolves.toMatchObject({ status: 'completed' });
+    const secondAnswer = service.submitInteractionAnswer(
+      permissionAnswer(firstHandled.execution.request, 'parallel-2'),
+    );
+    const secondHandled = await service.deliverInteractionAnswer(secondAnswer.handoff_id);
+    expect(secondHandled.execution).toMatchObject({ status: 'completed' });
 
     await service.close();
     database.close();
@@ -1802,8 +1868,6 @@ describe('Claude conversation executor', () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'permission-progress');
     const fake = createPermissionProgressQuery({ sessionId: 'claude-session-permission-progress' });
-    const decisions = [deferred(), deferred()];
-    let decisionIndex = 0;
     const service = createExecutorService({
       database,
       adapter: createClaudeConversationAdapter({ query: fake.query }),
@@ -1811,22 +1875,27 @@ describe('Claude conversation executor', () => {
       serviceInstanceId: 'executor-service-permission-progress',
       now: () => '2026-07-19T09:13:15Z',
       generateId: deterministicIds('permission-progress'),
-      permissionHandler: () => decisions[decisionIndex++].promise,
     });
 
-    const run = service.runNext();
-    decisions[0].resolve({ behavior: 'allow' });
-    await fake.progressEmitted.promise;
-    await new Promise((resolve) => setImmediate(resolve));
+    const firstWaiting = await service.runNext();
+    const firstAnswer = service.submitInteractionAnswer(
+      permissionAnswer(firstWaiting.request, 'progress-1'),
+    );
+    const firstHandled = await service.deliverInteractionAnswer(firstAnswer.handoff_id);
+    expect(firstHandled.execution).toMatchObject({ status: 'waiting_user' });
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
       .get(accepted.turn_id)).toEqual({ state: 'waiting_user' });
+    const secondAnswer = service.submitInteractionAnswer(
+      permissionAnswer(firstHandled.execution.request, 'progress-2'),
+    );
+    const secondHandled = await service.deliverInteractionAnswer(secondAnswer.handoff_id);
+    await fake.progressEmitted.promise;
     expect(readEvents(database, accepted.turn_id).find(({ kind }) => kind === 'tool_progress'))
       .toMatchObject({
       kind: 'tool_progress',
       phase: 'running',
     });
-    decisions[1].resolve({ behavior: 'allow' });
-    await expect(run).resolves.toMatchObject({ status: 'completed' });
+    expect(secondHandled.execution).toMatchObject({ status: 'completed' });
 
     await service.close();
     database.close();
@@ -1917,6 +1986,32 @@ describe('Claude conversation executor', () => {
     await expect(service.runNext()).rejects.toThrow(/closing|closed/);
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
       .get(afterClose.turn_id)).toEqual({ state: 'queued' });
+
+    database.close();
+  });
+
+  test('keeps durable resident ownership when query close is not confirmed', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'close-failure-resident');
+    const fake = createCloseFailingQuery({ sessionId: 'claude-session-close-failure' });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-close-failure',
+      now: () => '2026-07-19T09:14:30Z',
+      generateId: deterministicIds('close-failure'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ turn_id: accepted.turn_id });
+    await expect(service.close()).rejects.toThrow(/failed to close/);
+    expect(database.prepare(`
+      SELECT conversation_id, owner_service_instance_id
+      FROM runtime_executor_residents
+    `).all()).toEqual([{
+      conversation_id: accepted.conversation_id,
+      owner_service_instance_id: 'executor-service-close-failure',
+    }]);
 
     database.close();
   });
