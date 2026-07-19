@@ -1,56 +1,66 @@
-# Zylos public contract kernel
+# Public Contract Kernel
 
-This directory is the versioned, provider-neutral contract kernel shared by Core and its
-channel, provider, Dashboard, and Luna consumers. It intentionally contains no provider or
-channel runtime objects.
+This directory defines the provider-neutral public contract helpers for the
+runtime migration baseline.
 
-Import the public API from `contracts/public/index.js`.
+## Scope
 
-## Version and scalar validation
+- Validate `contract` and `contract_version` headers.
+- Enforce public ID, time, number, and safety-critical enum rules.
+- Produce the unified public `error` shape.
+- Canonicalize payloads with RFC 8785 JSON Canonicalization Scheme (JCS).
+- Build idempotency keys and payload hashes for the five public scopes plus the
+  legacy C4 bridge.
 
-- Every public payload has a known `contract` and a `<major>.<minor>` string
-  `contract_version`.
-- Major `1` is supported. Unknown majors are rejected; unknown optional fields in a known
-  same-major payload are split into `extensions` and retained in `forwarded` by
-  `validateContractDocument`.
-- Use the explicit field rules passed to `validateContractDocument` for opaque IDs,
-  RFC 3339 timestamps, safe integers, schema-declared decimals, and safety-critical enums.
-- Contract failures use `ContractKernelError.contractError`, whose shape is shared across
-  transports. HTTP or RPC status codes do not replace this shape.
+## Versioning
 
-Unknown optional fields are data to preserve, not capabilities to execute. Callers must list
-every security, lifecycle, terminal, interaction, and control enum in a `critical_enum` rule.
+- Known contracts are listed in `constants.js`.
+- Unknown major versions are rejected.
+- Same-major future optional extensions are accepted and forwarded unchanged.
+- Safety-critical enums remain closed even when optional extensions are present.
 
-## Canonicalization and idempotency
+## Public API
 
-`canonicalizeJson` implements the JSON Canonicalization Scheme from
-[RFC 8785](https://www.rfc-editor.org/rfc/rfc8785). It returns canonical text;
-`canonicalizeJsonBytes` returns the UTF-8 bytes hashed by the idempotency helpers. Public
-contract number validation is stricter than JCS itself, so validate/project a contract before
-canonicalizing it.
+- `validateContractHeaders(headers)`
+- `validateContractDocument(document, options)`
+- `validateContractError(error)`
+- `validateOpaqueId(value, fieldName)`
+- `validateRfc3339Timestamp(value, fieldName)`
+- `validatePublicNumber(value, fieldName, options)`
+- `validateSafetyCriticalEnum(value, allowedValues, fieldName)`
+- `createContractError(code, message, options)`
+- `canonicalizeJson(value)`
+- `canonicalizeJsonToUtf8(value)`
+- `createIdempotencyKey(scope, fields)`
+- `verifyIdempotencyKey(scope, fields, candidateKey)`
+- `createPayloadHash(payload, options)`
+- `resolveIdempotencyReplay(previousHash, nextHash)`
 
-Five standard scopes use `zid:v1:<scope>:<sha256>` keys. Legacy C4 pending migration alone
-uses the exact, unhashed `legacy-c4:<legacy_record_id>` form. Consumers must recompute the key
-from validated fields with `verifyIdempotencyKey`.
+## Fixture Goldens
 
-Payload hashes require an explicit `knownFields` list for the current contract. This removes
-unknown optional extensions before hashing. Common transport/diagnostic fields and delivery
-attempt fields are removed by the fixed projection rules. Decimal paths must be declared with
-`decimalPaths`; array items use the `[]` segment, for example `measurements[].ratio`.
+`fixtures/idempotency-v1.json` is the source of truth for:
 
-Use `resolveIdempotencyReplay` after persistence lookup:
+- inbound
+- scheduler
+- interaction
+- control
+- delivery
+- legacy-c4
 
-- the same key and payload hash is `duplicate` and reuses the original result;
-- the same key with a different payload hash is `conflict` and must not create side effects.
+Each vector locks both the canonical key input and the canonical payload
+projection, then records the expected SHA-256 digests. Consumers should reuse
+the same semantics instead of reinterpreting the rules locally.
 
-## Cross-repository golden vectors
+## Payload Hash Rules
 
-`fixtures/idempotency-v1.json` contains raw payloads, key inputs, canonical JCS strings, keys,
-payload projections, and payload hashes for inbound, scheduler, interaction, control,
-delivery, and legacy C4. Each consuming repository must calculate and assert these values with
-its own implementation. Comparing a copied Core result without recalculation is not a contract
-test.
+- Only known payload fields participate in the hash.
+- Same-major optional extensions are forwarded by validation, but excluded from
+  the compatibility hash until a future contract revision promotes them.
+- Transport and retry metadata such as headers, signatures, cookies,
+  `trace_id`, `received_at`, and retry timestamps are excluded.
+- Numbers used for hashing must already satisfy the public numeric subset.
 
-Run `validatePublicFixtureSafety` on fixture changes. Fixtures must not contain secrets or raw
-provider/channel private objects; only redacted `detail_ref` and `source_ref` references may
-point to controlled diagnostics.
+## Fixture Safety
+
+Fixtures must not contain secrets or raw provider/channel-private objects. Use
+normalized public fields only.
