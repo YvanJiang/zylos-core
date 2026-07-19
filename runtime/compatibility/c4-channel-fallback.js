@@ -84,7 +84,7 @@ function renderText(command) {
     ? actionText
     : (renderModel.error?.user_message ?? renderModel.text ?? 'Status updated.');
   const replyInstruction = actionRequired
-    ? '\nReply to this message to continue.'
+    ? '\nReply to this message so Zylos can route your response.'
     : '';
   return `${label}\n${body}${replyInstruction}`;
 }

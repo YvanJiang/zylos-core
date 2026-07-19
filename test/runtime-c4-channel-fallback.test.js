@@ -230,7 +230,7 @@ describe('C4 channel-neutral fallback', () => {
       'Received\nMessage received.',
       'Completed\nThe report is ready.',
       'Failed\nThe provider could not complete this request.',
-      'Action required\nChoose a deployment target.\nReply to this message to continue.',
+      'Action required\nChoose a deployment target.\nReply to this message so Zylos can route your response.',
     ]);
     expect(sent).toEqual(sent.map((delivery, index) => expect.objectContaining({
       target: received.target,
@@ -438,7 +438,7 @@ describe('C4 channel-neutral fallback', () => {
     database.close();
   });
 
-  test('delivers an issue-15 interaction prompt through the durable text lane', async () => {
+  test('delivers an issue-15 interaction prompt and routes its reply to the same lineage', async () => {
     const database = openTestDatabase();
     const accepted = acceptCompatibilityInbound(database, compatibilityMessage('interaction'), {
       now: () => '2026-07-19T08:40:00Z',
@@ -498,8 +498,8 @@ describe('C4 channel-neutral fallback', () => {
 
     expect(sent.map(({ text }) => text)).toEqual([
       'Received\nMessage received.',
-      'Action required\nYour input is required.\nReply to this message to continue.',
-      'Action required\nAllow the requested workspace write?\nReply to this message to continue.',
+      'Action required\nYour input is required.\nReply to this message so Zylos can route your response.',
+      'Action required\nAllow the requested workspace write?\nReply to this message so Zylos can route your response.',
     ]);
     const commands = database.prepare(`
       SELECT command_json
@@ -509,6 +509,27 @@ describe('C4 channel-neutral fallback', () => {
     `).all(accepted.turn_id).map(({ command_json: commandJson }) => JSON.parse(commandJson));
     expect(commands.every((command) => command.operation === 'send_text')).toBe(true);
     expect(new Set(commands.map((command) => command.mapping.mapping_id)).size).toBe(3);
+
+    const reply = compatibilityMessage('interaction-reply');
+    reply.reply = {
+      root_message_id: 'telegram-interaction-3',
+      parent_message_id: 'telegram-interaction-3',
+      reply_to_message_id: 'telegram-interaction-3',
+    };
+    const acceptedReply = acceptCompatibilityInbound(database, reply, {
+      now: () => '2026-07-19T08:40:03Z',
+      generateId: deterministicIds('interaction-reply'),
+    });
+    expect(acceptedReply).toMatchObject({
+      status: 'accepted',
+      conversation_id: accepted.conversation_id,
+      lineage_id: accepted.lineage_id,
+    });
+    expect(database.prepare(`
+      SELECT state, queue_sequence
+      FROM runtime_turns
+      WHERE turn_id = ?
+    `).get(acceptedReply.turn_id)).toEqual({ state: 'queued', queue_sequence: 2 });
 
     database.close();
   });
