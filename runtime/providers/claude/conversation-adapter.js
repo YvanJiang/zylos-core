@@ -611,13 +611,17 @@ export function createClaudeConversationAdapter({
   }
   const environment = queryOptions.env ?? process.env;
   const frozenEnvironment = Object.freeze({ ...environment });
+  const detectionEnvironment = Object.freeze(selectEnvironment(
+    frozenEnvironment,
+    environmentAllowlist,
+  ));
   const hasStaticAuthentication = [
     'ANTHROPIC_API_KEY',
     'ANTHROPIC_AUTH_TOKEN',
     'CLAUDE_CODE_OAUTH_TOKEN',
   ].some((key) => typeof frozenEnvironment[key] === 'string');
   const nativeAuthentication = hasStaticAuthentication
-    && detectNativeAuthentication(frozenEnvironment, queryOptions);
+    && detectNativeAuthentication(detectionEnvironment, queryOptions);
   const resolvedEnvironment = resolveEnvironment(frozenEnvironment, Object.freeze({
     nativeAuthentication,
   }));

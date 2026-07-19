@@ -80,6 +80,7 @@ export function createExecutorService({
   const permissionControllers = new Map();
   const activeRunSettlements = new Set();
   const cancellationSettlements = new Map();
+  const endedResidentFences = new Map();
   const uncertainTurnIds = new Set();
   let lifecycle = 'open';
   let closePromise = null;
@@ -119,6 +120,11 @@ export function createExecutorService({
     if (provider === 'claude' && residentHeartbeat === null) {
       residentHeartbeat = scheduleResidentHeartbeat(() => {
         try {
+          for (const [conversationId, ownerEpoch] of endedResidentFences) {
+            if (store.releaseExecutorResident(conversationId, ownerEpoch)) {
+              endedResidentFences.delete(conversationId);
+            }
+          }
           store.heartbeatOwnedResidents();
           residentHeartbeatFailure = null;
         } catch (error) {
@@ -170,10 +176,11 @@ export function createExecutorService({
       typeof adapter.hasResident === 'function'
       && !adapter.hasResident(turnContext.conversation_id)
     ) {
-      store.releaseExecutorResident(
+      const released = store.releaseExecutorResident(
         turnContext.conversation_id,
         turnContext.resident?.owner_epoch,
       );
+      if (released) endedResidentFences.delete(turnContext.conversation_id);
     }
   }
 
@@ -334,10 +341,13 @@ export function createExecutorService({
         ),
       }),
       residentEnded(context) {
-        store.releaseExecutorResident(
+        const ownerEpoch = turnContext.resident?.owner_epoch;
+        endedResidentFences.set(context.conversation_id, ownerEpoch);
+        const released = store.releaseExecutorResident(
           context.conversation_id,
-          turnContext.resident?.owner_epoch,
+          ownerEpoch,
         );
+        if (released) endedResidentFences.delete(context.conversation_id);
       },
       async requestPermission(request, { signal } = {}) {
         if (permissionHandler === null) {
@@ -429,6 +439,7 @@ export function createExecutorService({
       refresh();
       return { status: 'idle' };
     }
+    endedResidentFences.delete(turnContext.conversation_id);
     let resolveSettlement;
     const settlement = new Promise((resolve) => {
       resolveSettlement = resolve;
@@ -544,6 +555,7 @@ export function createExecutorService({
     });
     for (const conversationId of evicted) {
       store.releaseExecutorResident(conversationId);
+      endedResidentFences.delete(conversationId);
     }
     return evicted;
   }
@@ -598,6 +610,7 @@ export function createExecutorService({
         await Promise.allSettled([...activeRunSettlements]);
         for (const conversationId of closedConversationIds) {
           store.releaseExecutorResident(conversationId);
+          endedResidentFences.delete(conversationId);
         }
         lifecycle = 'closed';
         if (closeError) throw closeError;

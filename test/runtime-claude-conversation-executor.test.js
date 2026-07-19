@@ -924,16 +924,21 @@ describe('Claude conversation executor', () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'native-auth-keychain');
     const fake = createFakeQuery({ sessionId: 'claude-session-native-auth-keychain' });
+    let detectedEnvironment;
     const service = createExecutorService({
       database,
       adapter: createClaudeConversationAdapter({
         query: fake.query,
-        detectNativeAuthentication: () => true,
+        detectNativeAuthentication(environment) {
+          detectedEnvironment = environment;
+          return true;
+        },
         queryOptions: {
           env: {
             HOME: '/Users/keychain-user',
             PATH: '/test/bin',
             ANTHROPIC_AUTH_TOKEN: 'stale-static-token',
+            DATABASE_PASSWORD: 'must-not-reach-provider-process',
           },
         },
       }),
@@ -948,6 +953,7 @@ describe('Claude conversation executor', () => {
       HOME: '/Users/keychain-user',
       PATH: '/test/bin',
     });
+    expect(detectedEnvironment.DATABASE_PASSWORD).toBeUndefined();
     await service.close();
     database.close();
   });
@@ -1740,6 +1746,7 @@ describe('Claude conversation executor', () => {
     });
     let calls = 0;
     const finishFirstQuery = deferred();
+    let heartbeat;
     const adapter = createClaudeConversationAdapter({
       query({ prompt }) {
         calls += 1;
@@ -1777,6 +1784,11 @@ describe('Claude conversation executor', () => {
       now: () => '2026-07-19T09:11:30Z',
       generateId: deterministicIds('ended-capacity'),
       maxResidentExecutorsPerBot: 1,
+      scheduleResidentHeartbeat(callback) {
+        heartbeat = callback;
+        return { unref() {} };
+      },
+      cancelResidentHeartbeat() {},
     });
 
     await expect(service.runNext()).resolves.toMatchObject({
@@ -1785,8 +1797,19 @@ describe('Claude conversation executor', () => {
     });
     expect(database.prepare(`SELECT conversation_id FROM runtime_executor_residents`).all())
       .toEqual([{ conversation_id: first.conversation_id }]);
+    database.exec(`
+      CREATE TRIGGER fail_ended_resident_release
+      BEFORE DELETE ON runtime_executor_residents
+      BEGIN
+        SELECT RAISE(ABORT, 'forced ended resident release failure');
+      END;
+    `);
     finishFirstQuery.resolve();
     await new Promise((resolve) => setImmediate(resolve));
+    expect(database.prepare(`SELECT conversation_id FROM runtime_executor_residents`).all())
+      .toEqual([{ conversation_id: first.conversation_id }]);
+    database.exec(`DROP TRIGGER fail_ended_resident_release`);
+    heartbeat();
     expect(database.prepare(`SELECT conversation_id FROM runtime_executor_residents`).all())
       .toEqual([]);
     await expect(service.runNext()).resolves.toMatchObject({
