@@ -698,6 +698,78 @@ describe('runtime interaction happy path', () => {
     database.close();
   });
 
+  test('waits for an in-flight handler failure before closing provider ownership', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'service-handler-close-race');
+    let releaseHandler;
+    let handlerStarted;
+    const handlerStartedPromise = new Promise((resolve) => { handlerStarted = resolve; });
+    const handlerReleasePromise = new Promise((resolve) => { releaseHandler = resolve; });
+    const adapter = {
+      async *execute() {
+        yield {
+          kind: 'interaction_requested',
+          payload: {
+            provider_interaction_ref: 'provider-handler-close-race',
+            tool_use_id: 'tool-handler-close-race',
+            kind: 'tool_approval',
+            prompt: 'Allow the racing handler?',
+            choices: [],
+            authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+            allowed_sources: ['card_action'],
+          },
+        };
+      },
+      async handleInteractionAnswer() {
+        handlerStarted();
+        await handlerReleasePromise;
+        throw new Error('deferred uncertain handler send');
+      },
+      async abort() {},
+      async close() { return [accepted.conversation_id]; },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-handler-close-race',
+      now: () => '2026-07-19T07:02:03Z',
+      generateId: deterministicIds('handler-close-race'),
+    });
+    const waiting = await service.runNext();
+    const answer = service.submitInteractionAnswer(
+      interactionAnswer(waiting.request, 'handler-close-race'),
+    );
+    const delivery = service.deliverInteractionAnswer(answer.handoff_id);
+    await handlerStartedPromise;
+
+    let closeSettled = false;
+    const closing = service.close().finally(() => { closeSettled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(closeSettled).toBe(false);
+    releaseHandler();
+
+    await expect(delivery).rejects.toThrow(/deferred uncertain handler send/);
+    await expect(closing).resolves.toBeUndefined();
+    expect(database.prepare(`
+      SELECT interaction.state, handoff.state AS handoff_state, turn.state AS turn_state
+      FROM runtime_interactions AS interaction
+      JOIN runtime_interaction_handoffs AS handoff
+        ON handoff.interaction_id = interaction.interaction_id
+      JOIN runtime_turns AS turn ON turn.turn_id = interaction.turn_id
+      WHERE interaction.interaction_id = ?
+    `).get(waiting.request.interaction_id)).toEqual({
+      state: 'delivery_unknown',
+      handoff_state: 'delivery_unknown',
+      turn_state: 'recovering',
+    });
+    expect(database.prepare(`
+      SELECT lease_owner FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({ lease_owner: null });
+
+    database.close();
+  });
+
   test('does not advance an unanswered interaction while closing the service', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'service-close-waiting');

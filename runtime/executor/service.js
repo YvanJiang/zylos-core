@@ -84,6 +84,7 @@ export function createExecutorService({
   const closingPermissionTurnIds = new Set();
   const permissionControllers = new Map();
   const activeRunSettlements = new Set();
+  const interactionDeliverySettlements = new Set();
   const cancellationSettlements = new Map();
   const endedResidentFences = new Map();
   const pendingInteractionRecoveries = new Map();
@@ -775,7 +776,7 @@ export function createExecutorService({
     return { ...result, lease_released: leaseReleased };
   }
 
-  async function deliverInteractionAnswer(handoffId) {
+  async function executeInteractionDelivery(handoffId) {
     if (typeof adapter.handleInteractionAnswer !== 'function') {
       throw new TypeError('adapter.handleInteractionAnswer must be a function');
     }
@@ -869,6 +870,20 @@ export function createExecutorService({
     return { acknowledgement, execution };
   }
 
+  function deliverInteractionAnswer(handoffId) {
+    if (lifecycle !== 'open') {
+      return Promise.reject(new Error(
+        `Executor service is ${lifecycle}; it cannot deliver an interaction answer.`,
+      ));
+    }
+    const delivery = executeInteractionDelivery(handoffId);
+    interactionDeliverySettlements.add(delivery);
+    delivery.finally(() => {
+      interactionDeliverySettlements.delete(delivery);
+    }).catch(() => {});
+    return delivery;
+  }
+
   async function close() {
     if (closePromise) return closePromise;
     lifecycle = 'closing';
@@ -876,6 +891,7 @@ export function createExecutorService({
       try {
         clearAllInteractionDeadlines();
         const shutdownFailures = [];
+        await Promise.allSettled([...interactionDeliverySettlements]);
         let closedConversationIds = [];
         try {
           if (typeof adapter.close === 'function') {
