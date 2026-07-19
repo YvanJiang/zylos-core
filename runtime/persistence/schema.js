@@ -1,4 +1,7 @@
-import { createDeliveryLaneKey } from './delivery-lane-key.js';
+import {
+  createDeliveryLaneKey,
+  createDeliveryLaneKeyFromIdentity,
+} from './delivery-lane-key.js';
 
 const OUTBOX_TABLE_SCHEMA = `(
     outbox_id TEXT PRIMARY KEY,
@@ -229,6 +232,8 @@ const RUNTIME_SCHEMA = `
     lane_key TEXT PRIMARY KEY,
     turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
     aggregate_type TEXT NOT NULL,
+    lane_identity_version INTEGER NOT NULL DEFAULT 1
+      CHECK (lane_identity_version IN (0, 1)),
     delivery_mode TEXT NOT NULL DEFAULT 'main'
       CHECK (delivery_mode IN ('main', 'text')),
     target_json TEXT NOT NULL,
@@ -384,10 +389,11 @@ function backfillDeliveryLanes(database) {
     const delivered = row.status === 'delivered' && result?.status === 'delivered';
     database.prepare(`
       INSERT OR IGNORE INTO runtime_delivery_lanes (
-        lane_key, turn_id, aggregate_type, delivery_mode, target_json, mapping_json,
+        lane_key, turn_id, aggregate_type, lane_identity_version, delivery_mode,
+        target_json, mapping_json,
         platform_message_id, applied_platform_version, last_delivery_id,
         last_applied_version, last_delivered_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       laneKey,
       command.mapping.turn_id,
@@ -416,6 +422,52 @@ function backfillDeliveryLanes(database) {
       row.outbox_id,
     );
   }
+}
+
+function migrateDeliveryLaneIdentity(database) {
+  const migrate = database.transaction(() => {
+    database.pragma('defer_foreign_keys = ON');
+    const lanes = database.prepare(`
+      SELECT lane_key, turn_id, aggregate_type, target_json
+      FROM runtime_delivery_lanes
+      WHERE lane_identity_version = 0
+    `).all();
+    for (const lane of lanes) {
+      let target;
+      try {
+        target = JSON.parse(lane.target_json);
+      } catch {
+        continue;
+      }
+      let migratedLaneKey;
+      try {
+        migratedLaneKey = createDeliveryLaneKeyFromIdentity({
+          target,
+          turnId: lane.turn_id,
+          aggregateType: lane.aggregate_type,
+        });
+      } catch {
+        continue;
+      }
+      if (migratedLaneKey !== lane.lane_key) {
+        database.prepare(`
+          UPDATE runtime_delivery_lanes SET lane_key = ? WHERE lane_key = ?
+        `).run(migratedLaneKey, lane.lane_key);
+        database.prepare(`
+          UPDATE runtime_outbox SET lane_key = ? WHERE lane_key = ?
+        `).run(migratedLaneKey, lane.lane_key);
+        database.prepare(`
+          UPDATE runtime_projection_snapshots SET lane_key = ? WHERE lane_key = ?
+        `).run(migratedLaneKey, lane.lane_key);
+      }
+      database.prepare(`
+        UPDATE runtime_delivery_lanes
+        SET lane_identity_version = 1
+        WHERE lane_key = ?
+      `).run(migratedLaneKey);
+    }
+  });
+  migrate.immediate();
 }
 
 export function initializeRuntimePersistence(database) {
@@ -459,6 +511,12 @@ export function initializeRuntimePersistence(database) {
     'runtime_delivery_lanes',
     'delivery_mode',
     "TEXT NOT NULL DEFAULT 'main' CHECK (delivery_mode IN ('main', 'text'))",
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_delivery_lanes',
+    'lane_identity_version',
+    'INTEGER NOT NULL DEFAULT 0 CHECK (lane_identity_version IN (0, 1))',
   );
   addColumnIfMissing(
     database,
@@ -508,6 +566,7 @@ export function initializeRuntimePersistence(database) {
   );
   migrateLegacyOutboxConstraint(database);
   backfillDeliveryLanes(database);
+  migrateDeliveryLaneIdentity(database);
   database.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS runtime_lineages_provider_native_id
       ON runtime_lineages(provider, provider_native_id)

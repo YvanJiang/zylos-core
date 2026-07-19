@@ -130,9 +130,32 @@ Use `resolveIdempotencyReplay` after persistence lookup:
 
 ## Delivery commands, results, and message mappings
 
-`validateDeliveryCommand` is the authoritative v1 schema for Core outbox commands. It validates
-the provider-neutral target and render model, recomputes the delivery idempotency key, and
-enforces the operation matrix:
+`validateDeliveryCommand` is the authoritative v1 schema for Core outbox commands. The portable
+shape is published as `schemas/delivery-command-v1.schema.json`; the JavaScript validator remains
+authoritative for idempotency recomputation, target capability checks, and the operation matrix.
+The public version/target vocabulary is exported as `DELIVERY_COMMAND_CURRENT_VERSION`,
+`DELIVERY_COMMAND_VERSIONS`, `DELIVERY_TARGET_FIELDS_V1_0`, and
+`DELIVERY_TARGET_FIELDS_V1_1`.
+
+Version 1.0 remains compatible for non-thread delivery. Version 1.1 adds required nullable target
+fields `native_thread_root_message_id` and `native_thread_reply_target_message_id`. A 1.1 native
+thread requires non-null conversation, root-message, and reply-target anchors; a 1.1 DM, group, or
+synthetic target carries both new fields explicitly as null. A 1.0 native-thread `create_main`,
+`send_text`, or `send_fallback`, and a 1.1 target with missing or inconsistent anchors, fails closed
+with `unsupported_capability`.
+
+`native_thread_or_topic_id` is conversation identity only. Renderers must use exactly
+`native_thread_reply_target_message_id` for a platform reply API and use the root message ID to
+constrain/audit its native-thread scope. The reply target must differ from the conversation thread
+ID. Renderers may not substitute the thread ID, query a latest message, or fall back to the parent
+chat. Core derives both delivery anchors during authenticated inbound acceptance, persists them in
+the initial lane/outbox transaction, and reuses the durable lane target for update, text
+acknowledgement, and final fallback. Any target identity change is a `version_conflict`; delivery
+results cannot rewrite the lane target. Runtime schema initialization rekeys a pre-1.1 native-thread
+lane once so its v1.0 conversation identity is fenced before an exact `update_main` can resume.
+
+The validator also validates the provider-neutral render model, recomputes the delivery
+idempotency key, and enforces the operation matrix:
 
 - `create_main` and `send_text` have no platform target or predecessor;
 - `update_main` names both the exact platform message and predecessor delivery;
@@ -181,6 +204,11 @@ commands, every delivery result status with fencing/error/side-effect combinatio
 required/null cases, and the pending-to-bound/same-value/different-value authority matrix.
 Consumers must validate the documents against their own adapter implementation and may not
 infer an update target from the latest chat message.
+
+`fixtures/delivery-native-thread-v1.1.json` adds the v1.0 non-thread compatibility case, valid
+v1.1 native-thread commands for every delivery operation, and fail-closed vectors for missing,
+cross-scope, and legacy native-thread targets. Consumers must recompute the delivery key and must
+not treat the conversation thread ID as a platform reply message ID.
 
 Run `validatePublicFixtureSafety` on fixture changes. Fixtures must not contain secrets or raw
 provider/channel private objects; only redacted `detail_ref` and `source_ref` references may
