@@ -203,6 +203,8 @@ const RUNTIME_SCHEMA = `
     lane_key TEXT PRIMARY KEY,
     turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
     aggregate_type TEXT NOT NULL,
+    delivery_mode TEXT NOT NULL DEFAULT 'main'
+      CHECK (delivery_mode IN ('main', 'text')),
     target_json TEXT NOT NULL,
     mapping_json TEXT NOT NULL,
     platform_message_id TEXT,
@@ -356,14 +358,15 @@ function backfillDeliveryLanes(database) {
     const delivered = row.status === 'delivered' && result?.status === 'delivered';
     database.prepare(`
       INSERT OR IGNORE INTO runtime_delivery_lanes (
-        lane_key, turn_id, aggregate_type, target_json, mapping_json,
+        lane_key, turn_id, aggregate_type, delivery_mode, target_json, mapping_json,
         platform_message_id, applied_platform_version, last_delivery_id,
         last_applied_version, last_delivered_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       laneKey,
       command.mapping.turn_id,
       command.aggregate_type,
+      command.operation === 'send_text' ? 'text' : 'main',
       JSON.stringify(command.target),
       JSON.stringify(command.mapping),
       delivered ? result.platform_message_id : null,
@@ -408,6 +411,12 @@ export function initializeRuntimePersistence(database) {
     'INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0)',
   );
   addColumnIfMissing(database, 'runtime_turn_queue', 'wait_reason', 'TEXT');
+  addColumnIfMissing(
+    database,
+    'runtime_delivery_lanes',
+    'delivery_mode',
+    "TEXT NOT NULL DEFAULT 'main' CHECK (delivery_mode IN ('main', 'text'))",
+  );
   addColumnIfMissing(
     database,
     'runtime_outbox',
