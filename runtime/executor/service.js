@@ -48,6 +48,7 @@ export function createExecutorService({
   now = () => new Date().toISOString(),
   generateId = defaultGenerateId,
   leaseDurationMs,
+  maxResidentExecutorsPerBot = 20,
 }) {
   if (!database || typeof database.transaction !== 'function') {
     throw new TypeError('database must be a better-sqlite3 connection');
@@ -63,6 +64,12 @@ export function createExecutorService({
   }
   if (typeof generateId !== 'function') {
     throw new TypeError('generateId must be a function');
+  }
+  if (
+    !Number.isSafeInteger(maxResidentExecutorsPerBot)
+    || maxResidentExecutorsPerBot <= 0
+  ) {
+    throw new TypeError('maxResidentExecutorsPerBot must be a positive safe integer');
   }
 
   const store = createExecutorStore({
@@ -129,8 +136,19 @@ export function createExecutorService({
 
   async function runNext() {
     if (!started) start();
-    const turnContext = store.claimNextQueuedTurn();
-    if (!turnContext) return { status: 'idle' };
+    const reservation = store.reserveNextExecutor({ maxResidentExecutorsPerBot });
+    if (reservation.status === 'idle') return reservation;
+    if (reservation.status === 'capacity_wait') {
+      refresh();
+      return reservation;
+    }
+    const turnContext = store.claimNextQueuedTurn({
+      conversationId: reservation.conversation_id,
+    });
+    if (!turnContext) {
+      refresh();
+      return { status: 'idle' };
+    }
     refresh();
     store.transitionTurn(turnContext, 'starting', 'running');
     const providerError = await consumeAdapterEvents(turnContext, Object.freeze({

@@ -57,6 +57,17 @@ function projectRenderModel(renderModel, event) {
   } else if (event.kind === 'text_delta') {
     const currentText = event.payload.start_offset === 0 ? '' : (renderModel.text ?? '');
     text = `${currentText.slice(0, event.payload.start_offset)}${event.payload.text}`;
+  } else if (
+    event.kind === 'turn_state_changed'
+    && event.payload.reason_code === 'executor_capacity'
+  ) {
+    text = 'Waiting for executor capacity.';
+  } else if (
+    event.kind === 'turn_state_changed'
+    && event.payload.to_state === 'starting'
+    && renderModel.text === 'Waiting for executor capacity.'
+  ) {
+    text = 'Starting execution.';
   } else if (event.kind.startsWith('tool_')) {
     tools = [...tools, structuredClone(event.payload)];
   } else if (event.kind.startsWith('interaction_')) {
