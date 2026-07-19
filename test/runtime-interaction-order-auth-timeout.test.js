@@ -85,6 +85,42 @@ function readInteraction(database, interactionId) {
   return { ...row, request: JSON.parse(row.request_json) };
 }
 
+function createTimeoutCleanupAdapter({ returnError = null } = {}) {
+  return {
+    async abort() {},
+    execute() {
+      let delivered = false;
+      return {
+        [Symbol.asyncIterator]() { return this; },
+        async next() {
+          if (delivered) return new Promise(() => {});
+          delivered = true;
+          return {
+            done: false,
+            value: {
+              kind: 'interaction_requested',
+              payload: {
+                provider_interaction_ref: 'provider-timeout-cleanup',
+                tool_use_id: 'tool-timeout-cleanup',
+                kind: 'question',
+                prompt: 'Wait for timeout?',
+                choices: [],
+                authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+                allowed_sources: ['card_action'],
+              },
+            },
+          };
+        },
+        async return() {
+          if (returnError) throw returnError;
+          return { done: true, value: undefined };
+        },
+      };
+    },
+    hasResident() { return false; },
+  };
+}
+
 afterEach(() => {
   cleanupInteractionTestDatabases();
 });
@@ -550,6 +586,55 @@ describe('runtime interaction order, authorization, and timeout', () => {
     });
     expect(service.snapshot().executors).toEqual([]);
 
+    await service.close();
+    database.close();
+  });
+
+  test('cancels buffered provider-neutral interaction requests without re-entering waiting', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedInteractionTurn(database, 'buffered-generic-cancel');
+    const descriptor = (ordinal) => ({
+      provider_interaction_ref: `provider-buffered-generic-${ordinal}`,
+      tool_use_id: `tool-buffered-generic-${ordinal}`,
+      kind: 'question',
+      prompt: `Buffered question ${ordinal}?`,
+      choices: [],
+      authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+      allowed_sources: ['card_action'],
+    });
+    const adapter = {
+      async *execute() {
+        yield { kind: 'interaction_requested', payload: descriptor(1) };
+        yield { kind: 'interaction_requested', payload: descriptor(2) };
+        yield { type: 'turn_result', outcome: 'cancelled' };
+      },
+      async cancel() {},
+      hasResident() { return false; },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-buffered-generic-cancel',
+      now: () => '2026-07-19T07:01:03Z',
+      generateId: deterministicIds('buffered-generic-cancel'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ status: 'waiting_user' });
+    await expect(service.cancel(accepted.conversation_id)).resolves.toMatchObject({
+      status: 'cancellation_requested',
+      execution: { status: 'stopped' },
+    });
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'stopped' });
+    expect(database.prepare(`
+      SELECT ordinal, state FROM runtime_interactions WHERE turn_id = ? ORDER BY ordinal
+    `).all(accepted.turn_id)).toEqual([
+      { ordinal: 1, state: 'cancelled' },
+      { ordinal: 2, state: 'cancelled' },
+    ]);
+
+    await service.close();
     database.close();
   });
 
@@ -593,4 +678,224 @@ describe('runtime interaction order, authorization, and timeout', () => {
 
     database.close();
   });
+
+  test('clears local interaction timers when the executor service closes', async () => {
+    const database = openTestDatabase();
+    const { store, turnContext } = createRunningTurn(database, 'close-timer');
+    const request = requestInteraction(store, turnContext, 'close-timer');
+    const timer = { unref() {} };
+    const cleared = [];
+    const service = createExecutorService({
+      database,
+      adapter: { async *execute() {} },
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-close-timer',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('close-timer-service'),
+      setTimeoutFn: () => timer,
+      clearTimeoutFn: (value) => cleared.push(value),
+    });
+    service.start();
+
+    await service.close();
+
+    expect(cleared).toEqual([timer]);
+    expect(() => service.start()).toThrow(/closed/);
+    expect(readInteraction(database, request.interaction_id)).toMatchObject({ state: 'pending' });
+    database.close();
+  });
+
+  test.each(['missing iterator return', 'failed abort'])(
+    'releases a timed-out lease when later close proves isolation after %s',
+    async (failureKind) => {
+      const database = openTestDatabase();
+      const accepted = acceptQueuedInteractionTurn(database, `timeout-close-${failureKind}`);
+      const clock = { now: '2026-07-19T07:01:00Z' };
+      let delivered = false;
+      const iterator = {
+        [Symbol.asyncIterator]() { return this; },
+        async next() {
+          if (delivered) return new Promise(() => {});
+          delivered = true;
+          return {
+            done: false,
+            value: {
+              kind: 'interaction_requested',
+              payload: {
+                provider_interaction_ref: `provider-timeout-close-${failureKind}`,
+                tool_use_id: `tool-timeout-close-${failureKind}`,
+                kind: 'question',
+                prompt: 'Wait for later close?',
+                choices: [],
+                authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+                allowed_sources: ['card_action'],
+              },
+            },
+          };
+        },
+      };
+      if (failureKind === 'failed abort') iterator.return = async () => ({ done: true });
+      const adapter = {
+        execute: () => iterator,
+        async abort() {
+          if (failureKind === 'failed abort') throw new Error('forced abort failure');
+        },
+        async close() { return [accepted.conversation_id]; },
+      };
+      const service = createExecutorService({
+        database,
+        adapter,
+        provider: 'claude',
+        serviceInstanceId: `executor-service-timeout-close-${failureKind}`,
+        now: () => clock.now,
+        generateId: deterministicIds(`timeout-close-${failureKind}`),
+        interactionTimeoutMs: 1_000,
+      });
+      const waiting = await service.runNext();
+      clock.now = '2026-07-19T07:01:02Z';
+      const expiration = service.expireInteraction({
+        interaction_id: waiting.request.interaction_id,
+        interaction_version: waiting.request.version,
+      });
+      if (failureKind === 'failed abort') {
+        await expect(expiration).rejects.toThrow(/forced abort failure/);
+      } else {
+        await expect(expiration).resolves.toMatchObject({ lease_released: false });
+      }
+
+      await expect(service.close()).resolves.toBeUndefined();
+      expect(database.prepare(`
+        SELECT lease_owner, turn_id FROM runtime_executor_leases WHERE conversation_id = ?
+      `).get(accepted.conversation_id)).toEqual({ lease_owner: null, turn_id: null });
+
+      database.close();
+    },
+  );
+
+  test.each([
+    ['iterator cleanup', 'iterator', 'forced iterator cleanup failure'],
+    ['resident cleanup', 'resident', 'forced resident cleanup failure'],
+  ])('releases a proven-stopped timeout lease despite %s failure', async (
+    _label,
+    failureKind,
+    failureMessage,
+  ) => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedInteractionTurn(database, `timeout-${failureKind}`);
+    const clock = { now: '2026-07-19T07:01:00Z' };
+    let deadlineCallback;
+    let deadlineError;
+    let heartbeatCallback;
+    const adapter = createTimeoutCleanupAdapter({
+      returnError: failureKind === 'iterator' ? new Error(failureMessage) : null,
+    });
+    if (failureKind === 'resident') {
+      database.exec(`
+        CREATE TRIGGER fail_timeout_resident_delete
+        BEFORE DELETE ON runtime_executor_residents
+        BEGIN
+          SELECT RAISE(ABORT, '${failureMessage}');
+        END;
+      `);
+    }
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: `executor-service-timeout-${failureKind}`,
+      now: () => clock.now,
+      generateId: deterministicIds(`timeout-${failureKind}`),
+      interactionTimeoutMs: 1_000,
+      setTimeoutFn: (callback) => {
+        deadlineCallback = callback;
+        return { unref() {} };
+      },
+      clearTimeoutFn: () => {},
+      onDeadlineError: (error) => { deadlineError = error; },
+      scheduleResidentHeartbeat: (callback) => {
+        heartbeatCallback = callback;
+        return { unref() {} };
+      },
+      cancelResidentHeartbeat: () => {},
+    });
+    await service.runNext();
+    clock.now = '2026-07-19T07:01:02Z';
+
+    await deadlineCallback();
+
+    expect(deadlineError).toEqual(expect.objectContaining({ message: expect.stringContaining(failureMessage) }));
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({ lease_owner: null, turn_id: null });
+    if (failureKind === 'resident') {
+      database.exec('DROP TRIGGER fail_timeout_resident_delete');
+      heartbeatCallback();
+      expect(database.prepare(`
+        SELECT COUNT(*) AS count FROM runtime_executor_residents WHERE conversation_id = ?
+      `).get(accepted.conversation_id)).toEqual({ count: 0 });
+    }
+
+    await service.close();
+    database.close();
+  });
+
+  test.each(['claude', 'codex'])(
+    'retries a %s timed-out lease release after a transient persistence failure',
+    async (provider) => {
+      const database = openTestDatabase();
+      const accepted = acceptQueuedInteractionTurn(database, `timeout-lease-retry-${provider}`);
+      const clock = { now: '2026-07-19T07:01:00Z' };
+      let deadlineCallback;
+      let deadlineError;
+      let heartbeatCallback;
+      database.exec(`
+        CREATE TRIGGER fail_timeout_lease_release
+        BEFORE UPDATE OF lease_owner ON runtime_executor_leases
+        WHEN NEW.lease_owner IS NULL
+        BEGIN
+          SELECT RAISE(ABORT, 'forced timeout lease release failure');
+        END;
+      `);
+      const service = createExecutorService({
+        database,
+        adapter: createTimeoutCleanupAdapter(),
+        provider,
+        serviceInstanceId: `executor-service-timeout-lease-retry-${provider}`,
+        now: () => clock.now,
+        generateId: deterministicIds(`timeout-lease-retry-${provider}`),
+        interactionTimeoutMs: 1_000,
+        setTimeoutFn: (callback) => {
+          deadlineCallback = callback;
+          return { unref() {} };
+        },
+        clearTimeoutFn: () => {},
+        onDeadlineError: (error) => { deadlineError = error; },
+        scheduleResidentHeartbeat: (callback) => {
+          heartbeatCallback = callback;
+          return { unref() {} };
+        },
+        cancelResidentHeartbeat: () => {},
+      });
+      await service.runNext();
+      clock.now = '2026-07-19T07:01:02Z';
+      await deadlineCallback();
+      expect(deadlineError).toEqual(expect.objectContaining({
+        message: expect.stringContaining('forced timeout lease release failure'),
+      }));
+      expect(database.prepare(`
+        SELECT lease_owner FROM runtime_executor_leases WHERE conversation_id = ?
+      `).get(accepted.conversation_id)).toEqual({
+        lease_owner: `executor-service-timeout-lease-retry-${provider}`,
+      });
+
+      database.exec('DROP TRIGGER fail_timeout_lease_release');
+      heartbeatCallback();
+      expect(database.prepare(`
+        SELECT lease_owner FROM runtime_executor_leases WHERE conversation_id = ?
+      `).get(accepted.conversation_id)).toEqual({ lease_owner: null });
+
+      await service.close();
+      database.close();
+    },
+  );
 });

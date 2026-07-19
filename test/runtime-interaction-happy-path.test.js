@@ -552,6 +552,413 @@ describe('runtime interaction happy path', () => {
     database.close();
   });
 
+  test('uses iterator return to prove isolation when a failed handler has no abort primitive', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'service-handler-no-abort');
+    let iteratorReturnCalls = 0;
+    const adapter = {
+      async *execute() {
+        try {
+          yield {
+            kind: 'interaction_requested',
+            payload: {
+              provider_interaction_ref: 'provider-handler-no-abort',
+              tool_use_id: 'tool-handler-no-abort',
+              kind: 'tool_approval',
+              prompt: 'Allow the uncertain handler?',
+              choices: [],
+              authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+              allowed_sources: ['card_action'],
+            },
+          };
+        } finally {
+          iteratorReturnCalls += 1;
+        }
+      },
+      async handleInteractionAnswer() {
+        throw new Error('uncertain handler send');
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-handler-no-abort',
+      now: () => '2026-07-19T07:02:01Z',
+      generateId: deterministicIds('handler-no-abort'),
+    });
+
+    const waiting = await service.runNext();
+    const answer = service.submitInteractionAnswer(
+      interactionAnswer(waiting.request, 'handler-no-abort'),
+    );
+    await expect(service.deliverInteractionAnswer(answer.handoff_id)).rejects.toThrow(
+      /uncertain handler send/,
+    );
+
+    expect(iteratorReturnCalls).toBe(1);
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    expect(database.prepare(`
+      SELECT lease_owner FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({ lease_owner: null });
+
+    await service.close();
+    database.close();
+  });
+
+  test('retries atomic delivery-unknown recovery after persistence and abort failures', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'service-handler-recovery-retry');
+    let abortCalls = 0;
+    const adapter = {
+      async *execute() {
+        yield {
+          kind: 'interaction_requested',
+          payload: {
+            provider_interaction_ref: 'provider-handler-recovery-retry',
+            tool_use_id: 'tool-handler-recovery-retry',
+            kind: 'tool_approval',
+            prompt: 'Allow the retrying handler?',
+            choices: [],
+            authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+            allowed_sources: ['card_action'],
+          },
+        };
+      },
+      async handleInteractionAnswer() {
+        throw new Error('uncertain retrying send');
+      },
+      async abort() {
+        abortCalls += 1;
+        throw new Error('forced recovery abort failure');
+      },
+      async close() { return [accepted.conversation_id]; },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-handler-recovery-retry',
+      now: () => '2026-07-19T07:02:02Z',
+      generateId: deterministicIds('handler-recovery-retry'),
+    });
+    const waiting = await service.runNext();
+    const answer = service.submitInteractionAnswer(
+      interactionAnswer(waiting.request, 'handler-recovery-retry'),
+    );
+    database.exec(`
+      CREATE TRIGGER fail_delivery_unknown_audit
+      BEFORE INSERT ON runtime_interaction_audit
+      WHEN NEW.outcome = 'delivery_unknown'
+      BEGIN
+        SELECT RAISE(ABORT, 'forced delivery unknown audit failure');
+      END;
+    `);
+
+    await expect(service.deliverInteractionAnswer(answer.handoff_id)).rejects.toThrow(
+      /uncertain retrying send/,
+    );
+    expect(abortCalls).toBe(1);
+    expect(database.prepare(`
+      SELECT interaction.state, handoff.state AS handoff_state, turn.state AS turn_state
+      FROM runtime_interactions AS interaction
+      JOIN runtime_interaction_handoffs AS handoff
+        ON handoff.interaction_id = interaction.interaction_id
+      JOIN runtime_turns AS turn ON turn.turn_id = interaction.turn_id
+      WHERE interaction.interaction_id = ?
+    `).get(waiting.request.interaction_id)).toEqual({
+      state: 'answer_delivering',
+      handoff_state: 'delivering',
+      turn_state: 'waiting_user',
+    });
+    await expect(service.runNext()).rejects.toThrow(/close_failed/);
+
+    database.exec('DROP TRIGGER fail_delivery_unknown_audit');
+    await expect(service.close()).resolves.toBeUndefined();
+    expect(database.prepare(`
+      SELECT interaction.state, handoff.state AS handoff_state, turn.state AS turn_state
+      FROM runtime_interactions AS interaction
+      JOIN runtime_interaction_handoffs AS handoff
+        ON handoff.interaction_id = interaction.interaction_id
+      JOIN runtime_turns AS turn ON turn.turn_id = interaction.turn_id
+      WHERE interaction.interaction_id = ?
+    `).get(waiting.request.interaction_id)).toEqual({
+      state: 'delivery_unknown',
+      handoff_state: 'delivery_unknown',
+      turn_state: 'recovering',
+    });
+    expect(database.prepare(`
+      SELECT lease_owner FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({ lease_owner: null });
+    expect(database.prepare(`
+      SELECT owner_service_instance_id FROM runtime_executor_residents WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({ owner_service_instance_id: null });
+
+    database.close();
+  });
+
+  test('waits for an in-flight handler failure before closing provider ownership', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'service-handler-close-race');
+    let releaseHandler;
+    let handlerStarted;
+    const handlerStartedPromise = new Promise((resolve) => { handlerStarted = resolve; });
+    const handlerReleasePromise = new Promise((resolve) => { releaseHandler = resolve; });
+    const adapter = {
+      async *execute() {
+        yield {
+          kind: 'interaction_requested',
+          payload: {
+            provider_interaction_ref: 'provider-handler-close-race',
+            tool_use_id: 'tool-handler-close-race',
+            kind: 'tool_approval',
+            prompt: 'Allow the racing handler?',
+            choices: [],
+            authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+            allowed_sources: ['card_action'],
+          },
+        };
+      },
+      async handleInteractionAnswer() {
+        handlerStarted();
+        await handlerReleasePromise;
+        throw new Error('deferred uncertain handler send');
+      },
+      async abort() {},
+      async close() { return [accepted.conversation_id]; },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-handler-close-race',
+      now: () => '2026-07-19T07:02:03Z',
+      generateId: deterministicIds('handler-close-race'),
+    });
+    const waiting = await service.runNext();
+    const answer = service.submitInteractionAnswer(
+      interactionAnswer(waiting.request, 'handler-close-race'),
+    );
+    const delivery = service.deliverInteractionAnswer(answer.handoff_id);
+    await handlerStartedPromise;
+
+    let closeSettled = false;
+    const closing = service.close().finally(() => { closeSettled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(closeSettled).toBe(false);
+    releaseHandler();
+
+    await expect(delivery).rejects.toThrow(/deferred uncertain handler send/);
+    await expect(closing).resolves.toBeUndefined();
+    expect(database.prepare(`
+      SELECT interaction.state, handoff.state AS handoff_state, turn.state AS turn_state
+      FROM runtime_interactions AS interaction
+      JOIN runtime_interaction_handoffs AS handoff
+        ON handoff.interaction_id = interaction.interaction_id
+      JOIN runtime_turns AS turn ON turn.turn_id = interaction.turn_id
+      WHERE interaction.interaction_id = ?
+    `).get(waiting.request.interaction_id)).toEqual({
+      state: 'delivery_unknown',
+      handoff_state: 'delivery_unknown',
+      turn_state: 'recovering',
+    });
+    expect(database.prepare(`
+      SELECT lease_owner FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({ lease_owner: null });
+
+    database.close();
+  });
+
+  test('closes the provider after acknowledgement without waiting for resumed execution', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'service-ack-close-race');
+    let releaseResumedExecution;
+    let resumedExecutionStarted;
+    const resumedExecutionStartedPromise = new Promise((resolve) => {
+      resumedExecutionStarted = resolve;
+    });
+    const resumedExecutionGate = new Promise((resolve) => {
+      releaseResumedExecution = resolve;
+    });
+    let closeCalls = 0;
+    const adapter = {
+      async *execute() {
+        yield {
+          kind: 'interaction_requested',
+          payload: {
+            provider_interaction_ref: 'provider-ack-close-race',
+            tool_use_id: 'tool-ack-close-race',
+            kind: 'tool_approval',
+            prompt: 'Allow the provider close race?',
+            choices: [],
+            authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+            allowed_sources: ['card_action'],
+          },
+        };
+        resumedExecutionStarted();
+        await resumedExecutionGate;
+        yield {
+          kind: 'text_snapshot',
+          payload: { text: 'Resumed execution closed.', end_offset: 25 },
+          provider_native_id: null,
+        };
+      },
+      async handleInteractionAnswer(delivery) {
+        return {
+          status: 'accepted',
+          handoff_id: delivery.handoff.handoff_id,
+          provider_attempt_id: delivery.handoff.provider_attempt_id,
+          handoff_attempt_id: delivery.handoff.handoff_attempt_id,
+          handoff_attempt_no: delivery.handoff.handoff_attempt_no,
+          lease_epoch: delivery.handoff.lease_epoch,
+        };
+      },
+      async close() {
+        closeCalls += 1;
+        releaseResumedExecution();
+        return [accepted.conversation_id];
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-ack-close-race',
+      now: () => '2026-07-19T07:02:04Z',
+      generateId: deterministicIds('ack-close-race'),
+    });
+    const waiting = await service.runNext();
+    const answer = service.submitInteractionAnswer(
+      interactionAnswer(waiting.request, 'ack-close-race'),
+    );
+    const delivery = service.deliverInteractionAnswer(answer.handoff_id);
+    await resumedExecutionStartedPromise;
+
+    const closing = service.close();
+    await new Promise((resolve) => setImmediate(resolve));
+    const closeCallsBeforeManualRelease = closeCalls;
+    if (closeCalls === 0) releaseResumedExecution();
+    await expect(delivery).resolves.toMatchObject({
+      acknowledgement: { status: 'accepted', resumed: true },
+      execution: { status: 'completed' },
+    });
+    await expect(closing).resolves.toBeUndefined();
+    expect(closeCallsBeforeManualRelease).toBe(1);
+
+    database.close();
+  });
+
+  test('does not advance an unanswered interaction while closing the service', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'service-close-waiting');
+    let advancedPastQuestion = false;
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute() {
+          yield {
+            kind: 'interaction_requested',
+            payload: {
+              provider_interaction_ref: 'provider-question-service-close',
+              tool_use_id: 'tool-use-service-close',
+              kind: 'tool_approval',
+              prompt: 'Allow the requested workspace write?',
+              choices: [],
+              authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+              allowed_sources: ['main_card_reply', 'card_action'],
+            },
+          };
+          advancedPastQuestion = true;
+          yield {
+            kind: 'text_snapshot',
+            payload: { text: 'must not run', end_offset: 12 },
+            provider_native_id: null,
+          };
+        },
+      },
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-close-waiting',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('service-close-waiting'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ status: 'waiting_user' });
+    await expect(service.close()).resolves.toBeUndefined();
+    expect(advancedPastQuestion).toBe(false);
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    expect(readEvents(database, accepted.turn_id).at(-1)).toMatchObject({
+      kind: 'turn_state_changed',
+      payload: { reason_code: 'executor_shutdown_uncertain' },
+    });
+
+    database.close();
+  });
+
+  test('holds an answered interaction until a parallel permission callback settles', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'service-permission-interleave');
+    let resolvePermission;
+    const permission = new Promise((resolve) => { resolvePermission = resolve; });
+    const adapter = {
+      async *execute(context, controls) {
+        const permissionResult = controls.requestPermission(
+          { tool_name: 'Write', input: { path: '/workspace/file' } },
+        );
+        yield {
+          kind: 'interaction_requested',
+          payload: {
+            provider_interaction_ref: 'provider-question-permission-interleave',
+            tool_use_id: 'tool-use-permission-interleave',
+            kind: 'tool_approval',
+            prompt: 'Confirm the second blocking interaction.',
+            choices: [],
+            authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+            allowed_sources: ['main_card_reply', 'card_action'],
+          },
+        };
+        await permissionResult;
+      },
+      async handleInteractionAnswer(delivery) {
+        return {
+          status: 'accepted',
+          handoff_id: delivery.handoff.handoff_id,
+          provider_attempt_id: delivery.handoff.provider_attempt_id,
+          handoff_attempt_id: delivery.handoff.handoff_attempt_id,
+          handoff_attempt_no: delivery.handoff.handoff_attempt_no,
+          lease_epoch: delivery.handoff.lease_epoch,
+        };
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-permission-interleave',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('permission-interleave'),
+      permissionHandler: () => permission,
+    });
+
+    const waiting = await service.runNext();
+    const answerResult = service.submitInteractionAnswer(
+      interactionAnswer(waiting.request, 'permission-interleave'),
+    );
+    const handled = await service.deliverInteractionAnswer(answerResult.handoff_id);
+    expect(handled).toMatchObject({
+      acknowledgement: { resumed: false, turn_state: 'waiting_user' },
+      execution: null,
+    });
+    resolvePermission({ behavior: 'allow' });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'completed' });
+
+    await service.close();
+    database.close();
+  });
+
   test('rolls back the complete request transaction when its user projection cannot persist', () => {
     const database = openTestDatabase();
     const { accepted, store, turnContext } = createRunningTurn(database, 'request-rollback');
