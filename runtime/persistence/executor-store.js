@@ -27,7 +27,7 @@ const CANONICAL_TRANSITIONS = Object.freeze({
   starting: Object.freeze(['running', 'recovering', 'stopped', 'failed']),
   running: Object.freeze(['waiting_user', 'recovering', 'completed', 'stopped', 'failed']),
   waiting_user: Object.freeze(['running', 'recovering', 'stopped', 'timed_out', 'failed']),
-  recovering: Object.freeze(['running', 'stopped', 'failed', 'interrupted']),
+  recovering: Object.freeze(['running', 'waiting_user', 'stopped', 'failed', 'interrupted']),
 });
 
 const TERMINAL_STATES = new Set(['completed', 'stopped', 'failed', 'interrupted', 'timed_out']);
@@ -2085,7 +2085,8 @@ export function createExecutorStore({
     const claim = database.transaction(() => {
       const claimedAt = now();
       const row = database.prepare(`
-        SELECT interaction.request_json, answer.answer_json, handoff.record_json
+        SELECT interaction.handoff_version, interaction.request_json,
+          answer.answer_json, handoff.record_json
         FROM runtime_interaction_handoffs AS handoff
         JOIN runtime_interactions AS interaction
           ON interaction.interaction_id = handoff.interaction_id
@@ -2097,8 +2098,11 @@ export function createExecutorStore({
       const request = JSON.parse(row.request_json);
       const answer = JSON.parse(row.answer_json);
       const handoff = JSON.parse(row.record_json);
-      if (request.state !== 'answer_committed' || handoff.state !== 'pending') {
-        conflict('illegal_transition', 'Only a committed answer with a pending handoff can be claimed.');
+      if (
+        request.state !== 'answer_committed'
+        || !['pending', 'retry_wait'].includes(handoff.state)
+      ) {
+        conflict('illegal_transition', 'Only a committed answer with a pending or retry-wait handoff can be claimed.');
       }
       const turn = loadTurn(database, request.turn_id);
       if (turn.state !== 'waiting_user') {
@@ -2110,7 +2114,9 @@ export function createExecutorStore({
         lease_epoch: turn.lease_epoch,
       };
       if (
-        handoff.provider_attempt_id !== fence.attempt_id
+        request.runtime_fence?.provider_attempt_id !== fence.attempt_id
+        || request.runtime_fence?.lease_epoch !== fence.lease_epoch
+        || handoff.provider_attempt_id !== fence.attempt_id
         || handoff.lease_epoch !== fence.lease_epoch
       ) {
         conflict('stale_attempt', 'The pending handoff no longer matches the current runtime fence.');
@@ -2123,7 +2129,7 @@ export function createExecutorStore({
         occurredAt: claimedAt,
       });
       validateInteractionHandoffTransition({
-        from: 'pending',
+        from: handoff.state,
         to: 'delivering',
         occurredAt: claimedAt,
       });
@@ -2138,37 +2144,71 @@ export function createExecutorStore({
         ...handoff,
         state: 'delivering',
         handoff_attempt_id: generateId('handoff-attempt'),
-        handoff_attempt_no: 1,
+        handoff_attempt_no: handoff.state === 'pending'
+          ? 1
+          : handoff.handoff_attempt_no + 1,
         claimed_by: serviceInstanceId,
         claimed_at: claimedAt,
-        last_send_started_at: claimedAt,
+        last_send_started_at: null,
+        provider_acked_at: null,
+        reason_code: null,
+        error: null,
+        side_effect_status: 'none',
       };
       validateInteractionRequest(updatedRequest, { occurredAt: claimedAt });
       validateInteractionHandoff(updatedHandoff, { occurredAt: claimedAt });
 
+      const nextHandoffVersion = row.handoff_version + 1;
       const interactionUpdate = database.prepare(`
         UPDATE runtime_interactions
         SET state = 'answer_delivering', version = ?, handoff_state = 'delivering',
-          handoff_version = 2, request_json = ?, updated_at = ?
+          handoff_version = ?, request_json = ?, updated_at = ?
         WHERE interaction_id = ? AND state = 'answer_committed' AND version = ?
+          AND handoff_state = ? AND handoff_version = ?
       `).run(
         updatedRequest.version,
+        nextHandoffVersion,
         JSON.stringify(updatedRequest),
         claimedAt,
         request.interaction_id,
         request.version,
+        handoff.state,
+        row.handoff_version,
       );
-      const handoffUpdate = database.prepare(`
-        UPDATE runtime_interaction_handoffs
-        SET state = 'delivering', handoff_attempt_id = ?, handoff_attempt_no = 1,
-          record_json = ?, updated_at = ?
-        WHERE handoff_id = ? AND state = 'pending' AND handoff_attempt_id IS NULL
-      `).run(
-        updatedHandoff.handoff_attempt_id,
-        JSON.stringify(updatedHandoff),
-        claimedAt,
-        handoff.handoff_id,
-      );
+      const handoffUpdate = handoff.state === 'pending'
+        ? database.prepare(`
+          UPDATE runtime_interaction_handoffs
+          SET state = 'delivering', handoff_attempt_id = ?, handoff_attempt_no = 1,
+            record_json = ?, updated_at = ?
+          WHERE handoff_id = ? AND state = 'pending'
+            AND handoff_attempt_id IS NULL AND handoff_attempt_no IS NULL
+            AND provider_attempt_id = ? AND lease_epoch = ?
+        `).run(
+          updatedHandoff.handoff_attempt_id,
+          JSON.stringify(updatedHandoff),
+          claimedAt,
+          handoff.handoff_id,
+          handoff.provider_attempt_id,
+          handoff.lease_epoch,
+        )
+        : database.prepare(`
+          UPDATE runtime_interaction_handoffs
+          SET state = 'delivering', handoff_attempt_id = ?, handoff_attempt_no = ?,
+            record_json = ?, updated_at = ?
+          WHERE handoff_id = ? AND state = 'retry_wait'
+            AND handoff_attempt_id = ? AND handoff_attempt_no = ?
+            AND provider_attempt_id = ? AND lease_epoch = ?
+        `).run(
+          updatedHandoff.handoff_attempt_id,
+          updatedHandoff.handoff_attempt_no,
+          JSON.stringify(updatedHandoff),
+          claimedAt,
+          handoff.handoff_id,
+          handoff.handoff_attempt_id,
+          handoff.handoff_attempt_no,
+          handoff.provider_attempt_id,
+          handoff.lease_epoch,
+        );
       if (interactionUpdate.changes !== 1 || handoffUpdate.changes !== 1) {
         conflict('version_conflict', 'The interaction handoff claim lost its state/version fence.');
       }
@@ -2185,7 +2225,7 @@ export function createExecutorStore({
             interaction_id: request.interaction_id,
             ordinal: request.ordinal,
             interaction_version: updatedRequest.version,
-            handoff_version: 2,
+            handoff_version: nextHandoffVersion,
           },
         },
         occurredAt: claimedAt,
@@ -2203,16 +2243,341 @@ export function createExecutorStore({
         request: updatedRequest,
         answer,
         handoff: updatedHandoff,
+        handoff_version: nextHandoffVersion,
       };
     });
     return claim.immediate();
+  }
+
+  function markInteractionHandoffPreSendFailure(delivery, error) {
+    const markFailure = database.transaction(() => {
+      const occurredAt = now();
+      if (error?.side_effect_status !== 'none') {
+        conflict(
+          'provider_context_invalid',
+          'A pre-send failure must prove that no provider side effects occurred.',
+        );
+      }
+      const safeToRetry = error.retryable === true;
+      const row = database.prepare(`
+        SELECT interaction.handoff_version, interaction.request_json,
+          handoff.record_json
+        FROM runtime_interaction_handoffs AS handoff
+        JOIN runtime_interactions AS interaction
+          ON interaction.interaction_id = handoff.interaction_id
+        WHERE handoff.handoff_id = ?
+      `).get(delivery?.handoff?.handoff_id);
+      if (!row) {
+        conflict('handoff_not_found', 'The claimed interaction handoff does not exist.');
+      }
+      const request = JSON.parse(row.request_json);
+      const handoff = JSON.parse(row.record_json);
+      const turn = loadTurn(database, request.turn_id);
+      const fence = {
+        attempt_id: turn.attempt_id,
+        attempt_no: turn.attempt_no,
+        lease_epoch: turn.lease_epoch,
+      };
+      if (
+        request.state !== 'answer_delivering'
+        || handoff.state !== 'delivering'
+        || handoff.claimed_by !== serviceInstanceId
+        || handoff.last_send_started_at !== null
+        || request.runtime_fence?.provider_attempt_id !== fence.attempt_id
+        || request.runtime_fence?.lease_epoch !== fence.lease_epoch
+        || handoff.provider_attempt_id !== fence.attempt_id
+        || handoff.lease_epoch !== fence.lease_epoch
+        || delivery?.request?.interaction_id !== request.interaction_id
+        || delivery?.request?.version !== request.version
+        || delivery?.handoff_version !== row.handoff_version
+        || delivery?.handoff?.provider_attempt_id !== handoff.provider_attempt_id
+        || delivery?.handoff?.lease_epoch !== handoff.lease_epoch
+        || delivery?.handoff?.handoff_attempt_id !== handoff.handoff_attempt_id
+        || delivery?.handoff?.handoff_attempt_no !== handoff.handoff_attempt_no
+      ) {
+        conflict('stale_attempt', 'The pre-send failure does not match the current interaction handoff fence.');
+      }
+      if (turn.state !== 'waiting_user') {
+        conflict('illegal_transition', `Pre-send failure is invalid while turn is ${turn.state}.`);
+      }
+      assertActiveFence(database, turn, fence, serviceInstanceId);
+      assertResidentOwner(turn.conversation_id);
+      validateInteractionTransition({
+        from: 'answer_delivering',
+        to: safeToRetry ? 'answer_committed' : 'cancelled',
+        sendStarted: false,
+        occurredAt,
+      });
+      validateInteractionHandoffTransition({
+        from: 'delivering',
+        to: safeToRetry ? 'retry_wait' : 'cancelled',
+        sendStarted: false,
+        safeToRetry,
+        occurredAt,
+      });
+
+      const updatedRequest = {
+        ...request,
+        state: safeToRetry ? 'answer_committed' : 'cancelled',
+        version: request.version + 1,
+        handoff_state: safeToRetry ? 'retry_wait' : 'cancelled',
+        ...(safeToRetry ? {} : { terminal_reason: 'pre_send_non_retryable_failure' }),
+      };
+      const updatedHandoff = {
+        ...handoff,
+        state: safeToRetry ? 'retry_wait' : 'cancelled',
+        reason_code: safeToRetry ? 'pre_send_failure' : 'pre_send_non_retryable_failure',
+        error: structuredClone(error),
+        side_effect_status: 'none',
+      };
+      validateInteractionRequest(updatedRequest, { occurredAt });
+      validateInteractionHandoff(updatedHandoff, { occurredAt });
+      const nextHandoffVersion = row.handoff_version + 1;
+      const interactionUpdate = database.prepare(`
+        UPDATE runtime_interactions
+        SET state = ?, version = ?, handoff_state = ?,
+          handoff_version = ?, request_json = ?, updated_at = ?
+        WHERE interaction_id = ? AND state = 'answer_delivering' AND version = ?
+          AND handoff_state = 'delivering' AND handoff_version = ?
+      `).run(
+        updatedRequest.state,
+        updatedRequest.version,
+        updatedRequest.handoff_state,
+        nextHandoffVersion,
+        JSON.stringify(updatedRequest),
+        occurredAt,
+        request.interaction_id,
+        request.version,
+        row.handoff_version,
+      );
+      const handoffUpdate = database.prepare(`
+        UPDATE runtime_interaction_handoffs
+        SET state = ?, record_json = ?, updated_at = ?
+        WHERE handoff_id = ? AND state = 'delivering'
+          AND handoff_attempt_id = ? AND handoff_attempt_no = ?
+          AND provider_attempt_id = ? AND lease_epoch = ?
+      `).run(
+        updatedHandoff.state,
+        JSON.stringify(updatedHandoff),
+        occurredAt,
+        handoff.handoff_id,
+        handoff.handoff_attempt_id,
+        handoff.handoff_attempt_no,
+        handoff.provider_attempt_id,
+        handoff.lease_epoch,
+      );
+      if (interactionUpdate.changes !== 1 || handoffUpdate.changes !== 1) {
+        conflict('stale_attempt', 'The pre-send failure lost its interaction handoff fence.');
+      }
+      const auditId = generateId('audit');
+      database.prepare(`
+        INSERT INTO runtime_interaction_audit (
+          audit_id, interaction_id, handoff_id, outcome, provider_attempt_id,
+          lease_epoch, acknowledgement_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        auditId,
+        request.interaction_id,
+        handoff.handoff_id,
+        safeToRetry ? 'retry_wait' : 'cancelled_pre_send',
+        handoff.provider_attempt_id,
+        handoff.lease_epoch,
+        JSON.stringify({
+          status: safeToRetry ? 'retry_wait' : 'cancelled_pre_send',
+          handoff_attempt_id: handoff.handoff_attempt_id,
+          handoff_attempt_no: handoff.handoff_attempt_no,
+          error,
+        }),
+        occurredAt,
+      );
+      let turnState = 'waiting_user';
+      if (!safeToRetry) {
+        const cancellationEvent = buildEvent({
+          turn,
+          lastEvent: loadLastEvent(database, turn.turn_id),
+          fence,
+          provider,
+          descriptor: {
+            kind: 'interaction_cancelled',
+            phase: 'waiting_user',
+            provider_native_id: turn.provider_native_id,
+            payload: {
+              interaction_id: request.interaction_id,
+              ordinal: request.ordinal,
+              interaction_version: updatedRequest.version,
+              handoff_version: nextHandoffVersion,
+            },
+          },
+          occurredAt,
+          generateId,
+        });
+        commitTurnEvent(database, {
+          turn,
+          event: cancellationEvent,
+          fence,
+          nextState: 'waiting_user',
+          staleMessage: 'The pre-send cancellation lost its provider attempt fence.',
+          generateId,
+        });
+        transitionInTransaction(database, {
+          turnId: turn.turn_id,
+          fromState: 'waiting_user',
+          toState: 'recovering',
+          fence,
+          provider,
+          serviceInstanceId,
+          occurredAt,
+          generateId,
+          reasonCode: 'pre_send_non_retryable_failure',
+        });
+        const recoveringTurn = loadTurn(database, turn.turn_id);
+        const recoveryEvent = buildEvent({
+          turn: recoveringTurn,
+          lastEvent: loadLastEvent(database, turn.turn_id),
+          fence,
+          provider,
+          descriptor: {
+            kind: 'recovery_started',
+            phase: 'recovering',
+            provider_native_id: recoveringTurn.provider_native_id,
+            payload: {
+              recovery_id: generateId('recovery'),
+              recovery_of_turn_id: turn.turn_id,
+              recovery_of_lineage_id: turn.lineage_id,
+              side_effect_status: 'none',
+            },
+            error,
+          },
+          occurredAt,
+          generateId,
+        });
+        commitTurnEvent(database, {
+          turn: recoveringTurn,
+          event: recoveryEvent,
+          fence,
+          nextState: 'recovering',
+          staleMessage: 'The pre-send recovery notification lost its provider attempt fence.',
+          generateId,
+        });
+        turnState = 'recovering';
+      }
+      return {
+        status: safeToRetry ? 'retry_wait' : 'recovering',
+        interaction_id: request.interaction_id,
+        interaction_state: updatedRequest.state,
+        handoff_id: handoff.handoff_id,
+        handoff_state: updatedHandoff.state,
+        handoff_version: nextHandoffVersion,
+        audit_id: auditId,
+        turn_id: turn.turn_id,
+        turn_state: turnState,
+        request: updatedRequest,
+        handoff: updatedHandoff,
+      };
+    });
+    return markFailure.immediate();
+  }
+
+  function markInteractionHandoffSendStarted(delivery) {
+    const markStarted = database.transaction(() => {
+      const sendStartedAt = now();
+      const row = database.prepare(`
+        SELECT interaction.handoff_version, interaction.request_json,
+          handoff.record_json
+        FROM runtime_interaction_handoffs AS handoff
+        JOIN runtime_interactions AS interaction
+          ON interaction.interaction_id = handoff.interaction_id
+        WHERE handoff.handoff_id = ?
+      `).get(delivery?.handoff?.handoff_id);
+      if (!row) {
+        conflict('handoff_not_found', 'The claimed interaction handoff does not exist.');
+      }
+      const request = JSON.parse(row.request_json);
+      const handoff = JSON.parse(row.record_json);
+      const turn = loadTurn(database, request.turn_id);
+      const fence = {
+        attempt_id: turn.attempt_id,
+        attempt_no: turn.attempt_no,
+        lease_epoch: turn.lease_epoch,
+      };
+      if (
+        request.state !== 'answer_delivering'
+        || handoff.state !== 'delivering'
+        || handoff.claimed_by !== serviceInstanceId
+        || handoff.last_send_started_at !== null
+        || request.runtime_fence?.provider_attempt_id !== fence.attempt_id
+        || request.runtime_fence?.lease_epoch !== fence.lease_epoch
+        || handoff.provider_attempt_id !== fence.attempt_id
+        || handoff.lease_epoch !== fence.lease_epoch
+        || delivery?.request?.interaction_id !== request.interaction_id
+        || delivery?.request?.version !== request.version
+        || delivery?.handoff_version !== row.handoff_version
+        || delivery?.request?.runtime_fence?.provider_attempt_id !== fence.attempt_id
+        || delivery?.request?.runtime_fence?.lease_epoch !== fence.lease_epoch
+        || delivery?.handoff?.provider_attempt_id !== handoff.provider_attempt_id
+        || delivery?.handoff?.lease_epoch !== handoff.lease_epoch
+        || delivery?.handoff?.handoff_attempt_id !== handoff.handoff_attempt_id
+        || delivery?.handoff?.handoff_attempt_no !== handoff.handoff_attempt_no
+      ) {
+        conflict('stale_attempt', 'The send start does not match the current interaction handoff fence.');
+      }
+      if (turn.state !== 'waiting_user') {
+        conflict('illegal_transition', `Interaction send is invalid while turn is ${turn.state}.`);
+      }
+      assertActiveFence(database, turn, fence, serviceInstanceId);
+      assertResidentOwner(turn.conversation_id);
+
+      const updatedHandoff = {
+        ...handoff,
+        last_send_started_at: sendStartedAt,
+      };
+      validateInteractionHandoff(updatedHandoff, { occurredAt: sendStartedAt });
+      const nextHandoffVersion = row.handoff_version + 1;
+      const interactionUpdate = database.prepare(`
+        UPDATE runtime_interactions
+        SET handoff_version = ?, updated_at = ?
+        WHERE interaction_id = ? AND state = 'answer_delivering'
+          AND handoff_state = 'delivering' AND handoff_version = ?
+      `).run(
+        nextHandoffVersion,
+        sendStartedAt,
+        request.interaction_id,
+        row.handoff_version,
+      );
+      const handoffUpdate = database.prepare(`
+        UPDATE runtime_interaction_handoffs
+        SET record_json = ?, updated_at = ?
+        WHERE handoff_id = ? AND state = 'delivering'
+          AND handoff_attempt_id = ? AND handoff_attempt_no = ?
+          AND provider_attempt_id = ? AND lease_epoch = ?
+      `).run(
+        JSON.stringify(updatedHandoff),
+        sendStartedAt,
+        handoff.handoff_id,
+        handoff.handoff_attempt_id,
+        handoff.handoff_attempt_no,
+        handoff.provider_attempt_id,
+        handoff.lease_epoch,
+      );
+      if (interactionUpdate.changes !== 1 || handoffUpdate.changes !== 1) {
+        conflict('stale_attempt', 'The send start lost its interaction handoff fence.');
+      }
+      return {
+        ...delivery,
+        request,
+        handoff: updatedHandoff,
+        handoff_version: nextHandoffVersion,
+      };
+    });
+    return markStarted.immediate();
   }
 
   function markInteractionHandoffDeliveryUnknown(delivery, providerError = null) {
     const markUnknown = database.transaction(() => {
       const occurredAt = now();
       const row = database.prepare(`
-        SELECT interaction.request_json, handoff.record_json
+        SELECT interaction.handoff_version, interaction.request_json,
+          handoff.record_json
         FROM runtime_interaction_handoffs AS handoff
         JOIN runtime_interactions AS interaction
           ON interaction.interaction_id = handoff.interaction_id
@@ -2232,6 +2597,15 @@ export function createExecutorStore({
       if (
         request.state !== 'answer_delivering'
         || handoff.state !== 'delivering'
+        || handoff.claimed_by !== serviceInstanceId
+        || handoff.last_send_started_at === null
+        || request.runtime_fence?.provider_attempt_id !== fence.attempt_id
+        || request.runtime_fence?.lease_epoch !== fence.lease_epoch
+        || handoff.provider_attempt_id !== fence.attempt_id
+        || handoff.lease_epoch !== fence.lease_epoch
+        || delivery?.request?.interaction_id !== request.interaction_id
+        || delivery?.request?.version !== request.version
+        || delivery?.handoff_version !== row.handoff_version
         || handoff.handoff_attempt_id !== delivery?.handoff?.handoff_attempt_id
         || handoff.handoff_attempt_no !== delivery?.handoff?.handoff_attempt_no
         || handoff.provider_attempt_id !== delivery?.handoff?.provider_attempt_id
@@ -2292,17 +2666,21 @@ export function createExecutorStore({
       };
       validateInteractionRequest(updatedRequest, { occurredAt });
       validateInteractionHandoff(updatedHandoff, { occurredAt });
+      const nextHandoffVersion = row.handoff_version + 1;
       const interactionUpdate = database.prepare(`
         UPDATE runtime_interactions
         SET state = 'delivery_unknown', version = ?, handoff_state = 'delivery_unknown',
-          handoff_version = 3, request_json = ?, updated_at = ?
+          handoff_version = ?, request_json = ?, updated_at = ?
         WHERE interaction_id = ? AND state = 'answer_delivering' AND version = ?
+          AND handoff_state = 'delivering' AND handoff_version = ?
       `).run(
         updatedRequest.version,
+        nextHandoffVersion,
         JSON.stringify(updatedRequest),
         occurredAt,
         request.interaction_id,
         request.version,
+        row.handoff_version,
       );
       const handoffUpdate = database.prepare(`
         UPDATE runtime_interaction_handoffs
@@ -2347,7 +2725,7 @@ export function createExecutorStore({
             interaction_id: request.interaction_id,
             ordinal: request.ordinal,
             interaction_version: updatedRequest.version,
-            handoff_version: 3,
+            handoff_version: nextHandoffVersion,
             state: 'delivery_unknown',
             handoff_state: 'delivery_unknown',
           },
@@ -2376,7 +2754,16 @@ export function createExecutorStore({
         handoff.handoff_id,
         handoff.provider_attempt_id,
         handoff.lease_epoch,
-        JSON.stringify({ status: 'delivery_unknown', error }),
+        JSON.stringify({
+          status: 'delivery_unknown',
+          handoff_id: handoff.handoff_id,
+          handoff_attempt_id: handoff.handoff_attempt_id,
+          handoff_attempt_no: handoff.handoff_attempt_no,
+          provider_attempt_id: handoff.provider_attempt_id,
+          lease_epoch: handoff.lease_epoch,
+          last_send_started_at: handoff.last_send_started_at,
+          error,
+        }),
         occurredAt,
       );
       return {
@@ -2399,7 +2786,8 @@ export function createExecutorStore({
         conflict('invalid_acknowledgement', 'The happy-path handler acknowledgement must be accepted or deny.');
       }
       const row = database.prepare(`
-        SELECT interaction.request_json, handoff.record_json
+        SELECT interaction.handoff_version, interaction.request_json,
+          handoff.record_json
         FROM runtime_interaction_handoffs AS handoff
         JOIN runtime_interactions AS interaction
           ON interaction.interaction_id = handoff.interaction_id
@@ -2419,6 +2807,12 @@ export function createExecutorStore({
       if (
         request.state !== 'answer_delivering'
         || handoff.state !== 'delivering'
+        || handoff.claimed_by !== serviceInstanceId
+        || handoff.last_send_started_at === null
+        || request.runtime_fence?.provider_attempt_id !== fence.attempt_id
+        || request.runtime_fence?.lease_epoch !== fence.lease_epoch
+        || handoff.provider_attempt_id !== fence.attempt_id
+        || handoff.lease_epoch !== fence.lease_epoch
         || acknowledgement.provider_attempt_id !== handoff.provider_attempt_id
         || acknowledgement.handoff_attempt_id !== handoff.handoff_attempt_id
         || acknowledgement.handoff_attempt_no !== handoff.handoff_attempt_no
@@ -2455,17 +2849,21 @@ export function createExecutorStore({
       };
       validateInteractionRequest(updatedRequest, { occurredAt: acknowledgedAt });
       validateInteractionHandoff(updatedHandoff, { occurredAt: acknowledgedAt });
+      const nextHandoffVersion = row.handoff_version + 1;
       const interactionUpdate = database.prepare(`
         UPDATE runtime_interactions
         SET state = 'answered', version = ?, handoff_state = 'accepted',
-          handoff_version = 3, request_json = ?, updated_at = ?
+          handoff_version = ?, request_json = ?, updated_at = ?
         WHERE interaction_id = ? AND state = 'answer_delivering' AND version = ?
+          AND handoff_state = 'delivering' AND handoff_version = ?
       `).run(
         updatedRequest.version,
+        nextHandoffVersion,
         JSON.stringify(updatedRequest),
         acknowledgedAt,
         request.interaction_id,
         request.version,
+        row.handoff_version,
       );
       const handoffUpdate = database.prepare(`
         UPDATE runtime_interaction_handoffs
@@ -2537,7 +2935,7 @@ export function createExecutorStore({
             interaction_id: request.interaction_id,
             ordinal: request.ordinal,
             interaction_version: updatedRequest.version,
-            handoff_version: 3,
+            handoff_version: nextHandoffVersion,
             state: 'answered',
             handoff_state: 'accepted',
           },
@@ -2564,6 +2962,540 @@ export function createExecutorStore({
       };
     });
     return acknowledge.immediate();
+  }
+
+  function getInteractionHandoffForRecovery(handoffId) {
+    const row = database.prepare(`
+      SELECT interaction.handoff_version, interaction.request_json,
+        answer.answer_json, handoff.record_json
+      FROM runtime_interaction_handoffs AS handoff
+      JOIN runtime_interactions AS interaction
+        ON interaction.interaction_id = handoff.interaction_id
+      JOIN runtime_interaction_answers AS answer
+        ON answer.answer_id = handoff.answer_id
+      WHERE handoff.handoff_id = ?
+    `).get(handoffId);
+    if (!row) conflict('handoff_not_found', `Interaction handoff ${handoffId} does not exist.`);
+    const request = JSON.parse(row.request_json);
+    const answer = JSON.parse(row.answer_json);
+    const handoff = JSON.parse(row.record_json);
+    const turn = loadTurn(database, request.turn_id);
+    if (
+      request.state !== 'delivery_unknown'
+      || request.handoff_state !== 'delivery_unknown'
+      || handoff.state !== 'delivery_unknown'
+      || turn.state !== 'recovering'
+    ) {
+      conflict('illegal_transition', 'Only a recovering delivery-unknown handoff can be reconciled.');
+    }
+    if (
+      request.runtime_fence?.provider_attempt_id !== handoff.provider_attempt_id
+      || request.runtime_fence?.lease_epoch !== handoff.lease_epoch
+      || turn.attempt_id !== handoff.provider_attempt_id
+      || turn.lease_epoch !== handoff.lease_epoch
+    ) {
+      conflict('stale_attempt', 'The delivery-unknown handoff lost its interaction runtime fence.');
+    }
+    validateInteractionRequest(request);
+    validateInteractionHandoff(handoff);
+    return {
+      request,
+      answer,
+      handoff,
+      handoff_version: row.handoff_version,
+    };
+  }
+
+  function acknowledgeInteractionHandoffFromQuery(delivery, proof) {
+    const acknowledge = database.transaction(() => {
+      const acknowledgedAt = now();
+      const row = database.prepare(`
+        SELECT interaction.handoff_version, interaction.request_json,
+          handoff.record_json
+        FROM runtime_interaction_handoffs AS handoff
+        JOIN runtime_interactions AS interaction
+          ON interaction.interaction_id = handoff.interaction_id
+        WHERE handoff.handoff_id = ?
+      `).get(delivery?.handoff?.handoff_id);
+      if (!row) conflict('handoff_not_found', 'The delivery-unknown handoff does not exist.');
+      const request = JSON.parse(row.request_json);
+      const handoff = JSON.parse(row.record_json);
+      const turn = loadTurn(database, request.turn_id);
+      if (
+        proof?.status !== 'accepted'
+        || proof.read_only !== true
+        || proof.idempotent !== true
+        || typeof proof.accepted_at !== 'string'
+        || Number.isNaN(Date.parse(proof.accepted_at))
+        || Date.parse(proof.accepted_at) < Date.parse(handoff.last_send_started_at)
+        || typeof proof.evidence_ref !== 'string'
+        || proof.evidence_ref.length === 0
+        || proof.reason_code !== null
+      ) {
+        conflict(
+          'provider_context_invalid',
+          'Delivery-unknown acceptance requires read-only idempotent provider proof.',
+        );
+      }
+      if (
+        request.state !== 'delivery_unknown'
+        || handoff.state !== 'delivery_unknown'
+        || turn.state !== 'recovering'
+        || row.handoff_version !== delivery?.handoff_version
+        || request.runtime_fence?.provider_attempt_id !== handoff.provider_attempt_id
+        || request.runtime_fence?.lease_epoch !== handoff.lease_epoch
+        || turn.attempt_id !== handoff.provider_attempt_id
+        || turn.lease_epoch !== handoff.lease_epoch
+        || delivery?.request?.interaction_id !== request.interaction_id
+        || delivery?.request?.version !== request.version
+        || delivery?.handoff?.handoff_id !== handoff.handoff_id
+        || delivery?.handoff?.handoff_attempt_id !== handoff.handoff_attempt_id
+        || delivery?.handoff?.handoff_attempt_no !== handoff.handoff_attempt_no
+        || delivery?.handoff?.provider_attempt_id !== handoff.provider_attempt_id
+        || delivery?.handoff?.lease_epoch !== handoff.lease_epoch
+        || proof.handoff_id !== handoff.handoff_id
+        || proof.handoff_attempt_id !== handoff.handoff_attempt_id
+        || proof.handoff_attempt_no !== handoff.handoff_attempt_no
+        || proof.provider_attempt_id !== handoff.provider_attempt_id
+        || proof.lease_epoch !== handoff.lease_epoch
+      ) {
+        conflict('stale_attempt', 'The acceptance proof does not match the delivery-unknown handoff fence.');
+      }
+      validateInteractionTransition({
+        from: 'delivery_unknown',
+        to: 'answered',
+        sendStarted: true,
+        acknowledgementProven: true,
+        occurredAt: acknowledgedAt,
+      });
+      validateInteractionHandoffTransition({
+        from: 'delivery_unknown',
+        to: 'accepted',
+        sendStarted: true,
+        acknowledgementProven: true,
+        occurredAt: acknowledgedAt,
+      });
+
+      const updatedRequest = {
+        ...request,
+        state: 'answered',
+        version: request.version + 1,
+        handoff_state: 'accepted',
+      };
+      const updatedHandoff = {
+        ...handoff,
+        state: 'accepted',
+        provider_acked_at: proof.accepted_at,
+        reason_code: null,
+        error: null,
+        side_effect_status: 'known',
+      };
+      validateInteractionRequest(updatedRequest, { occurredAt: acknowledgedAt });
+      validateInteractionHandoff(updatedHandoff, { occurredAt: acknowledgedAt });
+      const nextHandoffVersion = row.handoff_version + 1;
+      const interactionUpdate = database.prepare(`
+        UPDATE runtime_interactions
+        SET state = 'answered', version = ?, handoff_state = 'accepted',
+          handoff_version = ?, request_json = ?, updated_at = ?
+        WHERE interaction_id = ? AND state = 'delivery_unknown' AND version = ?
+          AND handoff_state = 'delivery_unknown' AND handoff_version = ?
+      `).run(
+        updatedRequest.version,
+        nextHandoffVersion,
+        JSON.stringify(updatedRequest),
+        acknowledgedAt,
+        request.interaction_id,
+        request.version,
+        row.handoff_version,
+      );
+      const handoffUpdate = database.prepare(`
+        UPDATE runtime_interaction_handoffs
+        SET state = 'accepted', record_json = ?, updated_at = ?
+        WHERE handoff_id = ? AND state = 'delivery_unknown'
+          AND handoff_attempt_id = ? AND handoff_attempt_no = ?
+          AND provider_attempt_id = ? AND lease_epoch = ?
+      `).run(
+        JSON.stringify(updatedHandoff),
+        acknowledgedAt,
+        handoff.handoff_id,
+        handoff.handoff_attempt_id,
+        handoff.handoff_attempt_no,
+        handoff.provider_attempt_id,
+        handoff.lease_epoch,
+      );
+      if (interactionUpdate.changes !== 1 || handoffUpdate.changes !== 1) {
+        conflict('stale_attempt', 'The acceptance proof lost its delivery-unknown fence.');
+      }
+      const auditId = generateId('audit');
+      database.prepare(`
+        INSERT INTO runtime_interaction_audit (
+          audit_id, interaction_id, handoff_id, outcome, provider_attempt_id,
+          lease_epoch, acknowledgement_json, created_at
+        ) VALUES (?, ?, ?, 'accepted_via_query', ?, ?, ?, ?)
+      `).run(
+        auditId,
+        request.interaction_id,
+        handoff.handoff_id,
+        handoff.provider_attempt_id,
+        handoff.lease_epoch,
+        JSON.stringify({
+          ...proof,
+          acknowledgement_source: 'read_only_idempotent_query',
+        }),
+        acknowledgedAt,
+      );
+      const fence = {
+        attempt_id: turn.attempt_id,
+        attempt_no: turn.attempt_no,
+        lease_epoch: turn.lease_epoch,
+      };
+      const event = buildEvent({
+        turn,
+        lastEvent: loadLastEvent(database, turn.turn_id),
+        fence,
+        provider,
+        descriptor: {
+          kind: 'interaction_answered',
+          phase: 'recovering',
+          provider_native_id: turn.provider_native_id,
+          payload: {
+            interaction_id: request.interaction_id,
+            ordinal: request.ordinal,
+            interaction_version: updatedRequest.version,
+            handoff_version: nextHandoffVersion,
+            state: 'answered',
+            handoff_state: 'accepted',
+          },
+        },
+        occurredAt: acknowledgedAt,
+        generateId,
+      });
+      commitTurnEvent(database, {
+        turn,
+        event,
+        fence,
+        nextState: 'recovering',
+        staleMessage: 'The acceptance proof lost its recovering turn fence.',
+        generateId,
+      });
+      return {
+        status: 'accepted',
+        acknowledgement_source: 'read_only_idempotent_query',
+        interaction_id: request.interaction_id,
+        handoff_id: handoff.handoff_id,
+        handoff_version: nextHandoffVersion,
+        audit_id: auditId,
+        turn_id: turn.turn_id,
+        turn_state: 'recovering',
+        turn_version: event.turn_version,
+      };
+    });
+    return acknowledge.immediate();
+  }
+
+  function recordInteractionHandoffQueryUnproven(delivery, proof) {
+    const record = database.transaction(() => {
+      const occurredAt = now();
+      const current = getInteractionHandoffForRecovery(delivery?.handoff?.handoff_id);
+      if (
+        proof?.status !== 'unknown'
+        || proof.read_only !== true
+        || proof.idempotent !== true
+        || proof.handoff_id !== current.handoff.handoff_id
+        || proof.handoff_attempt_id !== current.handoff.handoff_attempt_id
+        || proof.handoff_attempt_no !== current.handoff.handoff_attempt_no
+        || proof.provider_attempt_id !== current.handoff.provider_attempt_id
+        || proof.lease_epoch !== current.handoff.lease_epoch
+        || proof.accepted_at !== null
+        || proof.evidence_ref !== null
+        || typeof proof.reason_code !== 'string'
+        || proof.reason_code.length === 0
+      ) {
+        conflict(
+          'provider_context_invalid',
+          'An unproven acceptance query must be read-only, idempotent, and match the handoff fence.',
+        );
+      }
+      if (
+        current.handoff_version !== delivery?.handoff_version
+        || current.handoff.handoff_attempt_id !== delivery?.handoff?.handoff_attempt_id
+        || current.handoff.handoff_attempt_no !== delivery?.handoff?.handoff_attempt_no
+        || current.handoff.provider_attempt_id !== delivery?.handoff?.provider_attempt_id
+        || current.handoff.lease_epoch !== delivery?.handoff?.lease_epoch
+      ) {
+        conflict('stale_attempt', 'The unproven query result lost its handoff fence.');
+      }
+      const auditId = generateId('audit');
+      database.prepare(`
+        INSERT INTO runtime_interaction_audit (
+          audit_id, interaction_id, handoff_id, outcome, provider_attempt_id,
+          lease_epoch, acknowledgement_json, created_at
+        ) VALUES (?, ?, ?, 'query_unproven', ?, ?, ?, ?)
+      `).run(
+        auditId,
+        current.request.interaction_id,
+        current.handoff.handoff_id,
+        current.handoff.provider_attempt_id,
+        current.handoff.lease_epoch,
+        JSON.stringify(proof),
+        occurredAt,
+      );
+      return {
+        status: 'unknown',
+        interaction_id: current.request.interaction_id,
+        handoff_id: current.handoff.handoff_id,
+        audit_id: auditId,
+        turn_id: current.request.turn_id,
+        turn_state: 'recovering',
+      };
+    });
+    return record.immediate();
+  }
+
+  function resolveInteractionHandoffDisposition(delivery, disposition, authorization) {
+    const resolve = database.transaction(() => {
+      const occurredAt = now();
+      const current = getInteractionHandoffForRecovery(delivery?.handoff?.handoff_id);
+      const { request, handoff } = current;
+      const turn = loadTurn(database, request.turn_id);
+      const dispositionKeys = disposition && typeof disposition === 'object'
+        ? Object.keys(disposition).sort()
+        : [];
+      if (
+        dispositionKeys.length !== 2
+        || dispositionKeys[0] !== 'action'
+        || dispositionKeys[1] !== 'replacement_interaction_id'
+        || !['terminate', 'supersede'].includes(disposition.action)
+        || (disposition.action === 'terminate' && disposition.replacement_interaction_id !== null)
+        || (disposition.action === 'supersede'
+          && (typeof disposition.replacement_interaction_id !== 'string'
+            || disposition.replacement_interaction_id.length === 0))
+      ) {
+        conflict('provider_context_invalid', 'Invalid interaction handoff disposition.');
+      }
+      const expectedScope = {
+        conversation_id: request.conversation_id,
+        turn_id: request.turn_id,
+        handoff_id: handoff.handoff_id,
+        action: disposition.action,
+        replacement_interaction_id: disposition.replacement_interaction_id,
+      };
+      const authorizationKeys = authorization && typeof authorization === 'object'
+        ? Object.keys(authorization).sort()
+        : [];
+      const scopeKeys = authorization?.scope && typeof authorization.scope === 'object'
+        ? Object.keys(authorization.scope).sort()
+        : [];
+      if (
+        authorizationKeys.join(',')
+          !== 'actor_id,authorized,authorized_at,capability,decision_id,policy_id,policy_version,scope'
+        || authorization.authorized !== true
+        || typeof authorization.decision_id !== 'string'
+        || authorization.decision_id.length === 0
+        || typeof authorization.actor_id !== 'string'
+        || authorization.actor_id.length === 0
+        || authorization.capability !== 'interaction.handoff.resolve'
+        || typeof authorization.policy_id !== 'string'
+        || authorization.policy_id.length === 0
+        || !Number.isSafeInteger(authorization.policy_version)
+        || authorization.policy_version < 1
+        || typeof authorization.authorized_at !== 'string'
+        || Number.isNaN(Date.parse(authorization.authorized_at))
+        || scopeKeys.join(',')
+          !== 'action,conversation_id,handoff_id,replacement_interaction_id,turn_id'
+        || Object.entries(expectedScope).some(
+          ([fieldName, value]) => authorization.scope[fieldName] !== value,
+        )
+      ) {
+        conflict('authorization_denied', 'A trusted scoped authorization is required.');
+      }
+      if (
+        current.handoff_version !== delivery?.handoff_version
+        || delivery?.request?.interaction_id !== request.interaction_id
+        || delivery?.request?.version !== request.version
+        || delivery?.handoff?.handoff_attempt_id !== handoff.handoff_attempt_id
+        || delivery?.handoff?.handoff_attempt_no !== handoff.handoff_attempt_no
+        || delivery?.handoff?.provider_attempt_id !== handoff.provider_attempt_id
+        || delivery?.handoff?.lease_epoch !== handoff.lease_epoch
+      ) {
+        conflict('stale_attempt', 'The authorized disposition lost its handoff fence.');
+      }
+
+      let replacement = null;
+      if (disposition.action === 'supersede') {
+        const replacementRow = database.prepare(`
+          SELECT request_json
+          FROM runtime_interactions
+          WHERE interaction_id = ?
+        `).get(disposition.replacement_interaction_id);
+        if (!replacementRow) {
+          conflict('interaction_not_found', 'The replacement interaction does not exist.');
+        }
+        replacement = JSON.parse(replacementRow.request_json);
+        if (
+          replacement.interaction_id === request.interaction_id
+          || replacement.conversation_id !== request.conversation_id
+          || replacement.turn_id !== request.turn_id
+          || replacement.lineage_id !== request.lineage_id
+          || replacement.ordinal <= request.ordinal
+          || replacement.state !== 'pending'
+          || replacement.handoff_state !== 'not_started'
+          || replacement.runtime_fence?.provider_attempt_id !== handoff.provider_attempt_id
+          || replacement.runtime_fence?.lease_epoch !== handoff.lease_epoch
+        ) {
+          conflict(
+            'provider_context_invalid',
+            'Supersession requires a newer pending interaction under the same runtime fence.',
+          );
+        }
+        validateInteractionRequest(replacement, { occurredAt });
+      }
+
+      validateInteractionTransition({
+        from: 'delivery_unknown',
+        to: 'cancelled',
+        sendStarted: true,
+        occurredAt,
+      });
+      validateInteractionHandoffTransition({
+        from: 'delivery_unknown',
+        to: 'cancelled',
+        sendStarted: true,
+        occurredAt,
+      });
+      const updatedRequest = {
+        ...request,
+        state: 'cancelled',
+        version: request.version + 1,
+        handoff_state: 'cancelled',
+        terminal_reason: disposition.action === 'terminate'
+          ? 'authorized_delivery_unknown_termination'
+          : 'authorized_delivery_unknown_supersession',
+      };
+      const updatedHandoff = {
+        ...handoff,
+        state: 'cancelled',
+        reason_code: updatedRequest.terminal_reason,
+      };
+      validateInteractionRequest(updatedRequest, { occurredAt });
+      validateInteractionHandoff(updatedHandoff, { occurredAt });
+      const nextHandoffVersion = current.handoff_version + 1;
+      const interactionUpdate = database.prepare(`
+        UPDATE runtime_interactions
+        SET state = 'cancelled', version = ?, handoff_state = 'cancelled',
+          handoff_version = ?, request_json = ?, updated_at = ?
+        WHERE interaction_id = ? AND state = 'delivery_unknown' AND version = ?
+          AND handoff_state = 'delivery_unknown' AND handoff_version = ?
+      `).run(
+        updatedRequest.version,
+        nextHandoffVersion,
+        JSON.stringify(updatedRequest),
+        occurredAt,
+        request.interaction_id,
+        request.version,
+        current.handoff_version,
+      );
+      const handoffUpdate = database.prepare(`
+        UPDATE runtime_interaction_handoffs
+        SET state = 'cancelled', record_json = ?, updated_at = ?
+        WHERE handoff_id = ? AND state = 'delivery_unknown'
+          AND handoff_attempt_id = ? AND handoff_attempt_no = ?
+          AND provider_attempt_id = ? AND lease_epoch = ?
+      `).run(
+        JSON.stringify(updatedHandoff),
+        occurredAt,
+        handoff.handoff_id,
+        handoff.handoff_attempt_id,
+        handoff.handoff_attempt_no,
+        handoff.provider_attempt_id,
+        handoff.lease_epoch,
+      );
+      if (interactionUpdate.changes !== 1 || handoffUpdate.changes !== 1) {
+        conflict('stale_attempt', 'The authorized disposition lost its durable handoff fence.');
+      }
+      const auditId = generateId('audit');
+      database.prepare(`
+        INSERT INTO runtime_interaction_audit (
+          audit_id, interaction_id, handoff_id, outcome, provider_attempt_id,
+          lease_epoch, acknowledgement_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        auditId,
+        request.interaction_id,
+        handoff.handoff_id,
+        disposition.action === 'terminate' ? 'authorized_termination' : 'authorized_supersession',
+        handoff.provider_attempt_id,
+        handoff.lease_epoch,
+        JSON.stringify({
+          disposition,
+          authorization,
+          previous_request: request,
+          previous_handoff: handoff,
+          replacement_interaction: replacement,
+        }),
+        occurredAt,
+      );
+      const fence = {
+        attempt_id: turn.attempt_id,
+        attempt_no: turn.attempt_no,
+        lease_epoch: turn.lease_epoch,
+      };
+      let currentTurn = turn;
+      if (disposition.action === 'supersede') {
+        transitionInTransaction(database, {
+          turnId: turn.turn_id,
+          fromState: 'recovering',
+          toState: 'waiting_user',
+          fence,
+          provider,
+          serviceInstanceId,
+          occurredAt,
+          generateId,
+          reasonCode: 'interaction_handoff_superseded',
+        });
+        currentTurn = loadTurn(database, turn.turn_id);
+      }
+      const event = buildEvent({
+        turn: currentTurn,
+        lastEvent: loadLastEvent(database, turn.turn_id),
+        fence,
+        provider,
+        descriptor: {
+          kind: 'interaction_cancelled',
+          phase: currentTurn.state,
+          provider_native_id: currentTurn.provider_native_id,
+          payload: {
+            interaction_id: request.interaction_id,
+            ordinal: request.ordinal,
+            interaction_version: updatedRequest.version,
+            handoff_version: nextHandoffVersion,
+            replacement_interaction_id: disposition.replacement_interaction_id,
+          },
+        },
+        occurredAt,
+        generateId,
+      });
+      commitTurnEvent(database, {
+        turn: currentTurn,
+        event,
+        fence,
+        nextState: currentTurn.state,
+        staleMessage: 'The authorized disposition lost its recovering turn fence.',
+        generateId,
+      });
+      return {
+        status: disposition.action === 'terminate' ? 'terminated' : 'superseded',
+        interaction_id: request.interaction_id,
+        handoff_id: handoff.handoff_id,
+        replacement_interaction_id: disposition.replacement_interaction_id,
+        handoff_version: nextHandoffVersion,
+        audit_id: auditId,
+        turn_id: turn.turn_id,
+        turn_state: currentTurn.state,
+        turn_version: event.turn_version,
+      };
+    });
+    return resolve.immediate();
   }
 
   function markProviderFailure(turnContext, error) {
@@ -2874,6 +3806,7 @@ export function createExecutorStore({
 
   return Object.freeze({
     acknowledgeInteractionHandoff,
+    acknowledgeInteractionHandoffFromQuery,
     appendAdapterEvent,
     assertCurrentFence,
     bindProviderNativeId,
@@ -2885,11 +3818,16 @@ export function createExecutorStore({
     heartbeatOwnedResidents,
     isConversationEvictable,
     markInteractionHandoffDeliveryUnknown,
+    markInteractionHandoffPreSendFailure,
+    markInteractionHandoffSendStarted,
     releaseExecutorResident,
     releaseRecoveringExecutorOwnership,
     reconcileExpiredResidents,
     expireInteraction,
+    getInteractionHandoffForRecovery,
     listPendingInteractionDeadlines,
+    recordInteractionHandoffQueryUnproven,
+    resolveInteractionHandoffDisposition,
     rebuildExecutorCache,
     releaseTimedOutExecutorLease,
     requestInteraction,

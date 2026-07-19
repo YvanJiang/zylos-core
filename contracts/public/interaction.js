@@ -1028,12 +1028,31 @@ export function validateInteractionHandoff(value, { occurredAt } = {}) {
       reject('Rejected handoff requires send/ack evidence plus reason and error.', occurredAt);
     }
   } else if (value.state === 'cancelled') {
+    if (value.reason_code === null || value.provider_acked_at !== null) {
+      reject('Cancelled handoff requires a reason and cannot contain provider ack evidence.', occurredAt);
+    }
     if (
-      value.reason_code === null
-      || value.last_send_started_at !== null
-      || value.provider_acked_at !== null
+      value.last_send_started_at !== null
+      && (
+        !hasClaim
+        || value.error === null
+        || value.error.side_effect_status !== 'unknown'
+        || value.side_effect_status !== 'unknown'
+      )
     ) {
-      reject('Cancelled handoff requires a reason and cannot contain send/ack evidence.', occurredAt);
+      reject(
+        'Post-send cancellation must preserve claim/send evidence and unknown side effects.',
+        occurredAt,
+      );
+    }
+    if (
+      value.last_send_started_at === null
+      && (
+        value.side_effect_status !== 'none'
+        || (value.error !== null && value.error.side_effect_status !== 'none')
+      )
+    ) {
+      reject('Pre-send cancellation cannot claim provider side effects.', occurredAt);
     }
   }
   return structuredClone(value);

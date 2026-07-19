@@ -7,6 +7,14 @@ function defaultGenerateId(kind) {
   return `${kind}-${crypto.randomUUID()}`;
 }
 
+function deepFreeze(value) {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
+}
+
 function normalizeProviderError(error, occurredAt) {
   const descriptor = error?.providerError;
   if (descriptor && typeof descriptor === 'object') {
@@ -33,6 +41,32 @@ function normalizeProviderError(error, occurredAt) {
   });
 }
 
+function normalizePreSendProviderError(error, occurredAt) {
+  const descriptor = error?.providerError;
+  if (descriptor && typeof descriptor === 'object') {
+    try {
+      return createContractError({
+        code: descriptor.code,
+        category: descriptor.category,
+        retryable: descriptor.retryable === true,
+        sideEffectStatus: 'none',
+        userMessage: descriptor.user_message,
+        occurredAt,
+      });
+    } catch {
+      // Invalid adapter metadata is replaced with the safe non-retryable failure below.
+    }
+  }
+  return createContractError({
+    code: 'provider_context_invalid',
+    category: 'provider',
+    retryable: false,
+    sideEffectStatus: 'none',
+    userMessage: 'The provider rejected the answer before delivery began.',
+    occurredAt,
+  });
+}
+
 function isExplicitProviderError(error) {
   return error !== null
     && typeof error === 'object'
@@ -53,6 +87,7 @@ export function createExecutorService({
   scheduleResidentHeartbeat = setInterval,
   cancelResidentHeartbeat = clearInterval,
   permissionHandler = null,
+  interactionHandoffDispositionAuthorizer = null,
   interactionTimeoutMs,
   maxResidentExecutorsPerBot = 20,
   setTimeoutFn = setTimeout,
@@ -76,6 +111,12 @@ export function createExecutorService({
   }
   if (permissionHandler !== null && typeof permissionHandler !== 'function') {
     throw new TypeError('permissionHandler must be a function or null');
+  }
+  if (
+    interactionHandoffDispositionAuthorizer !== null
+    && typeof interactionHandoffDispositionAuthorizer !== 'function'
+  ) {
+    throw new TypeError('interactionHandoffDispositionAuthorizer must be a function or null');
   }
   if (!Number.isFinite(residentLeaseDurationMs) || residentLeaseDurationMs <= 0) {
     throw new TypeError('residentLeaseDurationMs must be a positive finite number');
@@ -134,6 +175,7 @@ export function createExecutorService({
   function persistenceFailure(cause) {
     const error = new Error(`Runtime persistence failed: ${cause.message}`, { cause });
     error.persistenceFailure = true;
+    if (typeof cause?.code === 'string') error.code = cause.code;
     return error;
   }
 
@@ -959,22 +1001,50 @@ export function createExecutorService({
   }
 
   async function executeInteractionDelivery(handoffId) {
-    if (typeof adapter.handleInteractionAnswer !== 'function') {
-      throw new TypeError('adapter.handleInteractionAnswer must be a function');
+    if (typeof adapter.prepareInteractionAnswer !== 'function') {
+      throw new TypeError('adapter.prepareInteractionAnswer must be a function');
     }
     const delivery = store.claimInteractionHandoff(handoffId);
     const activeRun = activeRuns.get(delivery.request.turn_id);
+    let prepared;
+    try {
+      prepared = await adapter.prepareInteractionAnswer(deepFreeze(delivery));
+      if (!prepared || typeof prepared.send !== 'function') {
+        throw new TypeError('adapter.prepareInteractionAnswer must return a send function');
+      }
+    } catch (error) {
+      const providerError = normalizePreSendProviderError(error, now());
+      const resolution = persist(
+        () => store.markInteractionHandoffPreSendFailure(delivery, providerError),
+      );
+      if (resolution.status === 'recovering' && activeRun && !activeRun.durableSettled) {
+        const isolationProven = await isolateInteractionRecovery(activeRun);
+        if (!isolationProven) {
+          lifecycle = 'close_failed';
+          throw new Error('The non-retryable pre-send failure could not isolate its provider run.');
+        }
+        activeRun.durableSettled = true;
+        cleanupActiveRun(activeRun);
+        releaseRecoveringOwnership(activeRun.turnContext);
+      }
+      reschedulePendingInteractionDeadlines();
+      refresh();
+      return resolution;
+    }
+    const sendingDelivery = persist(
+      () => store.markInteractionHandoffSendStarted(delivery),
+    );
     let handlerAcknowledgement;
     try {
-      handlerAcknowledgement = await adapter.handleInteractionAnswer(
-        Object.freeze(delivery),
+      handlerAcknowledgement = await prepared.send(
+        deepFreeze(sendingDelivery),
       );
     } catch (error) {
       if (provider === 'codex' && isExplicitProviderError(error)) {
         const providerError = normalizeProviderError(error, now());
         if (providerError.side_effect_status === 'unknown') {
           const deliveryUnknown = persist(
-            () => store.markInteractionHandoffDeliveryUnknown(delivery, providerError),
+            () => store.markInteractionHandoffDeliveryUnknown(sendingDelivery, providerError),
           );
           if (activeRun && !activeRun.durableSettled) {
             activeRun.durableSettled = true;
@@ -987,7 +1057,7 @@ export function createExecutorService({
       }
       const recovery = {
         activeRun,
-        delivery,
+        delivery: sendingDelivery,
         deliveryUnknown: null,
         isolationProven: false,
         marked: false,
@@ -995,7 +1065,7 @@ export function createExecutorService({
       pendingInteractionRecoveries.set(delivery.request.turn_id, recovery);
       try {
         recovery.deliveryUnknown = persist(
-          () => store.markInteractionHandoffDeliveryUnknown(delivery),
+          () => store.markInteractionHandoffDeliveryUnknown(sendingDelivery),
         );
         recovery.marked = true;
       } catch (markFailure) {
@@ -1079,6 +1149,61 @@ export function createExecutorService({
       interactionDeliverySettlements.delete(delivery);
     }).catch(() => {});
     return delivery;
+  }
+
+  async function reconcileInteractionHandoff(handoffId) {
+    if (lifecycle !== 'open') {
+      throw new Error(
+        `Executor service is ${lifecycle}; it cannot reconcile an interaction handoff.`,
+      );
+    }
+    if (typeof adapter.queryInteractionHandoffAcceptance !== 'function') {
+      throw new TypeError('adapter.queryInteractionHandoffAcceptance must be a function');
+    }
+    const delivery = store.getInteractionHandoffForRecovery(handoffId);
+    const proof = await adapter.queryInteractionHandoffAcceptance(deepFreeze(delivery));
+    if (proof?.status === 'accepted') {
+      const acknowledgement = persist(
+        () => store.acknowledgeInteractionHandoffFromQuery(delivery, proof),
+      );
+      refresh();
+      return acknowledgement;
+    }
+    return persist(() => store.recordInteractionHandoffQueryUnproven(delivery, proof));
+  }
+
+  async function resolveInteractionHandoff(handoffId, disposition) {
+    if (lifecycle !== 'open') {
+      throw new Error(
+        `Executor service is ${lifecycle}; it cannot resolve an interaction handoff.`,
+      );
+    }
+    if (interactionHandoffDispositionAuthorizer === null) {
+      throw new TypeError('No interaction handoff disposition authorizer is configured.');
+    }
+    const delivery = store.getInteractionHandoffForRecovery(handoffId);
+    const decision = Object.freeze({
+      capability: 'interaction.handoff.resolve',
+      scope: Object.freeze({
+        conversation_id: delivery.request.conversation_id,
+        turn_id: delivery.request.turn_id,
+        handoff_id: delivery.handoff.handoff_id,
+        action: disposition?.action,
+        replacement_interaction_id: disposition?.replacement_interaction_id,
+      }),
+    });
+    const authorization = await interactionHandoffDispositionAuthorizer(
+      decision,
+      deepFreeze(delivery),
+    );
+    const result = persist(() => store.resolveInteractionHandoffDisposition(
+      delivery,
+      disposition,
+      authorization,
+    ));
+    reschedulePendingInteractionDeadlines();
+    refresh();
+    return result;
   }
 
   async function close() {
@@ -1269,6 +1394,8 @@ export function createExecutorService({
     deliverInteractionAnswer,
     evictIdleExecutors,
     expireInteraction,
+    reconcileInteractionHandoff,
+    resolveInteractionHandoff,
     runNext,
     snapshot,
     start,

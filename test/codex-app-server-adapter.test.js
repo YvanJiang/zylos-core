@@ -161,6 +161,12 @@ function handoffDelivery(providerInteractionRef, value, {
   };
 }
 
+async function deliverPreparedInteractionAnswer(adapter, delivery) {
+  const prepared = await adapter.prepareInteractionAnswer(delivery);
+  delivery.handoff.last_send_started_at ??= '2026-07-19T05:04:03Z';
+  return prepared.send(delivery);
+}
+
 function sendStartedFileChange({ send, threadId, turnId }, itemId) {
   send({
     method: 'item/started',
@@ -306,7 +312,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const runA = adapter.execute(runAContext)[Symbol.asyncIterator]();
     const interaction = await nextInteraction(runA);
-    await adapter.handleInteractionAnswer(handoffDelivery(
+    await deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
       { kind: 'decision', decision: 'approve' },
     ));
@@ -1054,10 +1060,22 @@ describe('Codex app-server provider adapter', () => {
     });
     expect(JSON.stringify(interaction.value)).not.toContain('requestUserInput');
 
-    await expect(adapter.handleInteractionAnswer(handoffDelivery(
+    const delivery = handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
       { kind: 'text', text: 'Alice' },
-    ))).resolves.toEqual({
+    );
+    await expect(adapter.queryInteractionHandoffAcceptance(delivery)).resolves.toMatchObject({
+      status: 'unknown',
+      read_only: true,
+      idempotent: true,
+      handoff_id: delivery.handoff.handoff_id,
+      handoff_attempt_id: delivery.handoff.handoff_attempt_id,
+      reason_code: 'provider_acceptance_query_unavailable',
+    });
+    const prepared = await adapter.prepareInteractionAnswer(delivery);
+    expect(server.received).not.toContainEqual(expect.objectContaining({ id: 71 }));
+    delivery.handoff.last_send_started_at = '2026-07-19T05:04:03Z';
+    await expect(prepared.send(delivery)).resolves.toEqual({
       handoff_id: 'handoff-1',
       status: 'accepted',
       provider_attempt_id: 'attempt-1',
@@ -1260,7 +1278,7 @@ describe('Codex app-server provider adapter', () => {
       }),
     });
     expect(JSON.stringify(interaction.value)).not.toMatch(/requestApproval|requestUserInput/);
-    await expect(adapter.handleInteractionAnswer(handoffDelivery(
+    await expect(deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
       answer,
     ))).resolves.toEqual(expect.objectContaining({
@@ -1577,7 +1595,7 @@ describe('Codex app-server provider adapter', () => {
     const iterator = adapter.execute(executionContext())[Symbol.asyncIterator]();
     const interaction = await iterator.next();
 
-    await expect(adapter.handleInteractionAnswer(handoffDelivery(
+    await expect(deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
       answer,
     ))).rejects.toMatchObject({ providerError: { code: 'side_effect_unknown' } });
@@ -1771,7 +1789,7 @@ describe('Codex app-server provider adapter', () => {
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     const iterator = adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]();
     const interaction = await nextInteraction(iterator);
-    await adapter.handleInteractionAnswer(handoffDelivery(
+    await deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
       { kind: 'decision', decision: 'approve' },
     ));
@@ -1819,7 +1837,7 @@ describe('Codex app-server provider adapter', () => {
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     const iterator = adapter.execute(executionContext())[Symbol.asyncIterator]();
     const first = await nextInteraction(iterator);
-    await adapter.handleInteractionAnswer(handoffDelivery(
+    await deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       first.value.payload.provider_interaction_ref,
       { kind: 'decision', decision: 'approve' },
       { handoffId: 'handoff-numeric', handoffAttemptId: 'attempt-numeric' },
@@ -1854,7 +1872,7 @@ describe('Codex app-server provider adapter', () => {
     });
 
     const second = await nextInteraction(iterator);
-    await adapter.handleInteractionAnswer(handoffDelivery(
+    await deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       second.value.payload.provider_interaction_ref,
       { kind: 'decision', decision: 'deny' },
       { handoffId: 'handoff-string', handoffAttemptId: 'attempt-string' },
@@ -2350,7 +2368,7 @@ describe('Codex app-server provider adapter', () => {
     delivery.handoff.lease_epoch = 4;
     const before = server.received.length;
 
-    await expect(adapter.handleInteractionAnswer(delivery)).rejects.toThrow(/runtime fence/);
+    await expect(deliverPreparedInteractionAnswer(adapter, delivery)).rejects.toThrow(/runtime fence/);
     expect(server.received).toHaveLength(before);
     await iterator.return();
   });
@@ -2374,7 +2392,7 @@ describe('Codex app-server provider adapter', () => {
       throw new Error('forced synchronous EPIPE');
     });
 
-    await expect(adapter.handleInteractionAnswer(handoffDelivery(
+    await expect(deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
       { kind: 'decision', decision: 'approve' },
     ))).rejects.toMatchObject({
@@ -2403,7 +2421,7 @@ describe('Codex app-server provider adapter', () => {
     server.child.emit('close', 1, null);
 
     expect(reportProviderFailure).toHaveBeenCalledTimes(1);
-    await expect(adapter.handleInteractionAnswer(handoffDelivery(
+    await expect(deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
       { kind: 'decision', decision: 'approve' },
     ))).rejects.toThrow(/current provider request/);
