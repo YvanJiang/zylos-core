@@ -196,6 +196,8 @@ export function validateContractHeader(value, { occurredAt } = {}) {
 
 function validateField(fieldName, value, rule, occurredAt) {
   switch (rule.kind) {
+    case 'presence':
+      return value;
     case 'opaque_id':
       return validateOpaqueId(fieldName, value, { occurredAt });
     case 'rfc3339':
