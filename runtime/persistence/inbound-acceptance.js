@@ -118,6 +118,7 @@ function buildInitialDeliveryCommand({
   text = 'Message received.',
   error = null,
   terminal = false,
+  operation = 'create_main',
 }) {
   const outboxId = generateId('outbox');
   const deliveryId = generateId('delivery');
@@ -142,7 +143,7 @@ function buildInitialDeliveryCommand({
     target,
     aggregate_type: 'turn_main',
     aggregate_id: turnId,
-    operation: 'create_main',
+    operation,
     aggregate_version: aggregateVersion,
     event_sequence_through: eventSequenceThrough,
     idempotency_key: createIdempotencyKey('delivery', {
@@ -235,10 +236,14 @@ export function acceptNormalInbound(
     now = () => new Date().toISOString(),
     generateId = defaultGenerateId,
     maxQueuedTurns = DEFAULT_MAX_QUEUED_TURNS,
+    initialDeliveryOperation = 'create_main',
   } = {},
 ) {
   if (!Number.isSafeInteger(maxQueuedTurns) || maxQueuedTurns <= 0) {
     throw new TypeError('maxQueuedTurns must be a positive safe integer');
+  }
+  if (!['create_main', 'send_text'].includes(initialDeliveryOperation)) {
+    throw new TypeError('initialDeliveryOperation must be create_main or send_text');
   }
   const validated = validateInboundEnvelope(envelope);
   const payloadHash = createPayloadHash(envelope, {
@@ -454,6 +459,7 @@ export function acceptNormalInbound(
       text: queueFull ? queueFullError.user_message : 'Message received.',
       error: queueFullError,
       terminal: queueFull,
+      operation: initialDeliveryOperation,
     });
     validateDeliveryCommand(deliveryCommand);
     const laneKey = initializeMainProjection(database, deliveryCommand);

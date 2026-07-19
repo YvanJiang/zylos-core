@@ -171,6 +171,7 @@ const RUNTIME_SCHEMA = `
     answer_id TEXT PRIMARY KEY,
     interaction_id TEXT NOT NULL UNIQUE REFERENCES runtime_interactions(interaction_id),
     idempotency_key TEXT NOT NULL UNIQUE,
+    payload_hash TEXT NOT NULL,
     answer_json TEXT NOT NULL,
     result_json TEXT NOT NULL,
     committed_at TEXT NOT NULL
@@ -209,6 +210,8 @@ const RUNTIME_SCHEMA = `
     lane_key TEXT PRIMARY KEY,
     turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
     aggregate_type TEXT NOT NULL,
+    delivery_mode TEXT NOT NULL DEFAULT 'main'
+      CHECK (delivery_mode IN ('main', 'text')),
     target_json TEXT NOT NULL,
     mapping_json TEXT NOT NULL,
     platform_message_id TEXT,
@@ -362,14 +365,15 @@ function backfillDeliveryLanes(database) {
     const delivered = row.status === 'delivered' && result?.status === 'delivered';
     database.prepare(`
       INSERT OR IGNORE INTO runtime_delivery_lanes (
-        lane_key, turn_id, aggregate_type, target_json, mapping_json,
+        lane_key, turn_id, aggregate_type, delivery_mode, target_json, mapping_json,
         platform_message_id, applied_platform_version, last_delivery_id,
         last_applied_version, last_delivered_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       laneKey,
       command.mapping.turn_id,
       command.aggregate_type,
+      command.operation === 'send_text' ? 'text' : 'main',
       JSON.stringify(command.target),
       JSON.stringify(command.mapping),
       delivered ? result.platform_message_id : null,
@@ -430,6 +434,13 @@ export function initializeRuntimePersistence(database) {
     'INTEGER NOT NULL DEFAULT 0 CHECK (owner_epoch >= 0)',
   );
   addColumnIfMissing(database, 'runtime_executor_residents', 'owner_expires_at', 'TEXT');
+  addColumnIfMissing(database, 'runtime_interaction_answers', 'payload_hash', 'TEXT');
+  addColumnIfMissing(
+    database,
+    'runtime_delivery_lanes',
+    'delivery_mode',
+    "TEXT NOT NULL DEFAULT 'main' CHECK (delivery_mode IN ('main', 'text'))",
+  );
   addColumnIfMissing(
     database,
     'runtime_outbox',
