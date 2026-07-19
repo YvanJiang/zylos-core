@@ -175,7 +175,7 @@ afterEach(() => {
 });
 
 describe('native-thread delivery authority', () => {
-  test('fences v1.0 native-thread conversation identity in the lane key', () => {
+  test('fences complete v1 target identity in the delivery lane key', () => {
     const target = nativeThreadEnvelope();
     const legacyTarget = {
       region: target.region,

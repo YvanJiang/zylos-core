@@ -405,7 +405,7 @@ function backfillDeliveryLanes(database) {
   }
 }
 
-function migrateDeliveryLaneThreadIdentity(database) {
+function migrateDeliveryLaneIdentity(database) {
   const migrate = database.transaction(() => {
     database.pragma('defer_foreign_keys = ON');
     const lanes = database.prepare(`
@@ -547,7 +547,7 @@ export function initializeRuntimePersistence(database) {
   );
   migrateLegacyOutboxConstraint(database);
   backfillDeliveryLanes(database);
-  migrateDeliveryLaneThreadIdentity(database);
+  migrateDeliveryLaneIdentity(database);
   database.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS runtime_lineages_provider_native_id
       ON runtime_lineages(provider, provider_native_id)
