@@ -9,7 +9,7 @@ import { isValidRfc3339Timestamp, isWellFormedUnicode } from './scalars.js';
 const VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/;
 const SECRET_FIELD_PATTERN = /(?:^|_)(?:secret|token|password|credential|credentials|authorization|cookie|signature)(?:$|_)/i;
-const EXPLICIT_SECRET_FIELD_NAMES = new Set([
+const EXPLICIT_SECRET_FIELD_SUFFIXES = Object.freeze([
   'api_key',
   'private_key',
   'access_key',
@@ -103,7 +103,10 @@ function normalizeFixtureFieldName(fieldName) {
 
 function isSecretFixtureField(fieldName) {
   const normalized = normalizeFixtureFieldName(fieldName);
-  return SECRET_FIELD_PATTERN.test(normalized) || EXPLICIT_SECRET_FIELD_NAMES.has(normalized);
+  return SECRET_FIELD_PATTERN.test(normalized)
+    || EXPLICIT_SECRET_FIELD_SUFFIXES.some(
+      (secretName) => normalized === secretName || normalized.endsWith(`_${secretName}`),
+    );
 }
 
 export function validatePublicFixtureSafety(value, { occurredAt } = {}) {

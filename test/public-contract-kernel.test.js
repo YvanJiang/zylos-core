@@ -346,7 +346,14 @@ describe('shared v1 idempotency golden vectors', () => {
       .toThrow(ContractKernelError);
     expect(() => validatePublicFixtureSafety({ api_secret: 'redacted' }))
       .toThrow(ContractKernelError);
-    for (const fieldName of ['apiKey', 'accessToken', 'clientSecret', 'privateKey']) {
+    for (const fieldName of [
+      'apiKey',
+      'openaiApiKey',
+      'x-api-key',
+      'accessToken',
+      'clientSecret',
+      'privateKey',
+    ]) {
       expect(() => validatePublicFixtureSafety({ [fieldName]: 'plain-secret' }))
         .toThrow(ContractKernelError);
     }
