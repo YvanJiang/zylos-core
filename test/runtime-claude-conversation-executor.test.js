@@ -1747,6 +1747,7 @@ describe('Claude conversation executor', () => {
     let calls = 0;
     const finishFirstQuery = deferred();
     let heartbeat;
+    let serviceTime = '2026-07-19T09:11:30Z';
     const adapter = createClaudeConversationAdapter({
       query({ prompt }) {
         calls += 1;
@@ -1781,7 +1782,7 @@ describe('Claude conversation executor', () => {
       adapter,
       provider: 'claude',
       serviceInstanceId: 'executor-service-ended-capacity',
-      now: () => '2026-07-19T09:11:30Z',
+      now: () => serviceTime,
       generateId: deterministicIds('ended-capacity'),
       maxResidentExecutorsPerBot: 1,
       scheduleResidentHeartbeat(callback) {
@@ -1808,6 +1809,13 @@ describe('Claude conversation executor', () => {
     await new Promise((resolve) => setImmediate(resolve));
     expect(database.prepare(`SELECT conversation_id FROM runtime_executor_residents`).all())
       .toEqual([{ conversation_id: first.conversation_id }]);
+    serviceTime = '2026-07-19T09:12:00Z';
+    heartbeat();
+    expect(database.prepare(`
+      SELECT owner_expires_at FROM runtime_executor_residents WHERE conversation_id = ?
+    `).get(first.conversation_id)).toEqual({
+      owner_expires_at: '2026-07-19T09:13:00.000Z',
+    });
     database.exec(`DROP TRIGGER fail_ended_resident_release`);
     heartbeat();
     expect(database.prepare(`SELECT conversation_id FROM runtime_executor_residents`).all())

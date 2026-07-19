@@ -120,15 +120,20 @@ export function createExecutorService({
     if (provider === 'claude' && residentHeartbeat === null) {
       residentHeartbeat = scheduleResidentHeartbeat(() => {
         try {
-          for (const [conversationId, ownerEpoch] of endedResidentFences) {
-            if (store.releaseExecutorResident(conversationId, ownerEpoch)) {
-              endedResidentFences.delete(conversationId);
-            }
-          }
           store.heartbeatOwnedResidents();
           residentHeartbeatFailure = null;
         } catch (error) {
           residentHeartbeatFailure = error;
+          return;
+        }
+        for (const [conversationId, ownerEpoch] of endedResidentFences) {
+          try {
+            if (store.releaseExecutorResident(conversationId, ownerEpoch)) {
+              endedResidentFences.delete(conversationId);
+            }
+          } catch (error) {
+            residentHeartbeatFailure = error;
+          }
         }
       }, residentHeartbeatIntervalMs);
       residentHeartbeat?.unref?.();
