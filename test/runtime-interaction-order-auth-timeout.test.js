@@ -590,6 +590,54 @@ describe('runtime interaction order, authorization, and timeout', () => {
     database.close();
   });
 
+  test('cancels buffered provider-neutral interaction requests without re-entering waiting', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedInteractionTurn(database, 'buffered-generic-cancel');
+    const descriptor = (ordinal) => ({
+      provider_interaction_ref: `provider-buffered-generic-${ordinal}`,
+      tool_use_id: `tool-buffered-generic-${ordinal}`,
+      kind: 'question',
+      prompt: `Buffered question ${ordinal}?`,
+      choices: [],
+      authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+      allowed_sources: ['card_action'],
+    });
+    const adapter = {
+      async *execute() {
+        yield { kind: 'interaction_requested', payload: descriptor(1) };
+        yield { kind: 'interaction_requested', payload: descriptor(2) };
+        yield { type: 'turn_result', outcome: 'cancelled' };
+      },
+      async cancel() {},
+      hasResident() { return false; },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-buffered-generic-cancel',
+      now: () => '2026-07-19T07:01:03Z',
+      generateId: deterministicIds('buffered-generic-cancel'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ status: 'waiting_user' });
+    await expect(service.cancel(accepted.conversation_id)).resolves.toMatchObject({
+      status: 'cancellation_requested',
+      execution: { status: 'stopped' },
+    });
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'stopped' });
+    expect(database.prepare(`
+      SELECT ordinal, state FROM runtime_interactions WHERE turn_id = ? ORDER BY ordinal
+    `).all(accepted.turn_id)).toEqual([
+      { ordinal: 1, state: 'cancelled' },
+      { ordinal: 2, state: 'cancelled' },
+    ]);
+
+    await service.close();
+    database.close();
+  });
+
   test('retains the timeout lease when this service cannot prove the writer stopped', async () => {
     const database = openTestDatabase();
     const { clock, store, turnContext } = createRunningTurn(database, 'timeout-no-writer');

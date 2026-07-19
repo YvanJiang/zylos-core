@@ -329,6 +329,23 @@ function createCaughtPermissionFailureQuery({ sessionId }) {
   return { permissionRequested, query };
 }
 
+function createEndingPermissionQuery({ sessionId }) {
+  function query({ prompt, options }) {
+    const stream = (async function* generateSdkMessages() {
+      for await (const input of prompt) {
+        yield { type: 'system', subtype: 'init', session_id: sessionId };
+        options.canUseTool('Bash', { command: `echo ${input.message.content}` }, {})
+          .catch(() => {});
+        return;
+      }
+    }());
+    stream.interrupt = async () => ({ still_queued: [] });
+    stream.close = () => {};
+    return stream;
+  }
+  return { query };
+}
+
 function createCaughtPermissionCancellationQuery({ sessionId }) {
   const interruptRequested = deferred();
   const permissionRequested = deferred();
@@ -1282,6 +1299,59 @@ describe('Claude conversation executor', () => {
       .get(accepted.turn_id)).toEqual({ state: 'recovering' });
 
     database.exec(`DROP TRIGGER fail_permission_ack_audit`);
+    await service.close();
+    database.close();
+  });
+
+  test('marks answer delivery unknown when the SDK query ended before handler acknowledgement', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'permission-ended-before-answer');
+    const fake = createEndingPermissionQuery({
+      sessionId: 'claude-session-permission-ended-before-answer',
+    });
+    const adapter = createClaudeConversationAdapter({ query: fake.query });
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-permission-ended-before-answer',
+      now: () => '2026-07-19T09:03:25Z',
+      generateId: deterministicIds('permission-ended-before-answer'),
+    });
+
+    const waiting = await service.runNext();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(adapter.hasResident(accepted.conversation_id)).toBe(false);
+    const answer = service.submitInteractionAnswer(
+      permissionAnswer(waiting.request, 'ended-before-answer'),
+    );
+
+    await expect(service.deliverInteractionAnswer(answer.handoff_id)).rejects.toThrow(
+      /active provider attempt fence|pending SDK permission/,
+    );
+    expect(database.prepare(`
+      SELECT interaction.state, interaction.handoff_state,
+        handoff.state AS durable_handoff_state, turn.state AS turn_state
+      FROM runtime_interactions AS interaction
+      JOIN runtime_interaction_handoffs AS handoff
+        ON handoff.interaction_id = interaction.interaction_id
+      JOIN runtime_turns AS turn ON turn.turn_id = interaction.turn_id
+      WHERE interaction.interaction_id = ?
+    `).get(waiting.request.interaction_id)).toEqual({
+      state: 'delivery_unknown',
+      handoff_state: 'delivery_unknown',
+      durable_handoff_state: 'delivery_unknown',
+      turn_state: 'recovering',
+    });
+    const latestEvent = JSON.parse(database.prepare(`
+      SELECT event_json FROM runtime_normalized_events
+      WHERE turn_id = ? ORDER BY event_sequence DESC LIMIT 1
+    `).get(accepted.turn_id).event_json);
+    expect(latestEvent).toMatchObject({
+      kind: 'interaction_answer_delivery_unknown',
+      phase: 'recovering',
+    });
+
     await service.close();
     database.close();
   });
@@ -2365,6 +2435,36 @@ describe('Claude conversation executor', () => {
     await expect(service.runNext()).rejects.toThrow(/closing|closed/);
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
       .get(afterClose.turn_id)).toEqual({ state: 'queued' });
+
+    database.close();
+  });
+
+  test('close relinquishes durable ownership for a recovering permission turn', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'close-recovering-ownership');
+    const fake = createPermissionQuery({
+      sessionId: 'claude-session-close-recovering-ownership',
+    });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-close-recovering-ownership',
+      now: () => '2026-07-19T09:14:15Z',
+      generateId: deterministicIds('close-recovering-ownership'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ status: 'waiting_user' });
+    await service.close();
+
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    expect(database.prepare(`
+      SELECT lease_owner FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({ lease_owner: null });
+    expect(database.prepare(`
+      SELECT owner_service_instance_id FROM runtime_executor_residents WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({ owner_service_instance_id: null });
 
     database.close();
   });

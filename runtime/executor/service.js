@@ -86,6 +86,7 @@ export function createExecutorService({
   const activeRunSettlements = new Set();
   const cancellationSettlements = new Map();
   const endedResidentFences = new Map();
+  const recoveringOwnershipReleases = new Map();
   const timedOutLeaseReleases = new Map();
   const uncertainTurnIds = new Set();
   let lifecycle = 'open';
@@ -203,6 +204,13 @@ export function createExecutorService({
             residentHeartbeatFailure = error;
           }
         }
+        for (const turnContext of recoveringOwnershipReleases.values()) {
+          try {
+            releaseRecoveringOwnership(turnContext);
+          } catch (error) {
+            residentHeartbeatFailure = error;
+          }
+        }
       }, residentHeartbeatIntervalMs);
       residentHeartbeat?.unref?.();
     }
@@ -255,6 +263,14 @@ export function createExecutorService({
       const released = store.releaseExecutorResident(turnContext.conversation_id, ownerEpoch);
       if (released) endedResidentFences.delete(turnContext.conversation_id);
     }
+  }
+
+  function releaseRecoveringOwnership(turnContext) {
+    recoveringOwnershipReleases.set(turnContext.turn_id, turnContext);
+    const result = store.releaseRecoveringExecutorOwnership(turnContext);
+    recoveringOwnershipReleases.delete(turnContext.turn_id);
+    endedResidentFences.delete(turnContext.conversation_id);
+    return result;
   }
 
   async function awaitCancellationSettlement(turnId) {
@@ -369,6 +385,7 @@ export function createExecutorService({
             record.payload,
           ));
           reschedulePendingInteractionDeadlines();
+          if (cancelledTurnIds.has(activeRun.turnContext.turn_id)) continue;
           activeRun.pauseKind = 'interaction';
           refresh();
           return resultFor(activeRun, 'waiting_user', { request });
@@ -721,11 +738,44 @@ export function createExecutorService({
       throw new TypeError('adapter.handleInteractionAnswer must be a function');
     }
     const delivery = store.claimInteractionHandoff(handoffId);
-    const handlerAcknowledgement = await adapter.handleInteractionAnswer(
-      Object.freeze(delivery),
-    );
-    const managedPermissions = permissionControllers.get(delivery.request.turn_id)?.size ?? 0;
     const activeRun = activeRuns.get(delivery.request.turn_id);
+    let handlerAcknowledgement;
+    try {
+      handlerAcknowledgement = await adapter.handleInteractionAnswer(
+        Object.freeze(delivery),
+      );
+    } catch (error) {
+      const deliveryUnknown = persist(
+        () => store.markInteractionHandoffDeliveryUnknown(delivery),
+      );
+      if (activeRun && !activeRun.durableSettled) {
+        let isolated = typeof adapter.abort !== 'function';
+        if (typeof adapter.abort === 'function') {
+          try {
+            await adapter.abort(activeRun.turnContext);
+            isolated = true;
+          } catch (abortFailure) {
+            lifecycle = 'close_failed';
+            error.abortFailure = abortFailure;
+          }
+        }
+        activeRun.durableSettled = true;
+        refresh();
+        cleanupActiveRun(activeRun);
+        if (isolated) {
+          try {
+            releaseRecoveringOwnership(activeRun.turnContext);
+          } catch (ownershipFailure) {
+            lifecycle = 'close_failed';
+            error.ownershipFailure = ownershipFailure;
+          }
+        }
+      }
+      reschedulePendingInteractionDeadlines();
+      error.deliveryUnknown = deliveryUnknown;
+      throw error;
+    }
+    const managedPermissions = permissionControllers.get(delivery.request.turn_id)?.size ?? 0;
     let acknowledgement;
     try {
       acknowledgement = store.acknowledgeInteractionHandoff(handlerAcknowledgement, {
@@ -742,6 +792,7 @@ export function createExecutorService({
         if (typeof adapter.abort === 'function') {
           try {
             await adapter.abort(activeRun.turnContext);
+            releaseRecoveringOwnership(activeRun.turnContext);
           } catch (abortFailure) {
             error.abortFailure = abortFailure;
           }
@@ -792,7 +843,28 @@ export function createExecutorService({
             continue;
           }
           if (activeRun.pauseKind === 'interaction') {
+            let isolationProven = closedConversationIdSet.has(
+              activeRun.turnContext.conversation_id,
+            );
+            if (!isolationProven && typeof activeRun.iterator?.return === 'function') {
+              try {
+                await activeRun.iterator.return();
+                isolationProven = true;
+              } catch (error) {
+                shutdownFailures.push(error);
+              }
+            }
             transitionToRecovery(activeRun, 'executor_shutdown_uncertain');
+            if (isolationProven) {
+              recoveringOwnershipReleases.set(
+                activeRun.turnContext.turn_id,
+                activeRun.turnContext,
+              );
+            } else {
+              shutdownFailures.push(new Error(
+                `Provider close did not prove isolation for recovering turn ${activeRun.turnContext.turn_id}.`,
+              ));
+            }
           } else if (!activeRun.advancing && activeRun.iterator) {
             advanceRun(activeRun);
           }
@@ -803,6 +875,13 @@ export function createExecutorService({
         for (const conversationId of closedConversationIds) {
           if (!endedResidentFences.has(conversationId)) {
             endedResidentFences.set(conversationId, null);
+          }
+        }
+        for (const turnContext of recoveringOwnershipReleases.values()) {
+          try {
+            releaseRecoveringOwnership(turnContext);
+          } catch (error) {
+            shutdownFailures.push(error);
           }
         }
         for (const [conversationId, ownerEpoch] of endedResidentFences) {
