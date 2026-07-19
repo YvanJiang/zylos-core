@@ -79,6 +79,35 @@ Use `resolveIdempotencyReplay` after persistence lookup:
 - the same key and payload hash is `duplicate` and reuses the original result;
 - the same key with a different payload hash is `conflict` and must not create side effects.
 
+## Delivery commands, results, and message mappings
+
+`validateDeliveryCommand` is the authoritative v1 schema for Core outbox commands. It validates
+the provider-neutral target and render model, recomputes the delivery idempotency key, and
+enforces the operation matrix:
+
+- `create_main` and `send_text` have no platform target or predecessor;
+- `update_main` names both the exact platform message and predecessor delivery;
+- `send_fallback` creates a new mapping and names the failed or exhausted predecessor;
+- main-card operations keep the mapping on the same turn, with either a bound lineage or the
+  explicitly pending recovery exception.
+
+`validateDeliveryResult` requires the current fenced command. It rejects any result that does
+not echo the logical IDs, attempt number, lease epoch, mapping, operation, and aggregate version.
+The result required/null matrix distinguishes `delivered`, `retryable_failure`,
+`permanent_failure`, and update-only `obsolete`; ambiguous creates remain retryable with
+`side_effect_status=unknown` until reconciled.
+
+`validateDeliveryMapping` distinguishes bound, provisional pending, and non-reply mappings.
+Pending mappings add a required `reason`, exactly one of
+`mapping_missing`, `mapping_corrupt`, `mapping_unbound`, or `provider_lineage_invalid`, and a
+mapping bound from recovery retains that reason for auditability. Normal bound and non-reply
+mappings follow the fixed v1 mapping shape and may omit `reason`; an explicit null is also
+accepted for same-major forward compatibility.
+Only `resolveProvisionalMappingBinding` may project the Core-owned `pending` version 1 mapping to
+one bound lineage at version 2. Repeating the same lineage is idempotent; a different lineage,
+stale version, or non-Core authority cannot mutate the mapping. Persistence still performs the
+specification's atomic compare-and-swap; the pure helper defines the cross-repository outcome.
+
 ## Cross-repository golden vectors
 
 `fixtures/idempotency-v1.json` contains raw payloads, explicit optional extensions, key inputs,
@@ -93,6 +122,12 @@ status; executable request/source and smallest-blocking-ordinal adjudication exa
 durable handoff state; the complete allowed transition tables; and explicit send-before-ack,
 delivery-unknown, rejected/cancelled, and late-ack examples. Consumers must treat every omitted
 state edge as prohibited.
+
+`fixtures/delivery-mapping-v1.json` contains valid and rejected create/update/text/fallback
+commands, every delivery result status with fencing/error/side-effect combinations, mapping
+required/null cases, and the pending-to-bound/same-value/different-value authority matrix.
+Consumers must validate the documents against their own adapter implementation and may not
+infer an update target from the latest chat message.
 
 Run `validatePublicFixtureSafety` on fixture changes. Fixtures must not contain secrets or raw
 provider/channel private objects; only redacted `detail_ref` and `source_ref` references may
