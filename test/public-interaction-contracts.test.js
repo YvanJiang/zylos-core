@@ -421,6 +421,52 @@ describe('interaction answer v1 public contract', () => {
       },
     )).toBe(true);
   });
+
+  test('binds provider-neutral answer values to the requested interaction kind', () => {
+    const question = providerRequest({ kind: 'question' });
+    const choice = providerRequest({
+      kind: 'choice',
+      choices: [
+        { choice_id: 'safe', label: 'Safe path' },
+        { choice_id: 'fast', label: 'Fast path' },
+      ],
+    });
+
+    expect(validateInteractionAnswerAgainstRequest(
+      answer('main_card_reply', 'question-text', {
+        value: { kind: 'text', text: 'Use the safer path.' },
+      }),
+      question,
+      { requestScope: REQUEST_SCOPE },
+    )).toBe(true);
+    expect(validateInteractionAnswerAgainstRequest(
+      answer('card_action', 'choice-safe', {
+        value: { kind: 'choice', choice_id: 'safe' },
+      }),
+      choice,
+      { requestScope: REQUEST_SCOPE },
+    )).toBe(true);
+
+    expect(() => validateInteractionAnswerAgainstRequest(
+      answer('card_action', 'question-decision'),
+      question,
+      { requestScope: REQUEST_SCOPE },
+    )).toThrow(ContractKernelError);
+    expect(() => validateInteractionAnswerAgainstRequest(
+      answer('card_action', 'choice-unknown', {
+        value: { kind: 'choice', choice_id: 'unknown' },
+      }),
+      choice,
+      { requestScope: REQUEST_SCOPE },
+    )).toThrow(ContractKernelError);
+    expect(() => validateInteractionAnswerAgainstRequest(
+      answer('card_action', 'approval-text', {
+        value: { kind: 'text', text: 'approve' },
+      }),
+      providerRequest(),
+      { requestScope: REQUEST_SCOPE },
+    )).toThrow(ContractKernelError);
+  });
 });
 
 describe('interaction answer result v1 public contract', () => {

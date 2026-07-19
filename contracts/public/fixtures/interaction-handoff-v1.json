@@ -222,7 +222,7 @@
           "platform_message_or_action_id": "message-reply-A"
         },
         "source": "main_card_reply",
-        "value": { "kind": "text", "text": "Use the safer path." },
+        "value": { "kind": "decision", "decision": "approve" },
         "answered_at": "2026-07-19T05:04:00Z",
         "idempotency_key": "zid:v1:interaction:135aa995a3f4c5e1c8ea30fe7e59a5df43d5f186bf428b20d19f4d452bf9a22a"
       }
