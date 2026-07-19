@@ -410,6 +410,7 @@ describe('Codex exec provider adapter', () => {
       spawnProcess,
       env: {
         HOME: '/safe/home',
+        OPENAI_BASE_URL: 'https://codex-proxy.example.test/v1',
         PATH: '/safe/bin',
         UNRELATED_SECRET: 'must-not-pass',
       },
@@ -419,8 +420,45 @@ describe('Codex exec provider adapter', () => {
 
     expect(spawnProcess.mock.calls[0][2].env).toEqual({
       HOME: '/safe/home',
+      OPENAI_BASE_URL: 'https://codex-proxy.example.test/v1',
       PATH: '/safe/bin',
     });
+  });
+
+  test('terminates and reaps the exact process group when its consumer cancels', async () => {
+    const process = controlledChild();
+    const signalProcessGroup = jest.fn((_pid, _signal) => process.close());
+    const context = executionContext({
+      lineage: { provider_native_id: 'codex-thread-1' },
+    });
+    const adapter = createCodexExecAdapter({
+      spawnProcess: () => process.child,
+      signalProcessGroup,
+    });
+    const iterator = adapter.execute(context)[Symbol.asyncIterator]();
+
+    process.child.stdout.write(`${JSON.stringify({
+      type: 'thread.started',
+      thread_id: 'codex-thread-1',
+    })}\n`);
+    process.child.stdout.write(`${JSON.stringify({ type: 'turn.started' })}\n`);
+    process.child.stdout.write(`${JSON.stringify({
+      type: 'item.completed',
+      item: { id: 'message-1', type: 'agent_message', text: 'partial output' },
+    })}\n`);
+
+    await expect(iterator.next()).resolves.toMatchObject({
+      done: false,
+      value: { kind: 'text_snapshot' },
+    });
+    await expect(iterator.return()).resolves.toEqual({ done: true, value: undefined });
+
+    expect(signalProcessGroup).toHaveBeenCalledTimes(1);
+    expect(signalProcessGroup).toHaveBeenCalledWith(4102, 'SIGTERM');
+    await expect(adapter.terminateAttempt({
+      attempt: context.attempt,
+      reason: 'stop',
+    })).resolves.toEqual({ status: 'not_current', reason: 'stop' });
   });
 
   test.each([
@@ -512,6 +550,40 @@ describe('Codex exec provider adapter', () => {
       reason: 'stop',
     })).resolves.toEqual({ status: 'signalled', reason: 'stop' });
     expect(signalProcessGroup).toHaveBeenCalledTimes(2);
+
+    process.close();
+    await expect(execution).rejects.toMatchObject({
+      code: 'provider_attempt_terminated',
+    });
+  });
+
+  test('coalesces concurrent termination requests onto one process-group signal', async () => {
+    const process = controlledChild();
+    let releaseSignal;
+    const pendingSignal = new Promise((resolve) => {
+      releaseSignal = resolve;
+    });
+    const signalProcessGroup = jest.fn(() => pendingSignal);
+    const context = executionContext({
+      lineage: { provider_native_id: 'codex-thread-1' },
+    });
+    const adapter = createCodexExecAdapter({
+      spawnProcess: () => process.child,
+      signalProcessGroup,
+    });
+    const execution = collect(adapter.execute(context));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const stop = adapter.terminateAttempt({ attempt: context.attempt, reason: 'stop' });
+    const timeout = adapter.terminateAttempt({ attempt: context.attempt, reason: 'timeout' });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(signalProcessGroup).toHaveBeenCalledTimes(1);
+
+    releaseSignal();
+    await expect(Promise.all([stop, timeout])).resolves.toEqual([
+      { status: 'signalled', reason: 'stop' },
+      { status: 'signalled', reason: 'stop' },
+    ]);
 
     process.close();
     await expect(execution).rejects.toMatchObject({

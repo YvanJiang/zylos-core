@@ -15,6 +15,7 @@ const DEFAULT_ENV_ALLOWLIST = Object.freeze([
   'NO_COLOR',
   'NO_PROXY',
   'OPENAI_API_KEY',
+  'OPENAI_BASE_URL',
   'PATH',
   'SHELL',
   'SSH_AUTH_SOCK',
@@ -341,7 +342,7 @@ function spawnCodexChild({
     attempt: Object.freeze({ ...attempt }),
     child,
     processClosed: false,
-    terminationReason: null,
+    termination: null,
   };
   const closed = new Promise((resolve) => {
     child.once('error', (error) => {
@@ -363,6 +364,26 @@ function spawnCodexChild({
   return { child, closed, handle };
 }
 
+async function signalAttempt(handle, reason, signalProcessGroup) {
+  if (handle.processClosed) return false;
+  if (handle.termination !== null) {
+    await handle.termination.promise;
+    return true;
+  }
+  const reservation = { reason, promise: null };
+  reservation.promise = Promise.resolve().then(() => (
+    signalProcessGroup(handle.child.pid, 'SIGTERM')
+  ));
+  handle.termination = reservation;
+  try {
+    await reservation.promise;
+    return true;
+  } catch (error) {
+    if (handle.termination === reservation) handle.termination = null;
+    throw error;
+  }
+}
+
 function assertProcessCompletion({ completion, handle, normalizer }) {
   const { exitCode, signal, spawnError } = completion;
   if (spawnError) {
@@ -371,10 +392,10 @@ function assertProcessCompletion({ completion, handle, normalizer }) {
       'Codex process could not be started.',
     );
   }
-  if (handle.terminationReason !== null) {
+  if (handle.termination !== null) {
     throw new CodexExecAdapterError(
       'provider_attempt_terminated',
-      `Codex process group was terminated for ${handle.terminationReason}.`,
+      `Codex process group was terminated for ${handle.termination.reason}.`,
       { exitCode, signal },
     );
   }
@@ -429,6 +450,8 @@ export function createCodexExecAdapter({
     activeAttempts.set(context.attempt.attempt_id, handle);
     const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
     const normalizer = createJsonlNormalizer(context);
+    let executionFailed = false;
+    let executionComplete = false;
 
     try {
       for await (const line of lines) {
@@ -437,17 +460,23 @@ export function createCodexExecAdapter({
         if (descriptor) yield descriptor;
       }
       assertProcessCompletion({ completion: await closed, handle, normalizer });
+      executionComplete = true;
     } catch (error) {
-      if (!handle.processClosed && handle.terminationReason === null) {
-        try {
-          await signalProcessGroup(child.pid, 'SIGTERM');
-        } catch {
-          // The process may have exited between the stream failure and the group signal.
-        }
-      }
+      executionFailed = true;
       throw error;
     } finally {
-      if (activeAttempts.get(context.attempt.attempt_id) === handle) {
+      try {
+        if (!executionComplete && !handle.processClosed) {
+          await signalAttempt(handle, 'consumer_cancelled', signalProcessGroup);
+          await closed;
+        }
+      } catch (cleanupError) {
+        if (!executionFailed) throw cleanupError;
+      }
+      if (
+        handle.processClosed
+        && activeAttempts.get(context.attempt.attempt_id) === handle
+      ) {
         activeAttempts.delete(context.attempt.attempt_id);
       }
     }
@@ -462,11 +491,8 @@ export function createCodexExecAdapter({
     if (!handle || !sameAttempt(handle.attempt, attempt) || handle.processClosed) {
       return Object.freeze({ status: 'not_current', reason });
     }
-    if (handle.terminationReason === null) {
-      await signalProcessGroup(handle.child.pid, 'SIGTERM');
-      handle.terminationReason = reason;
-    }
-    return Object.freeze({ status: 'signalled', reason: handle.terminationReason });
+    await signalAttempt(handle, reason, signalProcessGroup);
+    return Object.freeze({ status: 'signalled', reason: handle.termination.reason });
   }
 
   return Object.freeze({ execute, terminateAttempt });

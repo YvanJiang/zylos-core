@@ -1,10 +1,7 @@
 import crypto from 'node:crypto';
 
 import { createContractError } from '../../contracts/public/index.js';
-import {
-  createExecutorStore,
-  ExecutorPersistenceError,
-} from '../persistence/executor-store.js';
+import { createExecutorStore } from '../persistence/executor-store.js';
 
 function defaultGenerateId(kind) {
   return `${kind}-${crypto.randomUUID()}`;
@@ -34,6 +31,13 @@ function normalizeProviderError(error, occurredAt) {
     userMessage: 'The provider execution failed after side effects may have occurred.',
     occurredAt,
   });
+}
+
+function isExplicitProviderError(error) {
+  return error !== null
+    && typeof error === 'object'
+    && error.providerError !== null
+    && typeof error.providerError === 'object';
 }
 
 export function createExecutorService({
@@ -92,33 +96,59 @@ export function createExecutorService({
     return snapshot();
   }
 
+  async function consumeAdapterEvents(turnContext, executionContext) {
+    let iterable;
+    try {
+      iterable = adapter.execute(executionContext);
+    } catch (error) {
+      if (isExplicitProviderError(error)) return error;
+      throw error;
+    }
+    const iterator = iterable[Symbol.asyncIterator]();
+    while (true) {
+      let result;
+      try {
+        result = await iterator.next();
+      } catch (error) {
+        if (isExplicitProviderError(error)) return error;
+        throw error;
+      }
+      if (result.done) return null;
+      try {
+        store.appendAdapterEvent(turnContext, result.value);
+      } catch (persistenceError) {
+        try {
+          await iterator.return?.();
+        } catch {
+          // Preserve the durable write failure; adapter cleanup is best-effort here.
+        }
+        throw persistenceError;
+      }
+    }
+  }
+
   async function runNext() {
     if (!started) start();
     const turnContext = store.claimNextQueuedTurn();
     if (!turnContext) return { status: 'idle' };
     refresh();
     store.transitionTurn(turnContext, 'starting', 'running');
-    try {
-      const events = adapter.execute(Object.freeze({
-        conversation_id: turnContext.conversation_id,
-        turn_id: turnContext.turn_id,
-        lineage_id: turnContext.lineage_id,
-        trace_id: turnContext.trace_id,
-        input: turnContext.input,
-        lineage: Object.freeze({ ...turnContext.lineage }),
-        bindProviderNativeId: (providerNativeId) => (
-          store.bindProviderNativeId(turnContext, providerNativeId)
-        ),
-        attempt: Object.freeze({ ...turnContext.attempt }),
-      }));
-      for await (const event of events) {
-        store.appendAdapterEvent(turnContext, event);
-      }
-    } catch (error) {
-      if (error instanceof ExecutorPersistenceError) throw error;
+    const providerError = await consumeAdapterEvents(turnContext, Object.freeze({
+      conversation_id: turnContext.conversation_id,
+      turn_id: turnContext.turn_id,
+      lineage_id: turnContext.lineage_id,
+      trace_id: turnContext.trace_id,
+      input: turnContext.input,
+      lineage: Object.freeze({ ...turnContext.lineage }),
+      bindProviderNativeId: (providerNativeId) => (
+        store.bindProviderNativeId(turnContext, providerNativeId)
+      ),
+      attempt: Object.freeze({ ...turnContext.attempt }),
+    }));
+    if (providerError !== null) {
       store.transitionTurn(turnContext, 'running', 'failed', {
         reasonCode: 'executor_failed',
-        error: normalizeProviderError(error, now()),
+        error: normalizeProviderError(providerError, now()),
       });
       refresh();
       return {

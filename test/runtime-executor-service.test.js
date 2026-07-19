@@ -382,6 +382,60 @@ describe('runtime executor service', () => {
     database.close();
   });
 
+  test('propagates adapter-event persistence failure without committing provider failure', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'adapter-persistence-failure');
+    const adapter = {
+      async *execute() {
+        database.exec(`
+          CREATE TRIGGER force_service_adapter_projection_failure
+          BEFORE INSERT ON runtime_projection_snapshots
+          WHEN json_extract(NEW.render_model_json, '$.phase') = 'running'
+            AND json_extract(NEW.render_model_json, '$.text') = 'must roll back'
+          BEGIN
+            SELECT RAISE(ABORT, 'forced service adapter projection failure');
+          END
+        `);
+        yield {
+          kind: 'text_snapshot',
+          provider_native_id: null,
+          payload: { text: 'must roll back', end_offset: 14 },
+        };
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-adapter-persistence-failure',
+      now: () => '2026-07-19T07:05:30Z',
+      generateId: deterministicIds('adapter-persistence-failure'),
+    });
+
+    await expect(service.runNext()).rejects.toMatchObject({
+      message: expect.stringMatching(/forced service adapter projection failure/),
+    });
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'running' });
+    expect(database.prepare(`
+      SELECT status FROM runtime_turn_queue WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ status: 'claimed' });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id, attempt_id
+      FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual(expect.objectContaining({
+      lease_owner: 'executor-service-adapter-persistence-failure',
+      turn_id: accepted.turn_id,
+    }));
+    expect(readEvents(database, accepted.turn_id))
+      .not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: 'text_snapshot' }),
+      ]));
+
+    database.close();
+  });
+
   test('runs one durable queued turn through a provider-neutral adapter to completion', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database);
