@@ -82,6 +82,7 @@ export function createExecutorService({
   });
   let executors = [];
   let started = false;
+  const activeRuns = new Map();
 
   function refresh() {
     executors = store.rebuildExecutorCache();
@@ -103,32 +104,62 @@ export function createExecutorService({
     return snapshot();
   }
 
-  async function consumeAdapterEvents(turnContext, executionContext) {
-    let iterable;
-    try {
-      iterable = adapter.execute(executionContext);
-    } catch (error) {
-      if (isExplicitProviderError(error)) return error;
-      throw error;
-    }
-    const iterator = iterable[Symbol.asyncIterator]();
+  function failTurn(turnContext, providerError) {
+    store.transitionTurn(turnContext, 'running', 'failed', {
+      reasonCode: 'executor_failed',
+      error: normalizeProviderError(providerError, now()),
+    });
+    activeRuns.delete(turnContext.turn_id);
+    refresh();
+    return {
+      status: 'failed',
+      conversation_id: turnContext.conversation_id,
+      turn_id: turnContext.turn_id,
+      ...turnContext.attempt,
+    };
+  }
+
+  async function advanceRun(activeRun) {
     while (true) {
-      let result;
+      let next;
       try {
-        result = await iterator.next();
+        next = await activeRun.iterator.next();
       } catch (error) {
-        if (isExplicitProviderError(error)) return error;
+        if (isExplicitProviderError(error)) return failTurn(activeRun.turnContext, error);
         throw error;
       }
-      if (result.done) return null;
+      if (next.done) {
+        store.transitionTurn(activeRun.turnContext, 'running', 'completed');
+        activeRuns.delete(activeRun.turnContext.turn_id);
+        refresh();
+        return {
+          status: 'completed',
+          conversation_id: activeRun.turnContext.conversation_id,
+          turn_id: activeRun.turnContext.turn_id,
+          ...activeRun.turnContext.attempt,
+        };
+      }
       try {
-        store.appendAdapterEvent(turnContext, result.value);
+        const event = next.value;
+        if (event?.kind === 'interaction_requested') {
+          const request = store.requestInteraction(activeRun.turnContext, event.payload);
+          refresh();
+          return {
+            status: 'waiting_user',
+            conversation_id: activeRun.turnContext.conversation_id,
+            turn_id: activeRun.turnContext.turn_id,
+            ...activeRun.turnContext.attempt,
+            request,
+          };
+        }
+        store.appendAdapterEvent(activeRun.turnContext, event);
       } catch (persistenceError) {
         try {
-          await iterator.return?.();
+          await activeRun.iterator.return?.();
         } catch {
           // Preserve the durable write failure; adapter cleanup is best-effort here.
         }
+        activeRuns.delete(activeRun.turnContext.turn_id);
         throw persistenceError;
       }
     }
@@ -151,40 +182,60 @@ export function createExecutorService({
     }
     refresh();
     store.transitionTurn(turnContext, 'starting', 'running');
-    const providerError = await consumeAdapterEvents(turnContext, Object.freeze({
-      conversation_id: turnContext.conversation_id,
-      turn_id: turnContext.turn_id,
-      lineage_id: turnContext.lineage_id,
-      trace_id: turnContext.trace_id,
-      input: turnContext.input,
-      lineage: Object.freeze({ ...turnContext.lineage }),
-      bindProviderNativeId: (providerNativeId) => (
-        store.bindProviderNativeId(turnContext, providerNativeId)
-      ),
-      attempt: Object.freeze({ ...turnContext.attempt }),
-    }));
-    if (providerError !== null) {
-      store.transitionTurn(turnContext, 'running', 'failed', {
-        reasonCode: 'executor_failed',
-        error: normalizeProviderError(providerError, now()),
-      });
-      refresh();
-      return {
-        status: 'failed',
+    let events;
+    try {
+      events = adapter.execute(Object.freeze({
         conversation_id: turnContext.conversation_id,
         turn_id: turnContext.turn_id,
-        ...turnContext.attempt,
-      };
+        lineage_id: turnContext.lineage_id,
+        trace_id: turnContext.trace_id,
+        input: turnContext.input,
+        lineage: Object.freeze({ ...turnContext.lineage }),
+        bindProviderNativeId: (providerNativeId) => (
+          store.bindProviderNativeId(turnContext, providerNativeId)
+        ),
+        attempt: Object.freeze({ ...turnContext.attempt }),
+      }));
+    } catch (error) {
+      if (isExplicitProviderError(error)) return failTurn(turnContext, error);
+      throw error;
     }
-    store.transitionTurn(turnContext, 'running', 'completed');
-    refresh();
-    return {
-      status: 'completed',
-      conversation_id: turnContext.conversation_id,
-      turn_id: turnContext.turn_id,
-      ...turnContext.attempt,
+    if (!events || typeof events[Symbol.asyncIterator] !== 'function') {
+      throw new TypeError('adapter.execute must return an async iterable');
+    }
+    const activeRun = {
+      turnContext,
+      iterator: events[Symbol.asyncIterator](),
     };
+    activeRuns.set(turnContext.turn_id, activeRun);
+    return advanceRun(activeRun);
   }
 
-  return Object.freeze({ runNext, snapshot, start });
+  function submitInteractionAnswer(answer) {
+    return store.commitInteractionAnswer(answer);
+  }
+
+  async function deliverInteractionAnswer(handoffId) {
+    if (typeof adapter.handleInteractionAnswer !== 'function') {
+      throw new TypeError('adapter.handleInteractionAnswer must be a function');
+    }
+    const delivery = store.claimInteractionHandoff(handoffId);
+    const handlerAcknowledgement = await adapter.handleInteractionAnswer(
+      Object.freeze(delivery),
+    );
+    const acknowledgement = store.acknowledgeInteractionHandoff(handlerAcknowledgement);
+    const activeRun = activeRuns.get(delivery.request.turn_id);
+    const execution = acknowledgement.resumed && activeRun
+      ? await advanceRun(activeRun)
+      : null;
+    return { acknowledgement, execution };
+  }
+
+  return Object.freeze({
+    deliverInteractionAnswer,
+    runNext,
+    snapshot,
+    start,
+    submitInteractionAnswer,
+  });
 }

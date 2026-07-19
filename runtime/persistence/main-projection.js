@@ -32,13 +32,14 @@ export function initializeMainProjection(database, command) {
   const laneKey = createDeliveryLaneKey(command);
   database.prepare(`
     INSERT INTO runtime_delivery_lanes (
-      lane_key, turn_id, aggregate_type, target_json, mapping_json,
+      lane_key, turn_id, aggregate_type, delivery_mode, target_json, mapping_json,
       created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     laneKey,
     command.mapping.turn_id,
     command.aggregate_type,
+    command.operation === 'send_text' ? 'text' : 'main',
     JSON.stringify(command.target),
     JSON.stringify(command.mapping),
     command.created_at,
@@ -205,8 +206,10 @@ export function materializeNextStagedMainProjection(
   `).get(laneKey);
   if (active) return null;
 
-  const createFailed = lane.platform_message_id === null
-    || lane.last_delivery_id === null;
+  const textMode = lane.delivery_mode === 'text';
+  const createFailed = !textMode && (
+    lane.platform_message_id === null || lane.last_delivery_id === null
+  );
   const failedCreate = createFailed
     ? findDeadLetteredInitialCreate(database, laneKey)
     : null;
@@ -217,21 +220,21 @@ export function materializeNextStagedMainProjection(
     ORDER BY aggregate_version ASC
     LIMIT 1
   `).get(laneKey);
-  if (!snapshot || (createFailed && !failedCreate)) return null;
+  if (!snapshot || (!textMode && createFailed && !failedCreate)) return null;
 
   const target = JSON.parse(lane.target_json);
   const outboxId = generateId('outbox');
   const deliveryId = generateId('delivery');
   const critical = snapshot.critical === 1;
-  const fallback = failedCreate !== null;
+  const fallback = !textMode && failedCreate !== null;
   const mapping = {
     ...JSON.parse(lane.mapping_json),
-    ...(fallback ? { mapping_id: generateId('mapping') } : {}),
+    ...((fallback || textMode) ? { mapping_id: generateId('mapping') } : {}),
   };
-  const predecessorDeliveryId = fallback
-    ? failedCreate.delivery_id
-    : latestLanePredecessor(database, laneKey);
-  const notBefore = critical || fallback
+  const predecessorDeliveryId = textMode
+    ? null
+    : (fallback ? failedCreate.delivery_id : latestLanePredecessor(database, laneKey));
+  const notBefore = critical || fallback || lane.last_delivered_at === null
     ? snapshot.created_at
     : laterTimestamp(
       snapshot.created_at,
@@ -249,7 +252,7 @@ export function materializeNextStagedMainProjection(
     target,
     aggregate_type: 'turn_main',
     aggregate_id: lane.turn_id,
-    operation: fallback ? 'send_fallback' : 'update_main',
+    operation: textMode ? 'send_text' : (fallback ? 'send_fallback' : 'update_main'),
     aggregate_version: snapshot.aggregate_version,
     event_sequence_through: snapshot.event_sequence_through,
     idempotency_key: createIdempotencyKey('delivery', {
@@ -259,9 +262,9 @@ export function materializeNextStagedMainProjection(
     }),
     render_model: JSON.parse(snapshot.render_model_json),
     mapping,
-    target_platform_message_id: fallback ? null : lane.platform_message_id,
+    target_platform_message_id: (fallback || textMode) ? null : lane.platform_message_id,
     predecessor_delivery_id: predecessorDeliveryId,
-    expected_platform_version: fallback ? null : lane.applied_platform_version,
+    expected_platform_version: (fallback || textMode) ? null : lane.applied_platform_version,
     priority: critical ? 100 : 10,
     not_before: notBefore,
     created_at: snapshot.created_at,

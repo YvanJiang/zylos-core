@@ -153,12 +153,66 @@ const RUNTIME_SCHEMA = `
     UNIQUE (turn_id, turn_version)
   );
 
+  CREATE TABLE IF NOT EXISTS runtime_interactions (
+    interaction_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),
+    lineage_id TEXT NOT NULL REFERENCES runtime_lineages(lineage_id),
+    ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+    state TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK (version > 0),
+    handoff_state TEXT NOT NULL,
+    handoff_version INTEGER CHECK (handoff_version IS NULL OR handoff_version > 0),
+    request_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (turn_id, ordinal)
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_interaction_answers (
+    answer_id TEXT PRIMARY KEY,
+    interaction_id TEXT NOT NULL UNIQUE REFERENCES runtime_interactions(interaction_id),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    answer_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    committed_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_interaction_handoffs (
+    handoff_id TEXT PRIMARY KEY,
+    interaction_id TEXT NOT NULL UNIQUE REFERENCES runtime_interactions(interaction_id),
+    answer_id TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL,
+    provider_attempt_id TEXT NOT NULL,
+    handoff_attempt_id TEXT,
+    handoff_attempt_no INTEGER CHECK (
+      handoff_attempt_no IS NULL OR handoff_attempt_no > 0
+    ),
+    lease_epoch INTEGER NOT NULL CHECK (lease_epoch > 0),
+    record_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_interaction_audit (
+    audit_id TEXT PRIMARY KEY,
+    interaction_id TEXT NOT NULL REFERENCES runtime_interactions(interaction_id),
+    handoff_id TEXT NOT NULL REFERENCES runtime_interaction_handoffs(handoff_id),
+    outcome TEXT NOT NULL,
+    provider_attempt_id TEXT NOT NULL,
+    lease_epoch INTEGER NOT NULL CHECK (lease_epoch > 0),
+    acknowledgement_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS runtime_outbox ${OUTBOX_TABLE_SCHEMA};
 
   CREATE TABLE IF NOT EXISTS runtime_delivery_lanes (
     lane_key TEXT PRIMARY KEY,
     turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
     aggregate_type TEXT NOT NULL,
+    delivery_mode TEXT NOT NULL DEFAULT 'main'
+      CHECK (delivery_mode IN ('main', 'text')),
     target_json TEXT NOT NULL,
     mapping_json TEXT NOT NULL,
     platform_message_id TEXT,
@@ -312,14 +366,15 @@ function backfillDeliveryLanes(database) {
     const delivered = row.status === 'delivered' && result?.status === 'delivered';
     database.prepare(`
       INSERT OR IGNORE INTO runtime_delivery_lanes (
-        lane_key, turn_id, aggregate_type, target_json, mapping_json,
+        lane_key, turn_id, aggregate_type, delivery_mode, target_json, mapping_json,
         platform_message_id, applied_platform_version, last_delivery_id,
         last_applied_version, last_delivered_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       laneKey,
       command.mapping.turn_id,
       command.aggregate_type,
+      command.operation === 'send_text' ? 'text' : 'main',
       JSON.stringify(command.target),
       JSON.stringify(command.mapping),
       delivered ? result.platform_message_id : null,
@@ -372,6 +427,12 @@ export function initializeRuntimePersistence(database) {
   );
   addColumnIfMissing(database, 'runtime_lineages', 'provider_native_id', 'TEXT');
   addColumnIfMissing(database, 'runtime_lineages', 'provider_native_id_bound_at', 'TEXT');
+  addColumnIfMissing(
+    database,
+    'runtime_delivery_lanes',
+    'delivery_mode',
+    "TEXT NOT NULL DEFAULT 'main' CHECK (delivery_mode IN ('main', 'text'))",
+  );
   addColumnIfMissing(
     database,
     'runtime_outbox',
