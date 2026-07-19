@@ -38,6 +38,14 @@ const PROJECTION_FIELDS = Object.freeze([
   'error',
 ]);
 
+const PROJECTION_SUPPORTED_FIELDS = Object.freeze([
+  'service',
+  'runtimes',
+  'queue_length',
+  'wait_reason',
+  'side_effect_status',
+]);
+
 const PROJECTION_FIELD_RULES = deepFreeze({
   projection_id: { required: true, kind: 'opaque_id' },
   dashboard_instance_id: { required: true, kind: 'opaque_id' },
@@ -58,6 +66,7 @@ export const DASHBOARD_RUNTIME_PROJECTION_V1_SCHEMA = deepFreeze({
   required: ['contract', 'contract_version', ...PROJECTION_FIELDS],
   canonical_turn_states: CANONICAL_TURN_STATES,
   executor_health_states: RUNTIME_HEALTH_STATES,
+  supported_fields: PROJECTION_SUPPORTED_FIELDS,
   ordering: 'dashboard_instance_id_projection_sequence',
   first_event: 'complete_projection',
   consumer_boundary: {
@@ -137,6 +146,12 @@ function validateCapabilities(value, options) {
     'core_direct_access',
   ], options);
   requireUniqueStrings('capabilities.supported_fields', value.supported_fields, options);
+  value.supported_fields.forEach((field, index) => requireEnum(
+    `capabilities.supported_fields[${index}]`,
+    field,
+    PROJECTION_SUPPORTED_FIELDS,
+    options,
+  ));
   requireArray('capabilities.supported_states', value.supported_states, options);
   const seenStates = new Set();
   value.supported_states.forEach((state, index) => {

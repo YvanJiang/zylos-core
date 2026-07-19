@@ -485,6 +485,7 @@ function validateExpectedVersion(value, targetIdentity, required, options) {
 export function validateControlRequest(value, { occurredAt } = {}) {
   const options = { occurredAt };
   requireRecord('control request', value, options);
+  validatePublicFixtureSafety(value, options);
   requireFields('control request', value, ['contract', 'contract_version', ...REQUEST_FIELDS], options);
   requireOpaqueId('trace_id', value.trace_id, options);
   validateCallerNamespace(value.caller_namespace, options);
@@ -761,6 +762,16 @@ export function resolveControlResultUpdate(currentValue, nextValue, { action } =
     );
   }
   if (next.control_result_version > current.control_result_version) {
+    if (current.status !== 'accepted' || next.status === 'accepted') {
+      rejectRuntimeContract(
+        'version_conflict',
+        'Control result versions can advance only once from accepted to a terminal status.',
+        {
+          category: 'conflict',
+          occurredAt: next.completed_at ?? next.accepted_at,
+        },
+      );
+    }
     return { status: 'replace', apply: true };
   }
   if (next.control_result_version < current.control_result_version) {

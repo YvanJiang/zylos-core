@@ -207,7 +207,10 @@ contracts do not maintain a second compatibility path around the public kernel.
   declared tenant/bot/aggregate scope covers the trusted auth context and target. This structural
   check does not authorize a request: Core must still resolve the target's authoritative namespace
   and re-check the current policy, grant, revocation, expiry, capability, and scope in the control
-  transaction. Because `zylos.control-result` does not carry
+  transaction. The entire public request, including `reason` and additive extensions, is rejected
+  when it contains credential-shaped values, secret fields, or provider/channel-private payloads.
+  A higher result version may advance only from `accepted` to a terminal status; terminal results
+  are immutable. Because `zylos.control-result` does not carry
   a duplicate top-level action field, consumers pass the correlated request action as
   `validateControlResult(value, { action })` when target/result shape alone is ambiguous, and pass
   the same context to `resolveControlResultUpdate`; the returned `metadata.action` is diagnostic
@@ -216,7 +219,9 @@ contracts do not maintain a second compatibility path around the public kernel.
   only Dashboard-to-Luna runtime seam. `resolveDashboardRuntimeProjectionUpdate` handles full
   first payloads, Dashboard instance replacement, sequence duplicates/obsolescence/gaps, and
   full resynchronization. Projection capabilities must state `control=false` and
-  `core_direct_access=false`; Luna is a read-only Dashboard consumer.
+  `core_direct_access=false`; `supported_fields` is restricted to the schema's declared
+  presentation allowlist and cannot advertise control or Core endpoints. Luna is a read-only
+  Dashboard consumer.
 
 The golden fixtures are `fixtures/observability-v1.json`, `fixtures/control-v1.json`, and
 `fixtures/dashboard-runtime-projection-v1.json`. They cover degraded visibility, answer handoff

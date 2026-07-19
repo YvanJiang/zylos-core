@@ -206,6 +206,16 @@ describe('operations control v1 contracts', () => {
     expect(() => validateControlRequest(wrongRecovery)).toThrow(ContractKernelError);
   });
 
+  test('rejects credential-shaped content anywhere in a control request', () => {
+    const secretReason = structuredClone(controlFixture.requests.inspect);
+    secretReason.reason = 'Bearer secret-token-value';
+    expect(() => validateControlRequest(secretReason)).toThrow(ContractKernelError);
+
+    const secretExtension = structuredClone(controlFixture.requests.inspect);
+    secretExtension.authorization = 'Bearer secret-token-value';
+    expect(() => validateControlRequest(secretExtension)).toThrow(ContractKernelError);
+  });
+
   test('publishes fenced result versions for synchronous and asynchronous controls', () => {
     for (const result of Object.values(controlFixture.results)) {
       expect(validateControlResult(result).known.control_result_version).toBeGreaterThan(0);
@@ -217,6 +227,20 @@ describe('operations control v1 contracts', () => {
       controlFixture.results.reconcile_accepted,
       controlFixture.results.reconcile_completed,
     )).toEqual({ status: 'replace', apply: true });
+
+    const regressed = structuredClone(controlFixture.results.reconcile_accepted);
+    regressed.control_result_version = 3;
+    expect(() => resolveControlResultUpdate(
+      controlFixture.results.reconcile_completed,
+      regressed,
+    )).toThrow(ContractKernelError);
+
+    const rewrittenTerminal = structuredClone(controlFixture.results.reconcile_completed);
+    rewrittenTerminal.control_result_version = 3;
+    expect(() => resolveControlResultUpdate(
+      controlFixture.results.reconcile_completed,
+      rewrittenTerminal,
+    )).toThrow(ContractKernelError);
 
     const conflict = structuredClone(controlFixture.results.reconcile_accepted);
     conflict.target_version = 99;
@@ -305,6 +329,11 @@ describe('Dashboard to Luna runtime projection v1 contract', () => {
     const controlLeak = structuredClone(projectionFixture.cases.initial_full);
     controlLeak.capabilities.control = true;
     expect(() => validateDashboardRuntimeProjection(controlLeak)).toThrow(ContractKernelError);
+
+    const impliedControlLeak = structuredClone(projectionFixture.cases.initial_full);
+    impliedControlLeak.capabilities.supported_fields = ['control', 'core_endpoint'];
+    expect(() => validateDashboardRuntimeProjection(impliedControlLeak))
+      .toThrow(ContractKernelError);
   });
 
   test('orders by Dashboard instance/sequence and makes gaps wait for a full replacement', () => {
