@@ -52,11 +52,16 @@ const RUNTIME_SCHEMA = `
     lineage_id TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
     lineage_kind TEXT NOT NULL,
-    provider TEXT,
+    is_default INTEGER NOT NULL CHECK (is_default IN (0, 1)),
+    created_at TEXT NOT NULL,
+    provider TEXT CHECK (provider IS NULL OR provider IN ('claude', 'codex')),
     provider_native_id TEXT,
     provider_native_id_bound_at TEXT,
-    is_default INTEGER NOT NULL CHECK (is_default IN (0, 1)),
-    created_at TEXT NOT NULL
+    CHECK (
+      (provider IS NULL AND provider_native_id IS NULL AND provider_native_id_bound_at IS NULL)
+      OR (provider IS NOT NULL AND provider_native_id IS NOT NULL
+          AND provider_native_id_bound_at IS NOT NULL)
+    )
   );
 
   CREATE UNIQUE INDEX IF NOT EXISTS runtime_lineages_one_default
@@ -194,6 +199,20 @@ const RUNTIME_SCHEMA = `
         AND attempt_no IS NOT NULL AND lease_expires_at IS NOT NULL
       )
     )
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_provider_stop_incidents (
+    incident_id TEXT PRIMARY KEY,
+    turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
+    attempt_id TEXT NOT NULL,
+    attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+    lease_epoch INTEGER NOT NULL CHECK (lease_epoch > 0),
+    provider_stop_status TEXT NOT NULL,
+    side_effect_status TEXT NOT NULL CHECK (side_effect_status = 'unknown'),
+    disposition TEXT NOT NULL CHECK (disposition = 'manual_recovery_required'),
+    error_json TEXT NOT NULL,
+    outbox_id TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS runtime_normalized_events (
@@ -522,14 +541,6 @@ export function initializeRuntimePersistence(database) {
     'lease_epoch',
     'INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0)',
   );
-  addColumnIfMissing(database, 'runtime_lineages', 'provider', 'TEXT');
-  addColumnIfMissing(database, 'runtime_lineages', 'provider_native_id', 'TEXT');
-  addColumnIfMissing(
-    database,
-    'runtime_lineages',
-    'provider_native_id_bound_at',
-    'TEXT',
-  );
   addColumnIfMissing(database, 'runtime_turn_queue', 'wait_reason', 'TEXT');
   addColumnIfMissing(database, 'runtime_turn_queue', 'wait_detail_json', 'TEXT');
   addColumnIfMissing(database, 'runtime_executor_residents', 'owner_service_instance_id', 'TEXT');
@@ -541,6 +552,14 @@ export function initializeRuntimePersistence(database) {
   );
   addColumnIfMissing(database, 'runtime_executor_residents', 'owner_expires_at', 'TEXT');
   addColumnIfMissing(database, 'runtime_interaction_answers', 'payload_hash', 'TEXT');
+  addColumnIfMissing(
+    database,
+    'runtime_lineages',
+    'provider',
+    "TEXT CHECK (provider IS NULL OR provider IN ('claude', 'codex'))",
+  );
+  addColumnIfMissing(database, 'runtime_lineages', 'provider_native_id', 'TEXT');
+  addColumnIfMissing(database, 'runtime_lineages', 'provider_native_id_bound_at', 'TEXT');
   addColumnIfMissing(
     database,
     'runtime_delivery_lanes',

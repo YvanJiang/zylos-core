@@ -527,6 +527,7 @@ describe('runtime interaction order, authorization, and timeout', () => {
     const accepted = acceptQueuedInteractionTurn(database, 'service-timeout');
     const clock = { now: '2026-07-19T07:01:00Z' };
     let providerStopped = false;
+    let interruptObservedProviderStopped;
     let deadlineCallback;
     let deadlineDelay;
     const adapter = {
@@ -547,6 +548,13 @@ describe('runtime interaction order, authorization, and timeout', () => {
         } finally {
           providerStopped = true;
         }
+      },
+      async interrupt({ turn_id: turnId, attempt, reason }) {
+        expect(turnId).toBe(accepted.turn_id);
+        expect(attempt).toMatchObject({ attempt_id: expect.any(String), lease_epoch: 1 });
+        expect(reason).toBe('timeout');
+        interruptObservedProviderStopped = providerStopped;
+        return { status: 'provider_stopped', reason, provider_status: 'interrupted' };
       },
     };
     const service = createExecutorService({
@@ -570,6 +578,7 @@ describe('runtime interaction order, authorization, and timeout', () => {
 
     clock.now = '2026-07-19T07:01:02Z';
     await deadlineCallback();
+    expect(interruptObservedProviderStopped).toBe(false);
     expect(providerStopped).toBe(true);
     expect(database.prepare(`
       SELECT state FROM runtime_turns WHERE turn_id = ?
@@ -638,6 +647,116 @@ describe('runtime interaction order, authorization, and timeout', () => {
     database.close();
   });
 
+  test.each([
+    ['direct-message', 'authenticated_dm_with_attachment', '1.0'],
+    ['native-thread', 'native_thread_or_topic', '1.1'],
+  ])('executor service retains the %s timeout lane when app-server cannot confirm provider stop', async (
+    laneKind,
+    fixtureName,
+    expectedContractVersion,
+  ) => {
+    const database = openTestDatabase();
+    const suffix = `service-timeout-uncertain-${laneKind}`;
+    const accepted = acceptQueuedInteractionTurn(database, suffix, { fixtureName });
+    const durableTarget = JSON.parse(database.prepare(`
+      SELECT target_json FROM runtime_delivery_lanes WHERE turn_id = ?
+    `).get(accepted.turn_id).target_json);
+    const clock = { now: '2026-07-19T07:01:00Z' };
+    let providerStopped = false;
+    const adapter = {
+      async *execute() {
+        try {
+          yield {
+            kind: 'interaction_requested',
+            payload: {
+              provider_interaction_ref: 'provider-question-service-timeout-uncertain',
+              tool_use_id: 'tool-use-service-timeout-uncertain',
+              kind: 'question',
+              prompt: 'Will the provider stop be confirmed?',
+              choices: [],
+              authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+              allowed_sources: ['card_action'],
+            },
+          };
+        } finally {
+          providerStopped = true;
+        }
+      },
+      async interrupt() {
+        return { status: 'not_current', reason: 'timeout' };
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: `executor-service-timeout-uncertain-${laneKind}`,
+      now: () => clock.now,
+      generateId: deterministicIds(suffix),
+      interactionTimeoutMs: 1_000,
+      setTimeoutFn: () => ({ unref() {} }),
+      clearTimeoutFn: () => {},
+    });
+    const waiting = await service.runNext();
+    clock.now = '2026-07-19T07:01:02Z';
+
+    await expect(service.expireInteraction({
+      interaction_id: waiting.request.interaction_id,
+      interaction_version: waiting.request.version,
+    })).resolves.toMatchObject({
+      status: 'expired',
+      turn_state: 'timed_out',
+      lease_released: false,
+      provider_stop_status: 'not_current',
+    });
+    expect(providerStopped).toBe(false);
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id
+      FROM runtime_executor_leases
+      WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({
+      lease_owner: `executor-service-timeout-uncertain-${laneKind}`,
+      turn_id: accepted.turn_id,
+    });
+    expect(database.prepare(`
+      SELECT provider_stop_status, side_effect_status, disposition
+      FROM runtime_provider_stop_incidents
+      WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({
+      provider_stop_status: 'not_current',
+      side_effect_status: 'unknown',
+      disposition: 'manual_recovery_required',
+    });
+    const notice = database.prepare(`
+      SELECT command_json
+      FROM runtime_outbox
+      WHERE aggregate_type = 'text_notice' AND aggregate_id LIKE ?
+    `).get(`${accepted.turn_id}-provider-stop-%`);
+    expect(JSON.parse(notice.command_json)).toMatchObject({
+      contract_version: expectedContractVersion,
+      target: durableTarget,
+      render_model: {
+        phase: 'timed_out',
+        terminal: true,
+        user_action_required: true,
+        error: {
+          code: 'side_effect_unknown',
+          side_effect_status: 'unknown',
+        },
+      },
+    });
+    if (laneKind === 'native-thread') {
+      expect(durableTarget).toMatchObject({
+        chat_type: 'thread',
+        native_thread_or_topic_id: expect.any(String),
+        native_thread_root_message_id: expect.any(String),
+        native_thread_reply_target_message_id: expect.any(String),
+      });
+    }
+
+    database.close();
+  });
+
   test('retains the timeout lease when this service cannot prove the writer stopped', async () => {
     const database = openTestDatabase();
     const { clock, store, turnContext } = createRunningTurn(database, 'timeout-no-writer');
@@ -675,6 +794,20 @@ describe('runtime interaction order, authorization, and timeout', () => {
       lease_owner: 'executor-service-timeout-no-writer',
       turn_id: request.turn_id,
     });
+    expect(database.prepare(`
+      SELECT provider_stop_status, side_effect_status, disposition
+      FROM runtime_provider_stop_incidents
+      WHERE turn_id = ?
+    `).get(request.turn_id)).toEqual({
+      provider_stop_status: 'not_current',
+      side_effect_status: 'unknown',
+      disposition: 'manual_recovery_required',
+    });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM runtime_outbox
+      WHERE aggregate_type = 'text_notice' AND aggregate_id LIKE ?
+    `).get(`${request.turn_id}-provider-stop-%`)).toEqual({ count: 1 });
 
     database.close();
   });

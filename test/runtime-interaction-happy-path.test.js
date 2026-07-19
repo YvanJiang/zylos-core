@@ -416,7 +416,7 @@ describe('runtime interaction happy path', () => {
       prompt: 'What should happen next?',
       choices: [],
       authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
-      allowed_sources: ['main_card_reply'],
+      allowed_sources: ['main_card_reply', 'card_action'],
     });
     expect([first.ordinal, second.ordinal]).toEqual([1, 2]);
 
@@ -896,6 +896,73 @@ describe('runtime interaction happy path', () => {
     database.close();
   });
 
+  test('retains Codex ownership when provider close cannot prove process-group isolation', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'codex-close-group-uncertain');
+    let iteratorReturned = false;
+    let interactionEmitted = false;
+    const adapter = {
+      execute() {
+        return {
+          [Symbol.asyncIterator]() { return this; },
+          async next() {
+            if (interactionEmitted) return new Promise(() => {});
+            interactionEmitted = true;
+            return {
+              done: false,
+              value: {
+                kind: 'interaction_requested',
+                payload: {
+                  provider_interaction_ref: 'provider-codex-close-group-uncertain',
+                  tool_use_id: 'tool-codex-close-group-uncertain',
+                  kind: 'tool_approval',
+                  prompt: 'Allow the uncertain provider action?',
+                  choices: [],
+                  authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+                  allowed_sources: ['card_action'],
+                },
+              },
+            };
+          },
+          async return() {
+            iteratorReturned = true;
+            return { done: true, value: undefined };
+          },
+        };
+      },
+      async close() {
+        const error = new Error('Codex process group is still alive');
+        error.closedConversationIds = [];
+        throw error;
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-codex-close-group-uncertain',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('codex-close-group-uncertain'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ status: 'waiting_user' });
+    await expect(service.close()).rejects.toBeInstanceOf(Error);
+    expect(iteratorReturned).toBe(false);
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id
+      FROM runtime_executor_leases
+      WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({
+      lease_owner: 'executor-service-codex-close-group-uncertain',
+      turn_id: accepted.turn_id,
+    });
+
+    database.close();
+  });
+
   test('holds an answered interaction until a parallel permission callback settles', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'service-permission-interleave');
@@ -959,6 +1026,277 @@ describe('runtime interaction happy path', () => {
     database.close();
   });
 
+  test('fails a sent provider answer closed as delivery_unknown when app-server acknowledgement is uncertain', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'app-server-answer-unknown');
+    const adapter = {
+      async *execute() {
+        yield {
+          kind: 'interaction_requested',
+          payload: {
+            provider_interaction_ref: 'provider-answer-unknown',
+            tool_use_id: 'tool-answer-unknown',
+            kind: 'tool_approval',
+            prompt: 'Allow the action?',
+            choices: [],
+            authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+            allowed_sources: ['main_card_reply', 'card_action'],
+          },
+        };
+      },
+      async handleInteractionAnswer() {
+        const error = new Error('connection closed after response write');
+        error.providerError = {
+          code: 'side_effect_unknown',
+          category: 'provider',
+          retryable: false,
+          side_effect_status: 'unknown',
+          user_message: 'The provider may have received the answer.',
+        };
+        throw error;
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-app-server-answer-unknown',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('app-server-answer-unknown'),
+    });
+    const waiting = await service.runNext();
+    const committed = service.submitInteractionAnswer(
+      interactionAnswer(waiting.request, 'app-server-answer-unknown'),
+    );
+
+    await expect(service.deliverInteractionAnswer(committed.handoff_id)).resolves.toMatchObject({
+      status: 'delivery_unknown',
+      turn_id: accepted.turn_id,
+      handoff_id: committed.handoff_id,
+    });
+    expect(database.prepare(`
+      SELECT state
+      FROM runtime_turns
+      WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    expect(database.prepare(`
+      SELECT interaction.state, interaction.handoff_state, handoff.state AS handoff_state_record
+      FROM runtime_interactions AS interaction
+      JOIN runtime_interaction_handoffs AS handoff
+        ON handoff.interaction_id = interaction.interaction_id
+      WHERE interaction.interaction_id = ?
+    `).get(waiting.request.interaction_id)).toEqual({
+      state: 'delivery_unknown',
+      handoff_state: 'delivery_unknown',
+      handoff_state_record: 'delivery_unknown',
+    });
+    expect(readEvents(database, accepted.turn_id).at(-1)).toMatchObject({
+      kind: 'interaction_answer_delivery_unknown',
+      phase: 'recovering',
+      error: {
+        code: 'side_effect_unknown',
+        side_effect_status: 'unknown',
+      },
+    });
+
+    database.close();
+  });
+
+  test('cancels a committed unsent handoff when the provider is no longer waiting', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'app-server-unsent-answer-cancel');
+    let reportProviderFailure;
+    const handlerCalls = [];
+    const adapter = {
+      async *execute(context) {
+        reportProviderFailure = context.reportProviderFailure;
+        yield {
+          kind: 'interaction_requested',
+          payload: {
+            provider_interaction_ref: 'provider-unsent-answer-cancel',
+            tool_use_id: 'tool-unsent-answer-cancel',
+            kind: 'tool_approval',
+            prompt: 'Allow the action?',
+            choices: [],
+            authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+            allowed_sources: ['main_card_reply', 'card_action'],
+          },
+        };
+      },
+      async handleInteractionAnswer(delivery) {
+        handlerCalls.push(delivery);
+        throw new Error('cancelled handoff must never reach the provider');
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-app-server-unsent-answer-cancel',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('app-server-unsent-answer-cancel'),
+    });
+    const waiting = await service.runNext();
+    const committed = service.submitInteractionAnswer(
+      interactionAnswer(waiting.request, 'app-server-unsent-answer-cancel'),
+    );
+    expect(reportProviderFailure({
+      providerError: {
+        code: 'side_effect_unknown',
+        category: 'provider',
+        retryable: false,
+        side_effect_status: 'unknown',
+        user_message: 'The app-server is no longer waiting for this answer.',
+      },
+    })).toMatchObject({
+      status: 'recovering',
+      cancelled_interaction_ids: [waiting.request.interaction_id],
+      cancelled_handoff_ids: [committed.handoff_id],
+    });
+
+    const authority = database.prepare(`
+      SELECT interaction.state, interaction.handoff_state, interaction.handoff_version,
+        interaction.request_json, handoff.state AS durable_handoff_state, handoff.record_json
+      FROM runtime_interactions AS interaction
+      JOIN runtime_interaction_handoffs AS handoff
+        ON handoff.interaction_id = interaction.interaction_id
+      WHERE interaction.interaction_id = ?
+    `).get(waiting.request.interaction_id);
+    expect(authority).toMatchObject({
+      state: 'cancelled',
+      handoff_state: 'cancelled',
+      handoff_version: 2,
+      durable_handoff_state: 'cancelled',
+    });
+    expect(JSON.parse(authority.request_json)).toMatchObject({
+      state: 'cancelled',
+      handoff_state: 'cancelled',
+      terminal_reason: 'provider_connection_lost',
+    });
+    expect(JSON.parse(authority.record_json)).toMatchObject({
+      state: 'cancelled',
+      last_send_started_at: null,
+      reason_code: 'provider_connection_lost',
+      side_effect_status: 'none',
+    });
+    expect(database.prepare(`
+      SELECT outcome, acknowledgement_json
+      FROM runtime_interaction_audit
+      WHERE handoff_id = ?
+    `).get(committed.handoff_id)).toMatchObject({
+      outcome: 'cancelled',
+      acknowledgement_json: expect.any(String),
+    });
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    expect(readEvents(database, accepted.turn_id).slice(-3).map(({ kind, phase }) => ({ kind, phase })))
+      .toEqual([
+        { kind: 'interaction_cancelled', phase: 'waiting_user' },
+        { kind: 'turn_state_changed', phase: 'recovering' },
+        { kind: 'recovery_started', phase: 'recovering' },
+      ]);
+    const recoveryProjection = database.prepare(`
+      SELECT status, render_model_json
+      FROM runtime_projection_snapshots
+      WHERE turn_id = ?
+      ORDER BY aggregate_version DESC
+      LIMIT 1
+    `).get(accepted.turn_id);
+    expect(recoveryProjection.status).toBe('staged');
+    expect(JSON.parse(recoveryProjection.render_model_json)).toMatchObject({
+      phase: 'recovering',
+    });
+    expect(database.prepare(`
+      SELECT status FROM runtime_outbox WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ status: 'pending' });
+    await expect(service.deliverInteractionAnswer(committed.handoff_id))
+      .rejects.toMatchObject({ code: 'illegal_transition' });
+    expect(handlerCalls).toEqual([]);
+
+    database.close();
+  });
+
+  test('rejects an unauthorized provider answer before creating its durable handoff', () => {
+    const database = openTestDatabase();
+    const { accepted, store, turnContext } = createRunningTurn(
+      database,
+      'app-server-answer-unauthorized',
+    );
+    const request = store.requestInteraction(turnContext, {
+      provider_interaction_ref: 'provider-answer-unauthorized',
+      tool_use_id: 'tool-answer-unauthorized',
+      kind: 'tool_approval',
+      prompt: 'Allow the action?',
+      choices: [],
+      authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+      allowed_sources: ['main_card_reply', 'card_action'],
+    });
+    const answer = interactionAnswer(request, 'app-server-answer-unauthorized');
+    answer.actor.actor_id = 'attacker';
+
+    expect(store.commitInteractionAnswer(answer)).toMatchObject({
+      status: 'rejected',
+      interaction_state: 'pending',
+      interaction_version: request.version,
+      handoff_state: 'not_applicable',
+      error: { code: 'interaction_actor_forbidden' },
+    });
+    expect(database.prepare(`
+      SELECT state, handoff_state
+      FROM runtime_interactions
+      WHERE interaction_id = ?
+    `).get(request.interaction_id)).toEqual({ state: 'pending', handoff_state: 'not_started' });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM runtime_interaction_handoffs
+      WHERE interaction_id = ?
+    `).get(request.interaction_id)).toEqual({ count: 0 });
+    expect(database.prepare(`
+      SELECT state
+      FROM runtime_turns
+      WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'waiting_user' });
+
+    database.close();
+  });
+
+  test('rejects an out-of-domain choice before creating durable answer or handoff state', () => {
+    const database = openTestDatabase();
+    const { store, turnContext } = createRunningTurn(database, 'choice-domain');
+    const request = store.requestInteraction(turnContext, {
+      provider_interaction_ref: 'provider-choice-domain',
+      tool_use_id: 'tool-choice-domain',
+      kind: 'choice',
+      prompt: 'Choose a safe path.',
+      choices: [{ choice_id: 'safe', label: 'Safe path' }],
+      authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+      allowed_sources: ['card_action'],
+    });
+    const invalidAnswer = interactionAnswer(request, 'choice-domain', {
+      value: { kind: 'choice', choice_id: 'unknown' },
+    });
+
+    expect(store.commitInteractionAnswer(invalidAnswer)).toMatchObject({
+      status: 'rejected',
+      interaction_state: 'pending',
+      interaction_version: request.version,
+      handoff_state: 'not_applicable',
+      error: { code: 'validation_error' },
+    });
+    expect(readInteractionAuthority(database, request.turn_id)).toMatchObject({
+      interactions: [{
+        interaction_id: request.interaction_id,
+        state: 'pending',
+        handoff_state: 'not_started',
+      }],
+      answers: [],
+      handoffs: [],
+    });
+
+    database.close();
+  });
+
   test('rolls back the complete request transaction when its user projection cannot persist', () => {
     const database = openTestDatabase();
     const { accepted, store, turnContext } = createRunningTurn(database, 'request-rollback');
@@ -979,7 +1317,7 @@ describe('runtime interaction happy path', () => {
       prompt: 'Should this transaction roll back?',
       choices: [],
       authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
-      allowed_sources: ['main_card_reply'],
+      allowed_sources: ['main_card_reply', 'card_action'],
     })).toThrow(/forced interaction request projection failure/);
     expect(readInteractionAuthority(database, accepted.turn_id)).toEqual(before);
 

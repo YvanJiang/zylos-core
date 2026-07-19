@@ -35,9 +35,11 @@ export function deterministicIds(namespace) {
   };
 }
 
-export function interactionInboundEnvelope(suffix) {
+export function interactionInboundEnvelope(suffix, {
+  fixtureName = 'authenticated_dm_with_attachment',
+} = {}) {
   const fixture = inboundFixture.valid.find(
-    ({ name }) => name === 'authenticated_dm_with_attachment',
+    ({ name }) => name === fixtureName,
   ).document;
   const envelope = structuredClone(fixture);
   envelope.inbound_event_id = `evt-${suffix}`;
@@ -55,8 +57,9 @@ export function interactionInboundEnvelope(suffix) {
 
 export function acceptQueuedInteractionTurn(database, suffix, {
   acceptedAt = '2026-07-19T07:00:00Z',
+  fixtureName,
 } = {}) {
-  return acceptNormalInbound(database, interactionInboundEnvelope(suffix), {
+  return acceptNormalInbound(database, interactionInboundEnvelope(suffix, { fixtureName }), {
     now: () => acceptedAt,
     generateId: deterministicIds(`inbound-${suffix}`),
   });
@@ -86,6 +89,11 @@ export function createRunningInteractionTurn(database, suffix = 'request', {
 
 export function interactionAnswer(request, suffix = '1', overrides = {}) {
   const sourceEventId = `card-action-${suffix}`;
+  const defaultValue = request.kind === 'question'
+    ? { kind: 'text', text: `answer ${suffix}` }
+    : request.kind === 'choice'
+      ? { kind: 'choice', choice_id: request.choices[0]?.choice_id }
+      : { kind: 'decision', decision: 'approve' };
   const answer = {
     contract: 'zylos.interaction-answer',
     contract_version: '1.0',
@@ -110,7 +118,7 @@ export function interactionAnswer(request, suffix = '1', overrides = {}) {
       platform_message_or_action_id: sourceEventId,
     },
     source: 'card_action',
-    value: { kind: 'decision', decision: 'approve' },
+    value: defaultValue,
     answered_at: '2026-07-19T07:02:00Z',
   };
   Object.assign(answer, overrides);

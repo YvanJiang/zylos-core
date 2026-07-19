@@ -1,10 +1,44 @@
 import crypto from 'node:crypto';
 
+import { createContractError } from '../../contracts/public/index.js';
 import { createExecutorStore } from '../persistence/executor-store.js';
 import { resolveProviderWorkspaceAccess } from '../workspace/lease-coordinator.js';
 
 function defaultGenerateId(kind) {
   return `${kind}-${crypto.randomUUID()}`;
+}
+
+function normalizeProviderError(error, occurredAt) {
+  const descriptor = error?.providerError;
+  if (descriptor && typeof descriptor === 'object') {
+    try {
+      return createContractError({
+        code: descriptor.code,
+        category: descriptor.category,
+        retryable: descriptor.retryable,
+        sideEffectStatus: descriptor.side_effect_status,
+        userMessage: descriptor.user_message,
+        occurredAt,
+      });
+    } catch {
+      // Invalid adapter error metadata is replaced with the safe generic provider failure below.
+    }
+  }
+  return createContractError({
+    code: 'side_effect_unknown',
+    category: 'provider',
+    retryable: false,
+    sideEffectStatus: 'unknown',
+    userMessage: 'The provider execution failed after side effects may have occurred.',
+    occurredAt,
+  });
+}
+
+function isExplicitProviderError(error) {
+  return error !== null
+    && typeof error === 'object'
+    && error.providerError !== null
+    && typeof error.providerError === 'object';
 }
 
 export function createExecutorService({
@@ -349,6 +383,13 @@ export function createExecutorService({
   async function isolateInteractionRecovery(activeRun) {
     if (typeof adapter.abort === 'function') {
       await adapter.abort(activeRun.turnContext);
+      if (provider === 'codex' && typeof activeRun.iterator?.return === 'function') {
+        try {
+          await activeRun.iterator.return();
+        } catch {
+          // Provider terminal is the isolation proof; iterator cleanup is best-effort.
+        }
+      }
       return true;
     }
     if (typeof activeRun.iterator?.return === 'function') {
@@ -497,8 +538,30 @@ export function createExecutorService({
     );
   }
 
+  async function retainRecoveringRun(activeRun) {
+    try {
+      await activeRun.iterator?.return?.();
+    } catch {
+      // The durable recovery fence is authoritative; iterator cleanup is best-effort.
+    }
+    activeRun.durableSettled = true;
+    cleanupActiveRun(activeRun);
+    refresh();
+    reschedulePendingInteractionDeadlines();
+    return resultFor(activeRun, 'recovering');
+  }
+
   async function handleRunFailure(activeRun, error) {
     const { turnContext } = activeRun;
+    if (activeRun.providerFailureOutcome?.status === 'recovering') {
+      return retainRecoveringRun(activeRun);
+    }
+    if (activeRun.providerFailurePersistenceError) {
+      activeRun.durableSettled = true;
+      cleanupActiveRun(activeRun);
+      refresh();
+      throw activeRun.providerFailurePersistenceError;
+    }
     if (activeRun.durableSettled) {
       cleanupActiveRun(activeRun);
       if (activeRun.forcedResult) return activeRun.forcedResult;
@@ -551,6 +614,19 @@ export function createExecutorService({
       return recovery;
     }
     const cancelled = cancelledTurnIds.has(turnContext.turn_id);
+    if (isExplicitProviderError(error) && !cancelled) {
+      const { state } = store.assertCurrentFence(turnContext);
+      persist(() => store.transitionTurn(turnContext, state, 'failed', {
+        error: normalizeProviderError(error, now()),
+        reasonCode: 'executor_failed',
+      }));
+      activeRun.durableSettled = true;
+      refresh();
+      cleanupActiveRun(activeRun);
+      releaseAbsentResident(turnContext);
+      reschedulePendingInteractionDeadlines();
+      return resultFor(activeRun, 'failed');
+    }
     const terminalState = cancelled ? 'stopped' : 'failed';
     const { state } = store.assertCurrentFence(turnContext);
     store.transitionTurn(turnContext, state, terminalState, {
@@ -574,6 +650,7 @@ export function createExecutorService({
     if (activeRun.durableSettled && activeRun.forcedResult) {
       return activeRun.forcedResult;
     }
+    activeRun.ensureProviderStarted();
     await awaitCancellationSettlement(activeRun.turnContext.turn_id);
     if (uncertainTurnIds.has(activeRun.turnContext.turn_id)) {
       const { turnContext } = activeRun;
@@ -625,6 +702,9 @@ export function createExecutorService({
     try {
       while (true) {
         const next = await activeRun.iterator.next();
+        if (activeRun.providerFailureOutcome?.status === 'recovering') {
+          return retainRecoveringRun(activeRun);
+        }
         if (next.done) return await finishRun(activeRun);
         const record = next.value;
         if (record?.type === 'interaction_persisted') {
@@ -654,6 +734,7 @@ export function createExecutorService({
           continue;
         }
         if (record?.kind === 'interaction_requested') {
+          activeRun.ensureProviderStarted();
           const request = persist(() => store.requestInteraction(
             activeRun.turnContext,
             record.payload,
@@ -671,6 +752,8 @@ export function createExecutorService({
               activeRun.turnContext,
               record.provider_native_id,
             ));
+            activeRun.currentProviderNativeId = record.provider_native_id;
+            activeRun.ensureProviderStarted();
             record.acknowledge();
           } catch (error) {
             record.acknowledge(error);
@@ -680,14 +763,17 @@ export function createExecutorService({
         }
         if (record?.type === 'normalized_event') {
           activeRun.usesManagedRecords = true;
+          activeRun.ensureProviderStarted();
           persist(() => store.appendAdapterEvent(activeRun.turnContext, record.event));
           continue;
         }
         if (record?.type === 'turn_result') {
           activeRun.usesManagedRecords = true;
+          activeRun.ensureProviderStarted();
           activeRun.outcome = record.outcome;
           continue;
         }
+        activeRun.ensureProviderStarted();
         persist(() => store.appendAdapterEvent(activeRun.turnContext, record));
       }
     } catch (error) {
@@ -743,6 +829,7 @@ export function createExecutorService({
         if (!controllers) {
           controllers = new Set();
           permissionControllers.set(turnContext.turn_id, controllers);
+          activeRun.ensureProviderStarted();
           persist(() => store.transitionTurn(turnContext, 'running', 'waiting_user'));
         }
         const controller = new AbortController();
@@ -883,11 +970,16 @@ export function createExecutorService({
     const activeRun = {
       advancing: null,
       backgroundUncertain: false,
+      currentProviderNativeId: turnContext.provider_native_id,
       durableSettled: false,
+      ensureProviderStarted: null,
       forcedResult: null,
       iterator: null,
       outcome: null,
       pauseKind: null,
+      providerFailureOutcome: null,
+      providerFailurePersistenceError: null,
+      providerStarted: false,
       resolveSettlement,
       settled: false,
       settlement,
@@ -898,9 +990,17 @@ export function createExecutorService({
     activeRunSettlements.add(settlement);
     activeRuns.set(turnContext.turn_id, activeRun);
     activeTurns.set(turnContext.conversation_id, turnContext);
+    activeRun.ensureProviderStarted = () => {
+      if (activeRun.providerStarted) return { status: 'already_started' };
+      persist(() => store.transitionTurn(turnContext, 'starting', 'running', {
+        reasonCode: 'provider_started',
+      }));
+      activeRun.providerStarted = true;
+      refresh();
+      return { status: 'running' };
+    };
     try {
       refresh();
-      persist(() => store.transitionTurn(turnContext, 'starting', 'running'));
       const adapterContext = Object.freeze({
         conversation_id: turnContext.conversation_id,
         turn_id: turnContext.turn_id,
@@ -908,6 +1008,60 @@ export function createExecutorService({
         provider_native_id: turnContext.provider_native_id,
         trace_id: turnContext.trace_id,
         input: turnContext.input,
+        interaction: Object.freeze({
+          authorized_subjects: Object.freeze(
+            turnContext.interaction.authorized_subjects.map((subject) => Object.freeze({
+              ...subject,
+            })),
+          ),
+          allowed_sources: Object.freeze([...turnContext.interaction.allowed_sources]),
+        }),
+        lineage: Object.freeze({ ...turnContext.lineage }),
+        bindProviderNativeId(providerNativeId) {
+          const binding = persist(() => store.bindProviderNativeId(
+            turnContext,
+            providerNativeId,
+          ));
+          activeRun.currentProviderNativeId = providerNativeId;
+          return binding;
+        },
+        reportProviderState(providerState) {
+          if (
+            !providerState
+            || providerState.state !== 'started'
+            || !Object.hasOwn(providerState, 'provider_native_id')
+            || providerState.provider_native_id !== activeRun.currentProviderNativeId
+          ) {
+            throw new TypeError('provider state must match the current started lineage');
+          }
+          return activeRun.ensureProviderStarted();
+        },
+        reportProviderFailure(providerFailure) {
+          if (activeRun.durableSettled) {
+            throw new Error('Provider failure arrived after the executor run settled.');
+          }
+          const normalizedFailure = normalizeProviderError(providerFailure, now());
+          let outcome;
+          try {
+            outcome = persist(() => store.markProviderFailure(
+              turnContext,
+              normalizedFailure,
+            ));
+          } catch (error) {
+            activeRun.providerFailurePersistenceError = error;
+            throw error;
+          }
+          activeRun.providerFailureOutcome = outcome;
+          if (outcome.status === 'recovering') {
+            reschedulePendingInteractionDeadlines();
+            refresh();
+            if (!activeRun.advancing) {
+              activeRun.durableSettled = true;
+              cleanupActiveRun(activeRun);
+            }
+          }
+          return outcome;
+        },
         attempt: Object.freeze({ ...turnContext.attempt }),
       });
       const events = adapter.execute(
@@ -1025,8 +1179,36 @@ export function createExecutorService({
     const timedOutRun = activeRuns.get(result.turn_id);
     if (timedOutRun) timedOutRun.timedOutExpiration = result;
     if (!timedOutRun || typeof timedOutRun.iterator.return !== 'function') {
+      store.markTimedOutProviderStopUnknown(result, 'not_current');
       reschedulePendingInteractionDeadlines();
-      return { ...result, lease_released: false };
+      return {
+        ...result,
+        lease_released: false,
+        provider_stop_status: 'not_current',
+      };
+    }
+    if (typeof adapter.interrupt === 'function') {
+      let interruption;
+      try {
+        interruption = await adapter.interrupt({
+          turn_id: result.turn_id,
+          attempt: result.attempt,
+          reason: 'timeout',
+        });
+      } catch {
+        store.markTimedOutProviderStopUnknown(result, 'uncertain');
+        reschedulePendingInteractionDeadlines();
+        return { ...result, lease_released: false, provider_stop_status: 'uncertain' };
+      }
+      if (interruption?.status !== 'provider_stopped') {
+        store.markTimedOutProviderStopUnknown(result, interruption?.status ?? 'uncertain');
+        reschedulePendingInteractionDeadlines();
+        return {
+          ...result,
+          lease_released: false,
+          provider_stop_status: interruption?.status ?? 'uncertain',
+        };
+      }
     }
     if (typeof adapter.abort === 'function') {
       try {
@@ -1080,6 +1262,21 @@ export function createExecutorService({
         Object.freeze(delivery),
       );
     } catch (error) {
+      if (provider === 'codex' && isExplicitProviderError(error)) {
+        const providerError = normalizeProviderError(error, now());
+        if (providerError.side_effect_status === 'unknown') {
+          const deliveryUnknown = persist(
+            () => store.markInteractionHandoffDeliveryUnknown(delivery, providerError),
+          );
+          if (activeRun && !activeRun.durableSettled) {
+            activeRun.durableSettled = true;
+            cleanupActiveRun(activeRun);
+          }
+          reschedulePendingInteractionDeadlines();
+          refresh();
+          return deliveryUnknown;
+        }
+      }
       const recovery = {
         activeRun,
         delivery,
@@ -1192,7 +1389,8 @@ export function createExecutorService({
         }
         const providerClosing = (async () => {
           if (typeof adapter.close !== 'function') return [];
-          return await adapter.close() ?? [];
+          const result = await adapter.close();
+          return Array.isArray(result) ? result : [];
         })().then(
           (closedConversationIds) => ({ closedConversationIds, error: null }),
           (error) => ({
@@ -1274,7 +1472,11 @@ export function createExecutorService({
             let isolationProven = closedConversationIdSet.has(
               activeRun.turnContext.conversation_id,
             );
-            if (!isolationProven && typeof activeRun.iterator?.return === 'function') {
+            if (
+              !isolationProven
+              && provider !== 'codex'
+              && typeof activeRun.iterator?.return === 'function'
+            ) {
               try {
                 await activeRun.iterator.return();
                 isolationProven = true;
