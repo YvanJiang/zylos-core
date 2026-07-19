@@ -1282,9 +1282,9 @@ describe('Claude conversation executor', () => {
         SELECT RAISE(ABORT, 'forced permission acknowledgement failure');
       END;
     `);
-    await expect(service.deliverInteractionAnswer(answer.handoff_id)).rejects.toThrow(
-      /forced permission acknowledgement failure/,
-    );
+    await expect(service.deliverInteractionAnswer(answer.handoff_id)).rejects.toMatchObject({
+      message: expect.stringMatching(/forced permission acknowledgement failure/),
+    });
     expect(fake.permissionResults).toEqual([{
       behavior: 'allow',
       updatedInput: { command: 'pwd' },
@@ -2529,7 +2529,9 @@ describe('Claude conversation executor', () => {
       END;
     `);
 
-    await expect(service.close()).rejects.toThrow(/forced close resident delete failure/);
+    await expect(service.close()).rejects.toMatchObject({
+      message: expect.stringMatching(/forced close resident delete failure/),
+    });
     expect(heartbeatCancelled).toBe(false);
     database.exec('DROP TRIGGER fail_close_resident_delete');
     await expect(service.close()).resolves.toBeUndefined();
