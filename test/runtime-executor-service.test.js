@@ -521,7 +521,7 @@ describe('runtime executor service', () => {
     database.close();
   });
 
-  test('releases durable resident capacity after a truly idle executor is evicted', async () => {
+  test('evicts a truly idle resident and retries capacity admission in the same run', async () => {
     const database = openTestDatabase();
     const first = acceptQueuedTurn(database, 'resident-eviction-first');
     const adapterCalls = [];
@@ -547,12 +547,6 @@ describe('runtime executor service', () => {
       status: 'completed',
       turn_id: first.turn_id,
     });
-    expect(database.prepare(`SELECT COUNT(*) AS count FROM runtime_executor_residents`)
-      .get().count).toBe(1);
-    await expect(service.evictIdleExecutors()).resolves.toEqual([first.conversation_id]);
-    expect(database.prepare(`SELECT COUNT(*) AS count FROM runtime_executor_residents`)
-      .get().count).toBe(0);
-
     const secondEnvelope = normalEnvelope('resident-eviction-second');
     secondEnvelope.chat_id = 'chat-resident-eviction-second';
     const second = acceptNormalInbound(database, secondEnvelope, {
@@ -564,6 +558,9 @@ describe('runtime executor service', () => {
       turn_id: second.turn_id,
     });
     expect(adapterCalls).toEqual([first.turn_id, second.turn_id]);
+    expect(database.prepare(`
+      SELECT conversation_id FROM runtime_executor_residents
+    `).all()).toEqual([{ conversation_id: second.conversation_id }]);
 
     await service.close();
     database.close();

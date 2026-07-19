@@ -58,6 +58,7 @@ export function createExecutorService({
   const closingPermissionTurnIds = new Set();
   const permissionControllers = new Map();
   const activeRunSettlements = new Set();
+  const cancellationSettlements = new Map();
   const uncertainTurnIds = new Set();
   let lifecycle = 'open';
   let closePromise = null;
@@ -116,6 +117,7 @@ export function createExecutorService({
     }
     cancelledTurnIds.delete(turnContext.turn_id);
     uncertainTurnIds.delete(turnContext.turn_id);
+    cancellationSettlements.delete(turnContext.turn_id);
     const controllers = permissionControllers.get(turnContext.turn_id);
     if (!controllers || controllers.size === 0) {
       permissionControllers.delete(turnContext.turn_id);
@@ -126,6 +128,11 @@ export function createExecutorService({
       activeRunSettlements.delete(activeRun.settlement);
       activeRun.resolveSettlement();
     }
+  }
+
+  async function awaitCancellationSettlement(turnId) {
+    const settlement = cancellationSettlements.get(turnId);
+    if (settlement) await settlement.promise;
   }
 
   function transitionToRecovery(activeRun) {
@@ -152,6 +159,7 @@ export function createExecutorService({
       cleanupActiveRun(activeRun);
       throw error;
     }
+    await awaitCancellationSettlement(turnContext.turn_id);
     closingPermissionTurnIds.add(turnContext.turn_id);
     for (const controller of permissionControllers.get(turnContext.turn_id) ?? []) {
       controller.abort();
@@ -174,10 +182,17 @@ export function createExecutorService({
     activeRun.durableSettled = true;
     refresh();
     cleanupActiveRun(activeRun);
+    if (
+      typeof adapter.hasResident === 'function'
+      && !adapter.hasResident(turnContext.conversation_id)
+    ) {
+      store.releaseExecutorResident(turnContext.conversation_id);
+    }
     return resultFor(activeRun, terminalState);
   }
 
   async function finishRun(activeRun) {
+    await awaitCancellationSettlement(activeRun.turnContext.turn_id);
     if (uncertainTurnIds.has(activeRun.turnContext.turn_id)) {
       return transitionToRecovery(activeRun);
     }
@@ -328,8 +343,14 @@ export function createExecutorService({
       throw new Error(`Executor service is ${lifecycle}; it cannot claim another turn.`);
     }
     if (!started) start();
-    const reservation = store.reserveNextExecutor({ maxResidentExecutorsPerBot });
+    let reservation = store.reserveNextExecutor({ maxResidentExecutorsPerBot });
     if (reservation.status === 'idle') return reservation;
+    if (reservation.status === 'capacity_wait') {
+      const evicted = await evictIdleExecutors();
+      if (evicted.length > 0) {
+        reservation = store.reserveNextExecutor({ maxResidentExecutorsPerBot });
+      }
+    }
     if (reservation.status === 'capacity_wait') {
       refresh();
       return reservation;
@@ -395,6 +416,16 @@ export function createExecutorService({
     if (typeof adapter.cancel !== 'function') {
       throw new TypeError('adapter.cancel must be a function to cancel an active turn');
     }
+    if (cancellationSettlements.has(turnContext.turn_id)) {
+      throw new Error('Cancellation is already pending for the active turn.');
+    }
+    let resolveCancellation;
+    const cancellation = {
+      promise: new Promise((resolve) => { resolveCancellation = resolve; }),
+      resolve: () => resolveCancellation(),
+      status: 'pending',
+    };
+    cancellationSettlements.set(turnContext.turn_id, cancellation);
     cancelledTurnIds.add(turnContext.turn_id);
     for (const controller of permissionControllers.get(turnContext.turn_id) ?? []) {
       controller.abort();
@@ -405,10 +436,17 @@ export function createExecutorService({
       cancelledTurnIds.delete(turnContext.turn_id);
       if (error.cancellationUncertain) {
         uncertainTurnIds.add(turnContext.turn_id);
+        cancellation.status = 'uncertain';
+        cancellation.resolve();
         if (typeof adapter.abort === 'function') await adapter.abort(turnContext);
+      } else {
+        cancellation.status = 'failed';
+        cancellation.resolve();
       }
       throw error;
     }
+    cancellation.status = 'confirmed';
+    cancellation.resolve();
     return {
       status: 'cancellation_requested',
       conversation_id: turnContext.conversation_id,
@@ -453,8 +491,11 @@ export function createExecutorService({
     lifecycle = 'closing';
     closePromise = (async () => {
       let closeError = null;
+      let closedConversationIds = [];
       try {
-        if (typeof adapter.close === 'function') await adapter.close();
+        if (typeof adapter.close === 'function') {
+          closedConversationIds = await adapter.close() ?? [];
+        }
       } catch (error) {
         closeError = error;
       }
@@ -462,6 +503,9 @@ export function createExecutorService({
         if (!activeRun.advancing && activeRun.iterator) advanceRun(activeRun);
       }
       await Promise.allSettled([...activeRunSettlements]);
+      for (const conversationId of closedConversationIds) {
+        store.releaseExecutorResident(conversationId);
+      }
       lifecycle = 'closed';
       if (closeError) throw closeError;
     })();

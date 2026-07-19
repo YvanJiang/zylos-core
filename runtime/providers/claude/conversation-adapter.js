@@ -2,6 +2,33 @@ import { randomUUID } from 'node:crypto';
 
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
 
+const DEFAULT_ENVIRONMENT_ALLOWLIST = Object.freeze([
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_BASE_URL',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'HOME',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'LANG',
+  'LC_ALL',
+  'NODE_EXTRA_CA_CERTS',
+  'NO_PROXY',
+  'PATH',
+  'SHELL',
+  'TERM',
+  'TMPDIR',
+  'USER',
+]);
+
+function selectEnvironment(environment, allowlist = DEFAULT_ENVIRONMENT_ALLOWLIST) {
+  const selected = {};
+  for (const key of allowlist) {
+    if (typeof environment[key] === 'string') selected[key] = environment[key];
+  }
+  return selected;
+}
+
 function createDeferred() {
   let resolve;
   let reject;
@@ -256,10 +283,18 @@ async function requestToolPermission(executor, toolName, input, sdkContext) {
       interrupt: true,
     };
   }
-  const decision = await activeTurn.controls.requestPermission(
-    Object.freeze({ tool_name: toolName, input }),
-    Object.freeze({ signal: sdkContext?.signal }),
-  );
+  let decision;
+  try {
+    decision = await activeTurn.controls.requestPermission(
+      Object.freeze({ tool_name: toolName, input }),
+      Object.freeze({ signal: sdkContext?.signal }),
+    );
+  } catch (error) {
+    // The SDK catches canUseTool failures on its private control channel. Close the
+    // provider-neutral turn explicitly so persistence/fence failures reach Core.
+    settleTurn(activeTurn, { error });
+    throw error;
+  }
   if (decision.behavior === 'allow') {
     return {
       behavior: 'allow',
@@ -273,26 +308,36 @@ async function requestToolPermission(executor, toolName, input, sdkContext) {
   };
 }
 
-function updateBackgroundTasks(executor, message) {
+function updateBackgroundTasks(executor, message, now) {
   if (message?.type !== 'system') return;
   if (message.subtype === 'background_tasks_changed' && Array.isArray(message.tasks)) {
+    const hadBackgroundTasks = executor.backgroundTaskIds.size > 0;
     executor.backgroundTaskIds = new Set(
       message.tasks.map(({ task_id: taskId }) => taskId).filter(
         (taskId) => typeof taskId === 'string' && taskId.length > 0,
       ),
     );
+    if (hadBackgroundTasks && executor.backgroundTaskIds.size === 0) {
+      executor.lastUsedAt = now();
+      executor.notifySwitchable();
+    }
     return;
   }
   if (typeof message.task_id !== 'string') return;
   if (message.subtype === 'task_started') {
     executor.backgroundTaskIds.add(message.task_id);
   } else if (message.subtype === 'task_notification') {
-    executor.backgroundTaskIds.delete(message.task_id);
+    const removed = executor.backgroundTaskIds.delete(message.task_id);
+    if (removed && executor.backgroundTaskIds.size === 0) {
+      executor.lastUsedAt = now();
+      executor.notifySwitchable();
+    }
   }
 }
 
 function createResidentExecutor({
   conversationId,
+  lineageId,
   providerNativeId,
   query,
   queryOptions,
@@ -312,6 +357,24 @@ function createResidentExecutor({
     sessionBound: providerNativeId !== null,
     sessionId: providerNativeId,
     lastUsedAt: now(),
+    lineageId,
+    switchWaiters: [],
+  };
+  executor.notifySwitchable = () => {
+    if (
+      executor.activeTurn !== null
+      || executor.providerTurn !== null
+      || executor.backgroundTaskIds.size > 0
+    ) return;
+    for (const resolve of executor.switchWaiters.splice(0)) resolve();
+  };
+  executor.waitUntilSwitchable = () => {
+    if (
+      executor.activeTurn === null
+      && executor.providerTurn === null
+      && executor.backgroundTaskIds.size === 0
+    ) return Promise.resolve();
+    return new Promise((resolve) => executor.switchWaiters.push(resolve));
   };
   executor.input = createAsyncQueue({
     mapValue({ message, turn }) {
@@ -340,7 +403,7 @@ function createResidentExecutor({
         for await (const message of executor.query) {
           const sessionId = assertSessionIdentity(executor, message);
           await establishDurableSession(executor, sessionId);
-          updateBackgroundTasks(executor, message);
+          updateBackgroundTasks(executor, message, now);
           if (
             message?.type === 'system'
             && message.subtype === 'session_state_changed'
@@ -349,6 +412,8 @@ function createResidentExecutor({
           ) {
             executor.providerTurn = null;
             executor.input.resume();
+            executor.lastUsedAt = now();
+            executor.notifySwitchable();
             continue;
           }
           const providerTurn = executor.providerTurn;
@@ -362,17 +427,20 @@ function createResidentExecutor({
             settleTurn(providerTurn, { outcome });
             if (executor.activeTurn === providerTurn) executor.activeTurn = null;
             executor.lastUsedAt = now();
+            executor.notifySwitchable();
           }
         }
       } catch (error) {
         settleUnfinishedTurns(executor, { error });
         executor.activeTurn = null;
         executor.providerTurn = null;
+        executor.notifySwitchable();
       } finally {
         settleUnfinishedTurns(executor);
         executor.activeTurn = null;
         executor.providerTurn = null;
         executor.ended = true;
+        executor.notifySwitchable();
       }
     })();
   };
@@ -383,9 +451,10 @@ function createResidentExecutor({
 export function createClaudeConversationAdapter({
   query = sdkQuery,
   queryOptions = {},
-  idleTimeoutMs = 300_000,
+  idleTimeoutMs = 1_800_000,
   now = () => Date.now(),
   generateMessageUuid = randomUUID,
+  environmentAllowlist = DEFAULT_ENVIRONMENT_ALLOWLIST,
 }) {
   if (typeof query !== 'function') throw new TypeError('query must be a function');
   if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs < 0) {
@@ -395,6 +464,16 @@ export function createClaudeConversationAdapter({
   if (typeof generateMessageUuid !== 'function') {
     throw new TypeError('generateMessageUuid must be a function');
   }
+  if (!Array.isArray(environmentAllowlist) || environmentAllowlist.some(
+    (key) => typeof key !== 'string' || key.length === 0,
+  )) {
+    throw new TypeError('environmentAllowlist must contain non-empty strings');
+  }
+  const environment = queryOptions.env ?? process.env;
+  const safeQueryOptions = {
+    ...queryOptions,
+    env: selectEnvironment(environment, environmentAllowlist),
+  };
   const executors = new Map();
 
   async function* execute(context, controls = {}) {
@@ -407,12 +486,21 @@ export function createClaudeConversationAdapter({
       executors.delete(context.conversation_id);
       executor = null;
     }
+    if (executor && executor.lineageId !== context.lineage_id) {
+      await executor.waitUntilSwitchable();
+      if (executors.get(context.conversation_id) === executor) {
+        executors.delete(context.conversation_id);
+        await closeExecutor(executor);
+      }
+      executor = null;
+    }
     if (!executor) {
       executor = createResidentExecutor({
         conversationId: context.conversation_id,
+        lineageId: context.lineage_id,
         providerNativeId: context.provider_native_id,
         query,
-        queryOptions,
+        queryOptions: safeQueryOptions,
         now,
       });
       executors.set(context.conversation_id, executor);
@@ -476,6 +564,7 @@ export function createClaudeConversationAdapter({
       activeTurn.output.close();
       executor.activeTurn = null;
       executor.lastUsedAt = now();
+      executor.notifySwitchable();
       return;
     }
     let receipt;
@@ -487,19 +576,45 @@ export function createClaudeConversationAdapter({
       error.cancellationUncertain = true;
       throw error;
     }
+    if (!receipt || !Array.isArray(receipt.still_queued)) {
+      activeTurn.cancelRequested = false;
+      const error = new Error('Claude interruption is uncertain: no valid receipt was returned.');
+      error.cancellationUncertain = true;
+      throw error;
+    }
     if (receipt?.still_queued?.includes(activeTurn.messageUuid)) {
-      if (typeof executor.query.cancelAsyncMessage === 'function') {
-        await executor.query.cancelAsyncMessage(activeTurn.messageUuid);
-      } else {
-        executors.delete(context.conversation_id);
-        settleTurn(activeTurn, { outcome: 'cancelled' });
-        if (executor.activeTurn === activeTurn) executor.activeTurn = null;
-        await closeExecutor(executor);
-        return;
+      if (typeof executor.query.cancelAsyncMessage !== 'function') {
+        activeTurn.cancelRequested = false;
+        const error = new Error(
+          'Claude queued-message cancellation is uncertain: cancelAsyncMessage is unavailable.',
+        );
+        error.cancellationUncertain = true;
+        throw error;
+      }
+      let removed;
+      try {
+        removed = await executor.query.cancelAsyncMessage(activeTurn.messageUuid);
+      } catch (cause) {
+        activeTurn.cancelRequested = false;
+        const error = new Error(
+          `Claude queued-message cancellation is uncertain: ${cause.message}`,
+          { cause },
+        );
+        error.cancellationUncertain = true;
+        throw error;
+      }
+      if (removed !== true) {
+        activeTurn.cancelRequested = false;
+        const error = new Error(
+          'Claude queued-message cancellation is uncertain: removal was not confirmed.',
+        );
+        error.cancellationUncertain = true;
+        throw error;
       }
       settleTurn(activeTurn, { outcome: 'cancelled' });
       if (executor.activeTurn === activeTurn) executor.activeTurn = null;
       executor.lastUsedAt = now();
+      executor.notifySwitchable();
     }
   }
 
@@ -532,6 +647,7 @@ export function createClaudeConversationAdapter({
     for (const [conversationId, executor] of executors) {
       if (
         executor.activeTurn !== null
+        || executor.providerTurn !== null
         || executor.backgroundTaskIds.size > 0
         || now() - executor.lastUsedAt < idleTimeoutMs
         || !await canEvict(conversationId)
@@ -541,9 +657,19 @@ export function createClaudeConversationAdapter({
       if (
         executors.get(conversationId) !== executor
         || executor.activeTurn !== null
+        || executor.providerTurn !== null
         || executor.backgroundTaskIds.size > 0
         || now() - executor.lastUsedAt < idleTimeoutMs
         || !await canEvict(conversationId)
+      ) {
+        continue;
+      }
+      if (
+        executors.get(conversationId) !== executor
+        || executor.activeTurn !== null
+        || executor.providerTurn !== null
+        || executor.backgroundTaskIds.size > 0
+        || now() - executor.lastUsedAt < idleTimeoutMs
       ) {
         continue;
       }
@@ -555,11 +681,17 @@ export function createClaudeConversationAdapter({
   }
 
   async function close() {
+    const conversationIds = [...executors.keys()];
     await Promise.allSettled(
       [...executors.values()].map((executor) => closeExecutor(executor)),
     );
     executors.clear();
+    return conversationIds;
   }
 
-  return Object.freeze({ abort, cancel, close, evictIdle, execute });
+  function hasResident(conversationId) {
+    return executors.has(conversationId);
+  }
+
+  return Object.freeze({ abort, cancel, close, evictIdle, execute, hasResident });
 }

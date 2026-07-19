@@ -102,6 +102,31 @@ function createFakeQuery({ sessionId, beforeFirstOutput }) {
   return { calls, inputs, query };
 }
 
+function createSessionPerQuery() {
+  const calls = [];
+  function query({ prompt, options }) {
+    const sessionId = `claude-lineage-session-${calls.length + 1}`;
+    calls.push({ options, sessionId });
+    const stream = (async function* generateSdkMessages() {
+      for await (const input of prompt) {
+        yield { type: 'system', subtype: 'init', session_id: sessionId };
+        yield {
+          type: 'assistant',
+          session_id: sessionId,
+          message: { content: [{ type: 'text', text: `answer ${input.message.content}` }] },
+          parent_tool_use_id: null,
+        };
+        yield { type: 'result', subtype: 'success', session_id: sessionId, result: 'answer' };
+        yield idleSession(sessionId);
+      }
+    }());
+    stream.interrupt = async () => ({ still_queued: [] });
+    stream.close = () => {};
+    return stream;
+  }
+  return { calls, query };
+}
+
 function deferred() {
   let resolve;
   const promise = new Promise((resolvePromise) => {
@@ -184,6 +209,7 @@ function createInterruptibleQuery({ sessionId }) {
     stream.interrupt = async () => {
       interruptCalls += 1;
       interrupted.resolve();
+      return { still_queued: [] };
     };
     stream.close = () => {};
     return stream;
@@ -231,12 +257,40 @@ function createPermissionQuery({ sessionId }) {
         yield idleSession(sessionId);
       }
     }());
-    stream.interrupt = async () => {};
+    stream.interrupt = async () => ({ still_queued: [] });
     stream.close = () => {};
     return stream;
   }
 
   return { permissionRequested, permissionResults, query };
+}
+
+function createCaughtPermissionFailureQuery({ sessionId }) {
+  const permissionRequested = deferred();
+  function query({ prompt, options }) {
+    const stream = (async function* generateSdkMessages() {
+      for await (const input of prompt) {
+        yield { type: 'system', subtype: 'init', session_id: sessionId };
+        permissionRequested.resolve();
+        try {
+          await options.canUseTool('Bash', { command: 'pwd' }, {});
+        } catch {
+          // The SDK reports callback failures on its private control channel and continues.
+        }
+        yield {
+          type: 'result',
+          subtype: 'success',
+          session_id: sessionId,
+          result: `continued ${input.message.content}`,
+        };
+        yield idleSession(sessionId);
+      }
+    }());
+    stream.interrupt = async () => ({ still_queued: [] });
+    stream.close = () => {};
+    return stream;
+  }
+  return { permissionRequested, query };
 }
 
 function createCaughtPermissionCancellationQuery({ sessionId }) {
@@ -319,6 +373,26 @@ function createBackgroundQuery({ sessionId }) {
   }
 
   return { backgroundFinished, notificationConsumed, query };
+}
+
+function createDelayedIdleQuery({ sessionId }) {
+  const idleConsumed = deferred();
+  const releaseIdle = deferred();
+  function query({ prompt }) {
+    const stream = (async function* generateSdkMessages() {
+      for await (const input of prompt) {
+        yield { type: 'system', subtype: 'init', session_id: sessionId };
+        yield { type: 'result', subtype: 'success', session_id: sessionId, result: input.message.content };
+        await releaseIdle.promise;
+        yield idleSession(sessionId);
+        idleConsumed.resolve();
+      }
+    }());
+    stream.interrupt = async () => ({ still_queued: [] });
+    stream.close = () => releaseIdle.resolve();
+    return stream;
+  }
+  return { idleConsumed, query, releaseIdle };
 }
 
 function createThrowingQuery({ sessionId }) {
@@ -501,7 +575,7 @@ function createCloseAwareQuery({ sessionId }) {
   return { query, turnStarted };
 }
 
-function createQueuedReceiptQuery({ sessionId }) {
+function createQueuedReceiptQuery({ cancelResult = true, sessionId }) {
   const cancelled = deferred();
   const inputConsumed = deferred();
   const cancelledMessageUuids = [];
@@ -526,12 +600,46 @@ function createQueuedReceiptQuery({ sessionId }) {
     stream.cancelAsyncMessage = async (messageUuid) => {
       cancelledMessageUuids.push(messageUuid);
       cancelled.resolve();
-      return false;
+      return cancelResult;
     };
     stream.close = () => cancelled.resolve();
     return stream;
   }
   return { cancelledMessageUuids, inputConsumed, query };
+}
+
+function createReceiptRaceQuery({ sessionId }) {
+  const cancellationStarted = deferred();
+  const inputConsumed = deferred();
+  const resultConsumed = deferred();
+  function query({ prompt }) {
+    let currentInput = null;
+    const stream = (async function* generateSdkMessages() {
+      for await (const input of prompt) {
+        currentInput = input;
+        inputConsumed.resolve();
+        yield { type: 'system', subtype: 'init', session_id: sessionId };
+        await cancellationStarted.promise;
+        yield {
+          type: 'result',
+          subtype: 'error_during_execution',
+          session_id: sessionId,
+          errors: ['provider result raced the cancellation receipt'],
+        };
+        resultConsumed.resolve();
+        yield idleSession(sessionId);
+      }
+    }());
+    stream.interrupt = async () => ({ still_queued: [currentInput.uuid] });
+    stream.cancelAsyncMessage = async () => {
+      cancellationStarted.resolve();
+      await resultConsumed.promise;
+      throw new Error('queued cancellation control failed');
+    };
+    stream.close = () => cancellationStarted.resolve();
+    return stream;
+  }
+  return { inputConsumed, query };
 }
 
 function createBoundaryEndingQuery({ sessionId }) {
@@ -735,7 +843,16 @@ describe('Claude conversation executor', () => {
         });
       },
     });
-    const adapter = createClaudeConversationAdapter({ query: fake.query });
+    const adapter = createClaudeConversationAdapter({
+      query: fake.query,
+      queryOptions: {
+        env: {
+          PATH: '/test/bin',
+          ANTHROPIC_API_KEY: 'test-key',
+          UNAPPROVED_PROVIDER_SECRET: 'must-not-cross-the-adapter',
+        },
+      },
+    });
     const service = createExecutorService({
       database,
       adapter,
@@ -756,6 +873,10 @@ describe('Claude conversation executor', () => {
 
     expect(fake.calls).toHaveLength(1);
     expect(fake.calls[0].options.resume).toBeUndefined();
+    expect(fake.calls[0].options.env).toEqual({
+      ANTHROPIC_API_KEY: 'test-key',
+      PATH: '/test/bin',
+    });
     expect(fake.inputs).toEqual(['turn first', 'turn second']);
     expect(readEvents(database, first.turn_id).at(-2)).toMatchObject({
       kind: 'text_snapshot',
@@ -775,6 +896,81 @@ describe('Claude conversation executor', () => {
         end_offset: 22,
       },
     });
+
+    await service.close();
+    database.close();
+  });
+
+  test('switches resident queries when FIFO advances to another lineage', async () => {
+    const database = openTestDatabase();
+    const firstEnvelope = normalEnvelope('claude-lineage-first');
+    const first = acceptNormalInbound(database, firstEnvelope, {
+      now: () => '2026-07-19T09:01:30Z',
+      generateId: deterministicIds('inbound-claude-lineage-first'),
+    });
+    const alternateLineageId = 'lineage-claude-alternate';
+    database.prepare(`
+      INSERT INTO runtime_lineages (
+        lineage_id, conversation_id, lineage_kind, is_default, created_at
+      ) VALUES (?, ?, 'normal', 0, ?)
+    `).run(alternateLineageId, first.conversation_id, first.committed_at);
+    database.prepare(`
+      INSERT INTO runtime_message_mappings (
+        region, tenant_id, channel, bot_id, platform_message_id,
+        conversation_id, turn_id, lineage_id, binding_state, reason,
+        mapping_id, mapping_version, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'bound', NULL, ?, 1, ?)
+    `).run(
+      firstEnvelope.region,
+      firstEnvelope.tenant_id,
+      firstEnvelope.channel,
+      firstEnvelope.bot_id,
+      'model-message-claude-alternate',
+      first.conversation_id,
+      first.turn_id,
+      alternateLineageId,
+      'mapping-claude-alternate',
+      first.committed_at,
+    );
+    const replyEnvelope = normalEnvelope('claude-lineage-reply');
+    replyEnvelope.reply = {
+      root_message_id: 'model-message-claude-root',
+      parent_message_id: 'model-message-claude-alternate',
+      reply_to_message_id: 'model-message-claude-alternate',
+    };
+    const reply = acceptNormalInbound(database, replyEnvelope, {
+      now: () => '2026-07-19T09:01:31Z',
+      generateId: deterministicIds('inbound-claude-lineage-reply'),
+    });
+    const fake = createSessionPerQuery();
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-claude-lineages',
+      now: () => '2026-07-19T09:01:32Z',
+      generateId: deterministicIds('claude-lineages'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ turn_id: first.turn_id });
+    await expect(service.runNext()).resolves.toMatchObject({ turn_id: reply.turn_id });
+    expect(fake.calls).toHaveLength(2);
+    expect(fake.calls.map(({ options }) => options.resume)).toEqual([undefined, undefined]);
+    expect(database.prepare(`
+      SELECT lineage_id, provider_native_id
+      FROM runtime_lineages
+      WHERE lineage_id IN (?, ?)
+      ORDER BY lineage_id
+    `).all(first.lineage_id, alternateLineageId)).toEqual([
+      {
+        lineage_id: alternateLineageId,
+        provider_native_id: 'claude-lineage-session-2',
+      },
+      {
+        lineage_id: first.lineage_id,
+        provider_native_id: 'claude-lineage-session-1',
+      },
+    ]);
 
     await service.close();
     database.close();
@@ -898,7 +1094,9 @@ describe('Claude conversation executor', () => {
         SELECT RAISE(ABORT, 'forced permission projection failure');
       END;
     `);
-    const fake = createPermissionQuery({ sessionId: 'claude-session-permission-projection' });
+    const fake = createCaughtPermissionFailureQuery({
+      sessionId: 'claude-session-permission-projection',
+    });
     const service = createExecutorService({
       database,
       adapter: createClaudeConversationAdapter({ query: fake.query }),
@@ -1049,6 +1247,65 @@ describe('Claude conversation executor', () => {
     database.close();
   });
 
+  test('uses the consensus thirty-minute idle timeout by default', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'idle-default');
+    const fake = createFakeQuery({ sessionId: 'claude-session-idle-default' });
+    let clock = 0;
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({
+        query: fake.query,
+        now: () => clock,
+      }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-idle-default',
+      now: () => '2026-07-19T09:04:30Z',
+      generateId: deterministicIds('idle-default'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ turn_id: accepted.turn_id });
+    clock = 300_001;
+    await expect(service.evictIdleExecutors()).resolves.toEqual([]);
+    clock = 1_800_001;
+    await expect(service.evictIdleExecutors()).resolves.toEqual([accepted.conversation_id]);
+
+    await service.close();
+    database.close();
+  });
+
+  test('starts the idle clock at the authoritative SDK idle boundary', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'idle-boundary');
+    const fake = createDelayedIdleQuery({ sessionId: 'claude-session-idle-boundary' });
+    let clock = 0;
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({
+        query: fake.query,
+        idleTimeoutMs: 100,
+        now: () => clock,
+      }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-idle-boundary',
+      now: () => '2026-07-19T09:04:45Z',
+      generateId: deterministicIds('idle-boundary'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ turn_id: accepted.turn_id });
+    clock = 1_000;
+    await expect(service.evictIdleExecutors()).resolves.toEqual([]);
+    fake.releaseIdle.resolve();
+    await fake.idleConsumed.promise;
+    clock = 1_099;
+    await expect(service.evictIdleExecutors()).resolves.toEqual([]);
+    clock = 1_100;
+    await expect(service.evictIdleExecutors()).resolves.toEqual([accepted.conversation_id]);
+
+    await service.close();
+    database.close();
+  });
+
   test('rebuilds a resident query from durable lineage after service restart', async () => {
     const database = openTestDatabase();
     const first = acceptQueuedTurn(database, 'restart-first');
@@ -1104,6 +1361,8 @@ describe('Claude conversation executor', () => {
     await expect(service.evictIdleExecutors()).resolves.toEqual([]);
     fake.backgroundFinished.resolve();
     await fake.notificationConsumed.promise;
+    await expect(service.evictIdleExecutors()).resolves.toEqual([]);
+    clock = 1_101;
     await expect(service.evictIdleExecutors()).resolves.toEqual([accepted.conversation_id]);
 
     await service.close();
@@ -1141,6 +1400,58 @@ describe('Claude conversation executor', () => {
 
     await service.close();
     database.close();
+  });
+
+  test('performs a synchronous final guard after the last durable eviction check', async () => {
+    const fake = createEvictionRaceQuery({ sessionId: 'claude-session-final-eviction-race' });
+    let clock = 0;
+    const adapter = createClaudeConversationAdapter({
+      query: fake.query,
+      idleTimeoutMs: 100,
+      now: () => clock,
+    });
+    const context = (turnId) => ({
+      conversation_id: 'conversation-final-eviction-race',
+      turn_id: turnId,
+      lineage_id: 'lineage-final-eviction-race',
+      provider_native_id: null,
+      trace_id: `trace-${turnId}`,
+      input: { text: `input ${turnId}` },
+      attempt: { attempt_id: `attempt-${turnId}`, attempt_no: 1, lease_epoch: 1 },
+    });
+    const controls = { requestPermission: async () => ({ behavior: 'deny' }) };
+    const consume = async (turnId) => {
+      const records = [];
+      for await (const record of adapter.execute(context(turnId), controls)) {
+        records.push(record);
+        if (record.type === 'provider_native_id') record.acknowledge();
+      }
+      return records;
+    };
+
+    await consume('turn-final-race-1');
+    await new Promise((resolve) => setImmediate(resolve));
+    clock = 1_000;
+    let durableChecks = 0;
+    let secondRun;
+    const eviction = adapter.evictIdle({
+      async canEvict() {
+        durableChecks += 1;
+        if (durableChecks === 2) {
+          secondRun = consume('turn-final-race-2');
+          await fake.secondTurnStarted.promise;
+        }
+        return true;
+      },
+    });
+
+    await expect(eviction).resolves.toEqual([]);
+    expect(fake.closeCalls).toBe(0);
+    fake.finishSecondTurn.resolve();
+    await expect(secondRun).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'turn_result', outcome: 'completed' }),
+    ]));
+    await adapter.close();
   });
 
   test('rechecks the durable queue before completing an idle eviction', async () => {
@@ -1369,6 +1680,70 @@ describe('Claude conversation executor', () => {
     database.close();
   });
 
+  test('recovers instead of claiming cancellation when queued-message removal is unconfirmed', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'cancel-sdk-unconfirmed');
+    const fake = createQueuedReceiptQuery({
+      cancelResult: false,
+      sessionId: 'claude-session-sdk-unconfirmed',
+    });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({
+        query: fake.query,
+        generateMessageUuid: () => '00000000-0000-4000-8000-000000000010',
+      }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-cancel-sdk-unconfirmed',
+      now: () => '2026-07-19T09:12:20Z',
+      generateId: deterministicIds('cancel-sdk-unconfirmed'),
+    });
+
+    const run = service.runNext();
+    await fake.inputConsumed.promise;
+    await expect(service.cancel(accepted.conversation_id)).rejects.toMatchObject({
+      cancellationUncertain: true,
+    });
+    await expect(run).resolves.toMatchObject({
+      status: 'recovering',
+      turn_id: accepted.turn_id,
+    });
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'recovering' });
+
+    await service.close();
+    database.close();
+  });
+
+  test('waits for a racing cancellation receipt before terminalizing provider output', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'cancel-receipt-race');
+    const fake = createReceiptRaceQuery({ sessionId: 'claude-session-cancel-receipt-race' });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-cancel-receipt-race',
+      now: () => '2026-07-19T09:12:25Z',
+      generateId: deterministicIds('cancel-receipt-race'),
+    });
+
+    const run = service.runNext();
+    await fake.inputConsumed.promise;
+    await expect(service.cancel(accepted.conversation_id)).rejects.toMatchObject({
+      cancellationUncertain: true,
+    });
+    await expect(run).resolves.toMatchObject({
+      status: 'recovering',
+      turn_id: accepted.turn_id,
+    });
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'recovering' });
+
+    await service.close();
+    database.close();
+  });
+
   test('settles a buffered next turn when the query fails before the prior idle boundary', async () => {
     const database = openTestDatabase();
     const first = acceptQueuedTurn(database, 'boundary-failure-first');
@@ -1487,7 +1862,12 @@ describe('Claude conversation executor', () => {
   test('rolls back a synchronous SDK setup failure so the next turn can start', async () => {
     const database = openTestDatabase();
     const first = acceptQueuedTurn(database, 'sync-setup-first');
-    const second = acceptQueuedTurn(database, 'sync-setup-second');
+    const secondEnvelope = normalEnvelope('sync-setup-second');
+    secondEnvelope.chat_id = 'chat-sync-setup-second';
+    const second = acceptNormalInbound(database, secondEnvelope, {
+      now: () => '2026-07-19T09:13:00Z',
+      generateId: deterministicIds('inbound-sync-setup-second'),
+    });
     const fake = createSyncThrowThenSuccessQuery({ sessionId: 'claude-session-sync-setup' });
     const service = createExecutorService({
       database,
@@ -1496,6 +1876,7 @@ describe('Claude conversation executor', () => {
       serviceInstanceId: 'executor-service-sync-setup',
       now: () => '2026-07-19T09:13:00Z',
       generateId: deterministicIds('sync-setup'),
+      maxResidentExecutorsPerBot: 1,
     });
 
     await expect(service.runNext()).resolves.toMatchObject({
