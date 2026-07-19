@@ -258,6 +258,7 @@ function createInterruptibleQuery({ sessionId }) {
 function createPermissionQuery({ sessionId }) {
   const permissionRequested = deferred();
   const permissionResults = [];
+  let closeCalls = 0;
 
   function query({ prompt, options }) {
     const stream = (async function* generateSdkMessages() {
@@ -288,11 +289,16 @@ function createPermissionQuery({ sessionId }) {
       }
     }());
     stream.interrupt = async () => ({ still_queued: [] });
-    stream.close = () => {};
+    stream.close = () => { closeCalls += 1; };
     return stream;
   }
 
-  return { permissionRequested, permissionResults, query };
+  return {
+    get closeCalls() { return closeCalls; },
+    permissionRequested,
+    permissionResults,
+    query,
+  };
 }
 
 function createCaughtPermissionFailureQuery({ sessionId }) {
@@ -1255,6 +1261,46 @@ describe('Claude conversation executor', () => {
       .get(accepted.turn_id)).toEqual({ state: 'recovering' });
 
     database.exec(`DROP TRIGGER fail_permission_ack_audit`);
+    await service.close();
+    database.close();
+  });
+
+  test('isolates a timed-out SDK permission before releasing its executor lease', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'permission-timeout');
+    const fake = createPermissionQuery({ sessionId: 'claude-session-permission-timeout' });
+    const clock = { now: '2026-07-19T09:03:15Z' };
+    let deadlineCallback;
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-permission-timeout',
+      now: () => clock.now,
+      generateId: deterministicIds('permission-timeout'),
+      interactionTimeoutMs: 1_000,
+      setTimeoutFn: (callback) => {
+        deadlineCallback = callback;
+        return { unref() {} };
+      },
+      clearTimeoutFn: () => {},
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ status: 'waiting_user' });
+    clock.now = '2026-07-19T09:03:17Z';
+    await deadlineCallback();
+
+    expect(fake.closeCalls).toBe(1);
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'timed_out' });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({ lease_owner: null, turn_id: null });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_executor_residents WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({ count: 0 });
+
     await service.close();
     database.close();
   });

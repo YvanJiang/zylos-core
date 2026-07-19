@@ -640,9 +640,13 @@ export function createExecutorService({
       reschedulePendingInteractionDeadlines();
       return { ...result, lease_released: false };
     }
+    if (typeof adapter.abort === 'function') {
+      await adapter.abort(timedOutRun.turnContext);
+    }
     await timedOutRun.iterator.return();
     timedOutRun.durableSettled = true;
     cleanupActiveRun(timedOutRun);
+    releaseAbsentResident(timedOutRun.turnContext);
     const leaseReleased = store.releaseTimedOutExecutorLease(result);
     refresh();
     reschedulePendingInteractionDeadlines();
