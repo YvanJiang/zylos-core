@@ -14,6 +14,7 @@
       "key_input_jcs": "[\"zylos-idempotency-v1\",\"inbound\",\"cn\",\"tenant-A\",\"feishu\",\"bot-A\",\"evt-FS-001\"]",
       "idempotency_key": "zid:v1:inbound:96579c1d8766cecd47048ea4932ddc4c0527741d2192cea4c38cbd83bd66fa85",
       "known_payload_fields": ["contract", "contract_version", "inbound_event_id", "idempotency_key", "trace_id", "occurred_at", "received_at", "region", "tenant_id", "channel", "bot_id", "message_id", "content", "source", "headers"],
+      "optional_extension_fields": ["future_optional"],
       "decimal_paths": [],
       "payload": {
         "contract": "zylos.inbound-envelope",
@@ -62,6 +63,7 @@
       "key_input_jcs": "[\"zylos-idempotency-v1\",\"scheduler\",\"cn\",\"tenant-A\",\"bot-A\",\"schedule-daily\",\"occurrence-2026-07-19\"]",
       "idempotency_key": "zid:v1:scheduler:689969cbec0b058e06d6b1d02523f7289f681018c87bd5ad37c30d1cf1b1e17e",
       "known_payload_fields": ["contract", "contract_version", "inbound_event_id", "idempotency_key", "trace_id", "occurred_at", "received_at", "region", "tenant_id", "channel", "bot_id", "chat_type", "chat_id", "native_thread_or_topic_id", "message_id", "schedule", "content", "source"],
+      "optional_extension_fields": ["future_optional"],
       "decimal_paths": [],
       "payload": {
         "contract": "zylos.inbound-envelope",
@@ -114,6 +116,7 @@
       "key_input_jcs": "[\"zylos-idempotency-v1\",\"interaction\",\"interaction-A\",\"action-A\"]",
       "idempotency_key": "zid:v1:interaction:5b22b318e0011f774e272d311c77fa26381d5eb165a618c029e59bcf7b93e224",
       "known_payload_fields": ["contract", "contract_version", "trace_id", "interaction_id", "answer_id", "source_event_or_action_id", "actor", "source", "value", "answered_at", "idempotency_key"],
+      "optional_extension_fields": ["future_optional"],
       "decimal_paths": [],
       "payload": {
         "contract": "zylos.interaction-answer",
@@ -153,6 +156,7 @@
       "key_input_jcs": "[\"zylos-idempotency-v1\",\"control\",\"dashboard.prod\",\"control-A\"]",
       "idempotency_key": "zid:v1:control:2ab777073e87e0fe4cc7fcfba0547a7ea290efe42b912a77325f99e7e6c138d1",
       "known_payload_fields": ["contract", "contract_version", "trace_id", "caller_namespace", "control_id", "action", "target", "reason", "idempotency_key", "created_at"],
+      "optional_extension_fields": ["future_optional"],
       "decimal_paths": [],
       "payload": {
         "contract": "zylos.control-request",
@@ -198,6 +202,7 @@
       "key_input_jcs": "[\"zylos-idempotency-v1\",\"delivery\",\"feishu\",[\"cn\",\"tenant-A\",\"bot-A\",\"group\",\"chat-A\",null],\"delivery-A\"]",
       "idempotency_key": "zid:v1:delivery:c1ac917e70503d51737bd5066881aeacdcf31d80e01d838108d5ccd1a8893c76",
       "known_payload_fields": ["contract", "contract_version", "outbox_id", "delivery_id", "trace_id", "delivery_attempt_id", "delivery_attempt_no", "outbox_lease_epoch", "target", "operation", "aggregate_type", "aggregate_id", "aggregate_version", "idempotency_key", "render_model", "not_before", "created_at"],
+      "optional_extension_fields": ["future_optional"],
       "decimal_paths": [],
       "payload": {
         "contract": "zylos.delivery-command",
@@ -242,6 +247,7 @@
       "key_input_jcs": null,
       "idempotency_key": "legacy-c4:record-42",
       "known_payload_fields": ["contract", "contract_version", "inbound_event_id", "idempotency_key", "trace_id", "occurred_at", "received_at", "region", "tenant_id", "channel", "bot_id", "message_id", "legacy", "content", "source"],
+      "optional_extension_fields": ["future_optional"],
       "decimal_paths": [],
       "payload": {
         "contract": "zylos.inbound-envelope",

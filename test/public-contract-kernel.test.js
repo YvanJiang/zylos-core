@@ -6,6 +6,7 @@ import {
   buildIdempotencyKeyInput,
   canonicalizeJson,
   ContractKernelError,
+  createContractError,
   createIdempotencyKey,
   createLegacyC4IdempotencyKey,
   createPayloadHash,
@@ -167,7 +168,11 @@ describe('idempotency payload projection', () => {
       'headers',
     ];
 
-    const projection = projectPayloadForHash(payload, { scope: 'inbound', knownFields });
+    const projection = projectPayloadForHash(payload, {
+      scope: 'inbound',
+      knownFields,
+      extensionFields: ['future_optional'],
+    });
 
     expect(projection).toEqual({
       contract: 'zylos.inbound-envelope',
@@ -182,9 +187,35 @@ describe('idempotency payload projection', () => {
       content: { kind: 'text', text: 'Hello, Zylos.', attachments: [] },
       source: { kind: 'platform_original' },
     });
-    expect(createPayloadHash(payload, { scope: 'inbound', knownFields })).toBe(
+    expect(createPayloadHash(payload, {
+      scope: 'inbound',
+      knownFields,
+      extensionFields: ['future_optional'],
+    })).toBe(
       '65d4f680026f87ba69c2b0e83c2ec707ecdd7f2e129e2e22b069c1aff255f212',
     );
+  });
+
+  test('rejects silent business-field omissions from the hash projection', () => {
+    const payload = {
+      contract: 'zylos.control-request',
+      contract_version: '1.0',
+      action: 'inspect',
+      target: { aggregate_type: 'service', service_instance_id: 'service-A' },
+      future_optional: { display_hint: 'compact' },
+    };
+
+    expect(() => createPayloadHash(payload, {
+      scope: 'control',
+      knownFields: ['contract', 'contract_version', 'action'],
+      extensionFields: ['future_optional'],
+    })).toThrow(ContractKernelError);
+
+    expect(createPayloadHash(payload, {
+      scope: 'control',
+      knownFields: ['contract', 'contract_version', 'action', 'target'],
+      extensionFields: ['future_optional'],
+    })).toMatch(/^[0-9a-f]{64}$/);
   });
 
   test('deduplicates the same key and payload while rejecting a changed payload', () => {
@@ -290,6 +321,7 @@ describe('shared v1 idempotency golden vectors', () => {
       const projection = projectPayloadForHash(vector.payload, {
         scope: vector.scope,
         knownFields: vector.known_payload_fields,
+        extensionFields: vector.optional_extension_fields,
         decimalPaths: vector.decimal_paths,
       });
       expect(projection).toEqual(vector.payload_projection);
@@ -297,6 +329,7 @@ describe('shared v1 idempotency golden vectors', () => {
       expect(createPayloadHash(vector.payload, {
         scope: vector.scope,
         knownFields: vector.known_payload_fields,
+        extensionFields: vector.optional_extension_fields,
         decimalPaths: vector.decimal_paths,
       })).toBe(vector.payload_hash);
     }
@@ -313,6 +346,10 @@ describe('shared v1 idempotency golden vectors', () => {
       .toThrow(ContractKernelError);
     expect(() => validatePublicFixtureSafety({ api_secret: 'redacted' }))
       .toThrow(ContractKernelError);
+    for (const fieldName of ['apiKey', 'accessToken', 'clientSecret', 'privateKey']) {
+      expect(() => validatePublicFixtureSafety({ [fieldName]: 'plain-secret' }))
+        .toThrow(ContractKernelError);
+    }
   });
 });
 
@@ -425,6 +462,19 @@ describe('unified contract errors', () => {
       'side_effect_unknown',
     ]));
     expect(new Set(PUBLIC_ERROR_CODES).size).toBe(PUBLIC_ERROR_CODES.length);
+  });
+
+  test('refuses to construct an invalid public error', () => {
+    expect(() => createContractError({ code: 'validation_error' })).toThrow(TypeError);
+    expect(() => createContractError({
+      code: 'typo_error_code',
+      userMessage: 'This should not be published.',
+    })).toThrow(TypeError);
+    expect(() => createContractError({
+      code: 'validation_error',
+      category: 'mystery',
+      userMessage: 'This should not be published.',
+    })).toThrow(TypeError);
   });
 });
 

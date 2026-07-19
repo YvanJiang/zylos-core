@@ -56,6 +56,12 @@ function rejectPayload(message) {
   }));
 }
 
+function isTransientField(scope, fieldName) {
+  const normalizedName = fieldName.toLowerCase();
+  return OMITTED_TRANSIENT_FIELDS.has(normalizedName)
+    || (scope === 'delivery' && OMITTED_DELIVERY_ATTEMPT_FIELDS.has(normalizedName));
+}
+
 function projectValue(value, { scope, path, decimalPaths }) {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
   if (typeof value === 'number') {
@@ -84,10 +90,7 @@ function projectValue(value, { scope, path, decimalPaths }) {
 
   const entries = [];
   for (const [fieldName, fieldValue] of Object.entries(value)) {
-    const normalizedName = fieldName.toLowerCase();
-    const deliveryTransient = scope === 'delivery'
-      && OMITTED_DELIVERY_ATTEMPT_FIELDS.has(normalizedName);
-    if (OMITTED_TRANSIENT_FIELDS.has(normalizedName) || deliveryTransient) continue;
+    if (isTransientField(scope, fieldName)) continue;
     const childPath = path ? `${path}.${fieldName}` : fieldName;
     entries.push([fieldName, projectValue(fieldValue, {
       scope,
@@ -190,7 +193,7 @@ export function verifyIdempotencyKey(
 
 export function projectPayloadForHash(
   payload,
-  { scope, knownFields, decimalPaths = [] } = {},
+  { scope, knownFields, extensionFields = [], decimalPaths = [] } = {},
 ) {
   if (!IDEMPOTENCY_SCOPES.includes(scope) && scope !== 'legacy-c4') {
     throw new TypeError(`unsupported idempotency scope: ${String(scope)}`);
@@ -202,7 +205,42 @@ export function projectPayloadForHash(
     throw new TypeError('knownFields must list the current contract fields');
   }
 
-  const known = new Set(knownFields);
+  function toFieldSet(fieldNames, optionName) {
+    if (
+      !Array.isArray(fieldNames)
+      || fieldNames.some((fieldName) => typeof fieldName !== 'string' || fieldName.length === 0)
+    ) {
+      throw new TypeError(`${optionName} must be an array of non-empty field names`);
+    }
+    const result = new Set(fieldNames);
+    if (result.size !== fieldNames.length) {
+      throw new TypeError(`${optionName} must not contain duplicate field names`);
+    }
+    return result;
+  }
+
+  const known = toFieldSet(knownFields, 'knownFields');
+  const extensions = toFieldSet(extensionFields, 'extensionFields');
+  for (const fieldName of known) {
+    if (extensions.has(fieldName)) {
+      throw new TypeError(`${fieldName} cannot be both known and an optional extension`);
+    }
+    if (!Object.hasOwn(payload, fieldName)) {
+      throw new TypeError(`known field ${fieldName} is absent from the payload`);
+    }
+  }
+  for (const fieldName of extensions) {
+    if (!Object.hasOwn(payload, fieldName)) {
+      throw new TypeError(`optional extension ${fieldName} is absent from the payload`);
+    }
+  }
+  for (const fieldName of Object.keys(payload)) {
+    if (!known.has(fieldName) && !extensions.has(fieldName) && !isTransientField(scope, fieldName)) {
+      rejectPayload(
+        `Payload field ${fieldName} is neither a known business field nor an explicit optional extension.`,
+      );
+    }
+  }
   const stableEntries = Object.entries(payload).filter(([fieldName]) => known.has(fieldName));
   return projectValue(Object.fromEntries(stableEntries), {
     scope,
