@@ -14,8 +14,11 @@ list and its function declarations are the authoritative signatures.
 - Major `1` is supported. Unknown majors are rejected; unknown optional fields in a known
   same-major payload are split into `extensions` and retained in `forwarded` by
   `validateContractDocument`.
-- Use the explicit field rules passed to `validateContractDocument` for opaque IDs,
-  RFC 3339 timestamps, safe integers, schema-declared decimals, and safety-critical enums.
+- Use the explicit field rules passed to `validateContractDocument` for every top-level scalar:
+  opaque IDs, text, booleans, RFC 3339 timestamps, safe integers, schema-declared decimals, and
+  safety-critical enums. A domain validator may mark only an already-validated nested object,
+  array, or nullable aggregate as `prevalidated`; it must apply these same scalar helpers and
+  critical-enum allowlists at every known nested path before partitioning the document.
 - Contract failures use `ContractKernelError.contractError`, whose shape is shared across
   transports. HTTP or RPC status codes do not replace this shape.
 - `createContractError` accepts one options object and refuses unknown v1 error codes or an
@@ -23,6 +26,83 @@ list and its function declarations are the authoritative signatures.
 
 Unknown optional fields are data to preserve, not capabilities to execute. Callers must list
 every security, lifecycle, terminal, interaction, and control enum in a `critical_enum` rule.
+
+## Inbound, result, and normalized-event contracts
+
+Issue 02 publishes three portable JSON Schema artifacts under `schemas/` and matching golden
+fixtures under `fixtures/`:
+
+| Contract | Authoritative validator | Portable schema | Golden fixture |
+|---|---|---|---|
+| `zylos.inbound-envelope` | `validateInboundEnvelope` | `inbound-envelope-v1.schema.json` | `inbound-envelope-v1.json` |
+| `zylos.inbound-result` | `validateInboundResult` | `inbound-result-v1.schema.json` | `inbound-result-v1.json` |
+| `zylos.normalized-event` | `validateNormalizedEvent` | `normalized-event-v1.schema.json` | `normalized-event-v1.json` |
+
+The JSON Schemas describe portable document shape and conditional fields. The JavaScript
+validators are authoritative for semantic checks that JSON Schema cannot express safely,
+including idempotency-key recomputation, scheduler synthetic identity, result required/null
+matrices, event-kind payload rules, and fixture secret safety.
+
+`validateInboundEnvelope` preserves additive same-major top-level extensions while enforcing the
+six-part conversation namespace, real thread/topic identity, reply-only mapping fields,
+authenticated actor shape, attachments, and the mutually exclusive platform, scheduler, and
+legacy sources. A scheduler synthetic conversation uses
+`scheduler:<bot_id>:<task_id>` and scheduler-scope idempotency; its required
+`bound_conversation` flag does not change that identity. Legacy compatibility alone uses the
+exact `legacy-c4:<legacy_record_id>` exception.
+
+`validateInboundResult` enforces the authoritative result matrix for a normal bound turn,
+control, pending lineage recovery, persisted queue-full failure, and nullable or persisted
+non-queue-full rejection.
+`deduplicated=true` does not define a new result shape: the producer must replay the first
+business result and commit time, changing only the response trace and deduplication marker.
+
+Use `createNormalizedEventStreamState` plus `admitNormalizedEvent` when consuming a turn stream.
+Admission requires continuous `event_sequence`, strictly increasing `turn_version`, current
+`attempt_id`/`attempt_no`/`lease_epoch` fencing, and immutable terminal state. A retry may advance
+the fence only through `retry_attempt_started` with the next attempt number and a newer lease
+epoch. The first admitted event establishes lifecycle state through `turn_state_changed`;
+provider output is rejected without a current fenced attempt or before a compatible
+`starting`/`running` state. Late events after a terminal transition are rejected with
+`turn_terminal`.
+
+Known lifecycle, interaction, retry, recovery, permission, and delivery kinds are fixed exports.
+An additive same-major unknown kind is rejected by default. A consumer may pass it through
+`unknownProgressKinds` only after capability negotiation and only as opaque, non-terminal,
+error-free `starting` or `running` progress. Reserved lifecycle/security prefixes and payload
+fields that could change state, permission, interaction, control, terminal, or side-effect
+semantics remain rejected.
+
+## Interaction answer and durable handoff
+
+`interaction.js` is the authoritative v1 contract package for interaction requests, answers,
+answer results, and the Core-owned durable answer handoff record. Import its public schema
+descriptors, transition tables, and validators through `contracts/public/index.js`:
+
+- `validateInteractionRequest` enforces provider-turn, security-control, and recovery-control
+  parent identity; positive `ordinal`; authorized actor/capability subjects; allowed answer
+  sources; runtime fencing; and coherent interaction/handoff projections.
+- `validateInteractionRequestSequence` enforces unique ordinals that are contiguous from one
+  within each turn or control parent. `validateInteractionAnswerAgainstRequest` binds a
+  standalone answer to its request, rejects sources outside `allowed_sources`, restricts
+  `magic_command_repeat` to permission confirmations, verifies actor/capability membership and
+  the Core-resolved request scope, and accepts only the smallest blocking ordinal. Its
+  `requestScope` and `actorCapabilities` options must come from Core's authenticated
+  conversation/policy state, not from channel payloads.
+- `validateInteractionAnswer` validates the provider-neutral answer value, authenticated actor,
+  source context, and the recomputed interaction idempotency key.
+- `validateInteractionAnswerResult` keeps `accepted` distinct from provider acknowledgement:
+  accepted and duplicate results can only expose `answer_committed` with a pending durable
+  handoff. `validateInteractionAnswerResultReplay` proves a duplicate preserved the first
+  immutable business result while allowing a new response trace.
+- `validateInteractionHandoff` validates the durable handoff record and its send/ack evidence.
+  `validateInteractionTransition` and `validateInteractionHandoffTransition` enforce the only
+  allowed edges, including pre-send retry/cancel guards, delivery-unknown proof, terminal
+  immutability, and late-ack rejection.
+
+The handoff is a Core persistence record, not a new transport payload, so it deliberately is not
+added to `PUBLIC_CONTRACTS`. Channels consume interaction request/answer/result documents;
+Dashboard observes the redacted handoff projection through its separate observability contract.
 
 ## Canonicalization and idempotency
 
@@ -85,6 +165,17 @@ interaction, control, delivery, and legacy C4. Each consuming repository must ca
 assert these values with its own implementation. Comparing a copied Core result without
 recalculation is not a contract test.
 
+The idempotency vectors are hashing-only projections from the issue 01 kernel. Use the issue 02
+contract fixtures above—not the intentionally minimal hashing vectors—as document acceptance
+fixtures.
+
+`fixtures/interaction-handoff-v1.json` publishes ordered provider-turn questions,
+security-control and recovery-control requests; every allowed answer source and answer-result
+status; executable request/source and smallest-blocking-ordinal adjudication examples; every
+durable handoff state; the complete allowed transition tables; and explicit send-before-ack,
+post-send retry prohibition, delivery-unknown, rejected/cancelled, and late-ack examples.
+Consumers must treat every omitted state edge as prohibited.
+
 `fixtures/delivery-mapping-v1.json` contains valid and rejected create/update/text/fallback
 commands, every delivery result status with fencing/error/side-effect combinations, mapping
 required/null cases, and the pending-to-bound/same-value/different-value authority matrix.
@@ -94,3 +185,53 @@ infer an update target from the latest chat message.
 Run `validatePublicFixtureSafety` on fixture changes. Fixtures must not contain secrets or raw
 provider/channel private objects; only redacted `detail_ref` and `source_ref` references may
 point to controlled diagnostics.
+
+## Runtime observability, operations control, and Luna projection
+
+The v1 runtime contract package is exported from the same authoritative `index.js` entrypoint:
+
+Each domain validator applies its nested scalar and safety-critical enum rules first, then delegates
+the top-level known/extension/forwarded partition to `validateContractDocument`; the runtime
+contracts do not maintain a second compatibility path around the public kernel.
+
+- `validateObservabilitySnapshot` and `OBSERVABILITY_SNAPSHOT_V1_SCHEMA` define Core's full
+  replacement snapshot. Every collection carries `complete` and `error`; a partial collection
+  can never masquerade as an empty successful collection. `resolveObservabilitySnapshotUpdate`
+  applies the `(core_service_instance_id, snapshot_version)` replacement rules. PID, PGID, and
+  process start time are present only inside a required `runtime_identity` object with
+  `diagnostic_only=true`. The full snapshot, including audit summaries, errors, and extensions,
+  is rejected if it contains credential-shaped values, secret fields, or channel/provider-private
+  payloads.
+- `validateControlRequest`, `validateControlResult`, and the two control schema descriptors
+  define the registered caller namespace, transport-injected actor/auth context, versioned
+  capability grants and scopes, discriminated action targets, mutation CAS, and asynchronous
+  `control_result_version`. Request validation requires an action-specific capability grant whose
+  declared tenant/bot/aggregate scope covers the trusted auth context and target. This structural
+  check does not authorize a request: Core must still resolve the target's authoritative namespace
+  and re-check the current policy, grant, revocation, expiry, capability, and scope in the control
+  transaction. Every public request and result, including `reason`, errors, and additive
+  extensions, is rejected when it contains credential-shaped values, secret fields, or
+  provider/channel-private payloads.
+  A higher result version may advance only from `accepted` to a terminal status; terminal results
+  are immutable. Accepted-to-terminal updates preserve the action-specific intent and audit
+  identities and cannot regress the accepted target version. Because `zylos.control-result` does
+  not carry
+  a duplicate top-level action field, consumers pass the correlated request action as
+  `validateControlResult(value, { action })` when target/result shape alone is ambiguous, and pass
+  the same context to `resolveControlResultUpdate`; the returned `metadata.action` is diagnostic
+  validation metadata and is never forwarded as contract data.
+- `validateDashboardRuntimeProjection` and `DASHBOARD_RUNTIME_PROJECTION_V1_SCHEMA` define the
+  only Dashboard-to-Luna runtime seam. `resolveDashboardRuntimeProjectionUpdate` handles full
+  first payloads, Dashboard instance replacement, sequence duplicates/obsolescence/gaps, and
+  full resynchronization. Projection capabilities must state `control=false` and
+  `core_direct_access=false`; `supported_fields` is restricted to the schema's declared
+  presentation allowlist and cannot advertise control or Core endpoints. Additive capability
+  metadata must remain presentation-only, and the full projection is subject to the same public
+  secret/private-payload scan. Luna is a read-only Dashboard consumer.
+
+The golden fixtures are `fixtures/observability-v1.json`, `fixtures/control-v1.json`, and
+`fixtures/dashboard-runtime-projection-v1.json`. They cover degraded visibility, answer handoff
+delivery uncertainty, service-instance replacement, all seven control targets, policy and CAS
+metadata, result-version progress, projection gaps/restarts, unsupported major/state behavior,
+and the no-control/no-direct-Core Luna boundary. Consumers must validate these payloads with
+their own implementation rather than copying Core's validation result.

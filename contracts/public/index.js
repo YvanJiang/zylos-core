@@ -23,6 +23,24 @@ export {
 export { canonicalizeJson, canonicalizeJsonBytes } from './jcs.js';
 
 export {
+  INTERACTION_ANSWER_RESULT_SCHEMA_V1,
+  INTERACTION_ANSWER_SCHEMA_V1,
+  INTERACTION_HANDOFF_TRANSITIONS_V1,
+  INTERACTION_HANDOFF_SCHEMA_V1,
+  INTERACTION_REQUEST_SCHEMA_V1,
+  INTERACTION_TRANSITIONS_V1,
+  validateInteractionAnswer,
+  validateInteractionAnswerAgainstRequest,
+  validateInteractionAnswerResult,
+  validateInteractionAnswerResultReplay,
+  validateInteractionHandoff,
+  validateInteractionHandoffTransition,
+  validateInteractionRequest,
+  validateInteractionRequestSequence,
+  validateInteractionTransition,
+} from './interaction.js';
+
+export {
   buildIdempotencyKeyInput,
   createIdempotencyKey,
   createLegacyC4IdempotencyKey,
@@ -43,3 +61,62 @@ export {
   validateRfc3339Timestamp,
   validateSafetyCriticalEnum,
 } from './validation.js';
+
+export {
+  CANONICAL_TURN_STATES,
+  HANDOFF_STATES,
+  INTERACTION_STATES,
+  PROVIDERS,
+  RUNTIME_HEALTH_STATES,
+  TURN_PHASES,
+} from './runtime-vocabulary.js';
+
+export {
+  OBSERVABILITY_SNAPSHOT_V1_SCHEMA,
+  resolveObservabilitySnapshotUpdate,
+  validateObservabilitySnapshot,
+} from './observability.js';
+
+export {
+  CONTROL_ACTIONS,
+  CONTROL_CAPABILITIES,
+  CONTROL_REQUEST_V1_SCHEMA,
+  CONTROL_RESULT_V1_SCHEMA,
+  resolveControlResultUpdate,
+  validateControlRequest,
+  validateControlResult,
+} from './control.js';
+
+export {
+  DASHBOARD_RUNTIME_PROJECTION_V1_SCHEMA,
+  resolveDashboardRuntimeProjectionUpdate,
+  validateDashboardRuntimeProjection,
+} from './dashboard-runtime-projection.js';
+
+export {
+  CHAT_TYPES,
+  INBOUND_ACTOR_ROLES,
+  INBOUND_ACTOR_TYPES,
+  INBOUND_CONTENT_KINDS,
+  INBOUND_ENVELOPE_CONTRACT,
+  INBOUND_RESULT_STATUSES,
+  INBOUND_RESULT_CONTRACT,
+  INBOUND_SOURCE_KINDS,
+  LINEAGE_RESOLUTION_STATES,
+  validateInboundEnvelope,
+  validateInboundResult,
+} from './inbound.js';
+
+export {
+  admitNormalizedEvent,
+  createNormalizedEventStreamState,
+  INTERACTION_EVENT_KINDS,
+  NORMALIZED_EVENT_CONTRACT,
+  NORMALIZED_EVENT_KINDS,
+  NORMALIZED_EVENT_PHASES,
+  RECOVERY_EVENT_KINDS,
+  RETRY_EVENT_KINDS,
+  TERMINAL_TURN_STATES,
+  TURN_STATES,
+  validateNormalizedEvent,
+} from './normalized-event.js';
