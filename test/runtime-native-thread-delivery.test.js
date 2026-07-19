@@ -35,6 +35,12 @@ function nativeThreadEnvelope() {
   ).document);
 }
 
+function nonThreadEnvelope() {
+  return structuredClone(inboundFixture.valid.find(
+    ({ name }) => name === 'authenticated_dm_with_attachment',
+  ).document);
+}
+
 function deterministicIds(namespace) {
   const counts = new Map();
   return (kind) => {
@@ -68,6 +74,31 @@ function readInitialCommand(database, turnId) {
     ORDER BY created_at, outbox_id
     LIMIT 1
   `).get(turnId).command_json);
+}
+
+function downgradePersistedDeliveryToV10(database, turnId) {
+  const lane = readLane(database, turnId);
+  const target = structuredClone(lane.target);
+  delete target.native_thread_root_message_id;
+  delete target.native_thread_reply_target_message_id;
+  database.prepare(`
+    UPDATE runtime_delivery_lanes SET target_json = ? WHERE turn_id = ?
+  `).run(JSON.stringify(target), turnId);
+
+  const rows = database.prepare(`
+    SELECT outbox_id, command_json
+    FROM runtime_outbox
+    WHERE turn_id = ?
+  `).all(turnId);
+  for (const row of rows) {
+    const command = JSON.parse(row.command_json);
+    command.contract_version = '1.0';
+    command.target = target;
+    database.prepare(`
+      UPDATE runtime_outbox SET command_json = ? WHERE outbox_id = ?
+    `).run(JSON.stringify(command), row.outbox_id);
+  }
+  return target;
 }
 
 function permanentFailure(command, resultAt) {
@@ -253,6 +284,24 @@ describe('native-thread delivery authority', () => {
     database.close();
   });
 
+  test('rejects unauthenticated native-thread facts before creating durable state', () => {
+    const database = openTestDatabase();
+    const envelope = nativeThreadEnvelope();
+    envelope.actor.authenticated = false;
+
+    expectContractFailure(
+      () => acceptNormalInbound(database, envelope, acceptanceOptions('unauthenticated')),
+      'unauthenticated',
+    );
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM sqlite_master
+      WHERE type = 'table' AND name LIKE 'runtime_%'
+    `).get().count).toBe(0);
+
+    database.close();
+  });
+
   test('reuses the durable reply target for the initial text acknowledgement', () => {
     const database = openTestDatabase();
     const envelope = nativeThreadEnvelope();
@@ -282,6 +331,68 @@ describe('native-thread delivery authority', () => {
     expect(text.target.native_thread_reply_target_message_id).not.toBe(text.target.chat_id);
 
     database.close();
+  });
+
+  test('preserves persisted v1.0 non-thread lanes for update and text acknowledgement', () => {
+    const updateDatabase = openTestDatabase();
+    const updateAccepted = acceptNormalInbound(
+      updateDatabase,
+      nonThreadEnvelope(),
+      acceptanceOptions('legacy-update'),
+    );
+    const legacyUpdateTarget = downgradePersistedDeliveryToV10(
+      updateDatabase,
+      updateAccepted.turn_id,
+    );
+    const updateOutbox = createOutboxService({
+      database: updateDatabase,
+      serviceInstanceId: 'delivery-service-legacy-update',
+      now: () => '2026-07-19T13:00:01Z',
+      generateId: deterministicIds('delivery-legacy-update'),
+      throttleMs: 0,
+    });
+    const create = updateOutbox.claimNext();
+    expect(create).toMatchObject({ contract_version: '1.0', target: legacyUpdateTarget });
+    expect(updateOutbox.recordResult(deliveredResult(create, '2026-07-19T13:00:01Z')))
+      .toEqual({ status: 'applied', outbox_status: 'delivered' });
+    const update = updateOutbox.claimNext();
+    expect(update).toMatchObject({
+      contract_version: '1.0',
+      operation: 'update_main',
+      target: legacyUpdateTarget,
+    });
+    expect(update.target).not.toHaveProperty('native_thread_root_message_id');
+    expect(update.target).not.toHaveProperty('native_thread_reply_target_message_id');
+    updateDatabase.close();
+
+    const textDatabase = openTestDatabase();
+    const textAccepted = acceptNormalInbound(
+      textDatabase,
+      nonThreadEnvelope(),
+      acceptanceOptions('legacy-text'),
+    );
+    const legacyTextTarget = downgradePersistedDeliveryToV10(
+      textDatabase,
+      textAccepted.turn_id,
+    );
+    const textOutbox = createOutboxService({
+      database: textDatabase,
+      serviceInstanceId: 'delivery-service-legacy-text',
+      now: () => '2026-07-19T13:00:01Z',
+      generateId: deterministicIds('delivery-legacy-text'),
+    });
+    const failedCreate = textOutbox.claimNext();
+    expect(failedCreate).toMatchObject({ contract_version: '1.0', target: legacyTextTarget });
+    expect(textOutbox.recordResult(
+      retryableFailure(failedCreate, '2026-07-19T13:00:01Z'),
+    )).toEqual({ status: 'applied', outbox_status: 'retry_wait' });
+    const acknowledgement = textOutbox.claimNext();
+    expect(acknowledgement).toMatchObject({
+      contract_version: '1.0',
+      operation: 'send_text',
+      target: legacyTextTarget,
+    });
+    textDatabase.close();
   });
 
   test('keeps duplicate acceptance idempotent and rejects the same inbound key with changed anchors', () => {
@@ -365,6 +476,21 @@ describe('native-thread delivery authority', () => {
         ...command.target,
         native_thread_root_message_id: 'platform-root-message-other',
       },
+    }), command.outbox_id);
+    expectContractFailure(() => outbox.claimNext(), 'version_conflict');
+
+    const changedConversationTarget = {
+      ...command.target,
+      native_thread_or_topic_id: 'native-thread-other',
+    };
+    database.prepare(`
+      UPDATE runtime_delivery_lanes SET target_json = ? WHERE lane_key = ?
+    `).run(JSON.stringify(changedConversationTarget), lane.lane_key);
+    database.prepare(`
+      UPDATE runtime_outbox SET command_json = ? WHERE outbox_id = ?
+    `).run(JSON.stringify({
+      ...command,
+      target: changedConversationTarget,
     }), command.outbox_id);
     expectContractFailure(() => outbox.claimNext(), 'version_conflict');
 

@@ -253,6 +253,14 @@ export function acceptNormalInbound(
     throw new TypeError('initialDeliveryOperation must be create_main or send_text');
   }
   const validated = validateInboundEnvelope(envelope);
+  if (!validated.forwarded.actor.authenticated) {
+    throw new ContractKernelError(createContractError({
+      code: 'unauthenticated',
+      category: 'authentication',
+      userMessage: 'Inbound delivery facts must come from authenticated channel ingress.',
+      occurredAt: envelope.received_at,
+    }));
+  }
   const payloadHash = createPayloadHash(envelope, {
     scope: 'inbound',
     knownFields: INBOUND_ENVELOPE_KNOWN_FIELDS,

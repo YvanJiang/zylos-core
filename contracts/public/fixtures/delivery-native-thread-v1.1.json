@@ -389,6 +389,62 @@
       }
     },
     {
+      "name": "v1_1_thread_rejects_conversation_id_as_reply_target",
+      "valid": false,
+      "expected_error_code": "unsupported_capability",
+      "document": {
+        "contract": "zylos.delivery-command",
+        "contract_version": "1.1",
+        "outbox_id": "outbox-thread-conversation-as-reply",
+        "delivery_id": "delivery-thread-create",
+        "trace_id": "trace-thread-conversation-as-reply",
+        "delivery_attempt_id": "attempt-thread-conversation-as-reply",
+        "delivery_attempt_no": 1,
+        "outbox_lease_epoch": 1,
+        "target": {
+          "region": "global",
+          "tenant_id": "tenant-B",
+          "channel": "lark",
+          "bot_id": "bot-B",
+          "chat_type": "thread",
+          "chat_id": "chat-group-B",
+          "native_thread_or_topic_id": "thread-native-001",
+          "native_thread_root_message_id": "message-thread-root-001",
+          "native_thread_reply_target_message_id": "thread-native-001"
+        },
+        "aggregate_type": "turn_main",
+        "aggregate_id": "turn-thread",
+        "operation": "create_main",
+        "aggregate_version": 1,
+        "event_sequence_through": 1,
+        "idempotency_key": "zid:v1:delivery:910e67ef051ff58aa758cd472a133d1bbb49f601799c818b66219d28fcbf87e9",
+        "render_model": {
+          "title": "Zylos",
+          "phase": "received",
+          "text": "Message received.",
+          "error": null,
+          "tools": [],
+          "interactions": [],
+          "terminal": false,
+          "user_action_required": false
+        },
+        "mapping": {
+          "mapping_id": "mapping-thread",
+          "conversation_id": "conversation-thread",
+          "turn_id": "turn-thread",
+          "lineage_id": "lineage-thread",
+          "binding_state": "bound",
+          "mapping_version": 1
+        },
+        "target_platform_message_id": null,
+        "predecessor_delivery_id": null,
+        "expected_platform_version": null,
+        "priority": 10,
+        "not_before": "2026-07-19T13:00:00Z",
+        "created_at": "2026-07-19T13:00:00Z"
+      }
+    },
+    {
       "name": "v1_0_thread_create_requires_v1_1",
       "valid": false,
       "expected_error_code": "unsupported_capability",

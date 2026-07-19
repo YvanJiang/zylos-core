@@ -318,6 +318,14 @@ describe('delivery command v1 schema', () => {
         expectContractFailure(() => validateDeliveryCommand(nullAnchor), 'unsupported_capability');
       }
     }
+
+    const threadIdAsReplyTarget = nativeThreadCommand(createMainCommand(), '1.1');
+    threadIdAsReplyTarget.target.native_thread_reply_target_message_id
+      = threadIdAsReplyTarget.target.native_thread_or_topic_id;
+    expectContractFailure(
+      () => validateDeliveryCommand(threadIdAsReplyTarget),
+      'unsupported_capability',
+    );
   });
 
   test('fails closed for v1.0 native-thread create, text and fallback without blocking exact updates', () => {
@@ -616,6 +624,7 @@ describe('delivery/mapping cross-repository fixtures', () => {
       conversation_identity: 'native_thread_or_topic_id',
       reply_api_target: 'native_thread_reply_target_message_id',
       root_scope: 'native_thread_root_message_id',
+      reply_target_must_differ_from_conversation_identity: true,
       target_change: 'version_conflict',
       missing_capability: 'unsupported_capability',
       fallback_inference: false,

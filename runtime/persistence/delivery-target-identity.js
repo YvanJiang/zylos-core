@@ -2,6 +2,7 @@ import {
   canonicalizeJson,
   ContractKernelError,
   createContractError,
+  DELIVERY_COMMAND_CURRENT_VERSION,
 } from '../../contracts/public/index.js';
 import { createDeliveryLaneKeyFromIdentity } from './delivery-lane-key.js';
 
@@ -43,4 +44,28 @@ export function assertDeliveryLaneIdentity(lane, target, { occurredAt } = {}) {
     throw targetVersionConflict(occurredAt);
   }
   if (lane.lane_key !== expectedLaneKey) throw targetVersionConflict(occurredAt);
+}
+
+export function assertDurableDeliveryTarget({
+  lane,
+  targetJson,
+  candidateTarget,
+  occurredAt,
+}) {
+  const durableTarget = parseDurableDeliveryTarget(targetJson, { occurredAt });
+  assertDeliveryLaneIdentity(lane, durableTarget, { occurredAt });
+  if (candidateTarget !== undefined) {
+    assertDeliveryTargetIdentity(durableTarget, candidateTarget, { occurredAt });
+  }
+  return durableTarget;
+}
+
+export function resolveDeliveryCommandVersionForTarget(target) {
+  if (
+    Object.hasOwn(target, 'native_thread_root_message_id')
+    || Object.hasOwn(target, 'native_thread_reply_target_message_id')
+  ) {
+    return DELIVERY_COMMAND_CURRENT_VERSION;
+  }
+  return '1.0';
 }

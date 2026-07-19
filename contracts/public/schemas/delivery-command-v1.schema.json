@@ -175,6 +175,7 @@
     "conversation_identity": "native_thread_or_topic_id",
     "reply_api_target": "native_thread_reply_target_message_id",
     "root_scope": "native_thread_root_message_id",
+    "reply_target_must_differ_from_conversation_identity": true,
     "target_change": "version_conflict",
     "missing_capability": "unsupported_capability",
     "fallback_inference": false

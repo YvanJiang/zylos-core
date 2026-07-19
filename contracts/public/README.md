@@ -146,11 +146,12 @@ with `unsupported_capability`.
 
 `native_thread_or_topic_id` is conversation identity only. Renderers must use exactly
 `native_thread_reply_target_message_id` for a platform reply API and use the root message ID to
-constrain/audit its native-thread scope. They may not substitute the thread ID, query a latest
-message, or fall back to the parent chat. Core derives both delivery anchors during authenticated
-inbound acceptance, persists them in the initial lane/outbox transaction, and reuses the durable
-lane target for update, text acknowledgement, and final fallback. Any target identity change is a
-`version_conflict`; delivery results cannot rewrite the lane target.
+constrain/audit its native-thread scope. The reply target must differ from the conversation thread
+ID. Renderers may not substitute the thread ID, query a latest message, or fall back to the parent
+chat. Core derives both delivery anchors during authenticated inbound acceptance, persists them in
+the initial lane/outbox transaction, and reuses the durable lane target for update, text
+acknowledgement, and final fallback. Any target identity change is a `version_conflict`; delivery
+results cannot rewrite the lane target.
 
 The validator also validates the provider-neutral render model, recomputes the delivery
 idempotency key, and enforces the operation matrix:

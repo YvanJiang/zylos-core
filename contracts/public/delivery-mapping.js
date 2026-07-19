@@ -180,7 +180,7 @@ function validateNullablePlatformVersion(fieldName, value, occurredAt) {
   return value;
 }
 
-function rejectUnsupportedThreadTarget(userMessage, occurredAt) {
+function rejectUnsupportedDeliveryTarget(userMessage, occurredAt) {
   reject('unsupported_capability', userMessage, occurredAt);
 }
 
@@ -201,7 +201,7 @@ function validateTarget(value, { contractMinor, operation, occurredAt }) {
   if (requiresV11Anchors) {
     for (const fieldName of DELIVERY_TARGET_FIELDS_V1_1.slice(-3)) {
       if (!Object.hasOwn(value, fieldName)) {
-        rejectUnsupportedThreadTarget(
+        rejectUnsupportedDeliveryTarget(
           `target.${fieldName} is required by zylos.delivery-command@1.1.`,
           occurredAt,
         );
@@ -232,7 +232,7 @@ function validateTarget(value, { contractMinor, operation, occurredAt }) {
         || value.native_thread_reply_target_message_id === null
       ))
     ) {
-      rejectUnsupportedThreadTarget(
+      rejectUnsupportedDeliveryTarget(
         'Native-thread delivery requires immutable conversation, root-message, and reply-target anchors.',
         occurredAt,
       );
@@ -241,26 +241,36 @@ function validateTarget(value, { contractMinor, operation, occurredAt }) {
       !requiresV11Anchors
       && ['create_main', 'send_text', 'send_fallback'].includes(operation)
     ) {
-      rejectUnsupportedThreadTarget(
+      rejectUnsupportedDeliveryTarget(
         `${operation} for a native thread requires zylos.delivery-command@1.1.`,
         occurredAt,
       );
     }
   } else {
     if (value.native_thread_or_topic_id !== null) {
-      rejectUnsupportedThreadTarget(
+      rejectUnsupportedDeliveryTarget(
         'target.native_thread_or_topic_id must be null outside native-thread delivery.',
         occurredAt,
       );
     }
     for (const fieldName of DELIVERY_TARGET_FIELDS_V1_1.slice(-2)) {
       if (Object.hasOwn(value, fieldName) && value[fieldName] !== null) {
-        rejectUnsupportedThreadTarget(
+        rejectUnsupportedDeliveryTarget(
           `target.${fieldName} must be null outside native-thread delivery.`,
           occurredAt,
         );
       }
     }
+  }
+
+  if (
+    value.chat_type === 'thread'
+    && value.native_thread_reply_target_message_id === value.native_thread_or_topic_id
+  ) {
+    rejectUnsupportedDeliveryTarget(
+      'The native thread conversation ID cannot be used as the platform reply message target.',
+      occurredAt,
+    );
   }
 }
 

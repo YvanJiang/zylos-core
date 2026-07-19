@@ -2,7 +2,6 @@ import crypto from 'node:crypto';
 
 import {
   createIdempotencyKey,
-  DELIVERY_COMMAND_CURRENT_VERSION,
   validateDeliveryCommand,
   validateDeliveryResult,
 } from '../../contracts/public/index.js';
@@ -11,9 +10,8 @@ import {
 } from '../persistence/main-projection.js';
 import { createDeliveryLaneKey } from '../persistence/delivery-lane-key.js';
 import {
-  assertDeliveryLaneIdentity,
-  assertDeliveryTargetIdentity,
-  parseDurableDeliveryTarget,
+  assertDurableDeliveryTarget,
+  resolveDeliveryCommandVersionForTarget,
 } from '../persistence/delivery-target-identity.js';
 import { initializeRuntimePersistence } from '../persistence/schema.js';
 
@@ -106,7 +104,7 @@ function enqueueInitialTextAcknowledgement(database, command, resultAt, generate
   const deliveryId = generateId('delivery');
   const acknowledgement = {
     contract: 'zylos.delivery-command',
-    contract_version: DELIVERY_COMMAND_CURRENT_VERSION,
+    contract_version: resolveDeliveryCommandVersionForTarget(command.target),
     outbox_id: outboxId,
     delivery_id: deliveryId,
     trace_id: generateId('delivery-trace'),
@@ -320,19 +318,16 @@ export function createOutboxService({
         outbox_lease_epoch: outboxLeaseEpoch,
       };
       if (row.lane_target_json !== null) {
-        const durableTarget = parseDurableDeliveryTarget(row.lane_target_json, {
+        assertDurableDeliveryTarget({
+          lane: {
+            lane_key: row.durable_lane_key,
+            turn_id: row.lane_turn_id,
+            aggregate_type: row.lane_aggregate_type,
+          },
+          targetJson: row.lane_target_json,
+          candidateTarget: command.target,
           occurredAt: claimedAt,
         });
-        assertDeliveryLaneIdentity({
-          lane_key: row.durable_lane_key,
-          turn_id: row.lane_turn_id,
-          aggregate_type: row.lane_aggregate_type,
-        }, durableTarget, { occurredAt: claimedAt });
-        assertDeliveryTargetIdentity(
-          durableTarget,
-          command.target,
-          { occurredAt: claimedAt },
-        );
       }
       validateDeliveryCommand(command, { occurredAt: claimedAt });
       const leaseExpiresAt = new Date(
@@ -381,19 +376,16 @@ export function createOutboxService({
       if (!row) return { status: 'stale' };
       const command = JSON.parse(row.command_json);
       if (row.lane_target_json !== null) {
-        const durableTarget = parseDurableDeliveryTarget(row.lane_target_json, {
+        assertDurableDeliveryTarget({
+          lane: {
+            lane_key: row.durable_lane_key,
+            turn_id: row.lane_turn_id,
+            aggregate_type: row.lane_aggregate_type,
+          },
+          targetJson: row.lane_target_json,
+          candidateTarget: command.target,
           occurredAt: result.result_at,
         });
-        assertDeliveryLaneIdentity({
-          lane_key: row.durable_lane_key,
-          turn_id: row.lane_turn_id,
-          aggregate_type: row.lane_aggregate_type,
-        }, durableTarget, { occurredAt: result.result_at });
-        assertDeliveryTargetIdentity(
-          durableTarget,
-          command.target,
-          { occurredAt: result.result_at },
-        );
       }
       if (row.result_json === JSON.stringify(result)) {
         return { status: 'duplicate', outbox_status: row.status };
