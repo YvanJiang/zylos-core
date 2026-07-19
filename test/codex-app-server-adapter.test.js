@@ -1481,6 +1481,35 @@ describe('Codex app-server provider adapter', () => {
     },
   );
 
+  test('maps service cancellation to the current fenced app-server turn interrupt', async () => {
+    const server = createFakeAppServer({ afterTurnStart() {} });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const context = executionContext({ lineage: { provider_native_id: 'codex-thread-1' } });
+    const waiting = adapter.execute(context)[Symbol.asyncIterator]().next();
+    await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
+
+    await expect(adapter.cancel(context)).resolves.toEqual({
+      status: 'interrupt_requested',
+      reason: 'stop',
+    });
+    expect(server.received).toContainEqual(expect.objectContaining({
+      method: 'turn/interrupt',
+      params: { threadId: 'codex-thread-1', turnId: 'codex-turn-1' },
+    }));
+    expect(server.child.kill).not.toHaveBeenCalled();
+
+    server.send({
+      method: 'turn/completed',
+      params: {
+        threadId: 'codex-thread-1',
+        turn: { id: 'codex-turn-1', status: 'interrupted', items: [] },
+      },
+    });
+    await expect(waiting).rejects.toMatchObject({
+      providerError: { code: 'side_effect_unknown' },
+    });
+  });
+
   test('waits for the matching provider completion before confirming a timeout interrupt', async () => {
     const server = createFakeAppServer({ afterTurnStart() {} });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });

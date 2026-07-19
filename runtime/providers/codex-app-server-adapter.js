@@ -1802,6 +1802,35 @@ export function createCodexAppServerAdapter({
     return acknowledgementFor(delivery);
   }
 
+  async function cancel(context) {
+    let result;
+    try {
+      result = await interrupt({
+        turn_id: context?.turn_id,
+        attempt: context?.attempt,
+        reason: 'stop',
+      });
+    } catch (cause) {
+      const error = cause instanceof Error
+        ? cause
+        : new CodexAppServerAdapterError(
+          'side_effect_unknown',
+          'Codex app-server cancellation failed without a typed provider error.',
+        );
+      error.cancellationUncertain = true;
+      throw error;
+    }
+    if (result.status !== 'interrupt_requested') {
+      const error = new CodexAppServerAdapterError(
+        'side_effect_unknown',
+        'Codex app-server could not confirm cancellation for the current fenced turn.',
+      );
+      error.cancellationUncertain = true;
+      throw error;
+    }
+    return result;
+  }
+
   async function close() {
     const target = connection;
     if (!target || target.failed) return Object.freeze({ status: 'not_current' });
@@ -1814,5 +1843,5 @@ export function createCodexAppServerAdapter({
     return Object.freeze({ status: signalled === false ? 'not_current' : 'signalled' });
   }
 
-  return Object.freeze({ close, execute, handleInteractionAnswer, interrupt });
+  return Object.freeze({ cancel, close, execute, handleInteractionAnswer, interrupt });
 }

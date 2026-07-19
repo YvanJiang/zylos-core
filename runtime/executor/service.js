@@ -364,6 +364,12 @@ export function createExecutorService({
     if (activeRun.providerFailureOutcome?.status === 'recovering') {
       return retainRecoveringRun(activeRun);
     }
+    if (activeRun.providerFailurePersistenceError) {
+      activeRun.durableSettled = true;
+      cleanupActiveRun(activeRun);
+      refresh();
+      throw activeRun.providerFailurePersistenceError;
+    }
     if (activeRun.durableSettled) {
       cleanupActiveRun(activeRun);
       throw error;
@@ -374,19 +380,6 @@ export function createExecutorService({
       }
       cleanupActiveRun(activeRun);
       throw error;
-    }
-    if (isExplicitProviderError(error)) {
-      const { state } = store.assertCurrentFence(turnContext);
-      persist(() => store.transitionTurn(turnContext, state, 'failed', {
-        error: normalizeProviderError(error, now()),
-        reasonCode: 'executor_failed',
-      }));
-      activeRun.durableSettled = true;
-      refresh();
-      cleanupActiveRun(activeRun);
-      releaseAbsentResident(turnContext);
-      reschedulePendingInteractionDeadlines();
-      return resultFor(activeRun, 'failed');
     }
     await awaitCancellationSettlement(turnContext.turn_id);
     closingPermissionTurnIds.add(turnContext.turn_id);
@@ -406,6 +399,19 @@ export function createExecutorService({
       return recovery;
     }
     const cancelled = cancelledTurnIds.has(turnContext.turn_id);
+    if (isExplicitProviderError(error) && !cancelled) {
+      const { state } = store.assertCurrentFence(turnContext);
+      persist(() => store.transitionTurn(turnContext, state, 'failed', {
+        error: normalizeProviderError(error, now()),
+        reasonCode: 'executor_failed',
+      }));
+      activeRun.durableSettled = true;
+      refresh();
+      cleanupActiveRun(activeRun);
+      releaseAbsentResident(turnContext);
+      reschedulePendingInteractionDeadlines();
+      return resultFor(activeRun, 'failed');
+    }
     const terminalState = cancelled ? 'stopped' : 'failed';
     const { state } = store.assertCurrentFence(turnContext);
     store.transitionTurn(turnContext, state, terminalState, {
@@ -673,6 +679,7 @@ export function createExecutorService({
       outcome: null,
       pauseKind: null,
       providerFailureOutcome: null,
+      providerFailurePersistenceError: null,
       providerStarted: false,
       resolveSettlement,
       settled: false,
@@ -735,10 +742,16 @@ export function createExecutorService({
             throw new Error('Provider failure arrived after the executor run settled.');
           }
           const normalizedFailure = normalizeProviderError(providerFailure, now());
-          const outcome = persist(() => store.markProviderFailure(
-            turnContext,
-            normalizedFailure,
-          ));
+          let outcome;
+          try {
+            outcome = persist(() => store.markProviderFailure(
+              turnContext,
+              normalizedFailure,
+            ));
+          } catch (error) {
+            activeRun.providerFailurePersistenceError = error;
+            throw error;
+          }
           activeRun.providerFailureOutcome = outcome;
           if (outcome.status === 'recovering') {
             reschedulePendingInteractionDeadlines();

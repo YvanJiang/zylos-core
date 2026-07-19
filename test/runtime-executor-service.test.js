@@ -423,6 +423,135 @@ describe('runtime executor service', () => {
     database.close();
   });
 
+  test('retains authority when durable provider-loss recovery cannot be persisted', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'transport-loss-persistence-failure');
+    const providerFailure = Object.assign(new Error('private connection failure'), {
+      providerError: {
+        code: 'side_effect_unknown',
+        category: 'provider',
+        retryable: false,
+        side_effect_status: 'unknown',
+        user_message: 'The app-server connection was lost.',
+      },
+    });
+    const adapter = {
+      execute(context) {
+        return {
+          [Symbol.asyncIterator]() { return this; },
+          async next() {
+            database.exec(`
+              CREATE TRIGGER fail_provider_loss_recovery_projection
+              BEFORE INSERT ON runtime_projection_snapshots
+              WHEN json_extract(NEW.render_model_json, '$.phase') = 'recovering'
+              BEGIN
+                SELECT RAISE(ABORT, 'forced provider loss recovery failure');
+              END;
+            `);
+            try {
+              context.reportProviderFailure(providerFailure);
+            } catch {
+              // The transport then closes its iterator with the original provider error.
+            }
+            throw providerFailure;
+          },
+          async return() { return { done: true, value: undefined }; },
+        };
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-transport-loss-persistence-failure',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('transport-loss-persistence-failure'),
+    });
+
+    await expect(service.runNext()).rejects.toThrow(/forced provider loss recovery failure/);
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'starting' });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id
+      FROM runtime_executor_leases
+      WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({
+      lease_owner: 'executor-service-transport-loss-persistence-failure',
+      turn_id: accepted.turn_id,
+    });
+
+    database.close();
+  });
+
+  test('maps a confirmed Codex cancellation terminal to stopped and preserves lineage', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'codex-cancel-terminal');
+    let rejectTerminal;
+    const terminal = new Promise((resolve, reject) => { rejectTerminal = reject; });
+    terminal.catch(() => {});
+    const interrupted = Object.assign(new Error('provider turn interrupted'), {
+      providerError: {
+        code: 'side_effect_unknown',
+        category: 'provider',
+        retryable: false,
+        side_effect_status: 'unknown',
+        user_message: 'The provider turn was interrupted.',
+      },
+    });
+    const adapter = {
+      async *execute(context) {
+        await context.bindProviderNativeId('codex-thread-cancel-terminal');
+        yield {
+          kind: 'interaction_requested',
+          payload: {
+            provider_interaction_ref: 'provider-cancel-terminal',
+            tool_use_id: 'tool-cancel-terminal',
+            kind: 'tool_approval',
+            prompt: 'Allow the pending action?',
+            choices: [],
+            authorized_subjects: context.interaction.authorized_subjects,
+            allowed_sources: context.interaction.allowed_sources,
+          },
+        };
+        await terminal;
+      },
+      async cancel() {
+        rejectTerminal(interrupted);
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-codex-cancel-terminal',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('codex-cancel-terminal'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ status: 'waiting_user' });
+    await expect(service.cancel(accepted.conversation_id)).resolves.toMatchObject({
+      status: 'cancellation_requested',
+      execution: { status: 'stopped', turn_id: accepted.turn_id },
+    });
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'stopped' });
+    expect(database.prepare(`
+      SELECT state FROM runtime_interactions WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'cancelled' });
+    expect(database.prepare(`
+      SELECT provider, provider_native_id
+      FROM runtime_lineages
+      WHERE lineage_id = ?
+    `).get(accepted.lineage_id)).toEqual({
+      provider: 'codex',
+      provider_native_id: 'codex-thread-cancel-terminal',
+    });
+
+    database.close();
+  });
+
   test('rolls back a failed first lineage binding and rejects stale or conflicting bindings', () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'native-binding-fence');
