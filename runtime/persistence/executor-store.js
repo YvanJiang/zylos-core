@@ -26,6 +26,15 @@ const CANONICAL_TRANSITIONS = Object.freeze({
   waiting_user: ['running', 'timed_out'],
 });
 
+const ANSWER_CONFLICT_CODES = new Set([
+  'idempotency_conflict',
+  'interaction_already_answered',
+  'interaction_out_of_order',
+  'stale_attempt',
+  'turn_terminal',
+  'version_conflict',
+]);
+
 export class ExecutorPersistenceError extends Error {
   constructor(code, message) {
     super(message);
@@ -43,6 +52,19 @@ function translateContractError(error) {
     conflict(error.contractError.code, error.contractError.user_message);
   }
   throw error;
+}
+
+function validateAndHashInteractionAnswer(answer, occurredAt) {
+  try {
+    const validated = validateInteractionAnswer(answer, { occurredAt });
+    return createPayloadHash(answer, {
+      scope: 'interaction',
+      knownFields: INTERACTION_ANSWER_SCHEMA_V1.requiredFields,
+      extensionFields: Object.keys(validated.extensions),
+    });
+  } catch (error) {
+    translateContractError(error);
+  }
 }
 
 function requestScopeFromTurn(turn) {
@@ -334,6 +356,64 @@ export function createExecutorStore({
 }) {
   initializeRuntimePersistence(database);
 
+  function rejectedInteractionAnswerResult(answer, persistenceError) {
+    try {
+      validateInteractionAnswer(answer, { occurredAt: now() });
+    } catch {
+      throw persistenceError;
+    }
+    const interaction = database.prepare(`
+      SELECT request_json
+      FROM runtime_interactions
+      WHERE interaction_id = ?
+    `).get(answer.interaction_id);
+    const request = interaction ? JSON.parse(interaction.request_json) : null;
+    const turn = request?.turn_id === null || request === null
+      ? null
+      : database.prepare(`
+        SELECT state, turn_version
+        FROM runtime_turns
+        WHERE turn_id = ?
+      `).get(request.turn_id);
+    let code = persistenceError.code;
+    if (code === 'interaction_not_found') code = 'not_found';
+    if (code === 'illegal_transition' && turn && turn.state !== 'waiting_user') {
+      code = 'turn_terminal';
+    }
+    const category = code === 'interaction_actor_forbidden'
+      ? 'authorization'
+      : ANSWER_CONFLICT_CODES.has(code) || code === 'interaction_expired'
+        ? 'conflict'
+        : 'validation';
+    const rejectedAt = now();
+    const result = {
+      contract: 'zylos.interaction-answer-result',
+      contract_version: '1.0',
+      trace_id: answer.trace_id,
+      interaction_id: answer.interaction_id,
+      answer_id: answer.answer_id,
+      idempotency_key: answer.idempotency_key,
+      status: ANSWER_CONFLICT_CODES.has(code) ? 'conflict' : 'rejected',
+      interaction_state: request?.state ?? null,
+      interaction_version: request?.version ?? null,
+      handoff_state: 'not_applicable',
+      handoff_id: null,
+      turn_id: request?.turn_id ?? null,
+      turn_version: turn?.turn_version ?? null,
+      control_id: request?.control_id ?? null,
+      error: createContractError({
+        code,
+        category,
+        userMessage: persistenceError.message,
+        occurredAt: rejectedAt,
+      }),
+      received_at: null,
+      committed_at: null,
+    };
+    validateInteractionAnswerResult(result, { occurredAt: rejectedAt });
+    return result;
+  }
+
   function rebuildExecutorCache() {
     const rows = database.prepare(`
       SELECT conversation_id, turn_id, status, wait_reason, queue_sequence
@@ -360,6 +440,22 @@ export function createExecutorStore({
       }
     }
     return [...executors.values()];
+  }
+
+  function listPendingInteractionDeadlines() {
+    return database.prepare(`
+      SELECT request_json
+      FROM runtime_interactions
+      WHERE state = 'pending'
+      ORDER BY json_extract(request_json, '$.expires_at'), interaction_id
+    `).all().map(({ request_json: requestJson }) => {
+      const request = JSON.parse(requestJson);
+      return {
+        interaction_id: request.interaction_id,
+        interaction_version: request.version,
+        expires_at: request.expires_at,
+      };
+    });
   }
 
   function listClaimableQueuedTurns() {
@@ -781,39 +877,29 @@ export function createExecutorStore({
   function commitInteractionAnswer(answer, { replyToMessageId = null } = {}) {
     const commit = database.transaction(() => {
       const committedAt = now();
-      let validatedAnswer;
-      let payloadHash;
-      try {
-        validatedAnswer = validateInteractionAnswer(answer, { occurredAt: committedAt });
-        payloadHash = createPayloadHash(answer, {
-          scope: 'interaction',
-          knownFields: INTERACTION_ANSWER_SCHEMA_V1.requiredFields,
-          extensionFields: Object.keys(validatedAnswer.extensions),
-        });
-      } catch (error) {
-        translateContractError(error);
-      }
-      const existingAnswer = database.prepare(`
+      const payloadHash = validateAndHashInteractionAnswer(answer, committedAt);
+      const existingByKey = database.prepare(`
         SELECT answer_id, idempotency_key, payload_hash, answer_json, result_json
         FROM runtime_interaction_answers
-        WHERE idempotency_key = ? OR answer_id = ?
-        LIMIT 1
-      `).get(answer.idempotency_key, answer.answer_id);
+        WHERE idempotency_key = ?
+      `).get(answer.idempotency_key);
+      const existingByAnswerId = database.prepare(`
+        SELECT idempotency_key
+        FROM runtime_interaction_answers
+        WHERE answer_id = ?
+      `).get(answer.answer_id);
+      if (
+        existingByAnswerId
+        && existingByAnswerId.idempotency_key !== answer.idempotency_key
+      ) {
+        conflict('idempotency_conflict', 'The answer ID was already used by another answer.');
+      }
+      const existingAnswer = existingByKey;
       if (existingAnswer) {
-        if (existingAnswer.idempotency_key !== answer.idempotency_key) {
-          conflict('idempotency_conflict', 'The answer ID was already used by another answer.');
-        }
         let existingPayloadHash = existingAnswer.payload_hash;
         if (existingPayloadHash === null) {
           const storedAnswer = JSON.parse(existingAnswer.answer_json);
-          const validatedStoredAnswer = validateInteractionAnswer(storedAnswer, {
-            occurredAt: committedAt,
-          });
-          existingPayloadHash = createPayloadHash(storedAnswer, {
-            scope: 'interaction',
-            knownFields: INTERACTION_ANSWER_SCHEMA_V1.requiredFields,
-            extensionFields: Object.keys(validatedStoredAnswer.extensions),
-          });
+          existingPayloadHash = validateAndHashInteractionAnswer(storedAnswer, committedAt);
         }
         const replay = resolveIdempotencyReplay({
           idempotency_key: existingAnswer.idempotency_key,
@@ -849,6 +935,12 @@ export function createExecutorStore({
       const request = JSON.parse(row.request_json);
       if (request.state === 'expired') {
         conflict('interaction_expired', 'The interaction has expired.');
+      }
+      if (
+        request.state === 'cancelled'
+        && request.terminal_reason === 'parent_timed_out'
+      ) {
+        conflict('turn_terminal', 'The parent turn timed out before this answer arrived.');
       }
       if (request.state !== 'pending') {
         conflict('interaction_already_answered', 'Only a pending interaction can accept an answer.');
@@ -1015,7 +1107,12 @@ export function createExecutorStore({
       );
       return result;
     });
-    return commit.immediate();
+    try {
+      return commit.immediate();
+    } catch (error) {
+      if (!(error instanceof ExecutorPersistenceError)) throw error;
+      return rejectedInteractionAnswerResult(answer, error);
+    }
   }
 
   function expireInteraction(expiration) {
@@ -1153,6 +1250,69 @@ export function createExecutorStore({
         staleMessage: 'The interaction deadline lost its provider attempt fence.',
         generateId,
       });
+      let currentTurn = loadTurn(database, turn.turn_id);
+      const siblingRows = database.prepare(`
+        SELECT request_json
+        FROM runtime_interactions
+        WHERE turn_id = ? AND interaction_id != ? AND state = 'pending'
+        ORDER BY ordinal ASC
+      `).all(turn.turn_id, request.interaction_id);
+      for (const { request_json: siblingJson } of siblingRows) {
+        const sibling = JSON.parse(siblingJson);
+        validateInteractionTransition({
+          from: 'pending',
+          to: 'cancelled',
+          occurredAt: expiredAt,
+        });
+        const cancelledSibling = {
+          ...sibling,
+          state: 'cancelled',
+          version: sibling.version + 1,
+          terminal_reason: 'parent_timed_out',
+        };
+        validateInteractionRequest(cancelledSibling, { occurredAt: expiredAt });
+        const siblingUpdate = database.prepare(`
+          UPDATE runtime_interactions
+          SET state = 'cancelled', version = ?, request_json = ?, updated_at = ?
+          WHERE interaction_id = ? AND state = 'pending' AND version = ?
+        `).run(
+          cancelledSibling.version,
+          JSON.stringify(cancelledSibling),
+          expiredAt,
+          sibling.interaction_id,
+          sibling.version,
+        );
+        if (siblingUpdate.changes !== 1) {
+          conflict('version_conflict', 'The parent timeout lost a sibling interaction fence.');
+        }
+        const cancellationEvent = buildEvent({
+          turn: currentTurn,
+          lastEvent: loadLastEvent(database, currentTurn.turn_id),
+          fence,
+          provider,
+          descriptor: {
+            kind: 'interaction_cancelled',
+            phase: 'waiting_user',
+            payload: {
+              interaction_id: sibling.interaction_id,
+              ordinal: sibling.ordinal,
+              interaction_version: cancelledSibling.version,
+              handoff_version: null,
+            },
+          },
+          occurredAt: expiredAt,
+          generateId,
+        });
+        commitTurnEvent(database, {
+          turn: currentTurn,
+          event: cancellationEvent,
+          fence,
+          nextState: 'waiting_user',
+          staleMessage: 'The parent timeout lost its sibling cancellation fence.',
+          generateId,
+        });
+        currentTurn = loadTurn(database, turn.turn_id);
+      }
       const terminalEvent = transitionInTransaction(database, {
         turnId: turn.turn_id,
         fromState: 'waiting_user',
@@ -1536,6 +1696,7 @@ export function createExecutorStore({
     claimInteractionHandoff,
     commitInteractionAnswer,
     expireInteraction,
+    listPendingInteractionDeadlines,
     rebuildExecutorCache,
     releaseTimedOutExecutorLease,
     requestInteraction,

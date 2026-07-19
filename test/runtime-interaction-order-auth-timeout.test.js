@@ -1,69 +1,20 @@
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-
 import { afterEach, describe, expect, test } from '@jest/globals';
-import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/index.js';
-
-import {
-  createIdempotencyKey,
-} from '../contracts/public/index.js';
 import { createExecutorService } from '../runtime/executor/service.js';
-import { createExecutorStore } from '../runtime/persistence/executor-store.js';
-import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
-
-const inboundFixture = JSON.parse(fs.readFileSync(
-  new URL('../contracts/public/fixtures/inbound-envelope-v1.json', import.meta.url),
-  'utf8',
-));
-
-const temporaryDirectories = [];
+import {
+  acceptQueuedInteractionTurn,
+  cleanupInteractionTestDatabases,
+  createRunningInteractionTurn,
+  deterministicIds,
+  interactionAnswer as buildInteractionAnswer,
+  openInteractionTestDatabase,
+} from './helpers/runtime-interaction-fixtures.js';
 
 function openTestDatabase() {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-interaction-order-'));
-  temporaryDirectories.push(directory);
-  return new Database(path.join(directory, 'c4.db'));
-}
-
-function deterministicIds(namespace) {
-  const counts = new Map();
-  return (kind) => {
-    const next = (counts.get(kind) ?? 0) + 1;
-    counts.set(kind, next);
-    return `${kind}-${namespace}-${next}`;
-  };
+  return openInteractionTestDatabase('interaction-order');
 }
 
 function createRunningTurn(database, suffix = 'order') {
-  const fixture = inboundFixture.valid.find(
-    ({ name }) => name === 'authenticated_dm_with_attachment',
-  ).document;
-  const envelope = structuredClone(fixture);
-  envelope.inbound_event_id = `evt-${suffix}`;
-  envelope.trace_id = `trace-${suffix}`;
-  envelope.message_id = `message-${suffix}`;
-  envelope.idempotency_key = createIdempotencyKey('inbound', {
-    region: envelope.region,
-    tenant_id: envelope.tenant_id,
-    channel: envelope.channel,
-    bot_id: envelope.bot_id,
-    inbound_event_id: envelope.inbound_event_id,
-  });
-  const accepted = acceptNormalInbound(database, envelope, {
-    now: () => '2026-07-19T07:00:00Z',
-    generateId: deterministicIds(`inbound-${suffix}`),
-  });
-  const clock = { now: '2026-07-19T07:02:00Z' };
-  const store = createExecutorStore({
-    database,
-    provider: 'claude',
-    serviceInstanceId: `executor-service-${suffix}`,
-    now: () => clock.now,
-    generateId: deterministicIds(suffix),
-  });
-  const turnContext = store.claimNextQueuedTurn();
-  store.transitionTurn(turnContext, 'starting', 'running');
-  return { accepted, clock, envelope, store, turnContext };
+  return createRunningInteractionTurn(database, suffix);
 }
 
 function requestInteraction(store, turnContext, suffix, overrides = {}) {
@@ -80,40 +31,10 @@ function requestInteraction(store, turnContext, suffix, overrides = {}) {
 }
 
 function interactionAnswer(request, suffix = 'answer', overrides = {}) {
-  const sourceEventId = `card-action-${suffix}`;
-  const answer = {
-    contract: 'zylos.interaction-answer',
-    contract_version: '1.0',
-    trace_id: `trace-answer-${suffix}`,
-    interaction_id: request.interaction_id,
-    interaction_version: request.version,
-    answer_id: `answer-${suffix}`,
-    source_event_or_action_id: sourceEventId,
-    actor: {
-      type: 'user',
-      actor_id: 'user-123',
-      authenticated: true,
-      roles: ['member'],
-    },
-    source_context: {
-      region: 'cn',
-      tenant_id: 'tenant-A',
-      channel: 'feishu',
-      bot_id: 'bot-A',
-      chat_id: 'chat-dm-A',
-      native_thread_or_topic_id: null,
-      platform_message_or_action_id: sourceEventId,
-    },
-    source: 'card_action',
+  return buildInteractionAnswer(request, suffix, {
     value: { kind: 'text', text: `answer ${suffix}` },
-    answered_at: '2026-07-19T07:02:00Z',
-  };
-  Object.assign(answer, overrides);
-  answer.idempotency_key = overrides.idempotency_key ?? createIdempotencyKey('interaction', {
-    interaction_id: answer.interaction_id,
-    source_event_or_action_id: answer.source_event_or_action_id,
+    ...overrides,
   });
-  return answer;
 }
 
 function mainCardReply(request, suffix = 'reply', overrides = {}) {
@@ -165,9 +86,7 @@ function readInteraction(database, interactionId) {
 }
 
 afterEach(() => {
-  for (const directory of temporaryDirectories.splice(0)) {
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
+  cleanupInteractionTestDatabases();
 });
 
 describe('runtime interaction order, authorization, and timeout', () => {
@@ -178,8 +97,13 @@ describe('runtime interaction order, authorization, and timeout', () => {
     const second = requestInteraction(store, turnContext, 'second');
     const before = readInteraction(database, second.interaction_id);
 
-    expect(() => store.commitInteractionAnswer(interactionAnswer(second, 'early')))
-      .toThrow(expect.objectContaining({ code: 'interaction_out_of_order' }));
+    expect(store.commitInteractionAnswer(interactionAnswer(second, 'early'))).toMatchObject({
+      status: 'conflict',
+      interaction_state: 'pending',
+      interaction_version: second.version,
+      handoff_state: 'not_applicable',
+      error: { code: 'interaction_out_of_order' },
+    });
     expect(readInteraction(database, second.interaction_id)).toEqual(before);
     expect(readInteraction(database, first.interaction_id)).toMatchObject({
       state: 'pending',
@@ -207,8 +131,10 @@ describe('runtime interaction order, authorization, and timeout', () => {
       },
       value: { kind: 'text', text: 'I am user-123' },
     });
-    expect(() => store.commitInteractionAnswer(forbiddenActor))
-      .toThrow(expect.objectContaining({ code: 'interaction_actor_forbidden' }));
+    expect(store.commitInteractionAnswer(forbiddenActor)).toMatchObject({
+      status: 'rejected',
+      error: { code: 'interaction_actor_forbidden' },
+    });
 
     expect(() => store.commitInteractionAnswer(interactionAnswer(request, 'unauthenticated', {
       actor: {
@@ -220,8 +146,10 @@ describe('runtime interaction order, authorization, and timeout', () => {
     }))).toThrow(expect.objectContaining({ code: 'validation_error' }));
 
     const disallowedSource = mainCardReply(request, 'disallowed-source');
-    expect(() => store.commitInteractionAnswer(disallowedSource))
-      .toThrow(expect.objectContaining({ code: 'validation_error' }));
+    expect(store.commitInteractionAnswer(disallowedSource)).toMatchObject({
+      status: 'rejected',
+      error: { code: 'validation_error' },
+    });
 
     for (const [field, value] of [
       ['region', 'global'],
@@ -233,13 +161,18 @@ describe('runtime interaction order, authorization, and timeout', () => {
     ]) {
       const answer = interactionAnswer(request, `wrong-${field}`);
       answer.source_context = { ...answer.source_context, [field]: value };
-      expect(() => store.commitInteractionAnswer(answer))
-        .toThrow(expect.objectContaining({ code: 'validation_error' }));
+      expect(store.commitInteractionAnswer(answer)).toMatchObject({
+        status: 'rejected',
+        error: { code: 'validation_error' },
+      });
     }
 
-    expect(() => store.commitInteractionAnswer(interactionAnswer(request, 'stale-version', {
+    expect(store.commitInteractionAnswer(interactionAnswer(request, 'stale-version', {
       interaction_version: request.version + 1,
-    }))).toThrow(expect.objectContaining({ code: 'version_conflict' }));
+    }))).toMatchObject({
+      status: 'conflict',
+      error: { code: 'version_conflict' },
+    });
     expect(readInteraction(database, request.interaction_id)).toEqual(before);
 
     database.close();
@@ -249,7 +182,6 @@ describe('runtime interaction order, authorization, and timeout', () => {
     const database = openTestDatabase();
     const {
       accepted,
-      envelope,
       store,
       turnContext,
     } = createRunningTurn(database, 'reply-mapping');
@@ -259,30 +191,24 @@ describe('runtime interaction order, authorization, and timeout', () => {
     const answer = mainCardReply(request, 'reply-mapping');
     const before = readInteraction(database, request.interaction_id);
 
-    expect(() => store.commitInteractionAnswer(answer, {
+    expect(store.commitInteractionAnswer(answer, {
       replyToMessageId: 'unmapped-main-card',
-    })).toThrow(expect.objectContaining({ code: 'mapping_missing' }));
+    })).toMatchObject({
+      status: 'rejected',
+      error: { code: 'mapping_missing' },
+    });
     expect(readInteraction(database, request.interaction_id)).toEqual(before);
 
-    const otherEnvelope = structuredClone(envelope);
-    otherEnvelope.inbound_event_id = 'evt-foreign-mapping';
-    otherEnvelope.trace_id = 'trace-foreign-mapping';
-    otherEnvelope.message_id = 'message-foreign-mapping';
-    otherEnvelope.idempotency_key = createIdempotencyKey('inbound', {
-      region: otherEnvelope.region,
-      tenant_id: otherEnvelope.tenant_id,
-      channel: otherEnvelope.channel,
-      bot_id: otherEnvelope.bot_id,
-      inbound_event_id: otherEnvelope.inbound_event_id,
-    });
-    const foreignTurn = acceptNormalInbound(database, otherEnvelope, {
-      now: () => '2026-07-19T07:03:00Z',
-      generateId: deterministicIds('foreign-mapping'),
+    const foreignTurn = acceptQueuedInteractionTurn(database, 'foreign-mapping', {
+      acceptedAt: '2026-07-19T07:03:00Z',
     });
     insertBoundMapping(database, foreignTurn, 'foreign-main-card', 'foreign-turn');
-    expect(() => store.commitInteractionAnswer(answer, {
+    expect(store.commitInteractionAnswer(answer, {
       replyToMessageId: 'foreign-main-card',
-    })).toThrow(expect.objectContaining({ code: 'mapping_missing' }));
+    })).toMatchObject({
+      status: 'rejected',
+      error: { code: 'mapping_missing' },
+    });
     expect(readInteraction(database, request.interaction_id)).toEqual(before);
 
     insertBoundMapping(database, accepted, 'mapped-main-card', 'reply-mapping');
@@ -325,12 +251,16 @@ describe('runtime interaction order, authorization, and timeout', () => {
       ...structuredClone(firstAnswer),
       value: { kind: 'text', text: 'different value under the same key' },
     };
-    expect(() => store.commitInteractionAnswer(conflictingReplay))
-      .toThrow(expect.objectContaining({ code: 'idempotency_conflict' }));
+    expect(store.commitInteractionAnswer(conflictingReplay)).toMatchObject({
+      status: 'conflict',
+      error: { code: 'idempotency_conflict' },
+    });
 
     const competingAnswer = interactionAnswer(request, 'loser');
-    expect(() => store.commitInteractionAnswer(competingAnswer))
-      .toThrow(expect.objectContaining({ code: 'interaction_already_answered' }));
+    expect(store.commitInteractionAnswer(competingAnswer)).toMatchObject({
+      status: 'conflict',
+      error: { code: 'interaction_already_answered' },
+    });
 
     const stored = database.prepare(`
       SELECT answer_json FROM runtime_interaction_answers WHERE interaction_id = ?
@@ -347,6 +277,7 @@ describe('runtime interaction order, authorization, and timeout', () => {
     const database = openTestDatabase();
     const { clock, store, turnContext } = createRunningTurn(database, 'timeout-wins');
     const request = requestInteraction(store, turnContext, 'timeout-wins');
+    const sibling = requestInteraction(store, turnContext, 'timeout-sibling');
 
     expect(store.expireInteraction({
       interaction_id: request.interaction_id,
@@ -379,6 +310,16 @@ describe('runtime interaction order, authorization, and timeout', () => {
         version: request.version + 1,
       },
     });
+    expect(readInteraction(database, sibling.interaction_id)).toMatchObject({
+      state: 'cancelled',
+      version: sibling.version + 1,
+      handoff_state: 'not_started',
+      request: {
+        state: 'cancelled',
+        version: sibling.version + 1,
+        terminal_reason: 'parent_timed_out',
+      },
+    });
     expect(database.prepare(`
       SELECT state FROM runtime_turns WHERE turn_id = ?
     `).get(request.turn_id)).toEqual({ state: 'timed_out' });
@@ -387,10 +328,11 @@ describe('runtime interaction order, authorization, and timeout', () => {
     `).get(request.turn_id)).toEqual({ status: 'timed_out' });
     const events = database.prepare(`
       SELECT event_json FROM runtime_normalized_events
-      WHERE turn_id = ? ORDER BY event_sequence DESC LIMIT 2
+      WHERE turn_id = ? ORDER BY event_sequence DESC LIMIT 3
     `).all(request.turn_id).map(({ event_json: eventJson }) => JSON.parse(eventJson)).reverse();
     expect(events.map(({ kind, phase }) => ({ kind, phase }))).toEqual([
       { kind: 'interaction_expired', phase: 'waiting_user' },
+      { kind: 'interaction_cancelled', phase: 'waiting_user' },
       { kind: 'turn_state_changed', phase: 'timed_out' },
     ]);
     expect(events[0]).toMatchObject({
@@ -407,8 +349,18 @@ describe('runtime interaction order, authorization, and timeout', () => {
       WHERE turn_id = ? ORDER BY aggregate_version DESC LIMIT 1
     `).get(request.turn_id)).toEqual({ terminal: 1 });
 
-    expect(() => store.commitInteractionAnswer(interactionAnswer(request, 'late')))
-      .toThrow(expect.objectContaining({ code: 'interaction_expired' }));
+    expect(store.commitInteractionAnswer(interactionAnswer(request, 'late'))).toMatchObject({
+      status: 'rejected',
+      interaction_state: 'expired',
+      interaction_version: request.version + 1,
+      error: { code: 'interaction_expired' },
+    });
+    expect(store.commitInteractionAnswer(interactionAnswer(sibling, 'late-sibling'))).toMatchObject({
+      status: 'conflict',
+      interaction_state: 'cancelled',
+      interaction_version: sibling.version + 1,
+      error: { code: 'turn_terminal' },
+    });
     expect(database.prepare(`
       SELECT COUNT(*) AS count FROM runtime_interaction_answers WHERE interaction_id = ?
     `).get(request.interaction_id).count).toBe(0);
@@ -489,26 +441,11 @@ describe('runtime interaction order, authorization, and timeout', () => {
 
   test('executor service stops the suspended provider before releasing its timeout lease', async () => {
     const database = openTestDatabase();
-    const fixture = inboundFixture.valid.find(
-      ({ name }) => name === 'authenticated_dm_with_attachment',
-    ).document;
-    const envelope = structuredClone(fixture);
-    envelope.inbound_event_id = 'evt-service-timeout';
-    envelope.trace_id = 'trace-service-timeout';
-    envelope.message_id = 'message-service-timeout';
-    envelope.idempotency_key = createIdempotencyKey('inbound', {
-      region: envelope.region,
-      tenant_id: envelope.tenant_id,
-      channel: envelope.channel,
-      bot_id: envelope.bot_id,
-      inbound_event_id: envelope.inbound_event_id,
-    });
-    const accepted = acceptNormalInbound(database, envelope, {
-      now: () => '2026-07-19T07:00:00Z',
-      generateId: deterministicIds('inbound-service-timeout'),
-    });
+    const accepted = acceptQueuedInteractionTurn(database, 'service-timeout');
     const clock = { now: '2026-07-19T07:01:00Z' };
     let providerStopped = false;
+    let deadlineCallback;
+    let deadlineDelay;
     const adapter = {
       async *execute() {
         try {
@@ -537,21 +474,23 @@ describe('runtime interaction order, authorization, and timeout', () => {
       now: () => clock.now,
       generateId: deterministicIds('service-timeout'),
       interactionTimeoutMs: 1_000,
+      setTimeoutFn: (callback, delay) => {
+        deadlineCallback = callback;
+        deadlineDelay = delay;
+        return { unref() {} };
+      },
+      clearTimeoutFn: () => {},
     });
     const waiting = await service.runNext();
+    expect(deadlineDelay).toBe(1_000);
+    expect(deadlineCallback).toEqual(expect.any(Function));
 
     clock.now = '2026-07-19T07:01:02Z';
-    await expect(service.expireInteraction({
-      interaction_id: waiting.request.interaction_id,
-      interaction_version: waiting.request.version,
-    })).resolves.toMatchObject({
-      status: 'expired',
-      newly_expired: true,
-      turn_id: accepted.turn_id,
-      turn_state: 'timed_out',
-      lease_released: true,
-    });
+    await deadlineCallback();
     expect(providerStopped).toBe(true);
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'timed_out' });
     expect(database.prepare(`
       SELECT lease_owner, turn_id, attempt_id, attempt_no, lease_expires_at
       FROM runtime_executor_leases WHERE conversation_id = ?
@@ -563,6 +502,47 @@ describe('runtime interaction order, authorization, and timeout', () => {
       lease_expires_at: null,
     });
     expect(service.snapshot().executors).toEqual([]);
+
+    database.close();
+  });
+
+  test('retains the timeout lease when this service cannot prove the writer stopped', async () => {
+    const database = openTestDatabase();
+    const { clock, store, turnContext } = createRunningTurn(database, 'timeout-no-writer');
+    const request = requestInteraction(store, turnContext, 'timeout-no-writer');
+    let deadlineCallback;
+    let deadlineError;
+    const restartedService = createExecutorService({
+      database,
+      adapter: { async *execute() {} },
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-timeout-no-writer',
+      now: () => clock.now,
+      generateId: deterministicIds('timeout-no-writer-restart'),
+      setTimeoutFn: (callback) => {
+        deadlineCallback = callback;
+        return { unref() {} };
+      },
+      clearTimeoutFn: () => {},
+      onDeadlineError: (error) => { deadlineError = error; },
+    });
+    restartedService.start();
+    expect(deadlineCallback).toEqual(expect.any(Function));
+
+    clock.now = '2026-07-19T07:12:01Z';
+    await deadlineCallback();
+    expect(deadlineError).toBeUndefined();
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(request.turn_id)).toEqual({ state: 'timed_out' });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id
+      FROM runtime_executor_leases
+      WHERE conversation_id = ?
+    `).get(request.conversation_id)).toEqual({
+      lease_owner: 'executor-service-timeout-no-writer',
+      turn_id: request.turn_id,
+    });
 
     database.close();
   });

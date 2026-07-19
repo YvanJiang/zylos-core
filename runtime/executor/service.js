@@ -16,6 +16,9 @@ export function createExecutorService({
   leaseDurationMs,
   interactionTimeoutMs,
   maxResidentExecutorsPerBot = 20,
+  setTimeoutFn = setTimeout,
+  clearTimeoutFn = clearTimeout,
+  onDeadlineError = () => {},
 }) {
   if (!database || typeof database.transaction !== 'function') {
     throw new TypeError('database must be a better-sqlite3 connection');
@@ -51,6 +54,34 @@ export function createExecutorService({
   let executors = [];
   let started = false;
   const activeRuns = new Map();
+  const deadlineTimers = new Map();
+
+  function clearInteractionDeadline(interactionId) {
+    const timer = deadlineTimers.get(interactionId);
+    if (timer === undefined) return;
+    clearTimeoutFn(timer);
+    deadlineTimers.delete(interactionId);
+  }
+
+  function scheduleInteractionDeadline(request) {
+    clearInteractionDeadline(request.interaction_id);
+    const interactionVersion = request.interaction_version ?? request.version;
+    const delay = Math.max(0, Date.parse(request.expires_at) - Date.parse(now()));
+    const timer = setTimeoutFn(async () => {
+      deadlineTimers.delete(request.interaction_id);
+      try {
+        return await expireInteraction({
+          interaction_id: request.interaction_id,
+          interaction_version: interactionVersion,
+        });
+      } catch (error) {
+        onDeadlineError(error, request);
+        return null;
+      }
+    }, delay);
+    timer?.unref?.();
+    deadlineTimers.set(request.interaction_id, timer);
+  }
 
   function refresh() {
     executors = store.rebuildExecutorCache();
@@ -68,6 +99,9 @@ export function createExecutorService({
 
   function start() {
     refresh();
+    for (const deadline of store.listPendingInteractionDeadlines()) {
+      scheduleInteractionDeadline(deadline);
+    }
     started = true;
     return snapshot();
   }
@@ -89,6 +123,7 @@ export function createExecutorService({
       const event = next.value;
       if (event?.kind === 'interaction_requested') {
         const request = store.requestInteraction(activeRun.turnContext, event.payload);
+        scheduleInteractionDeadline(request);
         refresh();
         return {
           status: 'waiting_user',
@@ -139,21 +174,30 @@ export function createExecutorService({
   }
 
   function submitInteractionAnswer(answer, sourceEvidence) {
-    return store.commitInteractionAnswer(answer, sourceEvidence);
+    const result = store.commitInteractionAnswer(answer, sourceEvidence);
+    if (
+      ['accepted', 'duplicate'].includes(result.status)
+      || (result.interaction_state !== null && result.interaction_state !== 'pending')
+    ) {
+      clearInteractionDeadline(result.interaction_id);
+    }
+    return result;
   }
 
   async function expireInteraction(expiration) {
     const result = store.expireInteraction(expiration);
-    if (result.status !== 'expired' || result.turn_state !== 'timed_out') return result;
-
-    const activeRun = activeRuns.get(result.turn_id);
-    if (activeRun) {
-      if (typeof activeRun.iterator.return !== 'function') {
-        return { ...result, lease_released: false };
-      }
-      await activeRun.iterator.return();
-      activeRuns.delete(result.turn_id);
+    if (result.status !== 'expired' || result.turn_state !== 'timed_out') {
+      if (result.status === 'not_pending') clearInteractionDeadline(result.interaction_id);
+      return result;
     }
+    clearInteractionDeadline(result.interaction_id);
+
+    const timedOutRun = activeRuns.get(result.turn_id);
+    if (!timedOutRun || typeof timedOutRun.iterator.return !== 'function') {
+      return { ...result, lease_released: false };
+    }
+    await timedOutRun.iterator.return();
+    activeRuns.delete(result.turn_id);
     const leaseReleased = store.releaseTimedOutExecutorLease(result);
     refresh();
     return { ...result, lease_released: leaseReleased };
