@@ -172,6 +172,7 @@ describe('runtime executor service', () => {
         conversation_id: accepted.conversation_id,
         turn_id: accepted.turn_id,
         lineage_id: accepted.lineage_id,
+        provider_native_id: null,
         trace_id: 'trace-canonical',
         input: normalEnvelope().content,
         attempt: {
@@ -396,6 +397,22 @@ describe('runtime executor service', () => {
     })).toThrow(/forced adapter event outbox failure/);
     expect(readAuthority(database, accepted.turn_id, accepted.conversation_id)).toEqual(before);
 
+    database.close();
+  });
+
+  test('keeps recovering durable conversations ineligible for idle eviction', () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'recovering-eviction');
+    const store = createTestStore(database, 'recovering-eviction');
+    const turnContext = store.claimNextQueuedTurn();
+
+    expect(store.isConversationEvictable(accepted.conversation_id)).toBe(false);
+    store.transitionTurn(turnContext, 'starting', 'running');
+    store.transitionTurn(turnContext, 'running', 'recovering');
+    expect(store.isConversationEvictable(accepted.conversation_id)).toBe(false);
+
+    store.transitionTurn(turnContext, 'recovering', 'stopped');
+    expect(store.isConversationEvictable(accepted.conversation_id)).toBe(true);
     database.close();
   });
 

@@ -16,6 +16,9 @@ const RUNTIME_SCHEMA = `
     lineage_id TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
     lineage_kind TEXT NOT NULL,
+    provider TEXT,
+    provider_native_id TEXT,
+    provider_native_id_bound_at TEXT,
     is_default INTEGER NOT NULL CHECK (is_default IN (0, 1)),
     created_at TEXT NOT NULL
   );
@@ -160,4 +163,17 @@ export function initializeRuntimePersistence(database) {
     'lease_epoch',
     'INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0)',
   );
+  addColumnIfMissing(database, 'runtime_lineages', 'provider', 'TEXT');
+  addColumnIfMissing(database, 'runtime_lineages', 'provider_native_id', 'TEXT');
+  addColumnIfMissing(
+    database,
+    'runtime_lineages',
+    'provider_native_id_bound_at',
+    'TEXT',
+  );
+  database.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS runtime_lineages_provider_native_id
+      ON runtime_lineages(provider, provider_native_id)
+      WHERE provider IS NOT NULL AND provider_native_id IS NOT NULL;
+  `);
 }
