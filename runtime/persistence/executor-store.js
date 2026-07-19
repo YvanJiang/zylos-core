@@ -1,15 +1,16 @@
 import {
   admitNormalizedEvent,
   createNormalizedEventStreamState,
+  TERMINAL_TURN_STATES,
   validateDeliveryCommand,
   validateNormalizedEvent,
 } from '../../contracts/public/index.js';
 import { initializeRuntimePersistence } from './schema.js';
 
 const CANONICAL_TRANSITIONS = Object.freeze({
-  queued: 'starting',
-  starting: 'running',
-  running: 'completed',
+  queued: Object.freeze(['starting']),
+  starting: Object.freeze(['running']),
+  running: Object.freeze(['completed', 'failed']),
 });
 
 export class ExecutorPersistenceError extends Error {
@@ -41,10 +42,15 @@ function loadTurn(database, turnId) {
       turn.attempt_id,
       turn.attempt_no,
       turn.lease_epoch,
+      lineage.provider AS lineage_provider,
+      lineage.provider_native_id,
       inbound.envelope_json
     FROM runtime_turns AS turn
     JOIN runtime_inbound_events AS inbound
       ON inbound.inbound_event_id = turn.inbound_event_id
+    LEFT JOIN runtime_lineages AS lineage
+      ON lineage.lineage_id = turn.lineage_id
+     AND lineage.conversation_id = turn.conversation_id
     WHERE turn.turn_id = ?
   `).get(turnId);
   if (!turn) conflict('turn_not_found', `Turn ${turnId} does not exist.`);
@@ -144,7 +150,7 @@ function projectRenderModel(renderModel, event) {
     phase: event.phase,
     text,
     error: event.error,
-    terminal: event.phase === 'completed',
+    terminal: TERMINAL_TURN_STATES.includes(event.phase),
   };
 }
 
@@ -254,8 +260,10 @@ function transitionInTransaction(database, {
   serviceInstanceId,
   occurredAt,
   generateId,
+  reasonCode,
+  error,
 }) {
-  if (CANONICAL_TRANSITIONS[fromState] !== toState) {
+  if (!CANONICAL_TRANSITIONS[fromState]?.includes(toState)) {
     conflict('illegal_transition', `Canonical transition ${fromState} -> ${toState} is not allowed.`);
   }
   const turn = loadTurn(database, turnId);
@@ -277,8 +285,9 @@ function transitionInTransaction(database, {
       payload: {
         from_state: fromState,
         to_state: toState,
-        reason_code: `executor_${toState}`,
+        reason_code: reasonCode ?? `executor_${toState}`,
       },
+      error: error ?? null,
     },
     occurredAt,
     generateId,
@@ -290,14 +299,14 @@ function transitionInTransaction(database, {
     nextState: toState,
     staleMessage: 'The canonical turn transition lost its attempt fence.',
   });
-  if (toState === 'completed') {
+  if (TERMINAL_TURN_STATES.includes(toState)) {
     const completedQueueEntry = database.prepare(`
       UPDATE runtime_turn_queue
-      SET status = 'completed'
+      SET status = ?
       WHERE turn_id = ? AND status = 'claimed'
-    `).run(turnId);
+    `).run(toState, turnId);
     if (completedQueueEntry.changes !== 1) {
-      conflict('stale_attempt', 'The canonical turn completion lost its queue claim.');
+      conflict('stale_attempt', 'The canonical terminal transition lost its queue claim.');
     }
     const released = database.prepare(`
       UPDATE runtime_executor_leases
@@ -320,7 +329,7 @@ function transitionInTransaction(database, {
       fence.lease_epoch,
     );
     if (released.changes !== 1) {
-      conflict('stale_attempt', 'The canonical turn completion lost its executor lease.');
+      conflict('stale_attempt', 'The canonical terminal transition lost its executor lease.');
     }
   }
   return event;
@@ -456,19 +465,28 @@ export function createExecutorStore({
         generateId,
       });
       const envelope = JSON.parse(current.envelope_json);
+      if (current.lineage_provider !== null && current.lineage_provider !== provider) {
+        conflict(
+          'provider_context_invalid',
+          'The persisted lineage belongs to a different provider adapter.',
+        );
+      }
       return {
         conversation_id: current.conversation_id,
         turn_id: current.turn_id,
         lineage_id: current.lineage_id,
         trace_id: envelope.trace_id,
         input: envelope.content,
+        lineage: {
+          provider_native_id: current.provider_native_id,
+        },
         attempt: fence,
       };
     });
     return claim.immediate();
   }
 
-  function transitionTurn(turnContext, fromState, toState) {
+  function transitionTurn(turnContext, fromState, toState, { reasonCode, error } = {}) {
     const transition = database.transaction(() => transitionInTransaction(database, {
       turnId: turnContext.turn_id,
       fromState,
@@ -478,6 +496,8 @@ export function createExecutorStore({
       serviceInstanceId,
       occurredAt: now(),
       generateId,
+      reasonCode,
+      error,
     }));
     return transition.immediate();
   }
@@ -488,10 +508,23 @@ export function createExecutorStore({
     }
     const append = database.transaction(() => {
       const turn = loadTurn(database, turnContext.turn_id);
+      assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
       if (turn.state !== 'running') {
         conflict('illegal_transition', `Adapter output is invalid while turn is ${turn.state}.`);
       }
-      assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
+      const descriptorNativeId = descriptor.provider_native_id ?? null;
+      if (
+        (turn.provider_native_id !== null || descriptorNativeId !== null)
+        && (
+          turn.lineage_provider !== provider
+          || turn.provider_native_id !== descriptorNativeId
+        )
+      ) {
+        conflict(
+          'provider_context_invalid',
+          'Provider output does not match the atomically bound lineage.',
+        );
+      }
       const event = buildEvent({
         turn,
         lastEvent: loadLastEvent(database, turn.turn_id),
@@ -516,8 +549,61 @@ export function createExecutorStore({
     return append.immediate();
   }
 
+  function bindProviderNativeId(turnContext, providerNativeId) {
+    if (typeof providerNativeId !== 'string' || providerNativeId.trim().length === 0) {
+      throw new TypeError('providerNativeId must be a non-empty string');
+    }
+    const bind = database.transaction(() => {
+      const turn = loadTurn(database, turnContext.turn_id);
+      assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
+      if (turn.state !== 'running') {
+        conflict('illegal_transition', `Lineage binding is invalid while turn is ${turn.state}.`);
+      }
+      if (
+        turn.lineage_provider === provider
+        && turn.provider_native_id === providerNativeId
+      ) {
+        return Object.freeze({
+          provider,
+          provider_native_id: providerNativeId,
+          newly_bound: false,
+        });
+      }
+      if (turn.lineage_provider !== null || turn.provider_native_id !== null) {
+        conflict(
+          'provider_context_invalid',
+          'The lineage is already bound to a different provider context.',
+        );
+      }
+      const boundAt = now();
+      const result = database.prepare(`
+        UPDATE runtime_lineages
+        SET provider = ?, provider_native_id = ?, provider_native_id_bound_at = ?
+        WHERE lineage_id = ? AND conversation_id = ?
+          AND provider IS NULL AND provider_native_id IS NULL
+          AND provider_native_id_bound_at IS NULL
+      `).run(
+        provider,
+        providerNativeId,
+        boundAt,
+        turn.lineage_id,
+        turn.conversation_id,
+      );
+      if (result.changes !== 1) {
+        conflict('provider_context_invalid', 'The provider lineage binding changed concurrently.');
+      }
+      return Object.freeze({
+        provider,
+        provider_native_id: providerNativeId,
+        newly_bound: true,
+      });
+    });
+    return bind.immediate();
+  }
+
   return Object.freeze({
     appendAdapterEvent,
+    bindProviderNativeId,
     claimNextQueuedTurn,
     rebuildExecutorCache,
     transitionTurn,

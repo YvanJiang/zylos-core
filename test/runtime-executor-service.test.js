@@ -123,6 +123,245 @@ afterEach(() => {
 });
 
 describe('runtime executor service', () => {
+  test('atomically binds a provider-native lineage before persisting provider output', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'native-lineage');
+    const adapter = {
+      async *execute(context) {
+        expect(context.lineage).toEqual({ provider_native_id: null });
+        await context.bindProviderNativeId('native-thread-1');
+        yield {
+          kind: 'text_snapshot',
+          payload: { text: 'bound output', end_offset: 12 },
+          provider_native_id: 'native-thread-1',
+        };
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-native-lineage',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('native-lineage'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ status: 'completed' });
+
+    expect(database.prepare(`
+      SELECT provider, provider_native_id, provider_native_id_bound_at
+      FROM runtime_lineages
+      WHERE lineage_id = ?
+    `).get(accepted.lineage_id)).toEqual({
+      provider: 'codex',
+      provider_native_id: 'native-thread-1',
+      provider_native_id_bound_at: '2026-07-19T07:01:00Z',
+    });
+    expect(readEvents(database, accepted.turn_id)
+      .filter(({ kind }) => kind === 'text_snapshot'))
+      .toEqual([
+        expect.objectContaining({ provider_native_id: 'native-thread-1' }),
+      ]);
+
+    database.close();
+  });
+
+  test('supplies the persisted provider-native ID to the next turn on the same lineage', async () => {
+    const database = openTestDatabase();
+    const first = acceptQueuedTurn(database, 'persisted-resume-first');
+    const second = acceptQueuedTurn(database, 'persisted-resume-second');
+    const observedLineages = [];
+    const adapter = {
+      async *execute(context) {
+        observedLineages.push(context.lineage);
+        if (context.lineage.provider_native_id === null) {
+          await context.bindProviderNativeId('native-thread-resume');
+        }
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-persisted-resume',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('persisted-resume'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: first.turn_id,
+    });
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: second.turn_id,
+    });
+    expect(observedLineages).toEqual([
+      { provider_native_id: null },
+      { provider_native_id: 'native-thread-resume' },
+    ]);
+    expect(first.lineage_id).toBe(second.lineage_id);
+
+    database.close();
+  });
+
+  test('rolls back a failed first lineage binding and rejects stale or conflicting bindings', () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'native-binding-fence');
+    const store = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-native-binding-fence',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('native-binding-fence'),
+    });
+    const turnContext = store.claimNextQueuedTurn();
+    store.transitionTurn(turnContext, 'starting', 'running');
+    const staleContext = {
+      ...turnContext,
+      attempt: { ...turnContext.attempt, lease_epoch: turnContext.attempt.lease_epoch + 1 },
+    };
+    const readBinding = () => database.prepare(`
+      SELECT provider, provider_native_id, provider_native_id_bound_at
+      FROM runtime_lineages
+      WHERE lineage_id = ?
+    `).get(accepted.lineage_id);
+
+    expect(() => store.bindProviderNativeId(staleContext, 'native-thread-stale'))
+      .toThrow(expect.objectContaining({ code: 'stale_attempt' }));
+    expect(readBinding()).toEqual({
+      provider: null,
+      provider_native_id: null,
+      provider_native_id_bound_at: null,
+    });
+
+    database.exec(`
+      CREATE TRIGGER force_native_lineage_binding_failure
+      AFTER UPDATE OF provider_native_id ON runtime_lineages
+      BEGIN
+        SELECT RAISE(ABORT, 'forced native lineage binding failure');
+      END;
+    `);
+    expect(() => store.bindProviderNativeId(turnContext, 'native-thread-1'))
+      .toThrow(/forced native lineage binding failure/);
+    expect(readBinding()).toEqual({
+      provider: null,
+      provider_native_id: null,
+      provider_native_id_bound_at: null,
+    });
+
+    database.exec('DROP TRIGGER force_native_lineage_binding_failure');
+    expect(store.bindProviderNativeId(turnContext, 'native-thread-1')).toEqual({
+      provider: 'codex',
+      provider_native_id: 'native-thread-1',
+      newly_bound: true,
+    });
+    expect(store.bindProviderNativeId(turnContext, 'native-thread-1')).toEqual({
+      provider: 'codex',
+      provider_native_id: 'native-thread-1',
+      newly_bound: false,
+    });
+    expect(() => store.bindProviderNativeId(turnContext, 'native-thread-other'))
+      .toThrow(expect.objectContaining({ code: 'provider_context_invalid' }));
+    expect(readBinding()).toEqual({
+      provider: 'codex',
+      provider_native_id: 'native-thread-1',
+      provider_native_id_bound_at: '2026-07-19T07:02:00Z',
+    });
+    const authorityAfterBinding = readAuthority(
+      database,
+      accepted.turn_id,
+      accepted.conversation_id,
+    );
+    for (const providerNativeId of [null, 'native-thread-other']) {
+      expect(() => store.appendAdapterEvent(turnContext, {
+        kind: 'text_snapshot',
+        payload: { text: 'wrong lineage output', end_offset: 20 },
+        provider_native_id: providerNativeId,
+      })).toThrow(expect.objectContaining({ code: 'provider_context_invalid' }));
+      expect(readAuthority(database, accepted.turn_id, accepted.conversation_id))
+        .toEqual(authorityAfterBinding);
+    }
+
+    database.close();
+  });
+
+  test('normalizes provider failure into a fenced terminal state and public error', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'provider-failure');
+    const adapter = {
+      async *execute() {
+        const error = new Error('private provider stderr must not escape');
+        error.providerError = {
+          code: 'side_effect_unknown',
+          category: 'provider',
+          retryable: false,
+          side_effect_status: 'unknown',
+          user_message: 'The provider execution failed after side effects may have occurred.',
+        };
+        throw error;
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-provider-failure',
+      now: () => '2026-07-19T07:05:00Z',
+      generateId: deterministicIds('provider-failure'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'failed',
+      turn_id: accepted.turn_id,
+    });
+
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'failed' });
+    expect(database.prepare(`
+      SELECT status FROM runtime_turn_queue WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ status: 'failed' });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id, attempt_id
+      FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({
+      lease_owner: null,
+      turn_id: null,
+      attempt_id: null,
+    });
+    const terminalEvent = readEvents(database, accepted.turn_id).at(-1);
+    expect(terminalEvent).toMatchObject({
+      kind: 'turn_state_changed',
+      phase: 'failed',
+      payload: {
+        from_state: 'running',
+        to_state: 'failed',
+        reason_code: 'executor_failed',
+      },
+      error: {
+        code: 'side_effect_unknown',
+        category: 'provider',
+        retryable: false,
+        side_effect_status: 'unknown',
+        user_message: 'The provider execution failed after side effects may have occurred.',
+        occurred_at: '2026-07-19T07:05:00Z',
+      },
+    });
+    expect(JSON.stringify(terminalEvent)).not.toContain('private provider stderr');
+    const delivery = JSON.parse(database.prepare(`
+      SELECT command_json FROM runtime_outbox
+      WHERE turn_id = ? AND aggregate_type = 'turn_main'
+    `).get(accepted.turn_id).command_json);
+    expect(delivery.render_model).toMatchObject({
+      phase: 'failed',
+      terminal: true,
+      error: terminalEvent.error,
+    });
+
+    database.close();
+  });
+
   test('runs one durable queued turn through a provider-neutral adapter to completion', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database);
@@ -174,6 +413,8 @@ describe('runtime executor service', () => {
         lineage_id: accepted.lineage_id,
         trace_id: 'trace-canonical',
         input: normalEnvelope().content,
+        lineage: { provider_native_id: null },
+        bindProviderNativeId: expect.any(Function),
         attempt: {
           attempt_id: 'attempt-executor-1',
           attempt_no: 1,
@@ -319,13 +560,15 @@ describe('runtime executor service', () => {
       accepted.turn_id,
       accepted.conversation_id,
     );
-    expect(() => store.appendAdapterEvent(staleContexts[0], {
-      kind: 'text_snapshot',
-      payload: { text: 'late output', end_offset: 11 },
-      provider_native_id: null,
-    })).toThrow(expect.objectContaining({ code: 'stale_attempt' }));
-    expect(readAuthority(database, accepted.turn_id, accepted.conversation_id))
-      .toEqual(runningAuthority);
+    for (const staleContext of staleContexts) {
+      expect(() => store.appendAdapterEvent(staleContext, {
+        kind: 'text_snapshot',
+        payload: { text: 'late output', end_offset: 11 },
+        provider_native_id: null,
+      })).toThrow(expect.objectContaining({ code: 'stale_attempt' }));
+      expect(readAuthority(database, accepted.turn_id, accepted.conversation_id))
+        .toEqual(runningAuthority);
+    }
 
     database.close();
   });
@@ -369,6 +612,30 @@ describe('runtime executor service', () => {
     expect(() => store.transitionTurn(turnContext, 'running', 'completed'))
       .toThrow(/forced completion outbox failure/);
     expect(readAuthority(database, accepted.turn_id, accepted.conversation_id)).toEqual(before);
+
+    database.close();
+  });
+
+  test('rejects output arriving after terminal lease release as stale', () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'late-after-terminal');
+    const store = createTestStore(database, 'late-after-terminal');
+    const turnContext = store.claimNextQueuedTurn();
+    store.transitionTurn(turnContext, 'starting', 'running');
+    store.transitionTurn(turnContext, 'running', 'completed');
+    const terminalAuthority = readAuthority(
+      database,
+      accepted.turn_id,
+      accepted.conversation_id,
+    );
+
+    expect(() => store.appendAdapterEvent(turnContext, {
+      kind: 'text_snapshot',
+      payload: { text: 'late terminal output', end_offset: 20 },
+      provider_native_id: null,
+    })).toThrow(expect.objectContaining({ code: 'stale_attempt' }));
+    expect(readAuthority(database, accepted.turn_id, accepted.conversation_id))
+      .toEqual(terminalAuthority);
 
     database.close();
   });
