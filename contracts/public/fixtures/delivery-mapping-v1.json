@@ -1,0 +1,634 @@
+{
+  "fixture_version": "1.0",
+  "contract_versions": {
+    "zylos.delivery-command": "1.0",
+    "zylos.delivery-result": "1.0"
+  },
+  "command_vectors": [
+    {
+      "name": "create_main_bound",
+      "valid": true,
+      "document": {
+        "contract": "zylos.delivery-command",
+        "contract_version": "1.0",
+        "outbox_id": "outbox-create-A",
+        "delivery_id": "delivery-create-A",
+        "trace_id": "trace-create-A",
+        "delivery_attempt_id": "delivery-attempt-create-1",
+        "delivery_attempt_no": 1,
+        "outbox_lease_epoch": 7,
+        "target": {
+          "region": "cn",
+          "tenant_id": "tenant-A",
+          "channel": "feishu",
+          "bot_id": "bot-A",
+          "chat_type": "group",
+          "chat_id": "chat-A",
+          "native_thread_or_topic_id": null
+        },
+        "aggregate_type": "turn_main",
+        "aggregate_id": "turn-A",
+        "operation": "create_main",
+        "aggregate_version": 1,
+        "event_sequence_through": 1,
+        "idempotency_key": "zid:v1:delivery:d72b6f9d7a24f89681b4a3f4f7b3e0b680b117aae01f425075f41e009f28bb83",
+        "render_model": {
+          "title": "Zylos",
+          "phase": "received",
+          "text": "Message received.",
+          "error": null,
+          "tools": [],
+          "interactions": [],
+          "terminal": false,
+          "user_action_required": false
+        },
+        "mapping": {
+          "mapping_id": "mapping-A",
+          "conversation_id": "conversation-A",
+          "turn_id": "turn-A",
+          "lineage_id": "lineage-A",
+          "binding_state": "bound",
+          "mapping_version": 1
+        },
+        "target_platform_message_id": null,
+        "predecessor_delivery_id": null,
+        "expected_platform_version": null,
+        "priority": 10,
+        "not_before": "2026-07-19T04:00:00Z",
+        "created_at": "2026-07-19T04:00:00Z"
+      }
+    },
+    {
+      "name": "create_main_pending",
+      "valid": true,
+      "document": {
+        "contract": "zylos.delivery-command",
+        "contract_version": "1.0",
+        "outbox_id": "outbox-create-pending-A",
+        "delivery_id": "delivery-create-pending-A",
+        "trace_id": "trace-create-pending-A",
+        "delivery_attempt_id": "delivery-attempt-create-pending-1",
+        "delivery_attempt_no": 1,
+        "outbox_lease_epoch": 8,
+        "target": {
+          "region": "cn",
+          "tenant_id": "tenant-A",
+          "channel": "feishu",
+          "bot_id": "bot-A",
+          "chat_type": "group",
+          "chat_id": "chat-A",
+          "native_thread_or_topic_id": null
+        },
+        "aggregate_type": "turn_main",
+        "aggregate_id": "turn-pending-A",
+        "operation": "create_main",
+        "aggregate_version": 1,
+        "event_sequence_through": 1,
+        "idempotency_key": "zid:v1:delivery:7bae7ae7f59b5549a5732d23d776cea3a2db173039a34afaab710957474f219e",
+        "render_model": {
+          "title": "Zylos recovery",
+          "phase": "starting",
+          "text": "Lineage resolution is pending.",
+          "error": null,
+          "tools": [],
+          "interactions": [],
+          "terminal": false,
+          "user_action_required": false
+        },
+        "mapping": {
+          "mapping_id": "mapping-pending-A",
+          "conversation_id": "conversation-A",
+          "turn_id": "turn-pending-A",
+          "lineage_id": null,
+          "binding_state": "pending",
+          "mapping_version": 1,
+          "reason": "mapping_missing"
+        },
+        "target_platform_message_id": null,
+        "predecessor_delivery_id": null,
+        "expected_platform_version": null,
+        "priority": 20,
+        "not_before": "2026-07-19T04:00:00Z",
+        "created_at": "2026-07-19T04:00:00Z"
+      }
+    },
+    {
+      "name": "update_main_bound",
+      "valid": true,
+      "document": {
+        "contract": "zylos.delivery-command",
+        "contract_version": "1.0",
+        "outbox_id": "outbox-update-A",
+        "delivery_id": "delivery-update-A",
+        "trace_id": "trace-update-A",
+        "delivery_attempt_id": "delivery-attempt-update-2",
+        "delivery_attempt_no": 2,
+        "outbox_lease_epoch": 9,
+        "target": {
+          "region": "cn",
+          "tenant_id": "tenant-A",
+          "channel": "feishu",
+          "bot_id": "bot-A",
+          "chat_type": "group",
+          "chat_id": "chat-A",
+          "native_thread_or_topic_id": null
+        },
+        "aggregate_type": "turn_main",
+        "aggregate_id": "turn-A",
+        "operation": "update_main",
+        "aggregate_version": 2,
+        "event_sequence_through": 3,
+        "idempotency_key": "zid:v1:delivery:ee4cfe7792b9280f0b852df7650026aa3b4f5d6b5331b96ac61928ebb8b329e8",
+        "render_model": {
+          "title": "Zylos",
+          "phase": "running",
+          "text": "Working on the request.",
+          "error": null,
+          "tools": [],
+          "interactions": [],
+          "terminal": false,
+          "user_action_required": false
+        },
+        "mapping": {
+          "mapping_id": "mapping-A",
+          "conversation_id": "conversation-A",
+          "turn_id": "turn-A",
+          "lineage_id": "lineage-A",
+          "binding_state": "bound",
+          "mapping_version": 1
+        },
+        "target_platform_message_id": "platform-message-A",
+        "predecessor_delivery_id": "delivery-create-A",
+        "expected_platform_version": 4,
+        "priority": 10,
+        "not_before": "2026-07-19T04:00:02Z",
+        "created_at": "2026-07-19T04:00:02Z"
+      }
+    },
+    {
+      "name": "send_text_bound",
+      "valid": true,
+      "document": {
+        "contract": "zylos.delivery-command",
+        "contract_version": "1.0",
+        "outbox_id": "outbox-text-A",
+        "delivery_id": "delivery-text-A",
+        "trace_id": "trace-text-A",
+        "delivery_attempt_id": "delivery-attempt-text-1",
+        "delivery_attempt_no": 1,
+        "outbox_lease_epoch": 10,
+        "target": {
+          "region": "cn",
+          "tenant_id": "tenant-A",
+          "channel": "feishu",
+          "bot_id": "bot-A",
+          "chat_type": "group",
+          "chat_id": "chat-A",
+          "native_thread_or_topic_id": null
+        },
+        "aggregate_type": "text_notice",
+        "aggregate_id": "notice-A",
+        "operation": "send_text",
+        "aggregate_version": 1,
+        "event_sequence_through": null,
+        "idempotency_key": "zid:v1:delivery:fc9ea68670bc58e03b147926df5e825f1a69bfd2d442d7ab1e5c3d883eca0eb5",
+        "render_model": {
+          "title": null,
+          "phase": "received",
+          "text": "Your request was received.",
+          "error": null,
+          "tools": [],
+          "interactions": [],
+          "terminal": false,
+          "user_action_required": false
+        },
+        "mapping": {
+          "mapping_id": "mapping-text-A",
+          "conversation_id": "conversation-A",
+          "turn_id": "turn-A",
+          "lineage_id": "lineage-A",
+          "binding_state": "bound",
+          "mapping_version": 1
+        },
+        "target_platform_message_id": null,
+        "predecessor_delivery_id": null,
+        "expected_platform_version": null,
+        "priority": 20,
+        "not_before": "2026-07-19T04:00:00Z",
+        "created_at": "2026-07-19T04:00:00Z"
+      }
+    },
+    {
+      "name": "send_fallback_bound",
+      "valid": true,
+      "document": {
+        "contract": "zylos.delivery-command",
+        "contract_version": "1.0",
+        "outbox_id": "outbox-fallback-A",
+        "delivery_id": "delivery-fallback-A",
+        "trace_id": "trace-fallback-A",
+        "delivery_attempt_id": "delivery-attempt-fallback-1",
+        "delivery_attempt_no": 1,
+        "outbox_lease_epoch": 11,
+        "target": {
+          "region": "cn",
+          "tenant_id": "tenant-A",
+          "channel": "feishu",
+          "bot_id": "bot-A",
+          "chat_type": "group",
+          "chat_id": "chat-A",
+          "native_thread_or_topic_id": null
+        },
+        "aggregate_type": "turn_main",
+        "aggregate_id": "turn-A",
+        "operation": "send_fallback",
+        "aggregate_version": 3,
+        "event_sequence_through": 4,
+        "idempotency_key": "zid:v1:delivery:2611177e892e7a27989adb99746d8355696922b7aa087d24d545096c81b83ba5",
+        "render_model": {
+          "title": null,
+          "phase": "completed",
+          "text": "The request completed successfully.",
+          "error": null,
+          "tools": [],
+          "interactions": [],
+          "terminal": true,
+          "user_action_required": false
+        },
+        "mapping": {
+          "mapping_id": "mapping-fallback-A",
+          "conversation_id": "conversation-A",
+          "turn_id": "turn-A",
+          "lineage_id": "lineage-A",
+          "binding_state": "bound",
+          "mapping_version": 1
+        },
+        "target_platform_message_id": null,
+        "predecessor_delivery_id": "delivery-update-A",
+        "expected_platform_version": null,
+        "priority": 30,
+        "not_before": "2026-07-19T04:00:10Z",
+        "created_at": "2026-07-19T04:00:10Z"
+      }
+    },
+    {
+      "name": "create_main_rejects_target",
+      "valid": false,
+      "expected_error_code": "validation_error",
+      "document": {
+        "contract": "zylos.delivery-command", "contract_version": "1.0",
+        "outbox_id": "outbox-create-A", "delivery_id": "delivery-create-A", "trace_id": "trace-create-A",
+        "delivery_attempt_id": "delivery-attempt-create-1", "delivery_attempt_no": 1, "outbox_lease_epoch": 7,
+        "target": { "region": "cn", "tenant_id": "tenant-A", "channel": "feishu", "bot_id": "bot-A", "chat_type": "group", "chat_id": "chat-A", "native_thread_or_topic_id": null },
+        "aggregate_type": "turn_main", "aggregate_id": "turn-A", "operation": "create_main", "aggregate_version": 1,
+        "event_sequence_through": 1,
+        "idempotency_key": "zid:v1:delivery:d72b6f9d7a24f89681b4a3f4f7b3e0b680b117aae01f425075f41e009f28bb83",
+        "render_model": { "title": "Zylos", "phase": "received", "text": "Message received.", "error": null, "tools": [], "interactions": [], "terminal": false, "user_action_required": false },
+        "mapping": { "mapping_id": "mapping-A", "conversation_id": "conversation-A", "turn_id": "turn-A", "lineage_id": "lineage-A", "binding_state": "bound", "mapping_version": 1 },
+        "target_platform_message_id": "platform-message-unexpected", "predecessor_delivery_id": null, "expected_platform_version": null,
+        "priority": 10, "not_before": "2026-07-19T04:00:00Z", "created_at": "2026-07-19T04:00:00Z"
+      }
+    },
+    {
+      "name": "update_main_requires_target",
+      "valid": false,
+      "expected_error_code": "validation_error",
+      "document": {
+        "contract": "zylos.delivery-command", "contract_version": "1.0",
+        "outbox_id": "outbox-update-A", "delivery_id": "delivery-update-A", "trace_id": "trace-update-A",
+        "delivery_attempt_id": "delivery-attempt-update-2", "delivery_attempt_no": 2, "outbox_lease_epoch": 9,
+        "target": { "region": "cn", "tenant_id": "tenant-A", "channel": "feishu", "bot_id": "bot-A", "chat_type": "group", "chat_id": "chat-A", "native_thread_or_topic_id": null },
+        "aggregate_type": "turn_main", "aggregate_id": "turn-A", "operation": "update_main", "aggregate_version": 2,
+        "event_sequence_through": 3,
+        "idempotency_key": "zid:v1:delivery:ee4cfe7792b9280f0b852df7650026aa3b4f5d6b5331b96ac61928ebb8b329e8",
+        "render_model": { "title": "Zylos", "phase": "running", "text": "Working on the request.", "error": null, "tools": [], "interactions": [], "terminal": false, "user_action_required": false },
+        "mapping": { "mapping_id": "mapping-A", "conversation_id": "conversation-A", "turn_id": "turn-A", "lineage_id": "lineage-A", "binding_state": "bound", "mapping_version": 1 },
+        "target_platform_message_id": null, "predecessor_delivery_id": "delivery-create-A", "expected_platform_version": 4,
+        "priority": 10, "not_before": "2026-07-19T04:00:02Z", "created_at": "2026-07-19T04:00:02Z"
+      }
+    },
+    {
+      "name": "send_text_rejects_predecessor",
+      "valid": false,
+      "expected_error_code": "validation_error",
+      "document": {
+        "contract": "zylos.delivery-command", "contract_version": "1.0",
+        "outbox_id": "outbox-text-A", "delivery_id": "delivery-text-A", "trace_id": "trace-text-A",
+        "delivery_attempt_id": "delivery-attempt-text-1", "delivery_attempt_no": 1, "outbox_lease_epoch": 10,
+        "target": { "region": "cn", "tenant_id": "tenant-A", "channel": "feishu", "bot_id": "bot-A", "chat_type": "group", "chat_id": "chat-A", "native_thread_or_topic_id": null },
+        "aggregate_type": "text_notice", "aggregate_id": "notice-A", "operation": "send_text", "aggregate_version": 1,
+        "event_sequence_through": null,
+        "idempotency_key": "zid:v1:delivery:fc9ea68670bc58e03b147926df5e825f1a69bfd2d442d7ab1e5c3d883eca0eb5",
+        "render_model": { "title": null, "phase": "received", "text": "Your request was received.", "error": null, "tools": [], "interactions": [], "terminal": false, "user_action_required": false },
+        "mapping": { "mapping_id": "mapping-text-A", "conversation_id": "conversation-A", "turn_id": "turn-A", "lineage_id": "lineage-A", "binding_state": "bound", "mapping_version": 1 },
+        "target_platform_message_id": null, "predecessor_delivery_id": "delivery-create-A", "expected_platform_version": null,
+        "priority": 20, "not_before": "2026-07-19T04:00:00Z", "created_at": "2026-07-19T04:00:00Z"
+      }
+    },
+    {
+      "name": "send_fallback_requires_predecessor",
+      "valid": false,
+      "expected_error_code": "validation_error",
+      "document": {
+        "contract": "zylos.delivery-command", "contract_version": "1.0",
+        "outbox_id": "outbox-fallback-A", "delivery_id": "delivery-fallback-A", "trace_id": "trace-fallback-A",
+        "delivery_attempt_id": "delivery-attempt-fallback-1", "delivery_attempt_no": 1, "outbox_lease_epoch": 11,
+        "target": { "region": "cn", "tenant_id": "tenant-A", "channel": "feishu", "bot_id": "bot-A", "chat_type": "group", "chat_id": "chat-A", "native_thread_or_topic_id": null },
+        "aggregate_type": "turn_main", "aggregate_id": "turn-A", "operation": "send_fallback", "aggregate_version": 3,
+        "event_sequence_through": 4,
+        "idempotency_key": "zid:v1:delivery:2611177e892e7a27989adb99746d8355696922b7aa087d24d545096c81b83ba5",
+        "render_model": { "title": null, "phase": "completed", "text": "The request completed successfully.", "error": null, "tools": [], "interactions": [], "terminal": true, "user_action_required": false },
+        "mapping": { "mapping_id": "mapping-fallback-A", "conversation_id": "conversation-A", "turn_id": "turn-A", "lineage_id": "lineage-A", "binding_state": "bound", "mapping_version": 1 },
+        "target_platform_message_id": null, "predecessor_delivery_id": null, "expected_platform_version": null,
+        "priority": 30, "not_before": "2026-07-19T04:00:10Z", "created_at": "2026-07-19T04:00:10Z"
+      }
+    }
+  ],
+  "result_vectors": [
+    {
+      "name": "create_delivered",
+      "command": "create_main_bound",
+      "valid": true,
+      "document": {
+        "contract": "zylos.delivery-result", "contract_version": "1.0", "trace_id": "trace-create-A",
+        "outbox_id": "outbox-create-A", "delivery_id": "delivery-create-A",
+        "idempotency_key": "zid:v1:delivery:d72b6f9d7a24f89681b4a3f4f7b3e0b680b117aae01f425075f41e009f28bb83",
+        "delivery_attempt_id": "delivery-attempt-create-1", "delivery_attempt_no": 1, "outbox_lease_epoch": 7,
+        "mapping_id": "mapping-A", "operation": "create_main", "aggregate_version": 1, "status": "delivered",
+        "platform_message_id": "platform-message-A", "applied_platform_version": 4, "delivered_at": "2026-07-19T04:00:01Z", "error": null,
+        "renderer_capabilities": { "supports_update": true, "supports_actions": true, "supports_platform_idempotency": true, "supports_platform_version": true },
+        "result_at": "2026-07-19T04:00:01Z"
+      }
+    },
+    {
+      "name": "update_delivered",
+      "command": "update_main_bound",
+      "valid": true,
+      "document": {
+        "contract": "zylos.delivery-result", "contract_version": "1.0", "trace_id": "trace-update-A",
+        "outbox_id": "outbox-update-A", "delivery_id": "delivery-update-A",
+        "idempotency_key": "zid:v1:delivery:ee4cfe7792b9280f0b852df7650026aa3b4f5d6b5331b96ac61928ebb8b329e8",
+        "delivery_attempt_id": "delivery-attempt-update-2", "delivery_attempt_no": 2, "outbox_lease_epoch": 9,
+        "mapping_id": "mapping-A", "operation": "update_main", "aggregate_version": 2, "status": "delivered",
+        "platform_message_id": "platform-message-A", "applied_platform_version": 5, "delivered_at": "2026-07-19T04:00:03Z", "error": null,
+        "renderer_capabilities": { "supports_update": true, "supports_actions": true, "supports_platform_idempotency": true, "supports_platform_version": true },
+        "result_at": "2026-07-19T04:00:03Z"
+      }
+    },
+    {
+      "name": "create_retryable_unknown",
+      "command": "create_main_bound",
+      "valid": true,
+      "document": {
+        "contract": "zylos.delivery-result", "contract_version": "1.0", "trace_id": "trace-create-A",
+        "outbox_id": "outbox-create-A", "delivery_id": "delivery-create-A",
+        "idempotency_key": "zid:v1:delivery:d72b6f9d7a24f89681b4a3f4f7b3e0b680b117aae01f425075f41e009f28bb83",
+        "delivery_attempt_id": "delivery-attempt-create-1", "delivery_attempt_no": 1, "outbox_lease_epoch": 7,
+        "mapping_id": "mapping-A", "operation": "create_main", "aggregate_version": 1, "status": "retryable_failure",
+        "platform_message_id": null, "applied_platform_version": null, "delivered_at": null,
+        "error": { "code": "delivery_transient", "category": "channel", "retryable": true, "side_effect_status": "unknown", "user_message": "The channel may have accepted the message; reconciliation is required.", "occurred_at": "2026-07-19T04:00:01Z" },
+        "renderer_capabilities": { "supports_update": true, "supports_actions": true, "supports_platform_idempotency": true, "supports_platform_version": true },
+        "result_at": "2026-07-19T04:00:01Z"
+      }
+    },
+    {
+      "name": "update_permanent",
+      "command": "update_main_bound",
+      "valid": true,
+      "document": {
+        "contract": "zylos.delivery-result", "contract_version": "1.0", "trace_id": "trace-update-A",
+        "outbox_id": "outbox-update-A", "delivery_id": "delivery-update-A",
+        "idempotency_key": "zid:v1:delivery:ee4cfe7792b9280f0b852df7650026aa3b4f5d6b5331b96ac61928ebb8b329e8",
+        "delivery_attempt_id": "delivery-attempt-update-2", "delivery_attempt_no": 2, "outbox_lease_epoch": 9,
+        "mapping_id": "mapping-A", "operation": "update_main", "aggregate_version": 2, "status": "permanent_failure",
+        "platform_message_id": "platform-message-A", "applied_platform_version": null, "delivered_at": null,
+        "error": { "code": "delivery_permanent", "category": "channel", "retryable": false, "side_effect_status": "none", "user_message": "The channel rejected this update permanently.", "occurred_at": "2026-07-19T04:00:03Z" },
+        "renderer_capabilities": { "supports_update": true, "supports_actions": true, "supports_platform_idempotency": true, "supports_platform_version": true },
+        "result_at": "2026-07-19T04:00:03Z"
+      }
+    },
+    {
+      "name": "update_obsolete",
+      "command": "update_main_bound",
+      "valid": true,
+      "document": {
+        "contract": "zylos.delivery-result", "contract_version": "1.0", "trace_id": "trace-update-A",
+        "outbox_id": "outbox-update-A", "delivery_id": "delivery-update-A",
+        "idempotency_key": "zid:v1:delivery:ee4cfe7792b9280f0b852df7650026aa3b4f5d6b5331b96ac61928ebb8b329e8",
+        "delivery_attempt_id": "delivery-attempt-update-2", "delivery_attempt_no": 2, "outbox_lease_epoch": 9,
+        "mapping_id": "mapping-A", "operation": "update_main", "aggregate_version": 2, "status": "obsolete",
+        "platform_message_id": "platform-message-A", "applied_platform_version": 6, "delivered_at": null,
+        "error": { "code": "obsolete", "category": "conflict", "retryable": false, "side_effect_status": "none", "user_message": "A newer aggregate version is already applied.", "occurred_at": "2026-07-19T04:00:03Z" },
+        "renderer_capabilities": { "supports_update": true, "supports_actions": true, "supports_platform_idempotency": true, "supports_platform_version": true },
+        "result_at": "2026-07-19T04:00:03Z"
+      }
+    },
+    {
+      "name": "delivered_requires_platform_id",
+      "command": "create_main_bound",
+      "valid": false,
+      "expected_error_code": "validation_error",
+      "document": {
+        "contract": "zylos.delivery-result", "contract_version": "1.0", "trace_id": "trace-create-A",
+        "outbox_id": "outbox-create-A", "delivery_id": "delivery-create-A",
+        "idempotency_key": "zid:v1:delivery:d72b6f9d7a24f89681b4a3f4f7b3e0b680b117aae01f425075f41e009f28bb83",
+        "delivery_attempt_id": "delivery-attempt-create-1", "delivery_attempt_no": 1, "outbox_lease_epoch": 7,
+        "mapping_id": "mapping-A", "operation": "create_main", "aggregate_version": 1, "status": "delivered",
+        "platform_message_id": null, "applied_platform_version": 4, "delivered_at": "2026-07-19T04:00:01Z", "error": null,
+        "renderer_capabilities": { "supports_update": true, "supports_actions": true, "supports_platform_idempotency": true, "supports_platform_version": true },
+        "result_at": "2026-07-19T04:00:01Z"
+      }
+    },
+    {
+      "name": "retryable_requires_retryable_error",
+      "command": "create_main_bound",
+      "valid": false,
+      "expected_error_code": "validation_error",
+      "document": {
+        "contract": "zylos.delivery-result", "contract_version": "1.0", "trace_id": "trace-create-A",
+        "outbox_id": "outbox-create-A", "delivery_id": "delivery-create-A",
+        "idempotency_key": "zid:v1:delivery:d72b6f9d7a24f89681b4a3f4f7b3e0b680b117aae01f425075f41e009f28bb83",
+        "delivery_attempt_id": "delivery-attempt-create-1", "delivery_attempt_no": 1, "outbox_lease_epoch": 7,
+        "mapping_id": "mapping-A", "operation": "create_main", "aggregate_version": 1, "status": "retryable_failure",
+        "platform_message_id": null, "applied_platform_version": null, "delivered_at": null,
+        "error": { "code": "delivery_transient", "category": "channel", "retryable": false, "side_effect_status": "unknown", "user_message": "The retry flag is inconsistent.", "occurred_at": "2026-07-19T04:00:01Z" },
+        "renderer_capabilities": { "supports_update": true, "supports_actions": true, "supports_platform_idempotency": true, "supports_platform_version": true },
+        "result_at": "2026-07-19T04:00:01Z"
+      }
+    },
+    {
+      "name": "permanent_rejects_retryable_error",
+      "command": "update_main_bound",
+      "valid": false,
+      "expected_error_code": "validation_error",
+      "document": {
+        "contract": "zylos.delivery-result", "contract_version": "1.0", "trace_id": "trace-update-A",
+        "outbox_id": "outbox-update-A", "delivery_id": "delivery-update-A",
+        "idempotency_key": "zid:v1:delivery:ee4cfe7792b9280f0b852df7650026aa3b4f5d6b5331b96ac61928ebb8b329e8",
+        "delivery_attempt_id": "delivery-attempt-update-2", "delivery_attempt_no": 2, "outbox_lease_epoch": 9,
+        "mapping_id": "mapping-A", "operation": "update_main", "aggregate_version": 2, "status": "permanent_failure",
+        "platform_message_id": "platform-message-A", "applied_platform_version": null, "delivered_at": null,
+        "error": { "code": "delivery_permanent", "category": "channel", "retryable": true, "side_effect_status": "none", "user_message": "A permanent failure cannot invite automatic retry.", "occurred_at": "2026-07-19T04:00:03Z" },
+        "renderer_capabilities": { "supports_update": true, "supports_actions": true, "supports_platform_idempotency": true, "supports_platform_version": true },
+        "result_at": "2026-07-19T04:00:03Z"
+      }
+    },
+    {
+      "name": "create_permanent_rejects_unknown_side_effect",
+      "command": "create_main_bound",
+      "valid": false,
+      "expected_error_code": "validation_error",
+      "document": {
+        "contract": "zylos.delivery-result", "contract_version": "1.0", "trace_id": "trace-create-A",
+        "outbox_id": "outbox-create-A", "delivery_id": "delivery-create-A",
+        "idempotency_key": "zid:v1:delivery:d72b6f9d7a24f89681b4a3f4f7b3e0b680b117aae01f425075f41e009f28bb83",
+        "delivery_attempt_id": "delivery-attempt-create-1", "delivery_attempt_no": 1, "outbox_lease_epoch": 7,
+        "mapping_id": "mapping-A", "operation": "create_main", "aggregate_version": 1, "status": "permanent_failure",
+        "platform_message_id": null, "applied_platform_version": null, "delivered_at": null,
+        "error": { "code": "delivery_permanent", "category": "channel", "retryable": false, "side_effect_status": "unknown", "user_message": "An unconfirmed create cannot be classified as permanent.", "occurred_at": "2026-07-19T04:00:01Z" },
+        "renderer_capabilities": { "supports_update": true, "supports_actions": true, "supports_platform_idempotency": true, "supports_platform_version": true },
+        "result_at": "2026-07-19T04:00:01Z"
+      }
+    },
+    {
+      "name": "obsolete_is_update_only",
+      "command": "create_main_bound",
+      "valid": false,
+      "expected_error_code": "validation_error",
+      "document": {
+        "contract": "zylos.delivery-result", "contract_version": "1.0", "trace_id": "trace-create-A",
+        "outbox_id": "outbox-create-A", "delivery_id": "delivery-create-A",
+        "idempotency_key": "zid:v1:delivery:d72b6f9d7a24f89681b4a3f4f7b3e0b680b117aae01f425075f41e009f28bb83",
+        "delivery_attempt_id": "delivery-attempt-create-1", "delivery_attempt_no": 1, "outbox_lease_epoch": 7,
+        "mapping_id": "mapping-A", "operation": "create_main", "aggregate_version": 1, "status": "obsolete",
+        "platform_message_id": null, "applied_platform_version": null, "delivered_at": null,
+        "error": { "code": "obsolete", "category": "conflict", "retryable": false, "side_effect_status": "none", "user_message": "Create cannot be obsolete.", "occurred_at": "2026-07-19T04:00:01Z" },
+        "renderer_capabilities": { "supports_update": true, "supports_actions": true, "supports_platform_idempotency": true, "supports_platform_version": true },
+        "result_at": "2026-07-19T04:00:01Z"
+      }
+    },
+    {
+      "name": "result_rejects_stale_fencing",
+      "command": "create_main_bound",
+      "valid": false,
+      "expected_error_code": "stale_attempt",
+      "document": {
+        "contract": "zylos.delivery-result", "contract_version": "1.0", "trace_id": "trace-create-A",
+        "outbox_id": "outbox-create-A", "delivery_id": "delivery-create-A",
+        "idempotency_key": "zid:v1:delivery:d72b6f9d7a24f89681b4a3f4f7b3e0b680b117aae01f425075f41e009f28bb83",
+        "delivery_attempt_id": "delivery-attempt-create-1", "delivery_attempt_no": 1, "outbox_lease_epoch": 6,
+        "mapping_id": "mapping-A", "operation": "create_main", "aggregate_version": 1, "status": "delivered",
+        "platform_message_id": "platform-message-A", "applied_platform_version": 4, "delivered_at": "2026-07-19T04:00:01Z", "error": null,
+        "renderer_capabilities": { "supports_update": true, "supports_actions": true, "supports_platform_idempotency": true, "supports_platform_version": true },
+        "result_at": "2026-07-19T04:00:01Z"
+      }
+    }
+  ],
+  "mapping_schema_vectors": [
+    {
+      "name": "pending_mapping_missing",
+      "valid": true,
+      "mapping": { "mapping_id": "mapping-pending-A", "conversation_id": "conversation-A", "turn_id": "turn-pending-A", "lineage_id": null, "binding_state": "pending", "mapping_version": 1, "reason": "mapping_missing" }
+    },
+    {
+      "name": "pending_mapping_corrupt",
+      "valid": true,
+      "mapping": { "mapping_id": "mapping-pending-B", "conversation_id": "conversation-A", "turn_id": "turn-pending-B", "lineage_id": null, "binding_state": "pending", "mapping_version": 1, "reason": "mapping_corrupt" }
+    },
+    {
+      "name": "pending_mapping_unbound",
+      "valid": true,
+      "mapping": { "mapping_id": "mapping-pending-C", "conversation_id": "conversation-A", "turn_id": "turn-pending-C", "lineage_id": null, "binding_state": "pending", "mapping_version": 1, "reason": "mapping_unbound" }
+    },
+    {
+      "name": "pending_provider_lineage_invalid",
+      "valid": true,
+      "mapping": { "mapping_id": "mapping-pending-D", "conversation_id": "conversation-A", "turn_id": "turn-pending-D", "lineage_id": null, "binding_state": "pending", "mapping_version": 1, "reason": "provider_lineage_invalid" }
+    },
+    {
+      "name": "bound",
+      "valid": true,
+      "mapping": { "mapping_id": "mapping-A", "conversation_id": "conversation-A", "turn_id": "turn-A", "lineage_id": "lineage-A", "binding_state": "bound", "mapping_version": 2 }
+    },
+    {
+      "name": "not_applicable",
+      "valid": true,
+      "mapping": { "mapping_id": "mapping-security-A", "conversation_id": null, "turn_id": null, "lineage_id": null, "binding_state": "not_applicable", "mapping_version": 1 }
+    },
+    {
+      "name": "pending_rejects_lineage",
+      "valid": false,
+      "expected_error_code": "validation_error",
+      "mapping": { "mapping_id": "mapping-pending-A", "conversation_id": "conversation-A", "turn_id": "turn-pending-A", "lineage_id": "lineage-A", "binding_state": "pending", "mapping_version": 1, "reason": "mapping_missing" }
+    },
+    {
+      "name": "bound_requires_lineage",
+      "valid": false,
+      "expected_error_code": "validation_error",
+      "mapping": { "mapping_id": "mapping-A", "conversation_id": "conversation-A", "turn_id": "turn-A", "lineage_id": null, "binding_state": "bound", "mapping_version": 2 }
+    },
+    {
+      "name": "pending_starts_at_version_one",
+      "valid": false,
+      "expected_error_code": "validation_error",
+      "mapping": { "mapping_id": "mapping-pending-A", "conversation_id": "conversation-A", "turn_id": "turn-pending-A", "lineage_id": null, "binding_state": "pending", "mapping_version": 2, "reason": "mapping_missing" }
+    }
+  ],
+  "mapping_binding_vectors": [
+    {
+      "name": "core_binds_pending",
+      "occurred_at": "2026-07-19T04:01:00Z",
+      "current": { "mapping_id": "mapping-pending-A", "conversation_id": "conversation-A", "turn_id": "turn-pending-A", "lineage_id": null, "binding_state": "pending", "mapping_version": 1, "reason": "mapping_missing" },
+      "request": { "authority": "core", "mapping_id": "mapping-pending-A", "expected_mapping_version": 1, "lineage_id": "lineage-A" },
+      "expected": {
+        "status": "bound",
+        "mapping": { "mapping_id": "mapping-pending-A", "conversation_id": "conversation-A", "turn_id": "turn-pending-A", "lineage_id": "lineage-A", "binding_state": "bound", "mapping_version": 2, "reason": "mapping_missing" },
+        "error_code": null
+      }
+    },
+    {
+      "name": "same_value_replay_is_duplicate",
+      "occurred_at": "2026-07-19T04:01:01Z",
+      "current": { "mapping_id": "mapping-pending-A", "conversation_id": "conversation-A", "turn_id": "turn-pending-A", "lineage_id": "lineage-A", "binding_state": "bound", "mapping_version": 2, "reason": "mapping_missing" },
+      "request": { "authority": "core", "mapping_id": "mapping-pending-A", "expected_mapping_version": 1, "lineage_id": "lineage-A" },
+      "expected": {
+        "status": "duplicate",
+        "mapping": { "mapping_id": "mapping-pending-A", "conversation_id": "conversation-A", "turn_id": "turn-pending-A", "lineage_id": "lineage-A", "binding_state": "bound", "mapping_version": 2, "reason": "mapping_missing" },
+        "error_code": null
+      }
+    },
+    {
+      "name": "different_value_conflicts",
+      "occurred_at": "2026-07-19T04:01:02Z",
+      "current": { "mapping_id": "mapping-pending-A", "conversation_id": "conversation-A", "turn_id": "turn-pending-A", "lineage_id": "lineage-A", "binding_state": "bound", "mapping_version": 2, "reason": "mapping_missing" },
+      "request": { "authority": "core", "mapping_id": "mapping-pending-A", "expected_mapping_version": 1, "lineage_id": "lineage-B" },
+      "expected": {
+        "status": "conflict",
+        "mapping": { "mapping_id": "mapping-pending-A", "conversation_id": "conversation-A", "turn_id": "turn-pending-A", "lineage_id": "lineage-A", "binding_state": "bound", "mapping_version": 2, "reason": "mapping_missing" },
+        "error_code": "version_conflict"
+      }
+    },
+    {
+      "name": "channel_cannot_bind",
+      "occurred_at": "2026-07-19T04:01:03Z",
+      "current": { "mapping_id": "mapping-pending-A", "conversation_id": "conversation-A", "turn_id": "turn-pending-A", "lineage_id": null, "binding_state": "pending", "mapping_version": 1, "reason": "mapping_missing" },
+      "request": { "authority": "channel", "mapping_id": "mapping-pending-A", "expected_mapping_version": 1, "lineage_id": "lineage-A" },
+      "expected": {
+        "status": "forbidden",
+        "mapping": { "mapping_id": "mapping-pending-A", "conversation_id": "conversation-A", "turn_id": "turn-pending-A", "lineage_id": null, "binding_state": "pending", "mapping_version": 1, "reason": "mapping_missing" },
+        "error_code": "forbidden"
+      }
+    },
+    {
+      "name": "stale_mapping_version_conflicts",
+      "occurred_at": "2026-07-19T04:01:04Z",
+      "current": { "mapping_id": "mapping-pending-A", "conversation_id": "conversation-A", "turn_id": "turn-pending-A", "lineage_id": null, "binding_state": "pending", "mapping_version": 1, "reason": "mapping_missing" },
+      "request": { "authority": "core", "mapping_id": "mapping-pending-A", "expected_mapping_version": 2, "lineage_id": "lineage-A" },
+      "expected": {
+        "status": "conflict",
+        "mapping": { "mapping_id": "mapping-pending-A", "conversation_id": "conversation-A", "turn_id": "turn-pending-A", "lineage_id": null, "binding_state": "pending", "mapping_version": 1, "reason": "mapping_missing" },
+        "error_code": "version_conflict"
+      }
+    }
+  ]
+}

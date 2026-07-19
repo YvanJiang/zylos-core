@@ -29,6 +29,35 @@ export const ERROR_CATEGORIES = Object.freeze([
 
 export const SIDE_EFFECT_STATUSES = Object.freeze(['none', 'known', 'unknown']);
 
+export const DELIVERY_OPERATIONS = Object.freeze([
+  'create_main',
+  'update_main',
+  'send_text',
+  'send_fallback',
+]);
+
+export const DELIVERY_RESULT_STATUSES = Object.freeze([
+  'delivered',
+  'retryable_failure',
+  'permanent_failure',
+  'obsolete',
+]);
+
+export const MAPPING_BINDING_STATES = Object.freeze([
+  'pending',
+  'bound',
+  'not_applicable',
+]);
+
+export const MAPPING_BINDING_AUTHORITIES = Object.freeze(['core', 'channel']);
+
+export const MAPPING_RECOVERY_REASONS = Object.freeze([
+  'mapping_missing',
+  'mapping_corrupt',
+  'mapping_unbound',
+  'provider_lineage_invalid',
+]);
+
 export const PUBLIC_ERROR_CODES = Object.freeze([
   'unsupported_contract_version',
   'unsupported_capability',
