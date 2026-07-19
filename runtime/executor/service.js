@@ -151,8 +151,8 @@ export function createExecutorService({
     return snapshot();
   }
 
-  function failTurn(turnContext, providerError) {
-    store.transitionTurn(turnContext, 'running', 'failed', {
+  function failTurn(turnContext, providerError, fromState = 'running') {
+    store.transitionTurn(turnContext, fromState, 'failed', {
       reasonCode: 'executor_failed',
       error: normalizeProviderError(providerError, now()),
     });
@@ -172,10 +172,30 @@ export function createExecutorService({
       try {
         next = await activeRun.iterator.next();
       } catch (error) {
-        if (isExplicitProviderError(error)) return failTurn(activeRun.turnContext, error);
+        if (isExplicitProviderError(error)) {
+          return failTurn(
+            activeRun.turnContext,
+            error,
+            activeRun.providerStarted() ? 'running' : 'starting',
+          );
+        }
         throw error;
       }
+      const reportedProviderFailure = activeRun.providerFailure();
+      if (reportedProviderFailure !== null) {
+        try {
+          await activeRun.iterator.return?.();
+        } catch {
+          // The fenced transport failure is authoritative; iterator cleanup is best-effort.
+        }
+        return failTurn(
+          activeRun.turnContext,
+          { providerError: reportedProviderFailure },
+          activeRun.providerStarted() ? 'running' : 'starting',
+        );
+      }
       if (next.done) {
+        activeRun.ensureProviderStarted();
         store.transitionTurn(activeRun.turnContext, 'running', 'completed');
         activeRuns.delete(activeRun.turnContext.turn_id);
         refresh();
@@ -188,6 +208,7 @@ export function createExecutorService({
       }
       try {
         const event = next.value;
+        activeRun.ensureProviderStarted();
         if (event?.kind === 'interaction_requested') {
           const request = store.requestInteraction(activeRun.turnContext, event.payload);
           reschedulePendingInteractionDeadlines();
@@ -229,7 +250,18 @@ export function createExecutorService({
       return { status: 'idle' };
     }
     refresh();
-    store.transitionTurn(turnContext, 'starting', 'running');
+    let providerStarted = false;
+    let reportedProviderFailure = null;
+    let currentProviderNativeId = turnContext.lineage.provider_native_id;
+    const ensureProviderStarted = () => {
+      if (providerStarted) return { status: 'already_started' };
+      store.transitionTurn(turnContext, 'starting', 'running', {
+        reasonCode: 'provider_started',
+      });
+      providerStarted = true;
+      refresh();
+      return { status: 'running' };
+    };
     let events;
     try {
       events = adapter.execute(Object.freeze({
@@ -243,13 +275,28 @@ export function createExecutorService({
           allowed_sources: Object.freeze([...turnContext.interaction.allowed_sources]),
         }),
         lineage: Object.freeze({ ...turnContext.lineage }),
-        bindProviderNativeId: (providerNativeId) => (
-          store.bindProviderNativeId(turnContext, providerNativeId)
-        ),
+        bindProviderNativeId: (providerNativeId) => {
+          const binding = store.bindProviderNativeId(turnContext, providerNativeId);
+          currentProviderNativeId = providerNativeId;
+          return binding;
+        },
+        reportProviderState: (providerState) => {
+          if (
+            !providerState
+            || providerState.state !== 'started'
+            || !Object.hasOwn(providerState, 'provider_native_id')
+            || providerState.provider_native_id !== currentProviderNativeId
+          ) {
+            throw new TypeError('provider state must match the current started lineage');
+          }
+          return ensureProviderStarted();
+        },
         reportProviderFailure: (providerFailure) => {
+          const normalizedFailure = normalizeProviderError(providerFailure, now());
+          reportedProviderFailure = normalizedFailure;
           const outcome = store.markWaitingProviderFailure(
             turnContext,
-            normalizeProviderError(providerFailure, now()),
+            normalizedFailure,
           );
           if (outcome.status === 'recovering') {
             activeRuns.delete(turnContext.turn_id);
@@ -261,7 +308,9 @@ export function createExecutorService({
         attempt: Object.freeze({ ...turnContext.attempt }),
       }));
     } catch (error) {
-      if (isExplicitProviderError(error)) return failTurn(turnContext, error);
+      if (isExplicitProviderError(error)) {
+        return failTurn(turnContext, error, providerStarted ? 'running' : 'starting');
+      }
       throw error;
     }
     if (!events || typeof events[Symbol.asyncIterator] !== 'function') {
@@ -270,6 +319,9 @@ export function createExecutorService({
     const activeRun = {
       turnContext,
       iterator: events[Symbol.asyncIterator](),
+      ensureProviderStarted,
+      providerFailure: () => reportedProviderFailure,
+      providerStarted: () => providerStarted,
     };
     activeRuns.set(turnContext.turn_id, activeRun);
     return advanceRun(activeRun);
@@ -310,10 +362,12 @@ export function createExecutorService({
           reason: 'timeout',
         });
       } catch {
+        store.markTimedOutProviderStopUnknown(result, 'uncertain');
         reschedulePendingInteractionDeadlines();
         return { ...result, lease_released: false, provider_stop_status: 'uncertain' };
       }
       if (interruption?.status !== 'provider_stopped') {
+        store.markTimedOutProviderStopUnknown(result, interruption?.status ?? 'uncertain');
         reschedulePendingInteractionDeadlines();
         return {
           ...result,

@@ -2,6 +2,7 @@ import {
   admitNormalizedEvent,
   ContractKernelError,
   createContractError,
+  createIdempotencyKey,
   createPayloadHash,
   createNormalizedEventStreamState,
   TERMINAL_TURN_STATES,
@@ -16,13 +17,15 @@ import {
   validateInteractionRequest,
   validateInteractionTransition,
   validateNormalizedEvent,
+  validateDeliveryCommand,
 } from '../../contracts/public/index.js';
+import { createDeliveryLaneKey } from './delivery-lane-key.js';
 import { stageMainProjection } from './main-projection.js';
 import { initializeRuntimePersistence } from './schema.js';
 
 const CANONICAL_TRANSITIONS = Object.freeze({
   queued: ['starting'],
-  starting: ['running'],
+  starting: ['running', 'failed'],
   running: ['waiting_user', 'completed', 'failed'],
   waiting_user: ['running', 'recovering', 'timed_out'],
   recovering: [],
@@ -828,7 +831,7 @@ export function createExecutorStore({
     const bind = database.transaction(() => {
       const turn = loadTurn(database, turnContext.turn_id);
       assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
-      if (turn.state !== 'running') {
+      if (!['starting', 'running'].includes(turn.state)) {
         conflict('illegal_transition', `Lineage binding is invalid while turn is ${turn.state}.`);
       }
       if (
@@ -1475,6 +1478,142 @@ export function createExecutorStore({
     return expire.immediate();
   }
 
+  function markTimedOutProviderStopUnknown(expiration, providerStopStatus) {
+    const markUnknown = database.transaction(() => {
+      if (typeof providerStopStatus !== 'string' || providerStopStatus.length === 0) {
+        throw new TypeError('providerStopStatus must be a non-empty string');
+      }
+      const existing = database.prepare(`
+        SELECT incident_id, provider_stop_status, side_effect_status, disposition, outbox_id
+        FROM runtime_provider_stop_incidents
+        WHERE turn_id = ?
+      `).get(expiration.turn_id);
+      if (existing) return { status: 'manual_recovery_required', ...existing };
+
+      const occurredAt = now();
+      const turn = loadTurn(database, expiration.turn_id);
+      if (turn.state !== 'timed_out') {
+        conflict('illegal_transition', 'Provider stop uncertainty requires a timed-out turn.');
+      }
+      if (
+        expiration.attempt?.attempt_id !== turn.attempt_id
+        || expiration.attempt?.attempt_no !== turn.attempt_no
+        || expiration.attempt?.lease_epoch !== turn.lease_epoch
+      ) {
+        conflict('stale_attempt', 'Provider stop uncertainty lost its timeout attempt fence.');
+      }
+      assertActiveFence(database, turn, expiration.attempt, serviceInstanceId);
+      const lane = database.prepare(`
+        SELECT target_json, mapping_json
+        FROM runtime_delivery_lanes
+        WHERE turn_id = ?
+      `).get(turn.turn_id);
+      if (!lane) {
+        conflict('provider_context_invalid', 'The timed-out turn has no durable delivery lane.');
+      }
+
+      const incidentId = generateId('provider-stop-incident');
+      const outboxId = generateId('outbox');
+      const deliveryId = generateId('delivery');
+      const error = createContractError({
+        code: 'side_effect_unknown',
+        category: 'provider',
+        retryable: false,
+        sideEffectStatus: 'unknown',
+        userMessage: 'Provider stop could not be confirmed; manual recovery is required.',
+        occurredAt,
+      });
+      const target = JSON.parse(lane.target_json);
+      const mapping = {
+        ...JSON.parse(lane.mapping_json),
+        mapping_id: generateId('mapping'),
+      };
+      const command = {
+        contract: 'zylos.delivery-command',
+        contract_version: '1.0',
+        outbox_id: outboxId,
+        delivery_id: deliveryId,
+        trace_id: generateId('delivery-trace'),
+        delivery_attempt_id: generateId('delivery-attempt'),
+        delivery_attempt_no: 1,
+        outbox_lease_epoch: 1,
+        target,
+        aggregate_type: 'text_notice',
+        aggregate_id: `${turn.turn_id}-provider-stop-${incidentId}`,
+        operation: 'send_text',
+        aggregate_version: 1,
+        event_sequence_through: turn.turn_version,
+        idempotency_key: createIdempotencyKey('delivery', {
+          channel: target.channel,
+          target,
+          delivery_id: deliveryId,
+        }),
+        render_model: {
+          title: 'Zylos',
+          phase: 'timed_out',
+          text: 'Execution timed out, but provider stop could not be confirmed. Manual recovery is required.',
+          error,
+          tools: [],
+          interactions: [],
+          terminal: true,
+          user_action_required: true,
+        },
+        mapping,
+        target_platform_message_id: null,
+        predecessor_delivery_id: null,
+        expected_platform_version: null,
+        priority: 100,
+        not_before: occurredAt,
+        created_at: occurredAt,
+      };
+      validateDeliveryCommand(command, { occurredAt });
+      const laneKey = createDeliveryLaneKey(command);
+      database.prepare(`
+        INSERT INTO runtime_outbox (
+          outbox_id, delivery_id, aggregate_type, aggregate_id, turn_id, control_id,
+          lane_key, predecessor_delivery_id, aggregate_version, status, command_json,
+          priority, supersedable, terminal, next_attempt_at, created_at, updated_at
+        ) VALUES (?, ?, 'text_notice', ?, ?, NULL, ?, NULL, 1, 'pending', ?, 100, 0, 1, ?, ?, ?)
+      `).run(
+        outboxId,
+        deliveryId,
+        command.aggregate_id,
+        turn.turn_id,
+        laneKey,
+        JSON.stringify(command),
+        occurredAt,
+        occurredAt,
+        occurredAt,
+      );
+      database.prepare(`
+        INSERT INTO runtime_provider_stop_incidents (
+          incident_id, turn_id, attempt_id, attempt_no, lease_epoch,
+          provider_stop_status, side_effect_status, disposition, error_json,
+          outbox_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'unknown', 'manual_recovery_required', ?, ?, ?)
+      `).run(
+        incidentId,
+        turn.turn_id,
+        turn.attempt_id,
+        turn.attempt_no,
+        turn.lease_epoch,
+        providerStopStatus,
+        JSON.stringify(error),
+        outboxId,
+        occurredAt,
+      );
+      return {
+        status: 'manual_recovery_required',
+        incident_id: incidentId,
+        provider_stop_status: providerStopStatus,
+        side_effect_status: 'unknown',
+        disposition: 'manual_recovery_required',
+        outbox_id: outboxId,
+      };
+    });
+    return markUnknown.immediate();
+  }
+
   function releaseTimedOutExecutorLease(expiration) {
     const release = database.transaction(() => {
       if (
@@ -2098,6 +2237,7 @@ export function createExecutorStore({
     commitInteractionAnswer,
     markWaitingProviderFailure,
     markInteractionHandoffDeliveryUnknown,
+    markTimedOutProviderStopUnknown,
     expireInteraction,
     listPendingInteractionDeadlines,
     rebuildExecutorCache,

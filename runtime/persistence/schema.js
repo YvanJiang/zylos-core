@@ -142,6 +142,20 @@ const RUNTIME_SCHEMA = `
     )
   );
 
+  CREATE TABLE IF NOT EXISTS runtime_provider_stop_incidents (
+    incident_id TEXT PRIMARY KEY,
+    turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
+    attempt_id TEXT NOT NULL,
+    attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+    lease_epoch INTEGER NOT NULL CHECK (lease_epoch > 0),
+    provider_stop_status TEXT NOT NULL,
+    side_effect_status TEXT NOT NULL CHECK (side_effect_status = 'unknown'),
+    disposition TEXT NOT NULL CHECK (disposition = 'manual_recovery_required'),
+    error_json TEXT NOT NULL,
+    outbox_id TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS runtime_normalized_events (
     event_id TEXT PRIMARY KEY,
     turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),

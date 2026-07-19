@@ -622,6 +622,31 @@ describe('runtime interaction order, authorization, and timeout', () => {
       lease_owner: 'executor-service-timeout-uncertain',
       turn_id: accepted.turn_id,
     });
+    expect(database.prepare(`
+      SELECT provider_stop_status, side_effect_status, disposition
+      FROM runtime_provider_stop_incidents
+      WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({
+      provider_stop_status: 'not_current',
+      side_effect_status: 'unknown',
+      disposition: 'manual_recovery_required',
+    });
+    const notice = database.prepare(`
+      SELECT command_json
+      FROM runtime_outbox
+      WHERE aggregate_type = 'text_notice' AND aggregate_id LIKE ?
+    `).get(`${accepted.turn_id}-provider-stop-%`);
+    expect(JSON.parse(notice.command_json)).toMatchObject({
+      render_model: {
+        phase: 'timed_out',
+        terminal: true,
+        user_action_required: true,
+        error: {
+          code: 'side_effect_unknown',
+          side_effect_status: 'unknown',
+        },
+      },
+    });
 
     database.close();
   });

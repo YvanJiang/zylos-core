@@ -98,6 +98,9 @@ function requireExecutionContext(context) {
   if (typeof context.bindProviderNativeId !== 'function') {
     throw new TypeError('bindProviderNativeId must be a function');
   }
+  if (typeof context.reportProviderState !== 'function') {
+    throw new TypeError('reportProviderState must be a function');
+  }
   if (
     context.reportProviderFailure !== undefined
     && typeof context.reportProviderFailure !== 'function'
@@ -246,6 +249,15 @@ function sameAttempt(left, right) {
     && left.lease_epoch === right.lease_epoch;
 }
 
+function coreAttemptKey(coreTurnId, attempt) {
+  return [
+    coreTurnId,
+    attempt.attempt_id,
+    attempt.attempt_no,
+    attempt.lease_epoch,
+  ].join('\u0000');
+}
+
 export function createCodexAppServerAdapter({
   codexExecutable = 'codex',
   spawnProcess = spawn,
@@ -255,6 +267,9 @@ export function createCodexAppServerAdapter({
   clientInfo = Object.freeze({ name: 'zylos-core', title: 'Zylos Core', version: '0.6.0' }),
   approvalPolicy = 'on-request',
   sandbox = 'workspace-write',
+  interruptConfirmationTimeoutMs = 5_000,
+  setTimeoutFn = setTimeout,
+  clearTimeoutFn = clearTimeout,
 } = {}) {
   if (typeof codexExecutable !== 'string' || codexExecutable.length === 0) {
     throw new TypeError('codexExecutable must be a non-empty string');
@@ -272,17 +287,40 @@ export function createCodexAppServerAdapter({
   if (!['read-only', 'workspace-write', 'danger-full-access'].includes(sandbox)) {
     throw new TypeError('sandbox must be read-only, workspace-write, or danger-full-access');
   }
+  if (
+    !Number.isSafeInteger(interruptConfirmationTimeoutMs)
+    || interruptConfirmationTimeoutMs <= 0
+  ) {
+    throw new TypeError('interruptConfirmationTimeoutMs must be a positive safe integer');
+  }
+  if (typeof setTimeoutFn !== 'function' || typeof clearTimeoutFn !== 'function') {
+    throw new TypeError('timeout functions must be callable');
+  }
 
   const childEnvironment = selectEnvironment(env, envAllowlist);
   const loadedThreads = new Set();
   const activeRuns = new Map();
   const startingRuns = new Map();
+  const terminalRuns = new Map();
   const providerRequests = new Map();
   const pendingInteractions = new Map();
   let connection = null;
   let connecting = null;
   let nextConnectionNo = 0;
   let nextInteractionNo = 0;
+
+  function discardProviderRequestsForRun(run, failure) {
+    const discardedGroups = new Set();
+    for (const [requestKey, group] of providerRequests) {
+      if (group.run !== run) continue;
+      discardedGroups.add(group);
+      group.rejectResolved(failure);
+      providerRequests.delete(requestKey);
+    }
+    for (const [reference, entry] of pendingInteractions) {
+      if (discardedGroups.has(entry.group)) pendingInteractions.delete(reference);
+    }
+  }
 
   function failConnection(target, error, { terminate = true } = {}) {
     if (target.failed) return;
@@ -364,6 +402,10 @@ export function createCodexAppServerAdapter({
     if (method === 'turn/started') {
       const startingRun = startingRuns.get(runKey);
       if (!startingRun || startingRun.connection_id !== target.connection_id) return;
+      startingRun.context.reportProviderState({
+        state: 'started',
+        provider_native_id: startingRun.thread_id,
+      });
       startingRuns.delete(runKey);
       activeRuns.set(runKey, startingRun);
       return;
@@ -502,6 +544,12 @@ export function createCodexAppServerAdapter({
         return;
       }
       activeRuns.delete(runKey);
+      run.terminal_status = status;
+      terminalRuns.set(coreAttemptKey(run.context.turn_id, run.context.attempt), run);
+      discardProviderRequestsForRun(run, new CodexAppServerAdapterError(
+        'provider_execution_failed',
+        `Codex app-server completed the turn with status ${String(status)}.`,
+      ));
       run.resolveTerminal(status);
       if (status === 'completed') run.queue.end();
       else run.queue.fail(new CodexAppServerAdapterError(
@@ -626,6 +674,7 @@ export function createCodexAppServerAdapter({
       || typeof propertySchema !== 'object'
       || Array.isArray(propertySchema)
       || propertySchema.type !== 'string'
+      || propertySchema.format !== undefined
     ) {
       rejectProtocol(
         'Codex app-server requested an MCP form field that Core cannot represent safely.',
@@ -1009,6 +1058,7 @@ export function createCodexAppServerAdapter({
       text_item_order: [],
       tool_items: new Map(),
       turn_id: null,
+      terminal_status: null,
     };
     const result = await sendRequest(target, 'turn/start', {
       threadId,
@@ -1027,8 +1077,35 @@ export function createCodexAppServerAdapter({
         const runKey = activeRunKey(threadId, run.turn_id);
         startingRuns.delete(runKey);
         activeRuns.delete(runKey);
+        terminalRuns.delete(coreAttemptKey(context.turn_id, context.attempt));
       }
     }
+  }
+
+  function waitForTerminalConfirmation(run) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const timer = setTimeoutFn(() => {
+        if (settled) return;
+        settled = true;
+        resolve(null);
+      }, interruptConfirmationTimeoutMs);
+      timer?.unref?.();
+      run.terminal.then(
+        (providerStatus) => {
+          if (settled) return;
+          settled = true;
+          clearTimeoutFn(timer);
+          resolve(providerStatus);
+        },
+        () => {
+          if (settled) return;
+          settled = true;
+          clearTimeoutFn(timer);
+          resolve(null);
+        },
+      );
+    });
   }
 
   async function interrupt({ turn_id: coreTurnId, attempt, reason }) {
@@ -1040,6 +1117,16 @@ export function createCodexAppServerAdapter({
       && sameAttempt(candidate.context.attempt, attempt)
     ));
     if (!run || run.connection_id !== connection?.connection_id) {
+      if (reason === 'timeout') {
+        const terminalRun = terminalRuns.get(coreAttemptKey(coreTurnId, attempt));
+        if (terminalRun && terminalRun.terminal_status !== null) {
+          return Object.freeze({
+            status: 'provider_stopped',
+            reason,
+            provider_status: terminalRun.terminal_status,
+          });
+        }
+      }
       return Object.freeze({ status: 'not_current', reason });
     }
     await sendRequest(connection, 'turn/interrupt', {
@@ -1047,7 +1134,10 @@ export function createCodexAppServerAdapter({
       turnId: run.turn_id,
     });
     if (reason === 'timeout') {
-      const providerStatus = await run.terminal;
+      const providerStatus = await waitForTerminalConfirmation(run);
+      if (providerStatus === null) {
+        return Object.freeze({ status: 'uncertain', reason });
+      }
       return Object.freeze({
         status: 'provider_stopped',
         reason,

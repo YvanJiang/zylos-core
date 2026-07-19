@@ -84,6 +84,7 @@ function executionContext(overrides = {}) {
     input: { kind: 'text', text: 'Hello Codex', attachments: [] },
     lineage: { provider_native_id: null },
     bindProviderNativeId: jest.fn(async () => {}),
+    reportProviderState: jest.fn(),
     interaction: {
       authorized_subjects: [{ type: 'actor', actor_id: 'user-1' }],
       allowed_sources: ['main_card_reply', 'card_action'],
@@ -171,6 +172,10 @@ describe('Codex app-server provider adapter', () => {
       },
     }));
     expect(context.bindProviderNativeId).toHaveBeenCalledWith('codex-thread-1');
+    expect(context.reportProviderState).toHaveBeenCalledWith({
+      state: 'started',
+      provider_native_id: 'codex-thread-1',
+    });
     const turnStartIndex = server.received.findIndex(({ method }) => method === 'turn/start');
     expect(turnStartIndex).toBeGreaterThan(2);
     expect(server.received.findIndex(({ method }) => method === 'core/thread-bound'))
@@ -571,6 +576,21 @@ describe('Codex app-server provider adapter', () => {
         _meta: null,
       },
     },
+    {
+      label: 'formatted typed string',
+      params: {
+        mode: 'form',
+        message: 'Provide an email address.',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            email: { type: 'string', format: 'email', minLength: 1 },
+          },
+          required: ['email'],
+        },
+        _meta: null,
+      },
+    },
   ])('fails closed for an unsupported MCP $label', async ({ params }) => {
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
@@ -768,6 +788,84 @@ describe('Codex app-server provider adapter', () => {
       provider_status: 'interrupted',
     });
     await waitingFailure;
+  });
+
+  test('bounds timeout stop confirmation when app-server never emits a terminal notification', async () => {
+    let confirmTimeout;
+    const server = createFakeAppServer({ afterTurnStart() {} });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      interruptConfirmationTimeoutMs: 250,
+      setTimeoutFn(callback, delay) {
+        expect(delay).toBe(250);
+        confirmTimeout = callback;
+        return { unref() {} };
+      },
+      clearTimeoutFn: jest.fn(),
+    });
+    const context = executionContext({ lineage: { provider_native_id: 'codex-thread-1' } });
+    const iterator = adapter.execute(context)[Symbol.asyncIterator]();
+    const waiting = iterator.next();
+    await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
+
+    const interruption = adapter.interrupt({
+      turn_id: context.turn_id,
+      attempt: context.attempt,
+      reason: 'timeout',
+    });
+    await waitFor(() => typeof confirmTimeout === 'function');
+    confirmTimeout();
+    await expect(interruption).resolves.toEqual({
+      status: 'uncertain',
+      reason: 'timeout',
+    });
+
+    server.send({
+      method: 'turn/completed',
+      params: {
+        threadId: 'codex-thread-1',
+        turn: { id: 'codex-turn-1', status: 'interrupted', items: [] },
+      },
+    });
+    await expect(waiting).rejects.toMatchObject({
+      providerError: { code: 'side_effect_unknown' },
+    });
+  });
+
+  test('uses a fenced terminal tombstone when completion wins the timeout interrupt race', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          id: 'timeout-race-request',
+          method: 'item/fileChange/requestApproval',
+          params: { threadId, turnId, itemId: 'patch-timeout-race', startedAtMs: 1 },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const context = executionContext({ lineage: { provider_native_id: 'codex-thread-1' } });
+    const iterator = adapter.execute(context)[Symbol.asyncIterator]();
+    await iterator.next();
+
+    server.send({
+      method: 'turn/completed',
+      params: {
+        threadId: 'codex-thread-1',
+        turn: { id: 'codex-turn-1', status: 'interrupted', items: [] },
+      },
+    });
+
+    await expect(adapter.interrupt({
+      turn_id: context.turn_id,
+      attempt: context.attempt,
+      reason: 'timeout',
+    })).resolves.toEqual({
+      status: 'provider_stopped',
+      reason: 'timeout',
+      provider_status: 'interrupted',
+    });
+    expect(server.received.filter(({ method }) => method === 'turn/interrupt')).toHaveLength(0);
+    await iterator.return();
   });
 
   test('does not interrupt until the provider confirms turn/started', async () => {

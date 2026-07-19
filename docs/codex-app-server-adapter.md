@@ -38,6 +38,7 @@ Private app-server method and item names remain inside the adapter:
 
 | App-server input | Provider-neutral result |
 |---|---|
+| fenced `turn/started` | provider-neutral started signal; Core atomically authors `starting -> running` with `provider_started` |
 | `item/agentMessage/delta` and completed agent message | `text_delta` and `text_snapshot` |
 | command, file, MCP, dynamic, collaboration, web, and image tool lifecycle | `tool_started`, `tool_progress`, `tool_finished` |
 | completed turn | adapter iterator completion; Core authors the canonical completed state |
@@ -53,31 +54,39 @@ and handoff claim before writing a response. A handoff is acknowledged only afte
 written and the matching `serverRequest/resolved` notification arrives. Server request IDs are
 never reusable within one connection, including after acknowledgement.
 
-Multi-question and secret `requestUserInput` requests, multi-field/non-string/optional MCP typed
-forms, `openai/form`, URL elicitation, unknown server requests, duplicate request IDs, unsupported
-item types, and stale or mismatched traffic fail closed. URL elicitation is rejected because its
-URL can contain credentials and the public interaction contract has no safe reference field.
+Multi-question and secret `requestUserInput` requests, multi-field/non-string/optional/formatted
+MCP typed forms, `openai/form`, URL elicitation, unknown server requests, duplicate request IDs,
+unsupported item types, and stale or mismatched traffic fail closed. Formatted MCP strings are
+rejected because the provider-neutral answer contract cannot preserve or validate the fixed-version
+`email|uri|date|date-time` constraint. URL elicitation is rejected because its URL can contain
+credentials and the public interaction contract has no safe reference field.
 Connection loss before an answer cancels still-pending interactions and moves the turn to
 `recovering`. Loss after a response may have been sent is recorded as `delivery_unknown`. Neither
-case is automatically replayed. The supervised child's stderr is drained without persistence and
-stdio errors fail the fenced connection rather than escaping as unhandled stream errors.
+case is automatically replayed. A provider-failure latch rejects an interaction descriptor that
+was already removed from the connection but had not yet crossed Core's durable interaction
+transaction. The supervised child's stderr is drained without persistence and stdio errors fail
+the fenced connection rather than escaping as unhandled stream errors.
 
 ## Control and reconnect
 
 Stop, timeout, and steer share the provider-neutral adapter `interrupt` seam and use
 `turn/interrupt` for the exact current thread/turn/attempt/lease fence. Timeout retains the writer
-lease until the matching provider terminal notification confirms that the turn stopped; missing or
-uncertain confirmation leaves the lease held. Turn interrupts do not kill the shared app-server
-process and do not discard the persisted lineage. A protocol or stdio failure terminates the lost
-shared connection under supervision. A later safe turn creates a new connection and reloads its
-persisted thread before use; active work is never replayed automatically.
+lease until the matching provider terminal notification confirms that the turn stopped. A fenced
+terminal tombstone covers the race in which that notification wins immediately before the timeout
+interrupt lookup. Confirmation is bounded to five seconds; missing or uncertain confirmation
+leaves the lease held, persists a `side_effect_unknown` provider-stop incident, and enqueues a
+high-priority manual-recovery notice. Turn interrupts do not kill the shared app-server process and
+do not discard the persisted lineage. A protocol or stdio failure terminates the lost shared
+connection under supervision. A later safe turn creates a new connection and reloads its persisted
+thread before use; active work is never replayed automatically.
 
 ## Verification boundary
 
 Deterministic tests inject the child process and stdio streams and cover handshake ordering,
-single-process multiplexing, thread binding/resume/reconnect, text/tool normalization, every
-supported bidirectional interaction family, provider acknowledgement and request-ID tombstones,
-confirmed timeout interruption, transport loss, and stale request/answer/output fences. The
+single-process multiplexing, thread binding/resume/reconnect, provider-start and text/tool
+normalization, every supported bidirectional interaction family, provider acknowledgement and
+request-ID tombstones, bounded and confirmed timeout interruption, terminal race tombstones,
+transport loss, and stale request/answer/output fences. The
 current app-server protocol returns all questions in
 one JSON-RPC response, while Core requires each question to have a unique interaction and forbids
 answering the next blocking ordinal before provider acknowledgement of the previous one. Until the

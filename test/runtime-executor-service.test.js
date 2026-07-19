@@ -285,6 +285,71 @@ describe('runtime executor service', () => {
     database.close();
   });
 
+  test('rejects an interaction descriptor when transport loss wins before durable persistence', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'interaction-transport-race');
+    const providerFailure = {
+      providerError: {
+        code: 'side_effect_unknown',
+        category: 'provider',
+        retryable: false,
+        side_effect_status: 'unknown',
+        user_message: 'The app-server connection was lost.',
+      },
+    };
+    const adapter = {
+      execute(context) {
+        let delivered = false;
+        return {
+          [Symbol.asyncIterator]() { return this; },
+          async next() {
+            if (delivered) return { done: true, value: undefined };
+            delivered = true;
+            await context.bindProviderNativeId('native-thread-race');
+            context.reportProviderFailure(providerFailure);
+            return {
+              done: false,
+              value: {
+                kind: 'interaction_requested',
+                payload: {
+                  provider_interaction_ref: 'provider-interaction-race',
+                  tool_use_id: 'tool-race',
+                  kind: 'tool_approval',
+                  prompt: 'This descriptor must not become durable.',
+                  choices: [],
+                  authorized_subjects: context.interaction.authorized_subjects,
+                  allowed_sources: context.interaction.allowed_sources,
+                },
+              },
+            };
+          },
+          async return() { return { done: true, value: undefined }; },
+        };
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-interaction-transport-race',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('interaction-transport-race'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'failed',
+      turn_id: accepted.turn_id,
+    });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_interactions WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ count: 0 });
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'failed' });
+
+    database.close();
+  });
+
   test('rolls back a failed first lineage binding and rejects stale or conflicting bindings', () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'native-binding-fence');
@@ -415,7 +480,7 @@ describe('runtime executor service', () => {
       kind: 'turn_state_changed',
       phase: 'failed',
       payload: {
-        from_state: 'running',
+        from_state: 'starting',
         to_state: 'failed',
         reason_code: 'executor_failed',
       },
@@ -446,6 +511,48 @@ describe('runtime executor service', () => {
       terminal: true,
       error: terminalEvent.error,
     });
+
+    database.close();
+  });
+
+  test('keeps the turn starting until a provider-neutral started signal is persisted', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'provider-start-confirmation');
+    const observedStates = [];
+    const adapter = {
+      async *execute(context) {
+        observedStates.push(database.prepare(`
+          SELECT state FROM runtime_turns WHERE turn_id = ?
+        `).get(accepted.turn_id).state);
+        context.reportProviderState({ state: 'started', provider_native_id: null });
+        observedStates.push(database.prepare(`
+          SELECT state FROM runtime_turns WHERE turn_id = ?
+        `).get(accepted.turn_id).state);
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-provider-start-confirmation',
+      now: () => '2026-07-19T07:05:15Z',
+      generateId: deterministicIds('provider-start-confirmation'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: accepted.turn_id,
+    });
+    expect(observedStates).toEqual(['starting', 'running']);
+    expect(readEvents(database, accepted.turn_id).filter(({ kind }) => (
+      kind === 'turn_state_changed'
+    )).slice(-2)).toEqual([
+      expect.objectContaining({
+        phase: 'running',
+        payload: expect.objectContaining({ reason_code: 'provider_started' }),
+      }),
+      expect.objectContaining({ phase: 'completed' }),
+    ]);
 
     database.close();
   });
@@ -563,6 +670,7 @@ describe('runtime executor service', () => {
         lineage: { provider_native_id: null },
         bindProviderNativeId: expect.any(Function),
         reportProviderFailure: expect.any(Function),
+        reportProviderState: expect.any(Function),
         attempt: {
           attempt_id: 'attempt-executor-1',
           attempt_no: 1,
