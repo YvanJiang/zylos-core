@@ -10,6 +10,7 @@ import {
   validateDeliveryCommand,
   validateNormalizedEvent,
 } from '../contracts/public/index.js';
+import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { createExecutorService } from '../runtime/executor/service.js';
 import { createExecutorStore } from '../runtime/persistence/executor-store.js';
 import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
@@ -102,6 +103,13 @@ function readAuthority(database, turnId, conversationId) {
       FROM runtime_outbox
       WHERE turn_id = ?
       ORDER BY aggregate_type ASC, aggregate_version ASC
+    `).all(turnId),
+    projections: database.prepare(`
+      SELECT aggregate_version, event_sequence_through, critical, terminal,
+        status, render_model_json
+      FROM runtime_projection_snapshots
+      WHERE turn_id = ?
+      ORDER BY aggregate_version ASC
     `).all(turnId),
   };
 }
@@ -249,21 +257,44 @@ describe('runtime executor service', () => {
       FROM runtime_outbox
       WHERE turn_id = ? AND aggregate_type = 'turn_main'
     `).get(accepted.turn_id);
-    expect(turnOutbox.aggregate_version).toBe(6);
+    expect(turnOutbox.aggregate_version).toBe(1);
     const deliveryCommand = JSON.parse(turnOutbox.command_json);
     expect(validateDeliveryCommand(deliveryCommand).forwarded).toEqual(deliveryCommand);
     expect(deliveryCommand).toEqual(expect.objectContaining({
       aggregate_type: 'turn_main',
       aggregate_id: accepted.turn_id,
       operation: 'create_main',
-      aggregate_version: 6,
-      event_sequence_through: 6,
+      aggregate_version: 1,
+      event_sequence_through: 1,
       render_model: expect.objectContaining({
-        phase: 'completed',
-        text: 'provider-neutral result',
-        terminal: true,
+        phase: 'received',
+        terminal: false,
       }),
     }));
+    const projections = database.prepare(`
+      SELECT aggregate_version, event_sequence_through, critical, terminal,
+        status, render_model_json
+      FROM runtime_projection_snapshots
+      WHERE turn_id = ?
+      ORDER BY aggregate_version
+    `).all(accepted.turn_id);
+    expect(projections.map((projection) => ({
+      aggregate_version: projection.aggregate_version,
+      status: projection.status,
+      critical: projection.critical,
+      terminal: projection.terminal,
+    }))).toEqual([
+      { aggregate_version: 2, status: 'superseded', critical: 0, terminal: 0 },
+      { aggregate_version: 3, status: 'superseded', critical: 0, terminal: 0 },
+      { aggregate_version: 4, status: 'superseded', critical: 0, terminal: 0 },
+      { aggregate_version: 5, status: 'superseded', critical: 0, terminal: 0 },
+      { aggregate_version: 6, status: 'staged', critical: 1, terminal: 1 },
+    ]);
+    expect(JSON.parse(projections.at(-1).render_model_json)).toMatchObject({
+      phase: 'completed',
+      text: 'provider-neutral result',
+      terminal: true,
+    });
 
     database.close();
   });
@@ -360,13 +391,80 @@ describe('runtime executor service', () => {
         reason_code: 'executor_capacity',
       },
     });
-    const capacityDelivery = JSON.parse(database.prepare(`
-      SELECT command_json
-      FROM runtime_outbox
-      WHERE turn_id = ? AND aggregate_type = 'turn_main'
-    `).get(second.turn_id).command_json);
+    const capacityProjection = database.prepare(`
+      SELECT aggregate_version, event_sequence_through, render_model_json, status
+      FROM runtime_projection_snapshots
+      WHERE turn_id = ? AND aggregate_version = 3
+    `).get(second.turn_id);
+    expect(capacityProjection).toMatchObject({
+      aggregate_version: 3,
+      event_sequence_through: 3,
+      status: 'staged',
+    });
+    expect(JSON.parse(capacityProjection.render_model_json)).toMatchObject({
+      phase: 'queued',
+      text: 'Waiting for executor capacity.',
+      terminal: false,
+    });
+
+    const deliveredCommands = [];
+    const deliveryService = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-service-capacity',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('delivery-capacity'),
+      throttleMs: 0,
+    });
+    for (let deliveryNo = 0; deliveryNo < 8; deliveryNo += 1) {
+      const command = deliveryService.claimNext();
+      if (!command) break;
+      deliveredCommands.push(command);
+      const resultAt = '2026-07-19T07:02:00Z';
+      const result = {
+        contract: 'zylos.delivery-result',
+        contract_version: '1.0',
+        trace_id: command.trace_id,
+        outbox_id: command.outbox_id,
+        delivery_id: command.delivery_id,
+        idempotency_key: command.idempotency_key,
+        delivery_attempt_id: command.delivery_attempt_id,
+        delivery_attempt_no: command.delivery_attempt_no,
+        outbox_lease_epoch: command.outbox_lease_epoch,
+        mapping_id: command.mapping.mapping_id,
+        operation: command.operation,
+        aggregate_version: command.aggregate_version,
+        status: 'delivered',
+        platform_message_id: command.operation === 'update_main'
+          ? command.target_platform_message_id
+          : `platform-${command.mapping.turn_id}`,
+        applied_platform_version: null,
+        delivered_at: resultAt,
+        error: null,
+        renderer_capabilities: {
+          supports_update: true,
+          supports_actions: true,
+          supports_platform_idempotency: true,
+          supports_platform_version: false,
+        },
+        result_at: resultAt,
+      };
+      expect(deliveryService.recordResult(result)).toEqual({
+        status: 'applied',
+        outbox_status: 'delivered',
+      });
+      if (
+        command.operation === 'update_main'
+        && command.mapping.turn_id === second.turn_id
+      ) break;
+    }
+    const capacityDelivery = deliveredCommands.find(
+      (command) => command.operation === 'update_main'
+        && command.mapping.turn_id === second.turn_id,
+    );
+    expect(capacityDelivery).toBeDefined();
     expect(validateDeliveryCommand(capacityDelivery).forwarded).toEqual(capacityDelivery);
     expect(capacityDelivery).toMatchObject({
+      operation: 'update_main',
       aggregate_version: 3,
       event_sequence_through: 3,
       render_model: {
@@ -682,21 +780,21 @@ describe('runtime executor service', () => {
     database.close();
   });
 
-  test('rolls back queue claim, lease, state, event, and outbox when the atomic commit fails', () => {
+  test('rolls back queue claim, lease, state, event, and projection when the atomic commit fails', () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'atomic-claim');
     const store = createTestStore(database, 'atomic-claim');
     const before = readAuthority(database, accepted.turn_id, accepted.conversation_id);
     database.exec(`
-      CREATE TRIGGER force_executor_outbox_failure
-      BEFORE UPDATE ON runtime_outbox
-      WHEN OLD.aggregate_type = 'turn_main' AND NEW.aggregate_version = 3
+      CREATE TRIGGER force_executor_projection_failure
+      BEFORE INSERT ON runtime_projection_snapshots
+      WHEN NEW.aggregate_version = 3
       BEGIN
-        SELECT RAISE(ABORT, 'forced executor outbox failure');
+        SELECT RAISE(ABORT, 'forced executor projection failure');
       END;
     `);
 
-    expect(() => store.claimNextQueuedTurn()).toThrow(/forced executor outbox failure/);
+    expect(() => store.claimNextQueuedTurn()).toThrow(/forced executor projection failure/);
     expect(readAuthority(database, accepted.turn_id, accepted.conversation_id)).toEqual(before);
 
     database.close();
@@ -710,22 +808,22 @@ describe('runtime executor service', () => {
     store.transitionTurn(turnContext, 'starting', 'running');
     const before = readAuthority(database, accepted.turn_id, accepted.conversation_id);
     database.exec(`
-      CREATE TRIGGER force_completion_outbox_failure
-      BEFORE UPDATE ON runtime_outbox
-      WHEN OLD.aggregate_type = 'turn_main' AND NEW.aggregate_version = 5
+      CREATE TRIGGER force_completion_projection_failure
+      BEFORE INSERT ON runtime_projection_snapshots
+      WHEN NEW.aggregate_version = 5
       BEGIN
-        SELECT RAISE(ABORT, 'forced completion outbox failure');
+        SELECT RAISE(ABORT, 'forced completion projection failure');
       END;
     `);
 
     expect(() => store.transitionTurn(turnContext, 'running', 'completed'))
-      .toThrow(/forced completion outbox failure/);
+      .toThrow(/forced completion projection failure/);
     expect(readAuthority(database, accepted.turn_id, accepted.conversation_id)).toEqual(before);
 
     database.close();
   });
 
-  test('rolls back adapter event version, event, and outbox projection as one commit', () => {
+  test('rolls back adapter event version, event, and projection as one commit', () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'atomic-adapter-event');
     const store = createTestStore(database, 'atomic-adapter-event');
@@ -733,11 +831,11 @@ describe('runtime executor service', () => {
     store.transitionTurn(turnContext, 'starting', 'running');
     const before = readAuthority(database, accepted.turn_id, accepted.conversation_id);
     database.exec(`
-      CREATE TRIGGER force_adapter_event_outbox_failure
-      BEFORE UPDATE ON runtime_outbox
-      WHEN OLD.aggregate_type = 'turn_main' AND NEW.aggregate_version = 5
+      CREATE TRIGGER force_adapter_event_projection_failure
+      BEFORE INSERT ON runtime_projection_snapshots
+      WHEN NEW.aggregate_version = 5
       BEGIN
-        SELECT RAISE(ABORT, 'forced adapter event outbox failure');
+        SELECT RAISE(ABORT, 'forced adapter event projection failure');
       END;
     `);
 
@@ -745,7 +843,7 @@ describe('runtime executor service', () => {
       kind: 'text_snapshot',
       payload: { text: 'must roll back', end_offset: 14 },
       provider_native_id: null,
-    })).toThrow(/forced adapter event outbox failure/);
+    })).toThrow(/forced adapter event projection failure/);
     expect(readAuthority(database, accepted.turn_id, accepted.conversation_id)).toEqual(before);
 
     database.close();

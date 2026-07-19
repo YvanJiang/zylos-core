@@ -79,6 +79,8 @@ const RUNTIME_TABLES = Object.freeze([
   'runtime_turn_queue',
   'runtime_normalized_events',
   'runtime_outbox',
+  'runtime_delivery_lanes',
+  'runtime_projection_snapshots',
   'runtime_message_mappings',
 ]);
 
@@ -120,6 +122,8 @@ describe('acceptNormalInbound', () => {
       runtime_turn_queue: 1,
       runtime_normalized_events: 2,
       runtime_outbox: 1,
+      runtime_delivery_lanes: 1,
+      runtime_projection_snapshots: 1,
       runtime_message_mappings: 0,
     });
 
@@ -131,6 +135,15 @@ describe('acceptNormalInbound', () => {
       state: 'queued',
       turn_version: 2,
       queue_sequence: 1,
+    });
+    expect(database.prepare(`
+      SELECT aggregate_version, event_sequence_through, status
+      FROM runtime_projection_snapshots
+      WHERE turn_id = ?
+    `).get(result.turn_id)).toEqual({
+      aggregate_version: 2,
+      event_sequence_through: 2,
+      status: 'staged',
     });
     expect(database.prepare(`
       SELECT status, queue_sequence
@@ -230,6 +243,8 @@ describe('acceptNormalInbound', () => {
       runtime_turn_queue: 1,
       runtime_normalized_events: 4,
       runtime_outbox: 2,
+      runtime_delivery_lanes: 2,
+      runtime_projection_snapshots: 2,
       runtime_message_mappings: 0,
     });
     expect(database.prepare(`
