@@ -489,7 +489,7 @@ describe('runtime interaction happy path', () => {
       prompt: 'What should happen first?',
       choices: [],
       authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
-      allowed_sources: ['main_card_reply'],
+      allowed_sources: ['main_card_reply', 'card_action'],
     });
     const second = store.requestInteraction(turnContext, {
       provider_interaction_ref: 'provider-question-second',
@@ -671,7 +671,7 @@ describe('runtime interaction happy path', () => {
       prompt: 'Should this answer transaction roll back?',
       choices: [],
       authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
-      allowed_sources: ['main_card_reply'],
+      allowed_sources: ['main_card_reply', 'card_action'],
     });
     const before = readInteractionAuthority(database, accepted.turn_id);
     database.exec(`
@@ -699,7 +699,7 @@ describe('runtime interaction happy path', () => {
       prompt: 'Should this acknowledgement transaction roll back?',
       choices: [],
       authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
-      allowed_sources: ['main_card_reply'],
+      allowed_sources: ['main_card_reply', 'card_action'],
     });
     const result = store.commitInteractionAnswer(interactionAnswer(request, 'ack-rollback'));
     const delivery = store.claimInteractionHandoff(result.handoff_id);
@@ -735,7 +735,7 @@ describe('runtime interaction happy path', () => {
       prompt: 'Should this stale acknowledgement be ignored?',
       choices: [],
       authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
-      allowed_sources: ['main_card_reply'],
+      allowed_sources: ['main_card_reply', 'card_action'],
     });
     const result = store.commitInteractionAnswer(interactionAnswer(request, 'stale-ack'));
     const delivery = store.claimInteractionHandoff(result.handoff_id);

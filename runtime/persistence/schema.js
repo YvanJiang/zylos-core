@@ -165,6 +165,7 @@ const RUNTIME_SCHEMA = `
     answer_id TEXT PRIMARY KEY,
     interaction_id TEXT NOT NULL UNIQUE REFERENCES runtime_interactions(interaction_id),
     idempotency_key TEXT NOT NULL UNIQUE,
+    payload_hash TEXT NOT NULL,
     answer_json TEXT NOT NULL,
     result_json TEXT NOT NULL,
     committed_at TEXT NOT NULL
@@ -408,6 +409,7 @@ export function initializeRuntimePersistence(database) {
     'INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0)',
   );
   addColumnIfMissing(database, 'runtime_turn_queue', 'wait_reason', 'TEXT');
+  addColumnIfMissing(database, 'runtime_interaction_answers', 'payload_hash', 'TEXT');
   addColumnIfMissing(
     database,
     'runtime_outbox',

@@ -14,6 +14,7 @@ export function createExecutorService({
   now = () => new Date().toISOString(),
   generateId = defaultGenerateId,
   leaseDurationMs,
+  interactionTimeoutMs,
   maxResidentExecutorsPerBot = 20,
 }) {
   if (!database || typeof database.transaction !== 'function') {
@@ -45,6 +46,7 @@ export function createExecutorService({
     now,
     generateId,
     leaseDurationMs,
+    interactionTimeoutMs,
   });
   let executors = [];
   let started = false;
@@ -136,8 +138,25 @@ export function createExecutorService({
     return advanceRun(activeRun);
   }
 
-  function submitInteractionAnswer(answer) {
-    return store.commitInteractionAnswer(answer);
+  function submitInteractionAnswer(answer, sourceEvidence) {
+    return store.commitInteractionAnswer(answer, sourceEvidence);
+  }
+
+  async function expireInteraction(expiration) {
+    const result = store.expireInteraction(expiration);
+    if (result.status !== 'expired' || result.turn_state !== 'timed_out') return result;
+
+    const activeRun = activeRuns.get(result.turn_id);
+    if (activeRun) {
+      if (typeof activeRun.iterator.return !== 'function') {
+        return { ...result, lease_released: false };
+      }
+      await activeRun.iterator.return();
+      activeRuns.delete(result.turn_id);
+    }
+    const leaseReleased = store.releaseTimedOutExecutorLease(result);
+    refresh();
+    return { ...result, lease_released: leaseReleased };
   }
 
   async function deliverInteractionAnswer(handoffId) {
@@ -158,6 +177,7 @@ export function createExecutorService({
 
   return Object.freeze({
     deliverInteractionAnswer,
+    expireInteraction,
     runNext,
     snapshot,
     start,
