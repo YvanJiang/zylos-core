@@ -558,6 +558,13 @@ export function createCodexAppServerAdapter({
   }
 
   const childEnvironment = selectEnvironment(env, envAllowlist);
+  const effectiveCwd = cwd ?? process.cwd();
+  const workspaceAccess = Object.freeze({
+    root: sandbox === 'danger-full-access' ? path.parse(effectiveCwd).root : effectiveCwd,
+    mode: sandbox === 'read-only' ? 'read_only' : 'writable',
+    read_only_enforced: sandbox === 'read-only',
+    authority: 'provider_sandbox',
+  });
   const loadedThreads = new Set();
   const activeRuns = new Map();
   const startingRuns = new Map();
@@ -570,6 +577,46 @@ export function createCodexAppServerAdapter({
   let nextConnectionNo = 0;
   let nextHookNo = 0;
   let nextInteractionNo = 0;
+
+  function getWorkspaceAccess() {
+    return workspaceAccess;
+  }
+
+  function assertWorkspaceWrite(controls) {
+    if (typeof controls?.assertWorkspaceWrite !== 'function') {
+      throw new CodexAppServerAdapterError(
+        'unsupported_capability',
+        'Writable Codex app-server execution requires the Core workspace write fence.',
+      );
+    }
+    return controls.assertWorkspaceWrite();
+  }
+
+  function failCoreBoundary(target, cause, message, run) {
+    const failure = new CodexAppServerAdapterError(
+      'provider_connection_lost',
+      message,
+      { cause },
+    );
+    if (cause?.persistenceFailure === true) failure.persistenceFailure = true;
+    failConnection(target, failure, {
+      skipProviderFailureRun: failure.persistenceFailure ? run : null,
+    });
+    return failure;
+  }
+
+  function assertWorkspaceWriteOrFail(target, controls, run = null) {
+    try {
+      return assertWorkspaceWrite(controls);
+    } catch (cause) {
+      throw failCoreBoundary(
+        target,
+        cause,
+        'Codex app-server reached a write boundary after its workspace fence became stale.',
+        run,
+      );
+    }
+  }
 
   function rememberConnectionFence(target, fences, key, value = true) {
     if (!fences.has(key) && fences.size >= maxConnectionFenceEntries) {
@@ -667,7 +714,11 @@ export function createCodexAppServerAdapter({
     return discardedGroups.size;
   }
 
-  function failConnection(target, error, { terminate = true } = {}) {
+  function failConnection(
+    target,
+    error,
+    { terminate = true, skipProviderFailureRun = null } = {},
+  ) {
     if (target.failed) return;
     target.failed = true;
     const failure = error instanceof CodexAppServerAdapterError
@@ -685,10 +736,12 @@ export function createCodexAppServerAdapter({
     for (const [runKey, run] of activeRuns) {
       if (run.connection_id !== target.connection_id) continue;
       target.affected_conversation_ids.add(run.context.conversation_id);
-      try {
-        run.context.reportProviderFailure?.(failure);
-      } catch {
-        // The provider failure remains authoritative even if Core cannot persist recovery.
+      if (run !== skipProviderFailureRun) {
+        try {
+          run.context.reportProviderFailure?.(failure);
+        } catch {
+          // The provider failure remains authoritative even if Core cannot persist recovery.
+        }
       }
       run.rejectTerminal(failure);
       run.queue.fail(failure);
@@ -697,10 +750,12 @@ export function createCodexAppServerAdapter({
     for (const [runKey, run] of startingRuns) {
       if (run.connection_id !== target.connection_id) continue;
       target.affected_conversation_ids.add(run.context.conversation_id);
-      try {
-        run.context.reportProviderFailure?.(failure);
-      } catch {
-        // The provider failure remains authoritative even if Core cannot persist recovery.
+      if (run !== skipProviderFailureRun) {
+        try {
+          run.context.reportProviderFailure?.(failure);
+        } catch {
+          // The provider failure remains authoritative even if Core cannot persist recovery.
+        }
       }
       run.rejectTerminal(failure);
       run.queue.fail(failure);
@@ -709,10 +764,12 @@ export function createCodexAppServerAdapter({
     for (const run of inFlightTurnStarts) {
       if (run.connection_id !== target.connection_id) continue;
       target.affected_conversation_ids.add(run.context.conversation_id);
-      try {
-        run.context.reportProviderFailure?.(failure);
-      } catch {
-        // The provider failure remains authoritative even if Core cannot persist recovery.
+      if (run !== skipProviderFailureRun) {
+        try {
+          run.context.reportProviderFailure?.(failure);
+        } catch {
+          // The provider failure remains authoritative even if Core cannot persist recovery.
+        }
       }
       run.rejectTerminal(failure);
       run.queue.fail(failure);
@@ -780,6 +837,9 @@ export function createCodexAppServerAdapter({
           'Codex app-server started a stale or mismatched turn.',
         ));
         return;
+      }
+      if (workspaceAccess.mode === 'writable') {
+        assertWorkspaceWriteOrFail(target, startingRun.controls, startingRun);
       }
       startingRun.context.reportProviderState({
         state: 'started',
@@ -900,6 +960,12 @@ export function createCodexAppServerAdapter({
             'Codex app-server emitted an invalid or duplicate tool start.',
           ));
           return;
+        }
+        if (
+          item.type === 'fileChange'
+          || (item.type === 'commandExecution' && workspaceAccess.mode === 'writable')
+        ) {
+          assertWorkspaceWriteOrFail(target, run.controls, run);
         }
         run.tool_items.set(item.id, {
           item: structuredClone(item),
@@ -1807,7 +1873,7 @@ export function createCodexAppServerAdapter({
     return connecting;
   }
 
-  async function loadThread(target, context) {
+  async function loadThread(target, context, controls, run) {
     const persistedThreadId = context.lineage.provider_native_id;
     if (persistedThreadId === null) {
       const result = await sendRequest(target, 'thread/start', {
@@ -1816,7 +1882,19 @@ export function createCodexAppServerAdapter({
         sandbox,
       });
       const threadId = requireThreadResult(result);
-      await context.bindProviderNativeId(threadId);
+      if (workspaceAccess.mode === 'writable') {
+        assertWorkspaceWriteOrFail(target, controls, run);
+      }
+      try {
+        await context.bindProviderNativeId(threadId);
+      } catch (cause) {
+        throw failCoreBoundary(
+          target,
+          cause,
+          'Codex app-server created a thread that Core could not bind durably.',
+          run,
+        );
+      }
       loadedThreads.add(threadId);
       return threadId;
     }
@@ -1843,10 +1921,10 @@ export function createCodexAppServerAdapter({
     return persistedThreadId;
   }
 
-  async function* execute(context) {
+  async function* execute(context, controls) {
     requireExecutionContext(context);
+    if (workspaceAccess.mode === 'writable') assertWorkspaceWrite(controls);
     const target = await ensureConnection();
-    const threadId = await loadThread(target, context);
     let resolveTerminal;
     let rejectTerminal;
     const terminal = new Promise((resolve, reject) => {
@@ -1856,12 +1934,13 @@ export function createCodexAppServerAdapter({
     terminal.catch(() => {});
     const run = {
       connection_id: target.connection_id,
+      controls,
       context,
       queue: new AsyncEventQueue(),
       terminal,
       resolveTerminal,
       rejectTerminal,
-      thread_id: threadId,
+      thread_id: null,
       text_by_item: new Map(),
       text_item_order: [],
       tool_items: new Map(),
@@ -1871,6 +1950,11 @@ export function createCodexAppServerAdapter({
     };
     inFlightTurnStarts.add(run);
     try {
+      const threadId = await loadThread(target, context, controls, run);
+      run.thread_id = threadId;
+      if (workspaceAccess.mode === 'writable') {
+        assertWorkspaceWriteOrFail(target, controls, run);
+      }
       const result = await sendRequest(target, 'turn/start', {
         threadId,
         input: [{ type: 'text', text: context.input.text }],
@@ -1891,7 +1975,7 @@ export function createCodexAppServerAdapter({
     } finally {
       inFlightTurnStarts.delete(run);
       if (run.turn_id !== null) {
-        const runKey = activeRunKey(threadId, run.turn_id);
+        const runKey = activeRunKey(run.thread_id, run.turn_id);
         startingRuns.delete(runKey);
         activeRuns.delete(runKey);
         terminalRuns.delete(coreAttemptKey(context.turn_id, context.attempt));
@@ -2078,6 +2162,20 @@ export function createCodexAppServerAdapter({
     rejectProtocol('The provider request cannot accept an interaction answer.');
   }
 
+  function providerResponseAllowsWorkspaceWrite(group, answers) {
+    const value = answers.values().next().value;
+    if (value?.kind !== 'decision' || value.decision !== 'approve') return false;
+    if (group.method === 'item/fileChange/requestApproval') return true;
+    if (group.method === 'item/commandExecution/requestApproval') {
+      return workspaceAccess.mode === 'writable';
+    }
+    if (group.method !== 'item/permissions/requestApproval') return false;
+    const fileSystem = group.params.permissions.fileSystem;
+    return (Array.isArray(fileSystem?.write) && fileSystem.write.length > 0)
+      || (Array.isArray(fileSystem?.entries)
+        && fileSystem.entries.some((entry) => entry.access === 'write'));
+  }
+
   function acknowledgementFor(delivery) {
     return {
       handoff_id: delivery.handoff.handoff_id,
@@ -2119,6 +2217,9 @@ export function createCodexAppServerAdapter({
     const candidateAnswers = new Map(group.answers);
     candidateAnswers.set(entry.component_key, structuredClone(delivery.answer.value));
     const providerResponse = buildProviderResponse(group, candidateAnswers);
+    if (providerResponseAllowsWorkspaceWrite(group, candidateAnswers)) {
+      assertWorkspaceWriteOrFail(target, run.controls, run);
+    }
     group.answers.set(entry.component_key, structuredClone(delivery.answer.value));
     group.response_sent = true;
     sendServerResponse(target, group.request_id, providerResponse);
@@ -2259,5 +2360,13 @@ export function createCodexAppServerAdapter({
     return [...target.affected_conversation_ids];
   }
 
-  return Object.freeze({ abort, cancel, close, execute, handleInteractionAnswer, interrupt });
+  return Object.freeze({
+    abort,
+    cancel,
+    close,
+    execute,
+    getWorkspaceAccess,
+    handleInteractionAnswer,
+    interrupt,
+  });
 }

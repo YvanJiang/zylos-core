@@ -1,6 +1,8 @@
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { PassThrough } from 'node:stream';
 
 import { afterEach, describe, expect, test } from '@jest/globals';
 import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/index.js';
@@ -13,6 +15,7 @@ import { createExecutorService } from '../runtime/executor/service.js';
 import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { createExecutorStore } from '../runtime/persistence/executor-store.js';
 import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { createCodexAppServerAdapter } from '../runtime/providers/codex-app-server-adapter.js';
 import {
   createWorkspaceLeaseCoordinator,
   normalizeWorkspaceRoot,
@@ -56,6 +59,43 @@ function deferred() {
   let resolve;
   const promise = new Promise((resolvePromise) => { resolve = resolvePromise; });
   return { promise, resolve };
+}
+
+function createDeferredThreadStartAppServer() {
+  const child = new EventEmitter();
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  const threadStart = deferred();
+  const killSignals = [];
+  let buffer = '';
+
+  function send(message) {
+    child.stdout.write(`${JSON.stringify(message)}\n`);
+  }
+
+  child.kill = (signal) => {
+    killSignals.push(signal);
+    queueMicrotask(() => child.emit('close', 0, signal));
+    return true;
+  };
+  child.stdin.on('data', (chunk) => {
+    buffer += chunk.toString('utf8');
+    while (buffer.includes('\n')) {
+      const newline = buffer.indexOf('\n');
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      if (line.length === 0) continue;
+      const message = JSON.parse(line);
+      if (message.method === 'initialize') {
+        send({ id: message.id, result: { userAgent: 'workspace-fence-test' } });
+      } else if (message.method === 'thread/start') {
+        threadStart.resolve(message);
+      }
+    }
+  });
+
+  return { child, killSignals, send, threadStart: threadStart.promise };
 }
 
 function deliverTurnNotifications(database, turnId, suffix, deliveredAt) {
@@ -105,6 +145,105 @@ afterEach(() => {
 });
 
 describe('durable workspace lease coordinator', () => {
+  test('uses the production Codex sandbox declaration for trusted workspace access', () => {
+    const readOnlyAdapter = createCodexAppServerAdapter({
+      spawnProcess() {},
+      cwd: '/workspace/review',
+      sandbox: 'read-only',
+    });
+    const writableAdapter = createCodexAppServerAdapter({
+      spawnProcess() {},
+      cwd: '/workspace',
+      sandbox: 'workspace-write',
+    });
+
+    expect(resolveProviderWorkspaceAccess(readOnlyAdapter, {}, {
+      defaultRoot: '/fallback',
+    })).toEqual({
+      workspace_root: '/workspace/review',
+      mode: 'read_only',
+      read_only_enforced: true,
+    });
+    expect(resolveProviderWorkspaceAccess(writableAdapter, {}, {
+      defaultRoot: '/fallback',
+    })).toEqual({
+      workspace_root: '/workspace',
+      mode: 'writable',
+      read_only_enforced: false,
+    });
+  });
+
+  test('moves a production Codex pre-turn fence race into durable unknown recovery', async () => {
+    const { database, workspace } = createFixture();
+    const turn = acceptQueuedTurn(database, 'codex-pre-turn-race', 'chat-codex-pre-turn-race');
+    const server = createDeferredThreadStartAppServer();
+    let clock = '2026-07-19T13:19:00.000Z';
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: workspace,
+      sandbox: 'workspace-write',
+    });
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'workspace-codex-pre-turn-race',
+      now: () => clock,
+      generateId: deterministicIds('workspace-codex-pre-turn-race'),
+      workspaceRoot: workspace,
+      workspaceLeaseDurationMs: 1_000,
+      workspaceHeartbeatIntervalMs: 300,
+      scheduleWorkspaceHeartbeat() { return { unref() {} }; },
+      cancelWorkspaceHeartbeat() {},
+    });
+
+    const execution = service.runNext();
+    const threadStart = await server.threadStart;
+    clock = '2026-07-19T13:19:02.000Z';
+    server.send({
+      id: threadStart.id,
+      result: { thread: { id: 'codex-thread-pre-turn-race' } },
+    });
+
+    await expect(execution).resolves.toMatchObject({
+      status: 'recovering',
+      turn_id: turn.turn_id,
+    });
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(turn.turn_id)).toEqual({ state: 'recovering' });
+    expect(database.prepare(`
+      SELECT state FROM runtime_workspace_leases WHERE holder_turn_id = ?
+    `).get(turn.turn_id)).toEqual({ state: 'uncertain' });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_outbox
+      WHERE turn_id = ? AND aggregate_type = 'turn_main'
+    `).get(turn.turn_id).count).toBeGreaterThan(0);
+    await expect(service.reconcileWorkspaceRecoveries()).resolves.toEqual({
+      isolated: [],
+      notification_pending: [turn.turn_id],
+      isolation_pending: [],
+    });
+    expect(deliverTurnNotifications(
+      database,
+      turn.turn_id,
+      'codex-pre-turn-race',
+      clock,
+    )).not.toHaveLength(0);
+    await expect(service.reconcileWorkspaceRecoveries()).resolves.toMatchObject({
+      isolated: [turn.turn_id],
+      notification_pending: [],
+      isolation_pending: [],
+    });
+    expect(database.prepare(`
+      SELECT state FROM runtime_workspace_leases WHERE holder_turn_id = ?
+    `).get(turn.turn_id)).toEqual({ state: 'released' });
+    expect(server.killSignals).toContain('SIGTERM');
+
+    await service.close();
+    database.close();
+  });
+
   test('normalizes roots and fences an expired holder from write, renew, or release', () => {
     const { alias, database, workspace } = createFixture();
     const firstTurn = acceptQueuedTurn(database, 'first', 'chat-workspace-first');

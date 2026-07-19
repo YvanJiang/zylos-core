@@ -55,6 +55,36 @@ and handoff claim before writing a response. A handoff is acknowledged only afte
 written and the matching `serverRequest/resolved` notification arrives. Server request IDs are
 never reusable within one connection, including after acknowledgement.
 
+## Workspace access and write fencing
+
+The adapter advertises the access that its own app-server configuration enforces. `read-only`
+maps to provider-sandbox-authoritative read-only access at the configured working directory;
+`workspace-write` maps to writable access at that directory. `danger-full-access` is conservatively
+reported as writable access at the filesystem root so it cannot run concurrently merely because
+two configured working directories do not overlap. A request cannot self-report read-only access.
+
+Writable execution fails closed unless Core supplies `assertWorkspaceWrite`. The adapter checks
+that durable holder/epoch fence before it contacts app-server, again after thread load/binding and
+immediately before `turn/start`, when `turn/started` is observed, at every observed command or
+file-change start that can write, and immediately before accepting a command/file approval or a
+filesystem-write permission grant. A file-change start is fenced even under `read-only`, because it
+would contradict the provider sandbox authority that allowed overlapping execution. If a fence is
+stale at a running boundary, the shared connection is retired and the turn follows the existing
+side-effect-unknown recovery path; no approval response is written.
+
+The run is registered with the shared-connection failure latch before thread load or durable
+binding. If the failing fence came from Core persistence, the adapter preserves that failure marker
+instead of converting the current run to a generic provider error; the executor service then marks
+the expired workspace uncertain, persists the recovery notification, and waits for its delivery
+before isolation and ownership release. Other runs affected by retiring the shared connection still
+receive the normal provider-loss recovery signal.
+
+App-server provides a blocking pre-action boundary for requested approvals, but it does not expose
+a Claude-style synchronous pre-tool callback for every action already permitted by the configured
+sandbox. For those actions the item-start notification is the earliest protocol boundary available;
+the provider sandbox remains the enforcement mechanism and a stale observation retires the
+connection rather than claiming that a now-uncertain write was prevented.
+
 Multi-question, secret, provider-auto-resolving, and fixed-choice-plus-Other `requestUserInput`
 requests,
 multi-field/non-string/optional/formatted
