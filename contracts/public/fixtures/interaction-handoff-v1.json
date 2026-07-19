@@ -888,6 +888,17 @@
       "expected": "prohibited"
     },
     {
+      "name": "post_send_retry_prohibited",
+      "machine": "handoff",
+      "transition": {
+        "from": "delivering",
+        "to": "retry_wait",
+        "sendStarted": true,
+        "safeToRetry": true
+      },
+      "expected": "prohibited"
+    },
+    {
       "name": "provider_rejected",
       "machine": "interaction",
       "transition": {

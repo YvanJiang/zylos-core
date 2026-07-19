@@ -973,8 +973,14 @@ export function validateInteractionHandoff(value, { occurredAt } = {}) {
       reject('Delivering handoff cannot contain provider ack or error.', occurredAt);
     }
   } else if (value.state === 'retry_wait') {
-    if (value.provider_acked_at !== null || value.error === null) {
-      reject('retry_wait requires an error and no provider ack.', occurredAt);
+    if (
+      value.last_send_started_at !== null
+      || value.provider_acked_at !== null
+      || value.error === null
+      || value.error.side_effect_status !== 'none'
+      || value.side_effect_status !== 'none'
+    ) {
+      reject('retry_wait requires a pre-send error with no provider ack or side effects.', occurredAt);
     }
   } else if (value.state === 'accepted') {
     if (
@@ -1096,8 +1102,13 @@ export function validateInteractionHandoffTransition({
     if (to === 'cancelled' && sendStarted) {
       reject('A handoff can be cancelled from delivering only before send starts.', occurredAt);
     }
-    if (to === 'retry_wait' && !safeToRetry) {
-      reject('retry_wait requires proof that retry cannot duplicate provider effects.', occurredAt);
+    if (to === 'retry_wait') {
+      if (sendStarted) {
+        reject('A handoff can enter retry_wait only before delivery starts.', occurredAt);
+      }
+      if (!safeToRetry) {
+        reject('retry_wait requires proof that retry cannot duplicate provider effects.', occurredAt);
+      }
     }
   }
   if (from === 'delivery_unknown' && to === 'accepted' && !acknowledgementProven) {

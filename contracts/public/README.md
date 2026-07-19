@@ -170,8 +170,8 @@ fixtures.
 security-control and recovery-control requests; every allowed answer source and answer-result
 status; executable request/source and smallest-blocking-ordinal adjudication examples; every
 durable handoff state; the complete allowed transition tables; and explicit send-before-ack,
-delivery-unknown, rejected/cancelled, and late-ack examples. Consumers must treat every omitted
-state edge as prohibited.
+post-send retry prohibition, delivery-unknown, rejected/cancelled, and late-ack examples.
+Consumers must treat every omitted state edge as prohibited.
 
 `fixtures/delivery-mapping-v1.json` contains valid and rejected create/update/text/fallback
 commands, every delivery result status with fencing/error/side-effect combinations, mapping

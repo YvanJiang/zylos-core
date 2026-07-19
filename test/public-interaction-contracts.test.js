@@ -577,6 +577,36 @@ describe('durable interaction handoff v1 record contract', () => {
       .toThrow(ContractKernelError);
   });
 
+  test('only permits retry_wait before answer delivery starts', () => {
+    const retryWait = handoff({
+      state: 'retry_wait',
+      handoff_attempt_id: 'handoff-attempt-1',
+      handoff_attempt_no: 1,
+      claimed_by: 'executor-A',
+      claimed_at: '2026-07-19T05:04:02Z',
+      reason_code: 'pre_send_transient_failure',
+      error: {
+        code: 'provider_context_invalid',
+        category: 'provider',
+        retryable: true,
+        side_effect_status: 'none',
+        user_message: 'The provider handler was unavailable before answer delivery started.',
+        occurred_at: '2026-07-19T05:04:03Z',
+      },
+    });
+
+    expect(validateInteractionHandoff(retryWait).state).toBe('retry_wait');
+    expect(() => validateInteractionHandoff({
+      ...retryWait,
+      last_send_started_at: '2026-07-19T05:04:03Z',
+    })).toThrow(ContractKernelError);
+    expect(() => validateInteractionHandoff({
+      ...retryWait,
+      error: { ...retryWait.error, side_effect_status: 'unknown' },
+      side_effect_status: 'unknown',
+    })).toThrow(ContractKernelError);
+  });
+
   test('requires null provider fencing for security and recovery control handoffs', () => {
     const controlHandoff = handoff({
       parent_type: 'recovery_control',
@@ -711,6 +741,12 @@ describe('interaction and handoff transition contracts', () => {
       from: 'delivering',
       to: 'retry_wait',
       safeToRetry: false,
+    })).toThrow(ContractKernelError);
+    expect(() => validateInteractionHandoffTransition({
+      from: 'delivering',
+      to: 'retry_wait',
+      sendStarted: true,
+      safeToRetry: true,
     })).toThrow(ContractKernelError);
     expect(() => validateInteractionHandoffTransition({
       from: 'delivering',
@@ -854,6 +890,7 @@ describe('shared interaction and durable handoff v1 fixtures', () => {
       'send_before_ack_crash',
       'unknown_ack_proven',
       'post_send_cancel_prohibited',
+      'post_send_retry_prohibited',
       'provider_rejected',
       'late_ack_after_cancel_prohibited',
     ]));
