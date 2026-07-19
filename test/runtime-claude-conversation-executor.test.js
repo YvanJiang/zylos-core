@@ -382,6 +382,7 @@ function createCaughtPermissionCancellationQuery({ sessionId }) {
 function createBackgroundQuery({ sessionId }) {
   const backgroundFinished = deferred();
   const notificationConsumed = deferred();
+  const resultEmitted = deferred();
 
   function query({ prompt }) {
     const stream = (async function* generateSdkMessages() {
@@ -409,6 +410,7 @@ function createBackgroundQuery({ sessionId }) {
           session_id: sessionId,
           result: 'background started',
         };
+        resultEmitted.resolve();
         yield idleSession(sessionId);
         await backgroundFinished.promise;
         yield {
@@ -416,6 +418,13 @@ function createBackgroundQuery({ sessionId }) {
           subtype: 'background_tasks_changed',
           session_id: sessionId,
           tasks: [],
+        };
+        yield {
+          type: 'system',
+          subtype: 'task_notification',
+          session_id: sessionId,
+          task_id: 'background-task-1',
+          status: 'completed',
         };
         notificationConsumed.resolve();
       }
@@ -425,7 +434,41 @@ function createBackgroundQuery({ sessionId }) {
     return stream;
   }
 
-  return { backgroundFinished, notificationConsumed, query };
+  return { backgroundFinished, notificationConsumed, query, resultEmitted };
+}
+
+function createEndingBackgroundQuery({ sessionId, outcome = 'unknown' }) {
+  function query({ prompt }) {
+    const stream = (async function* generateSdkMessages() {
+      for await (const input of prompt) {
+        yield { type: 'system', subtype: 'init', session_id: sessionId };
+        yield {
+          type: 'system',
+          subtype: 'task_started',
+          session_id: sessionId,
+          task_id: 'background-task-ending',
+        };
+        yield {
+          type: 'result',
+          subtype: 'success',
+          session_id: sessionId,
+          result: input.message.content,
+        };
+        if (outcome === 'unknown') return;
+        yield {
+          type: 'system',
+          subtype: 'task_notification',
+          session_id: sessionId,
+          task_id: 'background-task-ending',
+          status: outcome === 'failed' ? 'failed' : 'completed',
+        };
+      }
+    }());
+    stream.interrupt = async () => ({ still_queued: [] });
+    stream.close = () => {};
+    return stream;
+  }
+  return { query };
 }
 
 function createDelayedIdleQuery({ sessionId }) {
@@ -1391,6 +1434,9 @@ describe('Claude conversation executor', () => {
     expect(database.prepare(`
       SELECT COUNT(*) AS count FROM runtime_executor_residents WHERE conversation_id = ?
     `).get(accepted.conversation_id)).toEqual({ count: 0 });
+    expect(database.prepare(`
+      SELECT state FROM runtime_workspace_leases WHERE holder_turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'released' });
 
     await service.close();
     database.close();
@@ -1777,14 +1823,95 @@ describe('Claude conversation executor', () => {
       generateId: deterministicIds('background'),
     });
 
-    await expect(service.runNext()).resolves.toMatchObject({ turn_id: accepted.turn_id });
+    let executionSettled = false;
+    const execution = service.runNext().finally(() => { executionSettled = true; });
+    await fake.resultEmitted.promise;
+    for (let index = 0; index < 10; index += 1) await Promise.resolve();
+    expect(executionSettled).toBe(false);
+    expect(service.snapshot().workspace_leases).toEqual([
+      expect.objectContaining({
+        holder_turn_id: accepted.turn_id,
+        holder_background_work_ids: ['background-work-background-1'],
+      }),
+    ]);
     clock = 1_000;
     await expect(service.evictIdleExecutors()).resolves.toEqual([]);
     fake.backgroundFinished.resolve();
     await fake.notificationConsumed.promise;
+    await expect(execution).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: accepted.turn_id,
+    });
+    expect(service.snapshot().workspace_leases).toEqual([]);
     await expect(service.evictIdleExecutors()).resolves.toEqual([]);
     clock = 1_101;
     await expect(service.evictIdleExecutors()).resolves.toEqual([accepted.conversation_id]);
+
+    await service.close();
+    database.close();
+  });
+
+  test('fails only after a known failed background task ends and then releases its workspace', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'background-failed');
+    const fake = createEndingBackgroundQuery({
+      sessionId: 'claude-session-background-failed',
+      outcome: 'failed',
+    });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-background-failed',
+      now: () => '2026-07-19T09:07:10Z',
+      generateId: deterministicIds('background-failed'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'failed',
+      turn_id: accepted.turn_id,
+    });
+    expect(database.prepare(`
+      SELECT state FROM runtime_workspace_background_work WHERE holder_turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'failed' });
+    expect(service.snapshot().workspace_leases).toEqual([]);
+
+    await service.close();
+    database.close();
+  });
+
+  test('notifies recovery and records unknown background side effects before releasing isolation', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'background-unknown');
+    const fake = createEndingBackgroundQuery({
+      sessionId: 'claude-session-background-unknown',
+      outcome: 'unknown',
+    });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-background-unknown',
+      now: () => '2026-07-19T09:07:20Z',
+      generateId: deterministicIds('background-unknown'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'recovering',
+      turn_id: accepted.turn_id,
+    });
+    expect(database.prepare(`
+      SELECT state FROM runtime_workspace_background_work WHERE holder_turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'unknown' });
+    expect(database.prepare(`
+      SELECT state FROM runtime_workspace_leases WHERE holder_turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'released' });
+    expect(readEvents(database, accepted.turn_id).at(-1)).toMatchObject({
+      phase: 'recovering',
+      kind: 'recovery_started',
+      payload: expect.objectContaining({ side_effect_status: 'unknown' }),
+      error: expect.objectContaining({ side_effect_status: 'unknown' }),
+    });
 
     await service.close();
     database.close();

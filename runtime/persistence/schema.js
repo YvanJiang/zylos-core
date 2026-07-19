@@ -97,6 +97,7 @@ const RUNTIME_SCHEMA = `
     turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
     status TEXT NOT NULL,
     wait_reason TEXT,
+    wait_detail_json TEXT,
     enqueued_at TEXT NOT NULL,
     PRIMARY KEY (conversation_id, queue_sequence)
   );
@@ -118,6 +119,58 @@ const RUNTIME_SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS runtime_executor_residents_by_bot
     ON runtime_executor_residents(bot_id, provider);
+
+  CREATE TABLE IF NOT EXISTS runtime_workspace_lease_fences (
+    workspace_root TEXT PRIMARY KEY,
+    last_epoch INTEGER NOT NULL CHECK (last_epoch > 0),
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_workspace_leases (
+    workspace_lease_id TEXT PRIMARY KEY,
+    workspace_root TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK (mode IN ('writable', 'read_only')),
+    holder_service_instance_id TEXT NOT NULL,
+    holder_conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    holder_turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),
+    lease_epoch INTEGER NOT NULL CHECK (lease_epoch > 0),
+    lease_expires_at TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('active', 'uncertain', 'released', 'expired')),
+    acquired_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    released_at TEXT,
+    UNIQUE (workspace_root, lease_epoch),
+    CHECK (
+      (state IN ('active', 'uncertain') AND released_at IS NULL)
+      OR (state IN ('released', 'expired') AND released_at IS NOT NULL)
+    )
+  );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS runtime_workspace_leases_active_turn
+    ON runtime_workspace_leases(holder_turn_id)
+    WHERE state IN ('active', 'uncertain');
+
+  CREATE INDEX IF NOT EXISTS runtime_workspace_leases_active_root
+    ON runtime_workspace_leases(state, workspace_root, lease_expires_at);
+
+  CREATE TABLE IF NOT EXISTS runtime_workspace_background_work (
+    background_work_id TEXT PRIMARY KEY,
+    workspace_lease_id TEXT NOT NULL REFERENCES runtime_workspace_leases(workspace_lease_id),
+    holder_turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),
+    provider_task_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('active', 'completed', 'failed', 'unknown')),
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    error_json TEXT,
+    UNIQUE (workspace_lease_id, provider_task_id),
+    CHECK (
+      (state = 'active' AND ended_at IS NULL)
+      OR (state IN ('completed', 'failed', 'unknown') AND ended_at IS NOT NULL)
+    )
+  );
+
+  CREATE INDEX IF NOT EXISTS runtime_workspace_background_work_active
+    ON runtime_workspace_background_work(holder_turn_id, state);
 
   CREATE TABLE IF NOT EXISTS runtime_executor_leases (
     conversation_id TEXT PRIMARY KEY REFERENCES runtime_conversations(conversation_id),
@@ -426,6 +479,7 @@ export function initializeRuntimePersistence(database) {
     'TEXT',
   );
   addColumnIfMissing(database, 'runtime_turn_queue', 'wait_reason', 'TEXT');
+  addColumnIfMissing(database, 'runtime_turn_queue', 'wait_detail_json', 'TEXT');
   addColumnIfMissing(database, 'runtime_executor_residents', 'owner_service_instance_id', 'TEXT');
   addColumnIfMissing(
     database,

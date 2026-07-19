@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 
 import { createExecutorStore } from '../persistence/executor-store.js';
+import { resolveProviderWorkspaceAccess } from '../workspace/lease-coordinator.js';
 
 function defaultGenerateId(kind) {
   return `${kind}-${crypto.randomUUID()}`;
@@ -16,8 +17,13 @@ export function createExecutorService({
   leaseDurationMs,
   residentLeaseDurationMs = 60_000,
   residentHeartbeatIntervalMs = 20_000,
+  workspaceRoot = process.cwd(),
+  workspaceLeaseDurationMs = 10_000,
+  workspaceHeartbeatIntervalMs = Math.min(3_000, workspaceLeaseDurationMs / 3),
   scheduleResidentHeartbeat = setInterval,
   cancelResidentHeartbeat = clearInterval,
+  scheduleWorkspaceHeartbeat = setInterval,
+  cancelWorkspaceHeartbeat = clearInterval,
   permissionHandler = null,
   interactionTimeoutMs,
   maxResidentExecutorsPerBot = 20,
@@ -60,6 +66,27 @@ export function createExecutorService({
     throw new TypeError('cancelResidentHeartbeat must be a function');
   }
   if (
+    !Number.isFinite(workspaceLeaseDurationMs)
+    || workspaceLeaseDurationMs <= 0
+  ) {
+    throw new TypeError('workspaceLeaseDurationMs must be a positive finite number');
+  }
+  if (
+    !Number.isFinite(workspaceHeartbeatIntervalMs)
+    || workspaceHeartbeatIntervalMs <= 0
+    || workspaceHeartbeatIntervalMs >= workspaceLeaseDurationMs
+  ) {
+    throw new TypeError(
+      'workspaceHeartbeatIntervalMs must be positive and below the workspace lease',
+    );
+  }
+  if (typeof scheduleWorkspaceHeartbeat !== 'function') {
+    throw new TypeError('scheduleWorkspaceHeartbeat must be a function');
+  }
+  if (typeof cancelWorkspaceHeartbeat !== 'function') {
+    throw new TypeError('cancelWorkspaceHeartbeat must be a function');
+  }
+  if (
     !Number.isSafeInteger(maxResidentExecutorsPerBot)
     || maxResidentExecutorsPerBot <= 0
   ) {
@@ -74,6 +101,7 @@ export function createExecutorService({
     generateId,
     leaseDurationMs,
     residentLeaseDurationMs,
+    workspaceLeaseDurationMs,
     interactionTimeoutMs,
   });
   let executors = [];
@@ -95,7 +123,9 @@ export function createExecutorService({
   let lifecycle = 'open';
   let closePromise = null;
   let residentHeartbeat = null;
+  let workspaceHeartbeat = null;
   let residentHeartbeatFailure = null;
+  let workspaceHeartbeatFailure = null;
 
   function persistenceFailure(cause) {
     const error = new Error(`Runtime persistence failed: ${cause.message}`, { cause });
@@ -172,6 +202,7 @@ export function createExecutorService({
         ...executor,
         queued_turn_ids: [...executor.queued_turn_ids],
       })),
+      workspace_leases: store.listActiveWorkspaceLeases(),
     };
   }
 
@@ -216,6 +247,17 @@ export function createExecutorService({
         }
       }, residentHeartbeatIntervalMs);
       residentHeartbeat?.unref?.();
+    }
+    if (workspaceHeartbeat === null) {
+      workspaceHeartbeat = scheduleWorkspaceHeartbeat(() => {
+        try {
+          store.heartbeatOwnedWorkspaceLeases();
+          workspaceHeartbeatFailure = null;
+        } catch (error) {
+          workspaceHeartbeatFailure = error;
+        }
+      }, workspaceHeartbeatIntervalMs);
+      workspaceHeartbeat?.unref?.();
     }
     refresh();
     reschedulePendingInteractionDeadlines();
@@ -299,11 +341,16 @@ export function createExecutorService({
     if (settlement) await settlement.promise;
   }
 
-  function transitionToRecovery(activeRun, reasonCode = 'provider_execution_uncertain') {
+  function transitionToRecovery(
+    activeRun,
+    reasonCode = 'provider_execution_uncertain',
+    error = null,
+  ) {
     const { state } = store.assertCurrentFence(activeRun.turnContext);
     persist(() => store.transitionTurn(activeRun.turnContext, state, 'recovering', {
       error: null,
       reasonCode,
+      recovery: error === null ? null : { error },
     }));
     activeRun.durableSettled = true;
     refresh();
@@ -329,6 +376,26 @@ export function createExecutorService({
     closingPermissionTurnIds.add(turnContext.turn_id);
     for (const controller of permissionControllers.get(turnContext.turn_id) ?? []) {
       controller.abort();
+    }
+    if (activeRun.backgroundUncertain) {
+      const recovery = transitionToRecovery(
+        activeRun,
+        'provider_background_work_unknown',
+        {
+          code: 'provider_background_work_unknown',
+          category: 'provider',
+          retryable: false,
+          side_effect_status: 'unknown',
+          user_message: 'Background workspace work ended without a confirmed outcome.',
+        },
+      );
+      try {
+        if (typeof adapter.abort === 'function') await adapter.abort(turnContext);
+        releaseRecoveringOwnership(turnContext);
+      } catch (isolationFailure) {
+        residentHeartbeatFailure = isolationFailure;
+      }
+      return recovery;
     }
     if (uncertainTurnIds.has(turnContext.turn_id)) {
       const isolationProven = cancellationSettlements.get(turnContext.turn_id)?.isolationProven;
@@ -377,6 +444,27 @@ export function createExecutorService({
       }
       return recovery;
     }
+    if (activeRun.backgroundUncertain) {
+      const { turnContext } = activeRun;
+      const recovery = transitionToRecovery(
+        activeRun,
+        'provider_background_work_unknown',
+        {
+          code: 'provider_background_work_unknown',
+          category: 'provider',
+          retryable: false,
+          side_effect_status: 'unknown',
+          user_message: 'Background workspace work ended without a confirmed outcome.',
+        },
+      );
+      try {
+        if (typeof adapter.abort === 'function') await adapter.abort(turnContext);
+        releaseRecoveringOwnership(turnContext);
+      } catch (isolationFailure) {
+        residentHeartbeatFailure = isolationFailure;
+      }
+      return recovery;
+    }
     const terminalState = activeRun.outcome === 'cancelled'
       ? 'stopped'
       : (activeRun.outcome === 'failed' ? 'failed' : 'completed');
@@ -419,6 +507,25 @@ export function createExecutorService({
           activeRun.pauseKind = 'interaction';
           refresh();
           return resultFor(activeRun, 'waiting_user', { request: record.request });
+        }
+        if (record?.type === 'background_work_started') {
+          activeRun.usesManagedRecords = true;
+          persist(() => store.startWorkspaceBackgroundWork(
+            activeRun.turnContext,
+            record.provider_task_id,
+          ));
+          continue;
+        }
+        if (record?.type === 'background_work_finished') {
+          activeRun.usesManagedRecords = true;
+          persist(() => store.finishWorkspaceBackgroundWork(
+            activeRun.turnContext,
+            record.provider_task_id,
+            record.outcome,
+          ));
+          if (record.outcome === 'unknown') activeRun.backgroundUncertain = true;
+          else if (record.outcome !== 'completed') activeRun.outcome = 'failed';
+          continue;
         }
         if (record?.kind === 'interaction_requested') {
           const request = persist(() => store.requestInteraction(
@@ -495,6 +602,9 @@ export function createExecutorService({
         );
         if (released) endedResidentFences.delete(context.conversation_id);
       },
+      assertWorkspaceWrite() {
+        return persist(() => store.assertWorkspaceWritable(turnContext));
+      },
       async requestPermission(request, { signal } = {}) {
         if (permissionHandler === null) {
           return Object.freeze({
@@ -555,23 +665,52 @@ export function createExecutorService({
     });
   }
 
+  function reserveWithWorkspace({ markCapacityWait = true } = {}) {
+    const workspaceAccessByConversation = new Map(
+      store.listWorkspaceReservationCandidates().map((candidate) => [
+        candidate.conversation_id,
+        resolveProviderWorkspaceAccess(adapter, {
+          conversation_id: candidate.conversation_id,
+          turn_id: candidate.turn_id,
+          provider,
+        }, { defaultRoot: workspaceRoot }),
+      ]),
+    );
+    return {
+      reservation: store.reserveNextExecutor({
+        maxResidentExecutorsPerBot,
+        markCapacityWait,
+        workspaceAccessByConversation,
+      }),
+      workspaceAccessByConversation,
+    };
+  }
+
   async function runNext() {
     if (lifecycle !== 'open') {
       throw new Error(`Executor service is ${lifecycle}; it cannot claim another turn.`);
     }
     if (!started) start();
     if (residentHeartbeatFailure) throw persistenceFailure(residentHeartbeatFailure);
-    let reservation = store.reserveNextExecutor({
-      maxResidentExecutorsPerBot,
-      markCapacityWait: false,
-    });
+    if (workspaceHeartbeatFailure) throw persistenceFailure(workspaceHeartbeatFailure);
+    let reserved = reserveWithWorkspace({ markCapacityWait: false });
+    let { reservation } = reserved;
     if (reservation.status === 'idle') return reservation;
+    if (reservation.status === 'workspace_wait') {
+      refresh();
+      return reservation;
+    }
     if (reservation.status === 'capacity_wait') {
       await evictIdleExecutors();
       if (lifecycle !== 'open') {
         throw new Error(`Executor service is ${lifecycle}; it cannot claim another turn.`);
       }
-      reservation = store.reserveNextExecutor({ maxResidentExecutorsPerBot });
+      reserved = reserveWithWorkspace();
+      ({ reservation } = reserved);
+    }
+    if (reservation.status === 'workspace_wait') {
+      refresh();
+      return reservation;
     }
     if (reservation.status === 'capacity_wait') {
       refresh();
@@ -580,7 +719,17 @@ export function createExecutorService({
     const turnContext = store.claimNextQueuedTurn({
       conversationId: reservation.conversation_id,
       requireResident: provider === 'claude',
+      workspaceAccess: reserved.workspaceAccessByConversation.get(
+        reservation.conversation_id,
+      ) ?? resolveProviderWorkspaceAccess(adapter, {
+        conversation_id: reservation.conversation_id,
+        provider,
+      }, { defaultRoot: workspaceRoot }),
     });
+    if (turnContext?.status === 'workspace_wait') {
+      refresh();
+      return turnContext;
+    }
     if (!turnContext) {
       refresh();
       return { status: 'idle' };
@@ -592,6 +741,7 @@ export function createExecutorService({
     });
     const activeRun = {
       advancing: null,
+      backgroundUncertain: false,
       durableSettled: false,
       iterator: null,
       outcome: null,
@@ -1051,6 +1201,10 @@ export function createExecutorService({
         if (lifecycle === 'closed' && residentHeartbeat !== null) {
           cancelResidentHeartbeat(residentHeartbeat);
           residentHeartbeat = null;
+        }
+        if (lifecycle === 'closed' && workspaceHeartbeat !== null) {
+          cancelWorkspaceHeartbeat(workspaceHeartbeat);
+          workspaceHeartbeat = null;
         }
         if (lifecycle === 'close_failed' && closePromise === closing) {
           closePromise = null;

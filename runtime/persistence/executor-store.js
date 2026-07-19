@@ -18,6 +18,7 @@ import {
 } from '../../contracts/public/index.js';
 import { stageMainProjection } from './main-projection.js';
 import { initializeRuntimePersistence } from './schema.js';
+import { createWorkspaceLeaseCoordinator } from '../workspace/lease-coordinator.js';
 
 const CANONICAL_TRANSITIONS = Object.freeze({
   queued: Object.freeze(['starting']),
@@ -383,9 +384,17 @@ export function createExecutorStore({
   generateId,
   leaseDurationMs = 10_000,
   residentLeaseDurationMs = 60_000,
+  workspaceLeaseDurationMs = 10_000,
   interactionTimeoutMs = 10 * 60_000,
 }) {
   initializeRuntimePersistence(database);
+  const workspaceLeases = createWorkspaceLeaseCoordinator({
+    database,
+    serviceInstanceId,
+    now,
+    generateId,
+    leaseDurationMs: workspaceLeaseDurationMs,
+  });
 
   function assertResidentOwner(conversationId, expectedEpoch = null) {
     if (provider !== 'claude') return;
@@ -407,6 +416,9 @@ export function createExecutorStore({
   function assertTurnContextFence(turn, turnContext) {
     assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
     assertResidentOwner(turn.conversation_id, turnContext.resident?.owner_epoch ?? null);
+    if (turnContext.workspace !== null && turnContext.workspace !== undefined) {
+      workspaceLeases.assertCurrent(turnContext.workspace);
+    }
   }
 
   function rejectedInteractionAnswerResult(answer, persistenceError) {
@@ -470,7 +482,7 @@ export function createExecutorStore({
 
   function rebuildExecutorCache() {
     const rows = database.prepare(`
-      SELECT conversation_id, turn_id, status, wait_reason, queue_sequence
+      SELECT conversation_id, turn_id, status, wait_reason, wait_detail_json, queue_sequence
       FROM runtime_turn_queue
       WHERE status IN ('queued', 'claimed')
       ORDER BY conversation_id ASC, queue_sequence ASC
@@ -490,7 +502,12 @@ export function createExecutorStore({
       if (row.status === 'claimed') projection.active_turn_id = row.turn_id;
       else {
         projection.queued_turn_ids.push(row.turn_id);
-        projection.wait_reason ??= row.wait_reason;
+        if (projection.wait_reason === null && row.wait_reason !== null) {
+          projection.wait_reason = row.wait_reason;
+          if (row.wait_detail_json !== null) {
+            projection.wait_detail = JSON.parse(row.wait_detail_json);
+          }
+        }
       }
     }
     return [...executors.values()];
@@ -589,7 +606,7 @@ export function createExecutorStore({
     `).run(event.turn_version, occurredAt, turnId, turn.turn_version);
     const queueUpdate = database.prepare(`
       UPDATE runtime_turn_queue
-      SET wait_reason = 'executor_capacity'
+      SET wait_reason = 'executor_capacity', wait_detail_json = NULL
       WHERE turn_id = ? AND status = 'queued' AND wait_reason IS NOT 'executor_capacity'
     `).run(turnId);
     if (turnUpdate.changes !== 1 || queueUpdate.changes !== 1) {
@@ -597,6 +614,78 @@ export function createExecutorStore({
     }
     persistEvent(database, turn, event, generateId);
     return result;
+  }
+
+  function markWorkspaceWaitInTransaction(turnId, wait, occurredAt) {
+    const queued = database.prepare(`
+      SELECT turn.turn_id, turn.conversation_id, turn.turn_version,
+        queue.wait_reason, queue.wait_detail_json
+      FROM runtime_turns AS turn
+      JOIN runtime_turn_queue AS queue ON queue.turn_id = turn.turn_id
+      WHERE turn.turn_id = ? AND turn.state = 'queued' AND queue.status = 'queued'
+    `).get(turnId);
+    if (!queued) return null;
+    const waitDetail = {
+      workspace_root: wait.workspace_root,
+      mode: wait.mode,
+      conflicting_workspace_root: wait.conflicting_workspace_root,
+      holder_conversation_id: wait.holder_conversation_id,
+      holder_turn_id: wait.holder_turn_id,
+      holder_background_work_ids: wait.holder_background_work_ids,
+      recovery_required: wait.recovery_required === true,
+    };
+    const waitDetailJson = JSON.stringify(waitDetail);
+    if (
+      queued.wait_reason === 'workspace_lease'
+      && queued.wait_detail_json === waitDetailJson
+    ) {
+      return {
+        status: 'workspace_wait',
+        conversation_id: queued.conversation_id,
+        turn_id: queued.turn_id,
+        wait_reason: 'workspace_lease',
+        wait_detail: waitDetail,
+      };
+    }
+    const turn = loadTurn(database, turnId);
+    const event = buildEvent({
+      turn,
+      lastEvent: loadLastEvent(database, turnId),
+      fence: null,
+      provider: null,
+      descriptor: {
+        kind: 'turn_state_changed',
+        phase: 'queued',
+        payload: {
+          from_state: 'queued',
+          to_state: 'queued',
+          reason_code: 'workspace_lease',
+        },
+      },
+      occurredAt,
+      generateId,
+    });
+    const turnUpdate = database.prepare(`
+      UPDATE runtime_turns
+      SET turn_version = ?, committed_at = ?
+      WHERE turn_id = ? AND state = 'queued' AND turn_version = ?
+    `).run(event.turn_version, occurredAt, turnId, turn.turn_version);
+    const queueUpdate = database.prepare(`
+      UPDATE runtime_turn_queue
+      SET wait_reason = 'workspace_lease', wait_detail_json = ?
+      WHERE turn_id = ? AND status = 'queued'
+    `).run(waitDetailJson, turnId);
+    if (turnUpdate.changes !== 1 || queueUpdate.changes !== 1) {
+      conflict('stale_attempt', 'The workspace-wait projection changed concurrently.');
+    }
+    persistEvent(database, turn, event, generateId);
+    return {
+      status: 'workspace_wait',
+      conversation_id: queued.conversation_id,
+      turn_id: queued.turn_id,
+      wait_reason: 'workspace_lease',
+      wait_detail: waitDetail,
+    };
   }
 
   function isResidentConversation(conversationId) {
@@ -660,11 +749,45 @@ export function createExecutorStore({
     `).get(botId).count;
   }
 
-  function reserveNextExecutor({ maxResidentExecutorsPerBot, markCapacityWait = true }) {
+  function reserveNextExecutor({
+    maxResidentExecutorsPerBot,
+    markCapacityWait = true,
+    workspaceAccessByConversation = null,
+  }) {
     const reserve = database.transaction(() => {
       reconcileExpiredResidents();
-      const candidates = listClaimableQueuedTurns();
-      if (candidates.length === 0) return { status: 'idle' };
+      const claimable = listClaimableQueuedTurns();
+      if (claimable.length === 0) return { status: 'idle' };
+      const workspaceWaits = [];
+      const candidates = [];
+      for (const candidate of claimable) {
+        const workspaceAccess = workspaceAccessByConversation?.get(candidate.conversation_id);
+        if (!workspaceAccess) {
+          candidates.push(candidate);
+          continue;
+        }
+        if (provider === 'claude') {
+          const resident = isResidentConversation(candidate.conversation_id);
+          const checkedAt = now();
+          const hasCapacity = resident?.owner_service_instance_id === serviceInstanceId
+            || (resident && (!resident.owner_expires_at || resident.owner_expires_at <= checkedAt))
+            || (!resident && residentCountForBot(candidate.bot_id) < maxResidentExecutorsPerBot);
+          if (!hasCapacity) {
+            candidates.push(candidate);
+            continue;
+          }
+        }
+        const availability = workspaceLeases.inspect(workspaceAccess);
+        if (availability.status === 'wait') {
+          const wait = markWorkspaceWaitInTransaction(candidate.turn_id, availability, now());
+          if (wait) workspaceWaits.push(wait);
+        } else {
+          candidates.push(candidate);
+        }
+      }
+      if (candidates.length === 0) {
+        return workspaceWaits[0] ?? { status: 'idle' };
+      }
       if (provider !== 'claude') {
         return {
           status: 'ready',
@@ -780,7 +903,11 @@ export function createExecutorStore({
     return reserve.immediate();
   }
 
-  function claimNextQueuedTurn({ conversationId = null, requireResident = false } = {}) {
+  function claimNextQueuedTurn({
+    conversationId = null,
+    requireResident = false,
+    workspaceAccess = null,
+  } = {}) {
     const claim = database.transaction(() => {
       const turn = database.prepare(`
         SELECT turn.turn_id
@@ -827,6 +954,15 @@ export function createExecutorStore({
         )
       ) {
         conflict('stale_attempt', 'The queued turn lost its resident executor reservation.');
+      }
+      const workspace = workspaceAccess === null ? null : workspaceLeases.acquire({
+        workspace_root: workspaceAccess.workspace_root,
+        mode: workspaceAccess.mode,
+        holder_conversation_id: current.conversation_id,
+        holder_turn_id: current.turn_id,
+      });
+      if (workspace?.status === 'wait') {
+        return markWorkspaceWaitInTransaction(current.turn_id, workspace, claimedAt);
       }
       const existingLease = database.prepare(`
         SELECT lease_epoch
@@ -880,7 +1016,7 @@ export function createExecutorStore({
       );
       const queueUpdate = database.prepare(`
         UPDATE runtime_turn_queue
-        SET status = 'claimed', wait_reason = NULL
+        SET status = 'claimed', wait_reason = NULL, wait_detail_json = NULL
         WHERE turn_id = ? AND status = 'queued'
       `).run(current.turn_id);
       if (turnUpdate.changes !== 1 || queueUpdate.changes !== 1) {
@@ -910,6 +1046,7 @@ export function createExecutorStore({
         resident: resident === null ? null : Object.freeze({
           owner_epoch: resident.owner_epoch,
         }),
+        workspace,
         attempt: fence,
       };
     });
@@ -1024,7 +1161,7 @@ export function createExecutorStore({
     turnContext,
     fromState,
     toState,
-    { error = null, reasonCode = null } = {},
+    { error = null, reasonCode = null, recovery = null } = {},
   ) {
     const transition = database.transaction(() => {
       let turn = loadTurn(database, turnContext.turn_id);
@@ -1033,7 +1170,7 @@ export function createExecutorStore({
       if (toState === 'stopped') {
         turn = cancelUnsentInteractions(turnContext, turn, occurredAt);
       }
-      return transitionInTransaction(database, {
+      let event = transitionInTransaction(database, {
         turnId: turnContext.turn_id,
         fromState,
         toState,
@@ -1045,6 +1182,49 @@ export function createExecutorStore({
         error,
         reasonCode: reasonCode ?? undefined,
       });
+      if (recovery !== null) {
+        if (toState !== 'recovering' || recovery?.error === null || !recovery?.error) {
+          conflict(
+            'validation_error',
+            'A recovery event requires a recovering transition and public error.',
+          );
+        }
+        turn = loadTurn(database, turnContext.turn_id);
+        event = buildEvent({
+          turn,
+          lastEvent: loadLastEvent(database, turn.turn_id),
+          fence: turnContext.attempt,
+          provider,
+          descriptor: {
+            kind: 'recovery_started',
+            phase: 'recovering',
+            payload: {
+              recovery_id: generateId('recovery'),
+              recovery_of_turn_id: turn.turn_id,
+              recovery_of_lineage_id: turn.lineage_id,
+              side_effect_status: recovery.error.side_effect_status,
+            },
+            error: {
+              ...recovery.error,
+              occurred_at: recovery.error.occurred_at ?? occurredAt,
+            },
+          },
+          occurredAt,
+          generateId,
+        });
+        commitTurnEvent(database, {
+          turn,
+          event,
+          fence: turnContext.attempt,
+          nextState: 'recovering',
+          staleMessage: 'The recovery notification lost its provider attempt fence.',
+          generateId,
+        });
+      }
+      if (TERMINAL_STATES.has(toState) && toState !== 'timed_out' && turnContext.workspace) {
+        workspaceLeases.release(turnContext.workspace);
+      }
+      return event;
     });
     return transition.immediate();
   }
@@ -1053,6 +1233,15 @@ export function createExecutorStore({
     const turn = loadTurn(database, turnContext.turn_id);
     assertTurnContextFence(turn, turnContext);
     return Object.freeze({ state: turn.state });
+  }
+
+  function assertWorkspaceWritable(turnContext) {
+    const turn = loadTurn(database, turnContext.turn_id);
+    assertTurnContextFence(turn, turnContext);
+    if (!turnContext.workspace) {
+      conflict('stale_workspace_lease', 'The turn has no workspace lease fence.');
+    }
+    return workspaceLeases.assertWritable(turnContext.workspace);
   }
 
   function bindProviderNativeId(turnContext, providerNativeId) {
@@ -1177,7 +1366,25 @@ export function createExecutorStore({
         )
       LIMIT 1
     `).get(conversationId);
-    return blockingTurn === undefined;
+    return blockingTurn === undefined
+      && !workspaceLeases.hasBlockingBackgroundWork(conversationId);
+  }
+
+  function startWorkspaceBackgroundWork(turnContext, providerTaskId) {
+    const turn = loadTurn(database, turnContext.turn_id);
+    assertTurnContextFence(turn, turnContext);
+    return workspaceLeases.startBackgroundWork(turnContext.workspace, {
+      provider_task_id: providerTaskId,
+    });
+  }
+
+  function finishWorkspaceBackgroundWork(turnContext, providerTaskId, outcome) {
+    const turn = loadTurn(database, turnContext.turn_id);
+    assertTurnContextFence(turn, turnContext);
+    return workspaceLeases.finishBackgroundWork(turnContext.workspace, {
+      provider_task_id: providerTaskId,
+      outcome,
+    });
   }
 
   function releaseExecutorResident(conversationId, ownerEpoch = null) {
@@ -1843,6 +2050,9 @@ export function createExecutorStore({
       if (released.changes !== 1) {
         conflict('stale_attempt', 'The timed-out turn lost its executor lease fence.');
       }
+      workspaceLeases.releaseTurnAfterIsolation(turn.turn_id, {
+        reason: 'timed_out_provider_isolation_confirmed',
+      });
       return true;
     });
     return release.immediate();
@@ -1859,6 +2069,11 @@ export function createExecutorStore({
           `Turn ${turn.turn_id} is ${turn.state}; expected recovering before ownership release.`,
         );
       }
+      const workspaceReleased = turnContext.workspace
+        ? workspaceLeases.releaseAfterIsolation(turnContext.workspace, {
+          reason: 'provider_isolation_confirmed',
+        })
+        : null;
       const releasedLease = database.prepare(`
         UPDATE runtime_executor_leases
         SET lease_owner = NULL, turn_id = NULL, attempt_id = NULL,
@@ -1907,7 +2122,11 @@ export function createExecutorStore({
           residentReleased = true;
         }
       }
-      return { lease_released: true, resident_released: residentReleased };
+      return {
+        lease_released: true,
+        resident_released: residentReleased,
+        workspace_released: workspaceReleased !== null,
+      };
     });
     return release.immediate();
   }
@@ -2421,23 +2640,29 @@ export function createExecutorStore({
     acknowledgeInteractionHandoff,
     appendAdapterEvent,
     assertCurrentFence,
+    assertWorkspaceWritable,
     bindProviderNativeId,
     claimNextQueuedTurn,
     claimInteractionHandoff,
     commitInteractionAnswer,
     heartbeatOwnedResidents,
+    heartbeatOwnedWorkspaceLeases: workspaceLeases.heartbeatOwned,
     isConversationEvictable,
     markInteractionHandoffDeliveryUnknown,
     releaseExecutorResident,
     releaseRecoveringExecutorOwnership,
     reconcileExpiredResidents,
     expireInteraction,
+    finishWorkspaceBackgroundWork,
     listPendingInteractionDeadlines,
+    listActiveWorkspaceLeases: workspaceLeases.listActive,
+    listWorkspaceReservationCandidates: listClaimableQueuedTurns,
     rebuildExecutorCache,
     releaseTimedOutExecutorLease,
     requestInteraction,
     resumeTurnAfterPermission,
     reserveNextExecutor,
+    startWorkspaceBackgroundWork,
     transitionTurn,
   });
 }
