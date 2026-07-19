@@ -490,6 +490,10 @@ describe('runtime executor service', () => {
         lineage_id: accepted.lineage_id,
         trace_id: 'trace-canonical',
         input: normalEnvelope().content,
+        interaction: {
+          authorized_subjects: [{ type: 'actor', actor_id: 'user-A' }],
+          allowed_sources: ['main_card_reply', 'card_action'],
+        },
         lineage: { provider_native_id: null },
         bindProviderNativeId: expect.any(Function),
         attempt: {

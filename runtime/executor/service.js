@@ -190,6 +190,10 @@ export function createExecutorService({
         lineage_id: turnContext.lineage_id,
         trace_id: turnContext.trace_id,
         input: turnContext.input,
+        interaction: Object.freeze({
+          authorized_subjects: turnContext.interaction.authorized_subjects.map(Object.freeze),
+          allowed_sources: Object.freeze([...turnContext.interaction.allowed_sources]),
+        }),
         lineage: Object.freeze({ ...turnContext.lineage }),
         bindProviderNativeId: (providerNativeId) => (
           store.bindProviderNativeId(turnContext, providerNativeId)
@@ -220,9 +224,18 @@ export function createExecutorService({
       throw new TypeError('adapter.handleInteractionAnswer must be a function');
     }
     const delivery = store.claimInteractionHandoff(handoffId);
-    const handlerAcknowledgement = await adapter.handleInteractionAnswer(
-      Object.freeze(delivery),
-    );
+    let handlerAcknowledgement;
+    try {
+      handlerAcknowledgement = await adapter.handleInteractionAnswer(Object.freeze(delivery));
+    } catch (error) {
+      if (!isExplicitProviderError(error)) throw error;
+      const providerError = normalizeProviderError(error, now());
+      if (providerError.side_effect_status !== 'unknown') throw error;
+      const outcome = store.markInteractionHandoffDeliveryUnknown(delivery, providerError);
+      activeRuns.delete(delivery.request.turn_id);
+      refresh();
+      return outcome;
+    }
     const acknowledgement = store.acknowledgeInteractionHandoff(handlerAcknowledgement);
     const activeRun = activeRuns.get(delivery.request.turn_id);
     const execution = acknowledgement.resumed && activeRun

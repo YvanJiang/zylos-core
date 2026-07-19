@@ -3,6 +3,7 @@ import {
   createNormalizedEventStreamState,
   TERMINAL_TURN_STATES,
   validateInteractionAnswer,
+  validateInteractionAnswerAgainstRequest,
   validateInteractionAnswerResult,
   validateInteractionHandoff,
   validateInteractionHandoffTransition,
@@ -17,7 +18,8 @@ const CANONICAL_TRANSITIONS = Object.freeze({
   queued: Object.freeze(['starting']),
   starting: Object.freeze(['running']),
   running: Object.freeze(['waiting_user', 'completed', 'failed']),
-  waiting_user: Object.freeze(['running']),
+  waiting_user: Object.freeze(['running', 'recovering']),
+  recovering: Object.freeze([]),
 });
 
 export class ExecutorPersistenceError extends Error {
@@ -570,6 +572,15 @@ export function createExecutorStore({
         lineage_id: current.lineage_id,
         trace_id: envelope.trace_id,
         input: envelope.content,
+        interaction: {
+          authorized_subjects: envelope.actor?.authenticated === true
+            && typeof envelope.actor.actor_id === 'string'
+            ? [{ type: 'actor', actor_id: envelope.actor.actor_id }]
+            : [],
+          allowed_sources: ['main_card_reply', ...(
+            ['feishu', 'lark'].includes(envelope.channel) ? ['card_action'] : []
+          )],
+        },
         lineage: {
           provider_native_id: current.provider_native_id,
         },
@@ -817,13 +828,32 @@ export function createExecutorStore({
       `).get(answer.interaction_id);
       if (!row) conflict('interaction_not_found', `Interaction ${answer.interaction_id} does not exist.`);
       const request = JSON.parse(row.request_json);
+      const turn = loadTurn(database, request.turn_id);
+      const envelope = JSON.parse(turn.envelope_json);
+      const interactions = database.prepare(`
+        SELECT request_json
+        FROM runtime_interactions
+        WHERE turn_id = ?
+        ORDER BY ordinal
+      `).all(request.turn_id).map(({ request_json: requestJson }) => JSON.parse(requestJson));
+      validateInteractionAnswerAgainstRequest(answer, request, {
+        interactions,
+        requestScope: {
+          region: envelope.region,
+          tenant_id: envelope.tenant_id,
+          channel: envelope.channel,
+          bot_id: envelope.bot_id,
+          chat_id: envelope.chat_id,
+          native_thread_or_topic_id: envelope.native_thread_or_topic_id,
+        },
+        occurredAt: committedAt,
+      });
       if (request.state !== 'pending') {
         conflict('interaction_already_answered', 'Only a pending interaction can accept an answer.');
       }
       if (answer.interaction_version !== request.version) {
         conflict('version_conflict', 'The answer does not match the current interaction version.');
       }
-      const turn = loadTurn(database, request.turn_id);
       if (turn.state !== 'waiting_user') {
         conflict('illegal_transition', `Interaction answers are invalid while turn is ${turn.state}.`);
       }
@@ -1268,6 +1298,148 @@ export function createExecutorStore({
     return acknowledge.immediate();
   }
 
+  function markInteractionHandoffDeliveryUnknown(delivery, error) {
+    const markUnknown = database.transaction(() => {
+      const occurredAt = now();
+      const { request, handoff } = delivery;
+      const row = database.prepare(`
+        SELECT interaction.request_json, durable_handoff.record_json
+        FROM runtime_interactions AS interaction
+        JOIN runtime_interaction_handoffs AS durable_handoff
+          ON durable_handoff.interaction_id = interaction.interaction_id
+        WHERE durable_handoff.handoff_id = ?
+      `).get(handoff.handoff_id);
+      if (!row) conflict('handoff_not_found', `Interaction handoff ${handoff.handoff_id} does not exist.`);
+      const persistedRequest = JSON.parse(row.request_json);
+      const persistedHandoff = JSON.parse(row.record_json);
+      const turn = loadTurn(database, persistedRequest.turn_id);
+      const fence = {
+        attempt_id: turn.attempt_id,
+        attempt_no: turn.attempt_no,
+        lease_epoch: turn.lease_epoch,
+      };
+      if (
+        persistedRequest.state !== 'answer_delivering'
+        || persistedHandoff.state !== 'delivering'
+        || request.interaction_id !== persistedRequest.interaction_id
+        || handoff.handoff_attempt_id !== persistedHandoff.handoff_attempt_id
+        || handoff.handoff_attempt_no !== persistedHandoff.handoff_attempt_no
+        || handoff.provider_attempt_id !== persistedHandoff.provider_attempt_id
+        || handoff.lease_epoch !== persistedHandoff.lease_epoch
+        || error?.side_effect_status !== 'unknown'
+      ) {
+        conflict('stale_attempt', 'The uncertain provider delivery does not match the current handoff fence.');
+      }
+      assertActiveFence(database, turn, fence, serviceInstanceId);
+      validateInteractionTransition({
+        from: 'answer_delivering',
+        to: 'delivery_unknown',
+        sendStarted: true,
+        occurredAt,
+      });
+      validateInteractionHandoffTransition({
+        from: 'delivering',
+        to: 'delivery_unknown',
+        sendStarted: true,
+        occurredAt,
+      });
+      const updatedRequest = {
+        ...persistedRequest,
+        state: 'delivery_unknown',
+        version: persistedRequest.version + 1,
+        handoff_state: 'delivery_unknown',
+      };
+      const updatedHandoff = {
+        ...persistedHandoff,
+        state: 'delivery_unknown',
+        reason_code: 'provider_ack_uncertain',
+        error,
+        side_effect_status: 'unknown',
+      };
+      validateInteractionRequest(updatedRequest, { occurredAt });
+      validateInteractionHandoff(updatedHandoff, { occurredAt });
+      const interactionUpdate = database.prepare(`
+        UPDATE runtime_interactions
+        SET state = 'delivery_unknown', version = ?, handoff_state = 'delivery_unknown',
+          handoff_version = 3, request_json = ?, updated_at = ?
+        WHERE interaction_id = ? AND state = 'answer_delivering' AND version = ?
+      `).run(
+        updatedRequest.version,
+        JSON.stringify(updatedRequest),
+        occurredAt,
+        persistedRequest.interaction_id,
+        persistedRequest.version,
+      );
+      const handoffUpdate = database.prepare(`
+        UPDATE runtime_interaction_handoffs
+        SET state = 'delivery_unknown', record_json = ?, updated_at = ?
+        WHERE handoff_id = ? AND state = 'delivering'
+          AND handoff_attempt_id = ? AND handoff_attempt_no = ?
+          AND provider_attempt_id = ? AND lease_epoch = ?
+      `).run(
+        JSON.stringify(updatedHandoff),
+        occurredAt,
+        persistedHandoff.handoff_id,
+        persistedHandoff.handoff_attempt_id,
+        persistedHandoff.handoff_attempt_no,
+        persistedHandoff.provider_attempt_id,
+        persistedHandoff.lease_epoch,
+      );
+      if (interactionUpdate.changes !== 1 || handoffUpdate.changes !== 1) {
+        conflict('stale_attempt', 'The uncertain provider delivery lost its handoff fence.');
+      }
+      transitionInTransaction(database, {
+        turnId: turn.turn_id,
+        fromState: 'waiting_user',
+        toState: 'recovering',
+        fence,
+        provider,
+        serviceInstanceId,
+        occurredAt,
+        generateId,
+        reasonCode: 'interaction_answer_delivery_unknown',
+      });
+      const recoveringTurn = loadTurn(database, turn.turn_id);
+      const event = buildEvent({
+        turn: recoveringTurn,
+        lastEvent: loadLastEvent(database, turn.turn_id),
+        fence,
+        provider,
+        descriptor: {
+          kind: 'interaction_answer_delivery_unknown',
+          phase: 'recovering',
+          payload: {
+            interaction_id: updatedRequest.interaction_id,
+            ordinal: updatedRequest.ordinal,
+            interaction_version: updatedRequest.version,
+            handoff_version: 3,
+          },
+          provider_native_id: recoveringTurn.provider_native_id,
+          error,
+        },
+        occurredAt,
+        generateId,
+      });
+      commitTurnEvent(database, {
+        turn: recoveringTurn,
+        event,
+        fence,
+        nextState: 'recovering',
+        staleMessage: 'The delivery-unknown event lost its provider attempt fence.',
+        generateId,
+      });
+      return {
+        status: 'delivery_unknown',
+        interaction_id: updatedRequest.interaction_id,
+        handoff_id: updatedHandoff.handoff_id,
+        turn_id: turn.turn_id,
+        turn_state: 'recovering',
+        turn_version: event.turn_version,
+      };
+    });
+    return markUnknown.immediate();
+  }
+
   return Object.freeze({
     acknowledgeInteractionHandoff,
     appendAdapterEvent,
@@ -1275,6 +1447,7 @@ export function createExecutorStore({
     claimNextQueuedTurn,
     claimInteractionHandoff,
     commitInteractionAnswer,
+    markInteractionHandoffDeliveryUnknown,
     rebuildExecutorCache,
     requestInteraction,
     reserveNextExecutor,
