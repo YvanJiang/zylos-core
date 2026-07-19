@@ -734,6 +734,7 @@ describe('runtime executor service', () => {
         conversation_id: accepted.conversation_id,
         turn_id: accepted.turn_id,
         lineage_id: accepted.lineage_id,
+        provider_native_id: null,
         trace_id: 'trace-canonical',
         input: normalEnvelope().content,
         interaction: {
@@ -1080,6 +1081,260 @@ describe('runtime executor service', () => {
     database.close();
   });
 
+  test('evicts a truly idle resident and retries capacity admission in the same run', async () => {
+    const database = openTestDatabase();
+    const first = acceptQueuedTurn(database, 'resident-eviction-first');
+    const adapterCalls = [];
+    const adapter = {
+      async *execute(context) {
+        adapterCalls.push(context.turn_id);
+      },
+      async evictIdle({ canEvict }) {
+        return await canEvict(first.conversation_id) ? [first.conversation_id] : [];
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-resident-eviction',
+      now: () => '2026-07-19T07:06:00Z',
+      generateId: deterministicIds('resident-eviction'),
+      maxResidentExecutorsPerBot: 1,
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: first.turn_id,
+    });
+    const secondEnvelope = normalEnvelope('resident-eviction-second');
+    secondEnvelope.chat_id = 'chat-resident-eviction-second';
+    const second = acceptNormalInbound(database, secondEnvelope, {
+      now: () => '2026-07-19T07:06:01Z',
+      generateId: deterministicIds('inbound-resident-eviction-second'),
+    });
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: second.turn_id,
+    });
+    expect(adapterCalls).toEqual([first.turn_id, second.turn_id]);
+    expect(database.prepare(`
+      SELECT conversation_id FROM runtime_executor_residents
+    `).all()).toEqual([{ conversation_id: second.conversation_id }]);
+    expect(readEvents(database, second.turn_id).some(
+      (event) => event.payload?.reason_code === 'executor_capacity',
+    )).toBe(false);
+
+    await service.close();
+    database.close();
+  });
+
+  test('reconciles an expired resident owner after an unclean process restart', async () => {
+    const firstDatabase = openTestDatabase();
+    const first = acceptQueuedTurn(firstDatabase, 'resident-crash-first');
+    const secondEnvelope = normalEnvelope('resident-crash-second');
+    secondEnvelope.chat_id = 'chat-resident-crash-second';
+    const second = acceptNormalInbound(firstDatabase, secondEnvelope, {
+      now: () => '2026-07-19T07:06:01Z',
+      generateId: deterministicIds('inbound-resident-crash-second'),
+    });
+    const databasePath = firstDatabase.name;
+    const firstAdapter = {
+      resident: new Set(),
+      async *execute(context) { this.resident.add(context.conversation_id); },
+      hasResident(conversationId) { return this.resident.has(conversationId); },
+    };
+    const firstService = createExecutorService({
+      database: firstDatabase,
+      adapter: firstAdapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-resident-crash-A',
+      now: () => '2026-07-19T07:06:00Z',
+      generateId: deterministicIds('resident-crash-A'),
+      maxResidentExecutorsPerBot: 1,
+      leaseDurationMs: 10_000,
+      residentLeaseDurationMs: 10_000,
+      residentHeartbeatIntervalMs: 3_000,
+    });
+    await expect(firstService.runNext()).resolves.toMatchObject({ turn_id: first.turn_id });
+    firstDatabase.close();
+
+    const restartedDatabase = new Database(databasePath);
+    const secondCalls = [];
+    const restartedService = createExecutorService({
+      database: restartedDatabase,
+      adapter: {
+        async *execute(context) { secondCalls.push(context.turn_id); },
+      },
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-resident-crash-B',
+      now: () => '2026-07-19T07:06:11Z',
+      generateId: deterministicIds('resident-crash-B'),
+      maxResidentExecutorsPerBot: 1,
+      leaseDurationMs: 10_000,
+      residentLeaseDurationMs: 10_000,
+      residentHeartbeatIntervalMs: 3_000,
+    });
+    await expect(restartedService.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: second.turn_id,
+    });
+    expect(secondCalls).toEqual([second.turn_id]);
+    expect(restartedDatabase.prepare(`
+      SELECT conversation_id, owner_service_instance_id, owner_epoch
+      FROM runtime_executor_residents
+    `).all()).toEqual([{
+      conversation_id: second.conversation_id,
+      owner_service_instance_id: 'executor-service-resident-crash-B',
+      owner_epoch: 1,
+    }]);
+
+    restartedDatabase.close();
+  });
+
+  test('heartbeats idle resident ownership so another live service cannot take capacity', async () => {
+    const database = openTestDatabase();
+    const first = acceptQueuedTurn(database, 'resident-heartbeat-first');
+    const secondEnvelope = normalEnvelope('resident-heartbeat-second');
+    secondEnvelope.chat_id = 'chat-resident-heartbeat-second';
+    const second = acceptNormalInbound(database, secondEnvelope, {
+      now: () => '2026-07-19T07:06:01Z',
+      generateId: deterministicIds('inbound-resident-heartbeat-second'),
+    });
+    let currentTime = '2026-07-19T07:06:00Z';
+    let heartbeat;
+    const firstAdapter = {
+      resident: new Set(),
+      async *execute(context) { this.resident.add(context.conversation_id); },
+      hasResident(conversationId) { return this.resident.has(conversationId); },
+    };
+    const firstService = createExecutorService({
+      database,
+      adapter: firstAdapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-resident-heartbeat-A',
+      now: () => currentTime,
+      generateId: deterministicIds('resident-heartbeat-A'),
+      maxResidentExecutorsPerBot: 1,
+      residentLeaseDurationMs: 60_000,
+      residentHeartbeatIntervalMs: 20_000,
+      scheduleResidentHeartbeat(callback) {
+        heartbeat = callback;
+        return { unref() {} };
+      },
+      cancelResidentHeartbeat() {},
+    });
+    await expect(firstService.runNext()).resolves.toMatchObject({ turn_id: first.turn_id });
+
+    currentTime = '2026-07-19T07:06:50Z';
+    heartbeat();
+    currentTime = '2026-07-19T07:07:10Z';
+    const competingService = createExecutorService({
+      database,
+      adapter: { async *execute() {} },
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-resident-heartbeat-B',
+      now: () => currentTime,
+      generateId: deterministicIds('resident-heartbeat-B'),
+      maxResidentExecutorsPerBot: 1,
+      residentLeaseDurationMs: 60_000,
+      residentHeartbeatIntervalMs: 20_000,
+    });
+    await expect(competingService.runNext()).resolves.toMatchObject({
+      status: 'capacity_wait',
+      turn_id: second.turn_id,
+    });
+    expect(database.prepare(`
+      SELECT owner_service_instance_id, owner_epoch, owner_expires_at
+      FROM runtime_executor_residents WHERE conversation_id = ?
+    `).get(first.conversation_id)).toEqual({
+      owner_service_instance_id: 'executor-service-resident-heartbeat-A',
+      owner_epoch: 1,
+      owner_expires_at: '2026-07-19T07:07:50.000Z',
+    });
+
+    await competingService.close();
+    await firstService.close();
+    database.close();
+  });
+
+  test('rejects provider output after the resident owner epoch changes', () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'resident-epoch-fence');
+    const store = createExecutorStore({
+      database,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-resident-epoch',
+      now: () => '2026-07-19T07:08:00Z',
+      generateId: deterministicIds('resident-epoch'),
+    });
+    expect(store.reserveNextExecutor({ maxResidentExecutorsPerBot: 1 }))
+      .toMatchObject({ status: 'ready', conversation_id: accepted.conversation_id });
+    const turnContext = store.claimNextQueuedTurn({ conversationId: accepted.conversation_id });
+    store.transitionTurn(turnContext, 'starting', 'running');
+    database.prepare(`
+      UPDATE runtime_executor_residents SET owner_epoch = owner_epoch + 1
+      WHERE conversation_id = ?
+    `).run(accepted.conversation_id);
+
+    expect(() => store.appendAdapterEvent(turnContext, {
+      kind: 'text_snapshot',
+      payload: { text: 'stale resident output', end_offset: 21 },
+      provider_native_id: null,
+    })).toThrow(/resident executor owner no longer matches/);
+    expect(readEvents(database, accepted.turn_id).some(
+      (event) => event.payload?.text === 'stale resident output',
+    )).toBe(false);
+
+    database.close();
+  });
+
+  test('does not claim a turn when shutdown races the capacity-eviction await', async () => {
+    const database = openTestDatabase();
+    const first = acceptQueuedTurn(database, 'admission-close-first');
+    let releaseEviction;
+    const evictionCanFinish = new Promise((resolve) => { releaseEviction = resolve; });
+    let markEvictionStarted;
+    const evictionStarted = new Promise((resolve) => { markEvictionStarted = resolve; });
+    const adapter = {
+      async *execute() {},
+      async evictIdle() {
+        markEvictionStarted();
+        await evictionCanFinish;
+        return [];
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-admission-close',
+      now: () => '2026-07-19T07:06:30Z',
+      generateId: deterministicIds('admission-close'),
+      maxResidentExecutorsPerBot: 1,
+    });
+    await service.runNext();
+    const secondEnvelope = normalEnvelope('admission-close-second');
+    secondEnvelope.chat_id = 'chat-admission-close-second';
+    const second = acceptNormalInbound(database, secondEnvelope, {
+      now: () => '2026-07-19T07:06:31Z',
+      generateId: deterministicIds('inbound-admission-close-second'),
+    });
+
+    const admission = service.runNext();
+    await evictionStarted;
+    const closing = service.close();
+    releaseEviction();
+    await expect(admission).rejects.toThrow(/closing|closed/);
+    await expect(closing).resolves.toBeUndefined();
+    expect(database.prepare(`
+      SELECT state, attempt_id FROM runtime_turns WHERE turn_id = ?
+    `).get(second.turn_id)).toEqual({ state: 'queued', attempt_id: null });
+    expect(first.turn_id).toBeDefined();
+
+    database.close();
+  });
+
   test('executes one conversation FIFO across lineages without two active turns', async () => {
     const database = openTestDatabase();
     const firstEnvelope = normalEnvelope('fifo-first');
@@ -1181,7 +1436,7 @@ describe('runtime executor service', () => {
 
     releaseFirst();
     await firstRun;
-    await expect(competingService.runNext()).resolves.toMatchObject({
+    await expect(firstService.runNext()).resolves.toMatchObject({
       status: 'completed',
       turn_id: reply.turn_id,
     });
@@ -1380,6 +1635,50 @@ describe('runtime executor service', () => {
     database.close();
   });
 
+  test('isolates the provider and preserves authority when terminal projection persistence fails', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'service-projection-failure');
+    database.exec(`
+      CREATE TRIGGER fail_service_terminal_projection
+      BEFORE INSERT ON runtime_projection_snapshots
+      WHEN NEW.terminal = 1
+      BEGIN
+        SELECT RAISE(ABORT, 'forced service terminal projection failure');
+      END;
+    `);
+    const aborts = [];
+    const adapter = {
+      async abort(context) {
+        aborts.push(context.turn_id);
+      },
+      async *execute() {},
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-projection-failure',
+      now: () => '2026-07-19T07:01:30Z',
+      generateId: deterministicIds('service-projection-failure'),
+    });
+
+    await expect(service.runNext()).rejects.toThrow(/forced service terminal projection failure/);
+    expect(aborts).toEqual([accepted.turn_id]);
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'running' });
+    expect(database.prepare(`SELECT status FROM runtime_turn_queue WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ status: 'claimed' });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({
+      lease_owner: 'executor-service-projection-failure',
+      turn_id: accepted.turn_id,
+    });
+
+    await service.close();
+    database.close();
+  });
+
   test('rolls back adapter event version, event, and projection as one commit', () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'atomic-adapter-event');
@@ -1403,6 +1702,22 @@ describe('runtime executor service', () => {
     })).toThrow(/forced adapter event projection failure/);
     expect(readAuthority(database, accepted.turn_id, accepted.conversation_id)).toEqual(before);
 
+    database.close();
+  });
+
+  test('keeps recovering durable conversations ineligible for idle eviction', () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'recovering-eviction');
+    const store = createTestStore(database, 'recovering-eviction');
+    const turnContext = store.claimNextQueuedTurn();
+
+    expect(store.isConversationEvictable(accepted.conversation_id)).toBe(false);
+    store.transitionTurn(turnContext, 'starting', 'running');
+    store.transitionTurn(turnContext, 'running', 'recovering');
+    expect(store.isConversationEvictable(accepted.conversation_id)).toBe(false);
+
+    store.transitionTurn(turnContext, 'recovering', 'stopped');
+    expect(store.isConversationEvictable(accepted.conversation_id)).toBe(true);
     database.close();
   });
 
