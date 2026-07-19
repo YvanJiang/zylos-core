@@ -1,0 +1,332 @@
+{
+  "fixture_version": "1.0",
+  "contract": "zylos.normalized-event",
+  "base_document": {
+    "contract": "zylos.normalized-event",
+    "contract_version": "1.0",
+    "event_id": "event-base",
+    "trace_id": "trace-normalized-event",
+    "conversation_id": "conversation-A",
+    "turn_id": "turn-A",
+    "lineage_id": "lineage-A",
+    "event_sequence": 1,
+    "turn_version": 1,
+    "attempt_id": "attempt-A-1",
+    "attempt_no": 1,
+    "lease_epoch": 7,
+    "kind": "text_snapshot",
+    "phase": "running",
+    "occurred_at": "2026-07-19T05:20:00Z",
+    "persisted_at": "2026-07-19T05:20:01Z",
+    "provider": "claude",
+    "provider_native_id": "session-claude-A",
+    "payload": {
+      "text": "Base snapshot.",
+      "end_offset": 14
+    },
+    "causation_event_id": null,
+    "error": null
+  },
+  "kind_families": {
+    "interaction": [
+      "interaction_requested",
+      "interaction_answer_committed",
+      "interaction_answer_handoff_started",
+      "interaction_answered",
+      "interaction_answer_delivery_unknown",
+      "interaction_rejected",
+      "interaction_expired",
+      "interaction_cancelled"
+    ],
+    "retry": [
+      "retry_scheduled",
+      "retry_attempt_started",
+      "retry_exhausted"
+    ],
+    "recovery": [
+      "recovery_started",
+      "recovery_waiting_decision",
+      "recovery_finished"
+    ]
+  },
+  "kind_cases": [
+    {
+      "kind": "interaction_requested",
+      "event_sequence": 1,
+      "turn_version": 1,
+      "phase": "waiting_user",
+      "payload": { "interaction_id": "interaction-A", "ordinal": 1, "interaction_version": 1, "handoff_version": null }
+    },
+    {
+      "kind": "interaction_answer_committed",
+      "event_sequence": 2,
+      "turn_version": 2,
+      "phase": "waiting_user",
+      "payload": { "interaction_id": "interaction-A", "ordinal": 1, "interaction_version": 2, "handoff_version": 1 }
+    },
+    {
+      "kind": "interaction_answer_handoff_started",
+      "event_sequence": 3,
+      "turn_version": 3,
+      "phase": "waiting_user",
+      "payload": { "interaction_id": "interaction-A", "ordinal": 1, "interaction_version": 3, "handoff_version": 2 }
+    },
+    {
+      "kind": "interaction_answered",
+      "event_sequence": 4,
+      "turn_version": 4,
+      "phase": "running",
+      "payload": { "interaction_id": "interaction-A", "ordinal": 1, "interaction_version": 4, "handoff_version": 3 }
+    },
+    {
+      "kind": "interaction_answer_delivery_unknown",
+      "event_sequence": 5,
+      "turn_version": 5,
+      "phase": "recovering",
+      "payload": { "interaction_id": "interaction-A", "ordinal": 1, "interaction_version": 4, "handoff_version": 3 },
+      "error": { "code": "interaction_answer_delivery_unknown", "category": "provider", "retryable": false, "side_effect_status": "unknown", "user_message": "The answer delivery acknowledgement is unknown.", "occurred_at": "2026-07-19T05:20:02Z" }
+    },
+    {
+      "kind": "interaction_rejected",
+      "event_sequence": 6,
+      "turn_version": 6,
+      "phase": "recovering",
+      "payload": { "interaction_id": "interaction-A", "ordinal": 1, "interaction_version": 5, "handoff_version": 4 },
+      "error": { "code": "provider_context_invalid", "category": "provider", "retryable": false, "side_effect_status": "none", "user_message": "The provider no longer accepts this answer.", "occurred_at": "2026-07-19T05:20:03Z" }
+    },
+    {
+      "kind": "interaction_expired",
+      "event_sequence": 7,
+      "turn_version": 7,
+      "phase": "waiting_user",
+      "payload": { "interaction_id": "interaction-A", "ordinal": 1, "interaction_version": 2, "handoff_version": null },
+      "error": { "code": "interaction_expired", "category": "conflict", "retryable": false, "side_effect_status": "none", "user_message": "The interaction expired before an answer was committed.", "occurred_at": "2026-07-19T05:20:04Z" }
+    },
+    {
+      "kind": "interaction_cancelled",
+      "event_sequence": 8,
+      "turn_version": 8,
+      "phase": "waiting_user",
+      "payload": { "interaction_id": "interaction-A", "ordinal": 1, "interaction_version": 2, "handoff_version": null }
+    },
+    {
+      "kind": "retry_scheduled",
+      "event_sequence": 9,
+      "turn_version": 9,
+      "phase": "retrying",
+      "payload": { "retry_no": 1, "attempt_no": 2, "backoff_ms": 2000, "reason_code": "provider_overloaded" },
+      "error": { "code": "delivery_transient", "category": "provider", "retryable": true, "side_effect_status": "none", "user_message": "The provider is temporarily overloaded.", "occurred_at": "2026-07-19T05:20:05Z" }
+    },
+    {
+      "kind": "retry_attempt_started",
+      "event_sequence": 10,
+      "turn_version": 10,
+      "phase": "retrying",
+      "document_fields": { "attempt_id": "attempt-A-2", "attempt_no": 2, "lease_epoch": 8 },
+      "payload": { "retry_no": 1, "attempt_no": 2, "backoff_ms": 2000, "reason_code": "provider_overloaded" },
+      "error": { "code": "delivery_transient", "category": "provider", "retryable": true, "side_effect_status": "none", "user_message": "Retry attempt started after transient overload.", "occurred_at": "2026-07-19T05:20:06Z" }
+    },
+    {
+      "kind": "retry_exhausted",
+      "event_sequence": 11,
+      "turn_version": 11,
+      "phase": "retrying",
+      "document_fields": { "attempt_id": "attempt-A-4", "attempt_no": 4, "lease_epoch": 10 },
+      "payload": { "retry_no": 3, "attempt_no": 4, "backoff_ms": 8000, "reason_code": "provider_overloaded" },
+      "error": { "code": "delivery_transient", "category": "provider", "retryable": false, "side_effect_status": "none", "user_message": "All safe provider retries were exhausted.", "occurred_at": "2026-07-19T05:20:07Z" }
+    },
+    {
+      "kind": "recovery_started",
+      "event_sequence": 12,
+      "turn_version": 12,
+      "phase": "recovering",
+      "payload": { "recovery_id": "recovery-A", "recovery_of_turn_id": "turn-previous-A", "recovery_of_lineage_id": "lineage-previous-A", "side_effect_status": "none" },
+      "error": { "code": "provider_context_invalid", "category": "provider", "retryable": true, "side_effect_status": "none", "user_message": "Safe provider recovery started.", "occurred_at": "2026-07-19T05:20:08Z" }
+    },
+    {
+      "kind": "recovery_waiting_decision",
+      "event_sequence": 13,
+      "turn_version": 13,
+      "phase": "recovering",
+      "payload": { "recovery_id": "recovery-B", "recovery_of_turn_id": "turn-previous-B", "recovery_of_lineage_id": "lineage-previous-B", "side_effect_status": "unknown" },
+      "error": { "code": "side_effect_unknown", "category": "provider", "retryable": false, "side_effect_status": "unknown", "user_message": "Recovery requires an authorized user decision.", "occurred_at": "2026-07-19T05:20:09Z" }
+    },
+    {
+      "kind": "recovery_finished",
+      "event_sequence": 14,
+      "turn_version": 14,
+      "phase": "recovering",
+      "payload": { "recovery_id": "recovery-A", "recovery_of_turn_id": "turn-previous-A", "recovery_of_lineage_id": "lineage-previous-A", "side_effect_status": "none" }
+    }
+  ],
+  "valid_streams": [
+    {
+      "name": "continuous_terminal",
+      "events": [
+        { "event_id": "event-A-1", "turn_id": "turn-stream-A", "event_sequence": 1, "turn_version": 1, "attempt_id": null, "attempt_no": null, "lease_epoch": null, "provider": null, "provider_native_id": null, "kind": "turn_state_changed", "phase": "received", "payload": { "from_state": null, "to_state": "received", "reason_code": "inbound_committed" } },
+        { "event_id": "event-A-2", "turn_id": "turn-stream-A", "event_sequence": 2, "turn_version": 2, "attempt_id": null, "attempt_no": null, "lease_epoch": null, "provider": null, "provider_native_id": null, "kind": "turn_state_changed", "phase": "queued", "payload": { "from_state": "received", "to_state": "queued", "reason_code": "queue_sequence_allocated" } },
+        { "event_id": "event-A-3", "turn_id": "turn-stream-A", "event_sequence": 3, "turn_version": 3, "attempt_id": "attempt-A-1", "attempt_no": 1, "lease_epoch": 3, "kind": "turn_state_changed", "phase": "starting", "payload": { "from_state": "queued", "to_state": "starting", "reason_code": "executor_claimed" } },
+        { "event_id": "event-A-4", "turn_id": "turn-stream-A", "event_sequence": 4, "turn_version": 4, "attempt_id": "attempt-A-1", "attempt_no": 1, "lease_epoch": 3, "kind": "turn_state_changed", "phase": "running", "payload": { "from_state": "starting", "to_state": "running", "reason_code": "provider_started" } },
+        { "event_id": "event-A-5", "turn_id": "turn-stream-A", "event_sequence": 5, "turn_version": 5, "attempt_id": "attempt-A-1", "attempt_no": 1, "lease_epoch": 3, "kind": "turn_state_changed", "phase": "completed", "payload": { "from_state": "running", "to_state": "completed", "reason_code": "provider_completed" } }
+      ]
+    },
+    {
+      "name": "retry_recovery_advances_attempt_and_lease",
+      "events": [
+        { "event_id": "event-B-1", "turn_id": "turn-stream-B", "event_sequence": 1, "turn_version": 1, "attempt_id": null, "attempt_no": null, "lease_epoch": null, "provider": null, "provider_native_id": null, "kind": "turn_state_changed", "phase": "received", "payload": { "from_state": null, "to_state": "received", "reason_code": "inbound_committed" } },
+        { "event_id": "event-B-2", "turn_id": "turn-stream-B", "event_sequence": 2, "turn_version": 2, "attempt_id": null, "attempt_no": null, "lease_epoch": null, "provider": null, "provider_native_id": null, "kind": "turn_state_changed", "phase": "queued", "payload": { "from_state": "received", "to_state": "queued", "reason_code": "queue_sequence_allocated" } },
+        { "event_id": "event-B-3", "turn_id": "turn-stream-B", "event_sequence": 3, "turn_version": 3, "attempt_id": "attempt-B-1", "attempt_no": 1, "lease_epoch": 11, "kind": "turn_state_changed", "phase": "starting", "payload": { "from_state": "queued", "to_state": "starting", "reason_code": "executor_claimed" } },
+        { "event_id": "event-B-4", "turn_id": "turn-stream-B", "event_sequence": 4, "turn_version": 4, "attempt_id": "attempt-B-1", "attempt_no": 1, "lease_epoch": 11, "kind": "turn_state_changed", "phase": "running", "payload": { "from_state": "starting", "to_state": "running", "reason_code": "provider_started" } },
+        { "event_id": "event-B-5", "turn_id": "turn-stream-B", "event_sequence": 5, "turn_version": 5, "attempt_id": "attempt-B-1", "attempt_no": 1, "lease_epoch": 11, "kind": "turn_state_changed", "phase": "recovering", "payload": { "from_state": "running", "to_state": "recovering", "reason_code": "provider_transient" } },
+        { "event_id": "event-B-6", "turn_id": "turn-stream-B", "event_sequence": 6, "turn_version": 6, "attempt_id": "attempt-B-1", "attempt_no": 1, "lease_epoch": 11, "kind": "recovery_started", "phase": "recovering", "payload": { "recovery_id": "recovery-stream-B", "recovery_of_turn_id": "turn-stream-B", "recovery_of_lineage_id": "lineage-A", "side_effect_status": "none" }, "error": { "code": "delivery_transient", "category": "provider", "retryable": true, "side_effect_status": "none", "user_message": "A safe retry path is available.", "occurred_at": "2026-07-19T05:21:00Z" } },
+        { "event_id": "event-B-7", "turn_id": "turn-stream-B", "event_sequence": 7, "turn_version": 7, "attempt_id": "attempt-B-1", "attempt_no": 1, "lease_epoch": 11, "kind": "retry_scheduled", "phase": "retrying", "payload": { "retry_no": 1, "attempt_no": 2, "backoff_ms": 2000, "reason_code": "provider_transient" }, "error": { "code": "delivery_transient", "category": "provider", "retryable": true, "side_effect_status": "none", "user_message": "Retry scheduled after a transient failure.", "occurred_at": "2026-07-19T05:21:01Z" } },
+        { "event_id": "event-B-8", "turn_id": "turn-stream-B", "event_sequence": 8, "turn_version": 8, "attempt_id": "attempt-B-2", "attempt_no": 2, "lease_epoch": 12, "kind": "retry_attempt_started", "phase": "retrying", "payload": { "retry_no": 1, "attempt_no": 2, "backoff_ms": 2000, "reason_code": "provider_transient" }, "error": { "code": "delivery_transient", "category": "provider", "retryable": true, "side_effect_status": "none", "user_message": "Retry attempt started.", "occurred_at": "2026-07-19T05:21:02Z" } },
+        { "event_id": "event-B-9", "turn_id": "turn-stream-B", "event_sequence": 9, "turn_version": 9, "attempt_id": "attempt-B-2", "attempt_no": 2, "lease_epoch": 12, "kind": "recovery_finished", "phase": "recovering", "payload": { "recovery_id": "recovery-stream-B", "recovery_of_turn_id": "turn-stream-B", "recovery_of_lineage_id": "lineage-A", "side_effect_status": "none" } },
+        { "event_id": "event-B-10", "turn_id": "turn-stream-B", "event_sequence": 10, "turn_version": 10, "attempt_id": "attempt-B-2", "attempt_no": 2, "lease_epoch": 12, "kind": "turn_state_changed", "phase": "starting", "payload": { "from_state": "recovering", "to_state": "starting", "reason_code": "retry_claimed" } },
+        { "event_id": "event-B-11", "turn_id": "turn-stream-B", "event_sequence": 11, "turn_version": 11, "attempt_id": "attempt-B-2", "attempt_no": 2, "lease_epoch": 12, "kind": "turn_state_changed", "phase": "running", "payload": { "from_state": "starting", "to_state": "running", "reason_code": "provider_restarted" } },
+        { "event_id": "event-B-12", "turn_id": "turn-stream-B", "event_sequence": 12, "turn_version": 12, "attempt_id": "attempt-B-2", "attempt_no": 2, "lease_epoch": 12, "kind": "turn_state_changed", "phase": "failed", "payload": { "from_state": "running", "to_state": "failed", "reason_code": "provider_failed" }, "error": { "code": "provider_context_invalid", "category": "provider", "retryable": false, "side_effect_status": "none", "user_message": "The recovered provider attempt failed.", "occurred_at": "2026-07-19T05:21:03Z" } }
+      ]
+    },
+    {
+      "name": "negotiated_unknown_progress_kind",
+      "unknown_progress_kinds": ["provider_progress_hint"],
+      "events": [
+        { "event_id": "event-C-1", "turn_id": "turn-stream-C", "event_sequence": 1, "turn_version": 1, "attempt_id": null, "attempt_no": null, "lease_epoch": null, "provider": null, "provider_native_id": null, "kind": "turn_state_changed", "phase": "received", "payload": { "from_state": null, "to_state": "received", "reason_code": "inbound_committed" } },
+        { "event_id": "event-C-2", "turn_id": "turn-stream-C", "event_sequence": 2, "turn_version": 2, "attempt_id": null, "attempt_no": null, "lease_epoch": null, "provider": null, "provider_native_id": null, "kind": "turn_state_changed", "phase": "queued", "payload": { "from_state": "received", "to_state": "queued", "reason_code": "queue_sequence_allocated" } },
+        { "event_id": "event-C-3", "turn_id": "turn-stream-C", "event_sequence": 3, "turn_version": 3, "attempt_id": "attempt-C-1", "attempt_no": 1, "lease_epoch": 21, "kind": "turn_state_changed", "phase": "starting", "payload": { "from_state": "queued", "to_state": "starting", "reason_code": "executor_claimed" } },
+        { "event_id": "event-C-4", "turn_id": "turn-stream-C", "event_sequence": 4, "turn_version": 4, "attempt_id": "attempt-C-1", "attempt_no": 1, "lease_epoch": 21, "kind": "turn_state_changed", "phase": "running", "payload": { "from_state": "starting", "to_state": "running", "reason_code": "provider_started" } },
+        { "event_id": "event-C-5", "turn_id": "turn-stream-C", "event_sequence": 5, "turn_version": 5, "attempt_id": "attempt-C-1", "attempt_no": 1, "lease_epoch": 21, "kind": "provider_progress_hint", "phase": "running", "payload": { "summary": "Provider emitted non-critical progress." } }
+      ]
+    },
+    {
+      "name": "lease_fenced_before_provider_attempt",
+      "events": [
+        { "event_id": "event-D-1", "turn_id": "turn-stream-D", "event_sequence": 1, "turn_version": 1, "attempt_id": null, "attempt_no": null, "lease_epoch": 9, "provider": null, "provider_native_id": null, "kind": "turn_state_changed", "phase": "received", "payload": { "from_state": null, "to_state": "received", "reason_code": "inbound_committed" } },
+        { "event_id": "event-D-2", "turn_id": "turn-stream-D", "event_sequence": 2, "turn_version": 2, "attempt_id": null, "attempt_no": null, "lease_epoch": 9, "provider": null, "provider_native_id": null, "kind": "turn_state_changed", "phase": "queued", "payload": { "from_state": "received", "to_state": "queued", "reason_code": "queue_sequence_allocated" } }
+      ]
+    },
+    {
+      "name": "fenced_interaction_after_waiting_state",
+      "events": [
+        { "event_id": "event-E-1", "turn_id": "turn-stream-E", "event_sequence": 1, "turn_version": 1, "attempt_id": null, "attempt_no": null, "lease_epoch": null, "provider": null, "provider_native_id": null, "kind": "turn_state_changed", "phase": "received", "payload": { "from_state": null, "to_state": "received", "reason_code": "inbound_committed" } },
+        { "event_id": "event-E-2", "turn_id": "turn-stream-E", "event_sequence": 2, "turn_version": 2, "attempt_id": null, "attempt_no": null, "lease_epoch": null, "provider": null, "provider_native_id": null, "kind": "turn_state_changed", "phase": "queued", "payload": { "from_state": "received", "to_state": "queued", "reason_code": "queue_sequence_allocated" } },
+        { "event_id": "event-E-3", "turn_id": "turn-stream-E", "event_sequence": 3, "turn_version": 3, "attempt_id": "attempt-E-1", "attempt_no": 1, "lease_epoch": 30, "kind": "turn_state_changed", "phase": "starting", "payload": { "from_state": "queued", "to_state": "starting", "reason_code": "executor_claimed" } },
+        { "event_id": "event-E-4", "turn_id": "turn-stream-E", "event_sequence": 4, "turn_version": 4, "attempt_id": "attempt-E-1", "attempt_no": 1, "lease_epoch": 30, "kind": "turn_state_changed", "phase": "running", "payload": { "from_state": "starting", "to_state": "running", "reason_code": "provider_started" } },
+        { "event_id": "event-E-5", "turn_id": "turn-stream-E", "event_sequence": 5, "turn_version": 5, "attempt_id": "attempt-E-1", "attempt_no": 1, "lease_epoch": 30, "kind": "turn_state_changed", "phase": "waiting_user", "payload": { "from_state": "running", "to_state": "waiting_user", "reason_code": "interaction_requested" } },
+        { "event_id": "event-E-6", "turn_id": "turn-stream-E", "event_sequence": 6, "turn_version": 6, "attempt_id": "attempt-E-1", "attempt_no": 1, "lease_epoch": 30, "kind": "interaction_requested", "phase": "waiting_user", "payload": { "interaction_id": "interaction-E", "ordinal": 1, "interaction_version": 1, "handoff_version": null } }
+      ]
+    }
+  ],
+  "invalid_streams": [
+    {
+      "name": "event_sequence_gap",
+      "error_code": "version_conflict",
+      "events": [
+        { "event_id": "event-gap-1", "turn_id": "turn-gap", "event_sequence": 1, "turn_version": 1, "attempt_id": null, "attempt_no": null, "lease_epoch": null, "provider": null, "provider_native_id": null, "kind": "turn_state_changed", "phase": "received", "payload": { "from_state": null, "to_state": "received", "reason_code": "inbound_committed" } },
+        { "event_id": "event-gap-3", "turn_id": "turn-gap", "event_sequence": 3, "turn_version": 2, "attempt_id": null, "attempt_no": null, "lease_epoch": null, "provider": null, "provider_native_id": null, "kind": "turn_state_changed", "phase": "queued", "payload": { "from_state": "received", "to_state": "queued", "reason_code": "queue_sequence_allocated" } }
+      ]
+    },
+    {
+      "name": "turn_version_regression",
+      "error_code": "version_conflict",
+      "events": [
+        { "event_id": "event-version-1", "turn_id": "turn-version", "event_sequence": 1, "turn_version": 2, "attempt_id": null, "attempt_no": null, "lease_epoch": null, "provider": null, "provider_native_id": null, "kind": "turn_state_changed", "phase": "received", "payload": { "from_state": null, "to_state": "received", "reason_code": "inbound_committed" } },
+        { "event_id": "event-version-2", "turn_id": "turn-version", "event_sequence": 2, "turn_version": 2, "attempt_id": null, "attempt_no": null, "lease_epoch": null, "provider": null, "provider_native_id": null, "kind": "turn_state_changed", "phase": "queued", "payload": { "from_state": "received", "to_state": "queued", "reason_code": "queue_sequence_allocated" } }
+      ]
+    },
+    {
+      "name": "stale_attempt_after_retry",
+      "error_code": "stale_attempt",
+      "events": [
+        { "event_id": "event-attempt-1", "turn_id": "turn-attempt", "event_sequence": 1, "turn_version": 1, "attempt_id": "attempt-old", "attempt_no": 1, "lease_epoch": 31, "kind": "turn_state_changed", "phase": "starting", "payload": { "from_state": null, "to_state": "starting", "reason_code": "executor_claimed" } },
+        { "event_id": "event-attempt-2", "turn_id": "turn-attempt", "event_sequence": 2, "turn_version": 2, "attempt_id": "attempt-current", "attempt_no": 2, "lease_epoch": 32, "kind": "retry_attempt_started", "phase": "retrying", "payload": { "retry_no": 1, "attempt_no": 2, "backoff_ms": 2000, "reason_code": "provider_transient" }, "error": { "code": "delivery_transient", "category": "provider", "retryable": true, "side_effect_status": "none", "user_message": "Retry attempt started.", "occurred_at": "2026-07-19T05:22:00Z" } },
+        { "event_id": "event-attempt-3", "turn_id": "turn-attempt", "event_sequence": 3, "turn_version": 3, "attempt_id": "attempt-old", "attempt_no": 1, "lease_epoch": 31, "kind": "text_delta", "phase": "running", "payload": { "text": "late", "start_offset": 0, "end_offset": 4 } }
+      ]
+    },
+    {
+      "name": "stale_lease_epoch",
+      "error_code": "stale_attempt",
+      "events": [
+        { "event_id": "event-lease-1", "turn_id": "turn-lease", "event_sequence": 1, "turn_version": 1, "attempt_id": "attempt-lease", "attempt_no": 1, "lease_epoch": 42, "kind": "turn_state_changed", "phase": "starting", "payload": { "from_state": null, "to_state": "starting", "reason_code": "executor_claimed" } },
+        { "event_id": "event-lease-2", "turn_id": "turn-lease", "event_sequence": 2, "turn_version": 2, "attempt_id": "attempt-lease", "attempt_no": 1, "lease_epoch": 41, "kind": "text_delta", "phase": "running", "payload": { "text": "late", "start_offset": 0, "end_offset": 4 } }
+      ]
+    },
+    {
+      "name": "stale_lease_before_provider_attempt",
+      "error_code": "stale_attempt",
+      "events": [
+        { "event_id": "event-lease-core-1", "turn_id": "turn-lease-core", "event_sequence": 1, "turn_version": 1, "attempt_id": null, "attempt_no": null, "lease_epoch": 52, "provider": null, "provider_native_id": null, "kind": "turn_state_changed", "phase": "received", "payload": { "from_state": null, "to_state": "received", "reason_code": "inbound_committed" } },
+        { "event_id": "event-lease-core-2", "turn_id": "turn-lease-core", "event_sequence": 2, "turn_version": 2, "attempt_id": null, "attempt_no": null, "lease_epoch": 51, "provider": null, "provider_native_id": null, "kind": "turn_state_changed", "phase": "queued", "payload": { "from_state": "received", "to_state": "queued", "reason_code": "queue_sequence_allocated" } }
+      ]
+    },
+    {
+      "name": "unknown_kind_without_negotiation",
+      "error_code": "unsupported_capability",
+      "events": [
+        { "event_id": "event-unknown-1", "turn_id": "turn-unknown", "event_sequence": 1, "turn_version": 1, "attempt_id": "attempt-unknown", "attempt_no": 1, "lease_epoch": 51, "kind": "provider_progress_hint", "phase": "running", "payload": { "summary": "Not negotiated." } }
+      ]
+    },
+    {
+      "name": "progress_event_with_error",
+      "error_code": "validation_error",
+      "events": [
+        { "event_id": "event-progress-error-1", "turn_id": "turn-progress-error", "event_sequence": 1, "turn_version": 1, "attempt_id": "attempt-progress-error", "attempt_no": 1, "lease_epoch": 53, "kind": "text_delta", "phase": "running", "payload": { "text": "partial", "start_offset": 0, "end_offset": 7 }, "error": { "code": "provider_context_invalid", "category": "provider", "retryable": false, "side_effect_status": "none", "user_message": "Progress cannot carry a terminal failure.", "occurred_at": "2026-07-19T05:22:30Z" } }
+      ]
+    },
+    {
+      "name": "attemptless_provider_output",
+      "error_code": "validation_error",
+      "events": [
+        { "event_id": "event-attemptless-output-1", "turn_id": "turn-attemptless-output", "event_sequence": 1, "turn_version": 1, "attempt_id": null, "attempt_no": null, "lease_epoch": null, "kind": "text_delta", "phase": "running", "payload": { "text": "unfenced", "start_offset": 0, "end_offset": 8 } }
+      ]
+    },
+    {
+      "name": "non_lifecycle_first_event",
+      "error_code": "version_conflict",
+      "events": [
+        { "event_id": "event-first-output-1", "turn_id": "turn-first-output", "event_sequence": 1, "turn_version": 1, "attempt_id": "attempt-first-output", "attempt_no": 1, "lease_epoch": 54, "kind": "text_delta", "phase": "running", "payload": { "text": "too early", "start_offset": 0, "end_offset": 9 } }
+      ]
+    },
+    {
+      "name": "reserved_unknown_kind_cannot_be_negotiated_as_progress",
+      "error_code": "unsupported_capability",
+      "unknown_progress_kinds": ["permission_future_granted"],
+      "events": [
+        { "event_id": "event-reserved-1", "turn_id": "turn-reserved", "event_sequence": 1, "turn_version": 1, "attempt_id": "attempt-reserved", "attempt_no": 1, "lease_epoch": 61, "kind": "permission_future_granted", "phase": "running", "payload": { "summary": "Unsafe lifecycle extension." } }
+      ]
+    },
+    {
+      "name": "unknown_tool_kind_cannot_be_negotiated_as_progress",
+      "error_code": "unsupported_capability",
+      "unknown_progress_kinds": ["tool_future_progress"],
+      "events": [
+        { "event_id": "event-tool-unknown-1", "turn_id": "turn-tool-unknown", "event_sequence": 1, "turn_version": 1, "attempt_id": "attempt-tool-unknown", "attempt_no": 1, "lease_epoch": 62, "kind": "tool_future_progress", "phase": "running", "payload": { "summary": "Tool lifecycle cannot be opaque." } }
+      ]
+    },
+    {
+      "name": "unknown_progress_kind_cannot_claim_interaction_phase",
+      "error_code": "unsupported_capability",
+      "unknown_progress_kinds": ["provider_progress_hint"],
+      "events": [
+        { "event_id": "event-phase-unknown-1", "turn_id": "turn-phase-unknown", "event_sequence": 1, "turn_version": 1, "attempt_id": "attempt-phase-unknown", "attempt_no": 1, "lease_epoch": 63, "kind": "provider_progress_hint", "phase": "waiting_user", "payload": { "summary": "Opaque progress cannot imply waiting_user." } }
+      ]
+    },
+    {
+      "name": "unknown_progress_kind_cannot_mutate_state",
+      "error_code": "unsupported_capability",
+      "unknown_progress_kinds": ["provider_progress_hint"],
+      "events": [
+        { "event_id": "event-mutation-1", "turn_id": "turn-mutation", "event_sequence": 1, "turn_version": 1, "attempt_id": "attempt-mutation", "attempt_no": 1, "lease_epoch": 71, "kind": "provider_progress_hint", "phase": "running", "payload": { "to_state": "completed", "summary": "Unsafe mutation." } }
+      ]
+    },
+    {
+      "name": "event_after_terminal",
+      "error_code": "turn_terminal",
+      "events": [
+        { "event_id": "event-terminal-1", "turn_id": "turn-terminal", "event_sequence": 1, "turn_version": 1, "attempt_id": null, "attempt_no": null, "lease_epoch": null, "provider": null, "provider_native_id": null, "kind": "turn_state_changed", "phase": "received", "payload": { "from_state": null, "to_state": "received", "reason_code": "inbound_committed" } },
+        { "event_id": "event-terminal-2", "turn_id": "turn-terminal", "event_sequence": 2, "turn_version": 2, "attempt_id": null, "attempt_no": null, "lease_epoch": null, "provider": null, "provider_native_id": null, "kind": "turn_state_changed", "phase": "failed", "payload": { "from_state": "received", "to_state": "failed", "reason_code": "validation_failed" }, "error": { "code": "validation_error", "category": "validation", "retryable": false, "side_effect_status": "none", "user_message": "The turn failed.", "occurred_at": "2026-07-19T05:23:00Z" } },
+        { "event_id": "event-terminal-3", "turn_id": "turn-terminal", "event_sequence": 3, "turn_version": 3, "attempt_id": null, "attempt_no": null, "lease_epoch": null, "provider": null, "provider_native_id": null, "kind": "text_snapshot", "phase": "failed", "payload": { "text": "late", "end_offset": 4 } }
+      ]
+    }
+  ]
+}
