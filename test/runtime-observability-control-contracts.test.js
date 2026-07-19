@@ -8,6 +8,9 @@ import {
   CONTROL_RESULT_V1_SCHEMA,
   ContractKernelError,
   DASHBOARD_RUNTIME_PROJECTION_V1_SCHEMA,
+  HANDOFF_STATES,
+  INTERACTION_REQUEST_SCHEMA_V1,
+  INTERACTION_STATES,
   NORMALIZED_EVENT_PHASES,
   OBSERVABILITY_SNAPSHOT_V1_SCHEMA,
   resolveControlResultUpdate,
@@ -41,6 +44,11 @@ describe('shared runtime vocabulary', () => {
   test('reuses the normalized event turn states and phases by identity', () => {
     expect(CANONICAL_TURN_STATES).toBe(TURN_STATES);
     expect(TURN_PHASES).toBe(NORMALIZED_EVENT_PHASES);
+  });
+
+  test('reuses the interaction contract states and handoff states by identity', () => {
+    expect(INTERACTION_STATES).toBe(INTERACTION_REQUEST_SCHEMA_V1.states);
+    expect(HANDOFF_STATES).toBe(INTERACTION_REQUEST_SCHEMA_V1.handoffStates);
   });
 });
 

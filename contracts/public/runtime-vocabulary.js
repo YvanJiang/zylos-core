@@ -1,3 +1,4 @@
+import { INTERACTION_REQUEST_SCHEMA_V1 } from './interaction.js';
 import {
   NORMALIZED_EVENT_PHASES,
   TURN_STATES,
@@ -14,24 +15,5 @@ export const RUNTIME_HEALTH_STATES = Object.freeze([
   'unknown',
 ]);
 
-export const INTERACTION_STATES = Object.freeze([
-  'pending',
-  'answer_committed',
-  'answer_delivering',
-  'delivery_unknown',
-  'answered',
-  'rejected',
-  'expired',
-  'cancelled',
-]);
-
-export const HANDOFF_STATES = Object.freeze([
-  'not_started',
-  'pending',
-  'delivering',
-  'retry_wait',
-  'accepted',
-  'delivery_unknown',
-  'rejected',
-  'cancelled',
-]);
+export const INTERACTION_STATES = INTERACTION_REQUEST_SCHEMA_V1.states;
+export const HANDOFF_STATES = INTERACTION_REQUEST_SCHEMA_V1.handoffStates;
