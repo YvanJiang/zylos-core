@@ -896,6 +896,73 @@ describe('runtime interaction happy path', () => {
     database.close();
   });
 
+  test('retains Codex ownership when provider close cannot prove process-group isolation', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'codex-close-group-uncertain');
+    let iteratorReturned = false;
+    let interactionEmitted = false;
+    const adapter = {
+      execute() {
+        return {
+          [Symbol.asyncIterator]() { return this; },
+          async next() {
+            if (interactionEmitted) return new Promise(() => {});
+            interactionEmitted = true;
+            return {
+              done: false,
+              value: {
+                kind: 'interaction_requested',
+                payload: {
+                  provider_interaction_ref: 'provider-codex-close-group-uncertain',
+                  tool_use_id: 'tool-codex-close-group-uncertain',
+                  kind: 'tool_approval',
+                  prompt: 'Allow the uncertain provider action?',
+                  choices: [],
+                  authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+                  allowed_sources: ['card_action'],
+                },
+              },
+            };
+          },
+          async return() {
+            iteratorReturned = true;
+            return { done: true, value: undefined };
+          },
+        };
+      },
+      async close() {
+        const error = new Error('Codex process group is still alive');
+        error.closedConversationIds = [];
+        throw error;
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-codex-close-group-uncertain',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('codex-close-group-uncertain'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ status: 'waiting_user' });
+    await expect(service.close()).rejects.toBeInstanceOf(Error);
+    expect(iteratorReturned).toBe(false);
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id
+      FROM runtime_executor_leases
+      WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({
+      lease_owner: 'executor-service-codex-close-group-uncertain',
+      turn_id: accepted.turn_id,
+    });
+
+    database.close();
+  });
+
   test('holds an answered interaction until a parallel permission callback settles', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'service-permission-interleave');

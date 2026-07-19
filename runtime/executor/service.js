@@ -1173,7 +1173,11 @@ export function createExecutorService({
             let isolationProven = closedConversationIdSet.has(
               activeRun.turnContext.conversation_id,
             );
-            if (!isolationProven && typeof activeRun.iterator?.return === 'function') {
+            if (
+              !isolationProven
+              && provider !== 'codex'
+              && typeof activeRun.iterator?.return === 'function'
+            ) {
               try {
                 await activeRun.iterator.return();
                 isolationProven = true;
