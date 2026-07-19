@@ -50,6 +50,23 @@ export function createExecutorService({
   const closingPermissionTurnIds = new Set();
   const permissionControllers = new Map();
   const activeRunSettlements = new Set();
+  const uncertainTurnIds = new Set();
+  let lifecycle = 'open';
+  let closePromise = null;
+
+  function persistenceFailure(cause) {
+    const error = new Error(`Runtime persistence failed: ${cause.message}`, { cause });
+    error.persistenceFailure = true;
+    return error;
+  }
+
+  function persist(operation) {
+    try {
+      return operation();
+    } catch (cause) {
+      throw persistenceFailure(cause);
+    }
+  }
 
   function refresh() {
     executors = store.rebuildExecutorCache();
@@ -72,6 +89,9 @@ export function createExecutorService({
   }
 
   async function runNext() {
+    if (lifecycle !== 'open') {
+      throw new Error(`Executor service is ${lifecycle}; it cannot claim another turn.`);
+    }
     if (!started) start();
     const turnContext = store.claimNextQueuedTurn();
     if (!turnContext) return { status: 'idle' };
@@ -84,7 +104,7 @@ export function createExecutorService({
     let durableSettled = false;
     try {
       refresh();
-      store.transitionTurn(turnContext, 'starting', 'running');
+      persist(() => store.transitionTurn(turnContext, 'starting', 'running'));
       const adapterContext = Object.freeze({
         conversation_id: turnContext.conversation_id,
         turn_id: turnContext.turn_id,
@@ -155,7 +175,7 @@ export function createExecutorService({
         if (record?.type === 'provider_native_id') {
           usesManagedRecords = true;
           try {
-            store.bindProviderNativeId(turnContext, record.provider_native_id);
+            persist(() => store.bindProviderNativeId(turnContext, record.provider_native_id));
             record.acknowledge();
           } catch (error) {
             record.acknowledge(error);
@@ -165,7 +185,7 @@ export function createExecutorService({
         }
         if (record?.type === 'normalized_event') {
           usesManagedRecords = true;
-          store.appendAdapterEvent(turnContext, record.event);
+          persist(() => store.appendAdapterEvent(turnContext, record.event));
           continue;
         }
         if (record?.type === 'turn_result') {
@@ -173,13 +193,27 @@ export function createExecutorService({
           outcome = record.outcome;
           continue;
         }
-        store.appendAdapterEvent(turnContext, record);
+        persist(() => store.appendAdapterEvent(turnContext, record));
+      }
+      if (uncertainTurnIds.has(turnContext.turn_id)) {
+        const { state } = store.assertCurrentFence(turnContext);
+        persist(() => store.transitionTurn(turnContext, state, 'recovering', {
+          error: null,
+        }));
+        durableSettled = true;
+        refresh();
+        return {
+          status: 'recovering',
+          conversation_id: turnContext.conversation_id,
+          turn_id: turnContext.turn_id,
+          ...turnContext.attempt,
+        };
       }
       const terminalState = outcome === 'cancelled'
         ? 'stopped'
         : (outcome === 'failed' ? 'failed' : 'completed');
       const failure = outcome === 'failed' || (usesManagedRecords && outcome === null);
-      store.transitionTurn(turnContext, 'running', failure ? 'failed' : terminalState, {
+      persist(() => store.transitionTurn(turnContext, 'running', failure ? 'failed' : terminalState, {
         error: failure ? {
           code: outcome === null ? 'provider_stream_ended' : 'provider_execution_failed',
           category: 'provider',
@@ -187,7 +221,7 @@ export function createExecutorService({
           side_effect_status: 'unknown',
           user_message: 'The provider turn did not complete successfully.',
         } : null,
-      });
+      }));
       durableSettled = true;
       refresh();
       return {
@@ -198,12 +232,31 @@ export function createExecutorService({
       };
     } catch (error) {
       if (durableSettled) throw error;
+      if (error.persistenceFailure) {
+        if (typeof adapter.abort === 'function') {
+          await adapter.abort(turnContext);
+        }
+        throw error;
+      }
       closingPermissionTurnIds.add(turnContext.turn_id);
       for (const controller of permissionControllers.get(turnContext.turn_id) ?? []) {
         controller.abort();
       }
       const cancelled = cancelledTurnIds.has(turnContext.turn_id);
       const { state } = store.assertCurrentFence(turnContext);
+      if (uncertainTurnIds.has(turnContext.turn_id)) {
+        store.transitionTurn(turnContext, state, 'recovering', {
+          error: null,
+        });
+        durableSettled = true;
+        refresh();
+        return {
+          status: 'recovering',
+          conversation_id: turnContext.conversation_id,
+          turn_id: turnContext.turn_id,
+          ...turnContext.attempt,
+        };
+      }
       const terminalState = cancelled ? 'stopped' : 'failed';
       store.transitionTurn(turnContext, state, terminalState, {
         error: cancelled ? null : {
@@ -227,6 +280,7 @@ export function createExecutorService({
         activeTurns.delete(turnContext.conversation_id);
       }
       cancelledTurnIds.delete(turnContext.turn_id);
+      uncertainTurnIds.delete(turnContext.turn_id);
       const controllers = permissionControllers.get(turnContext.turn_id);
       if (!controllers || controllers.size === 0) {
         permissionControllers.delete(turnContext.turn_id);
@@ -251,7 +305,16 @@ export function createExecutorService({
     for (const controller of permissionControllers.get(turnContext.turn_id) ?? []) {
       controller.abort();
     }
-    await adapter.cancel(turnContext);
+    try {
+      await adapter.cancel(turnContext);
+    } catch (error) {
+      cancelledTurnIds.delete(turnContext.turn_id);
+      if (error.cancellationUncertain) {
+        uncertainTurnIds.add(turnContext.turn_id);
+        if (typeof adapter.abort === 'function') await adapter.abort(turnContext);
+      }
+      throw error;
+    }
     return {
       status: 'cancellation_requested',
       conversation_id: turnContext.conversation_id,
@@ -268,8 +331,21 @@ export function createExecutorService({
   }
 
   async function close() {
-    if (typeof adapter.close === 'function') await adapter.close();
-    await Promise.allSettled([...activeRunSettlements]);
+    if (closePromise) return closePromise;
+    lifecycle = 'closing';
+    const settlements = [...activeRunSettlements];
+    closePromise = (async () => {
+      let closeError = null;
+      try {
+        if (typeof adapter.close === 'function') await adapter.close();
+      } catch (error) {
+        closeError = error;
+      }
+      await Promise.allSettled(settlements);
+      lifecycle = 'closed';
+      if (closeError) throw closeError;
+    })();
+    return closePromise;
   }
 
   return Object.freeze({ cancel, close, evictIdleExecutors, runNext, snapshot, start });

@@ -468,6 +468,125 @@ function createCloseAwareQuery({ sessionId }) {
   return { query, turnStarted };
 }
 
+function createQueuedReceiptQuery({ sessionId }) {
+  const cancelled = deferred();
+  const inputConsumed = deferred();
+  const cancelledMessageUuids = [];
+  function query({ prompt }) {
+    let currentInput = null;
+    const stream = (async function* generateSdkMessages() {
+      for await (const input of prompt) {
+        currentInput = input;
+        inputConsumed.resolve(input);
+        yield { type: 'system', subtype: 'init', session_id: sessionId };
+        await cancelled.promise;
+        yield {
+          type: 'result',
+          subtype: 'error_during_execution',
+          session_id: sessionId,
+          errors: ['interrupted while queued'],
+        };
+        yield idleSession(sessionId);
+      }
+    }());
+    stream.interrupt = async () => ({ still_queued: [currentInput.uuid] });
+    stream.cancelAsyncMessage = async (messageUuid) => {
+      cancelledMessageUuids.push(messageUuid);
+      cancelled.resolve();
+      return false;
+    };
+    stream.close = () => cancelled.resolve();
+    return stream;
+  }
+  return { cancelledMessageUuids, inputConsumed, query };
+}
+
+function createBoundaryEndingQuery({ sessionId }) {
+  const boundary = deferred();
+  let endWithError = false;
+  function query({ prompt }) {
+    const stream = (async function* generateSdkMessages() {
+      for await (const input of prompt) {
+        yield { type: 'system', subtype: 'init', session_id: sessionId };
+        yield {
+          type: 'result',
+          subtype: 'success',
+          session_id: sessionId,
+          result: `done ${input.message.content}`,
+        };
+        await boundary.promise;
+        if (endWithError) throw new Error('query failed before idle boundary');
+        return;
+      }
+    }());
+    stream.interrupt = async () => {};
+    stream.close = () => boundary.resolve();
+    return stream;
+  }
+  return {
+    fail() {
+      endWithError = true;
+      boundary.resolve();
+    },
+    query,
+  };
+}
+
+function createPermissionProgressQuery({ sessionId }) {
+  const progressEmitted = deferred();
+  function query({ prompt, options }) {
+    const stream = (async function* generateSdkMessages() {
+      for await (const input of prompt) {
+        yield { type: 'system', subtype: 'init', session_id: sessionId };
+        const first = options.canUseTool('Read', { path: '/tmp/first' }, {});
+        const second = options.canUseTool('Read', { path: '/tmp/second' }, {});
+        await first;
+        yield {
+          type: 'tool_progress',
+          session_id: sessionId,
+          tool_use_id: 'parallel-tool',
+          tool_name: 'Read',
+          elapsed_time_seconds: 1,
+        };
+        progressEmitted.resolve();
+        await second;
+        yield {
+          type: 'result',
+          subtype: 'success',
+          session_id: sessionId,
+          result: `done ${input.message.content}`,
+        };
+        yield idleSession(sessionId);
+      }
+    }());
+    stream.interrupt = async () => {};
+    stream.close = () => {};
+    return stream;
+  }
+  return { progressEmitted, query };
+}
+
+function createRejectingInterruptQuery({ sessionId }) {
+  const finish = deferred();
+  const turnStarted = deferred();
+  function query({ prompt }) {
+    const stream = (async function* generateSdkMessages() {
+      for await (const input of prompt) {
+        yield { type: 'system', subtype: 'init', session_id: sessionId };
+        turnStarted.resolve();
+        await finish.promise;
+        return;
+      }
+    }());
+    stream.interrupt = async () => {
+      throw new Error('interrupt receipt unavailable');
+    };
+    stream.close = () => finish.resolve();
+    return stream;
+  }
+  return { query, turnStarted };
+}
+
 function createToolQuery({ sessionId }) {
   function query({ prompt }) {
     const stream = (async function* generateSdkMessages() {
@@ -1121,6 +1240,153 @@ describe('Claude conversation executor', () => {
     database.close();
   });
 
+  test('cancels a UUID-stamped input that survives the SDK interrupt receipt', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'cancel-sdk-queued');
+    const fake = createQueuedReceiptQuery({ sessionId: 'claude-session-sdk-queued' });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({
+        query: fake.query,
+        generateMessageUuid: () => '00000000-0000-4000-8000-000000000009',
+      }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-cancel-sdk-queued',
+      now: () => '2026-07-19T09:12:15Z',
+      generateId: deterministicIds('cancel-sdk-queued'),
+    });
+
+    const run = service.runNext();
+    await expect(fake.inputConsumed.promise).resolves.toMatchObject({
+      uuid: '00000000-0000-4000-8000-000000000009',
+    });
+    await expect(service.cancel(accepted.conversation_id)).resolves.toMatchObject({
+      status: 'cancellation_requested',
+    });
+    await expect(run).resolves.toMatchObject({ status: 'stopped' });
+    expect(fake.cancelledMessageUuids).toEqual([
+      '00000000-0000-4000-8000-000000000009',
+    ]);
+
+    await service.close();
+    database.close();
+  });
+
+  test('settles a buffered next turn when the query fails before the prior idle boundary', async () => {
+    const database = openTestDatabase();
+    const first = acceptQueuedTurn(database, 'boundary-failure-first');
+    const second = acceptQueuedTurn(database, 'boundary-failure-second');
+    const fake = createBoundaryEndingQuery({ sessionId: 'claude-session-boundary-failure' });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-boundary-failure',
+      now: () => '2026-07-19T09:12:30Z',
+      generateId: deterministicIds('boundary-failure'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: first.turn_id,
+    });
+    const secondRun = service.runNext();
+    fake.fail();
+    await expect(secondRun).resolves.toMatchObject({
+      status: 'failed',
+      turn_id: second.turn_id,
+    });
+
+    await service.close();
+    database.close();
+  });
+
+  test('settles a buffered next turn when close arrives before the prior idle boundary', async () => {
+    const database = openTestDatabase();
+    acceptQueuedTurn(database, 'boundary-close-first');
+    const second = acceptQueuedTurn(database, 'boundary-close-second');
+    const fake = createBoundaryEndingQuery({ sessionId: 'claude-session-boundary-close' });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-boundary-close',
+      now: () => '2026-07-19T09:12:45Z',
+      generateId: deterministicIds('boundary-close'),
+    });
+
+    await service.runNext();
+    const secondRun = service.runNext();
+    await service.close();
+    await expect(secondRun).resolves.toMatchObject({
+      status: 'failed',
+      turn_id: second.turn_id,
+    });
+
+    database.close();
+  });
+
+  test('persists provider progress while another parallel permission remains pending', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'permission-progress');
+    const fake = createPermissionProgressQuery({ sessionId: 'claude-session-permission-progress' });
+    const decisions = [deferred(), deferred()];
+    let decisionIndex = 0;
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-permission-progress',
+      now: () => '2026-07-19T09:13:15Z',
+      generateId: deterministicIds('permission-progress'),
+      permissionHandler: () => decisions[decisionIndex++].promise,
+    });
+
+    const run = service.runNext();
+    decisions[0].resolve({ behavior: 'allow' });
+    await fake.progressEmitted.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'waiting_user' });
+    expect(readEvents(database, accepted.turn_id).find(({ kind }) => kind === 'tool_progress'))
+      .toMatchObject({
+      kind: 'tool_progress',
+      phase: 'running',
+    });
+    decisions[1].resolve({ behavior: 'allow' });
+    await expect(run).resolves.toMatchObject({ status: 'completed' });
+
+    await service.close();
+    database.close();
+  });
+
+  test('moves an interrupt-rejection turn to recovering instead of reporting cancellation', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'interrupt-rejection');
+    const fake = createRejectingInterruptQuery({ sessionId: 'claude-session-interrupt-rejection' });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-interrupt-rejection',
+      now: () => '2026-07-19T09:13:30Z',
+      generateId: deterministicIds('interrupt-rejection'),
+    });
+
+    const run = service.runNext();
+    await fake.turnStarted.promise;
+    await expect(service.cancel(accepted.conversation_id)).rejects.toThrow(
+      /interrupt receipt unavailable/,
+    );
+    await expect(run).resolves.toMatchObject({ status: 'recovering' });
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    await expect(service.evictIdleExecutors()).resolves.toEqual([]);
+
+    await service.close();
+    database.close();
+  });
+
   test('rolls back a synchronous SDK setup failure so the next turn can start', async () => {
     const database = openTestDatabase();
     const first = acceptQueuedTurn(database, 'sync-setup-first');
@@ -1168,6 +1434,11 @@ describe('Claude conversation executor', () => {
     await expect(run).resolves.toMatchObject({ status: 'failed' });
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
       .get(accepted.turn_id)).toEqual({ state: 'failed' });
+
+    const afterClose = acceptQueuedTurn(database, 'after-close');
+    await expect(service.runNext()).rejects.toThrow(/closing|closed/);
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(afterClose.turn_id)).toEqual({ state: 'queued' });
 
     database.close();
   });

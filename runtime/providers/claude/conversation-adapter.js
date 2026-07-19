@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
 
 function createDeferred() {
@@ -205,7 +207,7 @@ function normalizeProviderMessage(executor, message) {
   return [];
 }
 
-function createSdkUserMessage(input) {
+function createSdkUserMessage(input, messageUuid) {
   const content = typeof input === 'string' ? input : input?.text;
   if (typeof content !== 'string' || content.length === 0) {
     throw new TypeError('Claude turn input must contain non-empty text.');
@@ -214,7 +216,35 @@ function createSdkUserMessage(input) {
     type: 'user',
     message: { role: 'user', content },
     parent_tool_use_id: null,
+    uuid: messageUuid,
   };
+}
+
+function sameTurn(turn, context) {
+  return turn?.context.turn_id === context.turn_id
+    && turn.context.attempt.attempt_id === context.attempt.attempt_id
+    && turn.context.attempt.attempt_no === context.attempt.attempt_no
+    && turn.context.attempt.lease_epoch === context.attempt.lease_epoch;
+}
+
+function settleTurn(turn, { error = null, outcome = 'failed' } = {}) {
+  if (!turn || turn.resultSeen) return;
+  if (error) turn.output.close(error);
+  else {
+    turn.output.push({ type: 'turn_result', outcome });
+    turn.output.close();
+  }
+  turn.resultSeen = true;
+}
+
+function settleUnfinishedTurns(executor, options = {}) {
+  const turns = new Set([executor.providerTurn, executor.activeTurn]);
+  for (const turn of turns) {
+    settleTurn(turn, {
+      ...options,
+      outcome: turn?.cancelRequested ? 'cancelled' : (options.outcome ?? 'failed'),
+    });
+  }
 }
 
 async function requestToolPermission(executor, toolName, input, sdkContext) {
@@ -325,33 +355,21 @@ function createResidentExecutor({
           for (const record of normalizeProviderMessage(executor, message)) {
             providerTurn?.output.push(record);
           }
-          if (message?.type === 'result' && providerTurn) {
+          if (message?.type === 'result' && providerTurn && !providerTurn.resultSeen) {
             const outcome = providerTurn.cancelRequested
               ? 'cancelled'
               : (message.subtype === 'success' ? 'completed' : 'failed');
-            providerTurn.output.push({
-              type: 'turn_result',
-              outcome,
-            });
-            providerTurn.output.close();
-            providerTurn.resultSeen = true;
+            settleTurn(providerTurn, { outcome });
             if (executor.activeTurn === providerTurn) executor.activeTurn = null;
             executor.lastUsedAt = now();
           }
         }
       } catch (error) {
-        const failedTurn = executor.providerTurn ?? executor.activeTurn;
-        if (failedTurn) {
-          failedTurn.output.close(error);
-        }
+        settleUnfinishedTurns(executor, { error });
         executor.activeTurn = null;
         executor.providerTurn = null;
       } finally {
-        const unfinishedTurn = executor.providerTurn ?? executor.activeTurn;
-        if (unfinishedTurn && !unfinishedTurn.resultSeen) {
-          unfinishedTurn.output.push({ type: 'turn_result', outcome: 'failed' });
-          unfinishedTurn.output.close();
-        }
+        settleUnfinishedTurns(executor);
         executor.activeTurn = null;
         executor.providerTurn = null;
         executor.ended = true;
@@ -367,12 +385,16 @@ export function createClaudeConversationAdapter({
   queryOptions = {},
   idleTimeoutMs = 300_000,
   now = () => Date.now(),
+  generateMessageUuid = randomUUID,
 }) {
   if (typeof query !== 'function') throw new TypeError('query must be a function');
   if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs < 0) {
     throw new TypeError('idleTimeoutMs must be a non-negative finite number');
   }
   if (typeof now !== 'function') throw new TypeError('now must be a function');
+  if (typeof generateMessageUuid !== 'function') {
+    throw new TypeError('generateMessageUuid must be a function');
+  }
   const executors = new Map();
 
   async function* execute(context, controls = {}) {
@@ -406,10 +428,15 @@ export function createClaudeConversationAdapter({
     }
 
     const output = createAsyncQueue();
+    const messageUuid = generateMessageUuid();
+    if (typeof messageUuid !== 'string' || messageUuid.length === 0) {
+      throw new TypeError('generateMessageUuid must return a non-empty string');
+    }
     executor.activeTurn = {
       cancelRequested: false,
       controls,
       context,
+      messageUuid,
       output,
       resultSeen: false,
       text: '',
@@ -418,7 +445,7 @@ export function createClaudeConversationAdapter({
     try {
       executor.start();
       executor.input.push({
-        message: createSdkUserMessage(context.input),
+        message: createSdkUserMessage(context.input, messageUuid),
         turn: executor.activeTurn,
       });
     } catch (error) {
@@ -435,13 +462,7 @@ export function createClaudeConversationAdapter({
   async function cancel(context) {
     const executor = executors.get(context.conversation_id);
     const activeTurn = executor?.activeTurn;
-    if (
-      !activeTurn
-      || activeTurn.context.turn_id !== context.turn_id
-      || activeTurn.context.attempt.attempt_id !== context.attempt.attempt_id
-      || activeTurn.context.attempt.attempt_no !== context.attempt.attempt_no
-      || activeTurn.context.attempt.lease_epoch !== context.attempt.lease_epoch
-    ) {
+    if (!sameTurn(activeTurn, context)) {
       throw new Error('Claude cancellation does not match the active provider attempt fence.');
     }
     if (typeof executor.query?.interrupt !== 'function') {
@@ -457,13 +478,50 @@ export function createClaudeConversationAdapter({
       executor.lastUsedAt = now();
       return;
     }
-    await executor.query.interrupt();
+    let receipt;
+    try {
+      receipt = await executor.query.interrupt();
+    } catch (cause) {
+      activeTurn.cancelRequested = false;
+      const error = new Error(`Claude interruption is uncertain: ${cause.message}`, { cause });
+      error.cancellationUncertain = true;
+      throw error;
+    }
+    if (receipt?.still_queued?.includes(activeTurn.messageUuid)) {
+      if (typeof executor.query.cancelAsyncMessage === 'function') {
+        await executor.query.cancelAsyncMessage(activeTurn.messageUuid);
+      } else {
+        executors.delete(context.conversation_id);
+        settleTurn(activeTurn, { outcome: 'cancelled' });
+        if (executor.activeTurn === activeTurn) executor.activeTurn = null;
+        await closeExecutor(executor);
+        return;
+      }
+      settleTurn(activeTurn, { outcome: 'cancelled' });
+      if (executor.activeTurn === activeTurn) executor.activeTurn = null;
+      executor.lastUsedAt = now();
+    }
   }
 
   async function closeExecutor(executor) {
     executor.input.close();
     await executor.query?.close?.();
     if (executor.outputPump) await executor.outputPump;
+  }
+
+  async function abort(context) {
+    const executor = executors.get(context.conversation_id);
+    if (!executor) return;
+    const residentTurns = [executor.activeTurn, executor.providerTurn].filter(Boolean);
+    const turn = sameTurn(executor.activeTurn, context)
+      ? executor.activeTurn
+      : (sameTurn(executor.providerTurn, context) ? executor.providerTurn : null);
+    if (!turn && residentTurns.length > 0) {
+      throw new Error('Claude abort does not match the active provider attempt fence.');
+    }
+    if (turn) executor.input.remove(({ turn: queuedTurn }) => queuedTurn === turn);
+    executors.delete(context.conversation_id);
+    await closeExecutor(executor);
   }
 
   async function evictIdle({ canEvict }) {
@@ -503,5 +561,5 @@ export function createClaudeConversationAdapter({
     executors.clear();
   }
 
-  return Object.freeze({ cancel, close, evictIdle, execute });
+  return Object.freeze({ abort, cancel, close, evictIdle, execute });
 }

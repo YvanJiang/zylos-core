@@ -404,6 +404,50 @@ describe('runtime executor service', () => {
     database.close();
   });
 
+  test('isolates the provider and preserves authority when terminal projection persistence fails', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'service-projection-failure');
+    database.exec(`
+      CREATE TRIGGER fail_service_terminal_projection
+      BEFORE INSERT ON runtime_projection_snapshots
+      WHEN NEW.terminal = 1
+      BEGIN
+        SELECT RAISE(ABORT, 'forced service terminal projection failure');
+      END;
+    `);
+    const aborts = [];
+    const adapter = {
+      async abort(context) {
+        aborts.push(context.turn_id);
+      },
+      async *execute() {},
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-projection-failure',
+      now: () => '2026-07-19T07:01:30Z',
+      generateId: deterministicIds('service-projection-failure'),
+    });
+
+    await expect(service.runNext()).rejects.toThrow(/forced service terminal projection failure/);
+    expect(aborts).toEqual([accepted.turn_id]);
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'running' });
+    expect(database.prepare(`SELECT status FROM runtime_turn_queue WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ status: 'claimed' });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({
+      lease_owner: 'executor-service-projection-failure',
+      turn_id: accepted.turn_id,
+    });
+
+    await service.close();
+    database.close();
+  });
+
   test('rolls back adapter event version, event, and projection as one commit', () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'atomic-adapter-event');

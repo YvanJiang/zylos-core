@@ -10,7 +10,7 @@ const CANONICAL_TRANSITIONS = Object.freeze({
   queued: Object.freeze(['starting']),
   starting: Object.freeze(['running', 'stopped', 'failed']),
   running: Object.freeze(['waiting_user', 'recovering', 'completed', 'stopped', 'failed']),
-  waiting_user: Object.freeze(['running', 'stopped', 'timed_out', 'failed']),
+  waiting_user: Object.freeze(['running', 'recovering', 'stopped', 'timed_out', 'failed']),
   recovering: Object.freeze(['running', 'stopped', 'failed', 'interrupted']),
 });
 
@@ -496,7 +496,21 @@ export function createExecutorStore({
       conflict('illegal_transition', 'Provider adapters cannot author canonical state transitions.');
     }
     const append = database.transaction(() => {
-      const turn = loadTurn(database, turnContext.turn_id);
+      let turn = loadTurn(database, turnContext.turn_id);
+      const restoreWaitingUser = turn.state === 'waiting_user';
+      if (restoreWaitingUser) {
+        transitionInTransaction(database, {
+          turnId: turnContext.turn_id,
+          fromState: 'waiting_user',
+          toState: 'running',
+          fence: turnContext.attempt,
+          provider,
+          serviceInstanceId,
+          occurredAt: now(),
+          generateId,
+        });
+        turn = loadTurn(database, turnContext.turn_id);
+      }
       if (turn.state !== 'running') {
         conflict('illegal_transition', `Adapter output is invalid while turn is ${turn.state}.`);
       }
@@ -524,6 +538,18 @@ export function createExecutorStore({
         staleMessage: 'The adapter event lost its provider attempt fence.',
         generateId,
       });
+      if (restoreWaitingUser) {
+        transitionInTransaction(database, {
+          turnId: turnContext.turn_id,
+          fromState: 'running',
+          toState: 'waiting_user',
+          fence: turnContext.attempt,
+          provider,
+          serviceInstanceId,
+          occurredAt: now(),
+          generateId,
+        });
+      }
       return event;
     });
     return append.immediate();
