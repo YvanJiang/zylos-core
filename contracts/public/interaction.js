@@ -748,6 +748,23 @@ export function validateInteractionAnswerAgainstRequest(
       occurredAt,
     );
   }
+  const expectedAnswerKind = request.kind === 'question'
+    ? 'text'
+    : request.kind === 'choice'
+      ? 'choice'
+      : 'decision';
+  if (answer.value.kind !== expectedAnswerKind) {
+    reject(
+      `${request.kind} interactions require an answer value of kind ${expectedAnswerKind}.`,
+      occurredAt,
+    );
+  }
+  if (
+    request.kind === 'choice'
+    && !request.choices.some(({ choice_id: choiceId }) => choiceId === answer.value.choice_id)
+  ) {
+    reject('answer choice_id must identify one of the request choices.', occurredAt);
+  }
   if (!request.allowed_sources.includes(answer.source)) {
     reject('answer source is not allowed by the interaction request.', occurredAt);
   }

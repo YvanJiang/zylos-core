@@ -86,6 +86,11 @@ export function createRunningInteractionTurn(database, suffix = 'request', {
 
 export function interactionAnswer(request, suffix = '1', overrides = {}) {
   const sourceEventId = `card-action-${suffix}`;
+  const defaultValue = request.kind === 'question'
+    ? { kind: 'text', text: `answer ${suffix}` }
+    : request.kind === 'choice'
+      ? { kind: 'choice', choice_id: request.choices[0]?.choice_id }
+      : { kind: 'decision', decision: 'approve' };
   const answer = {
     contract: 'zylos.interaction-answer',
     contract_version: '1.0',
@@ -110,7 +115,7 @@ export function interactionAnswer(request, suffix = '1', overrides = {}) {
       platform_message_or_action_id: sourceEventId,
     },
     source: 'card_action',
-    value: { kind: 'decision', decision: 'approve' },
+    value: defaultValue,
     answered_at: '2026-07-19T07:02:00Z',
   };
   Object.assign(answer, overrides);

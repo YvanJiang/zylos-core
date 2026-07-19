@@ -319,6 +319,13 @@ export function createExecutorService({
   async function isolateInteractionRecovery(activeRun) {
     if (typeof adapter.abort === 'function') {
       await adapter.abort(activeRun.turnContext);
+      if (provider === 'codex' && typeof activeRun.iterator?.return === 'function') {
+        try {
+          await activeRun.iterator.return();
+        } catch {
+          // Provider terminal is the isolation proof; iterator cleanup is best-effort.
+        }
+      }
       return true;
     }
     if (typeof activeRun.iterator?.return === 'function') {

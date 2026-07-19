@@ -13,7 +13,6 @@ function createFakeAppServer({
   respondToTurnStart = true,
 } = {}) {
   const child = new EventEmitter();
-  child.pid = 4102;
   child.stdin = new PassThrough();
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
@@ -184,7 +183,11 @@ describe('Codex app-server provider adapter', () => {
     expect(spawnProcess).toHaveBeenCalledWith(
       'codex',
       ['app-server', '--stdio'],
-      expect.objectContaining({ shell: false, stdio: ['pipe', 'pipe', 'pipe'] }),
+      expect.objectContaining({
+        detached: process.platform !== 'win32',
+        shell: false,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }),
     );
     expect(server.received[0]).toEqual(expect.objectContaining({
       method: 'initialize',
@@ -257,6 +260,118 @@ describe('Codex app-server provider adapter', () => {
     expect(server.received.filter(({ method }) => method === 'turn/start')).toHaveLength(2);
   });
 
+  test('ignores tombstoned late traffic without changing another run on the current connection', async () => {
+    const reportRunBFailure = jest.fn();
+    const server = createFakeAppServer({
+      afterTurnStart(details) {
+        if (details.turnId !== 'codex-turn-1') return;
+        sendStartedFileChange(details, 'late-file-change');
+        details.send({
+          id: 'run-a-approval',
+          method: 'item/fileChange/requestApproval',
+          params: {
+            threadId: details.threadId,
+            turnId: details.turnId,
+            itemId: 'late-file-change',
+            startedAtMs: 1,
+          },
+        });
+      },
+      onClientResponse({ message, send }) {
+        if (message.id !== 'run-a-approval') return;
+        send({
+          method: 'serverRequest/resolved',
+          params: { threadId: 'codex-thread-A', requestId: 'run-a-approval' },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const runAContext = executionContext({
+      lineage: { provider_native_id: 'codex-thread-A' },
+    });
+    const runA = adapter.execute(runAContext)[Symbol.asyncIterator]();
+    const interaction = await nextInteraction(runA);
+    await adapter.handleInteractionAnswer(handoffDelivery(
+      interaction.value.payload.provider_interaction_ref,
+      { kind: 'decision', decision: 'approve' },
+    ));
+    server.send({
+      method: 'item/completed',
+      params: {
+        threadId: 'codex-thread-A',
+        turnId: 'codex-turn-1',
+        item: {
+          type: 'fileChange',
+          id: 'late-file-change',
+          status: 'completed',
+          changes: [],
+        },
+      },
+    });
+    server.send({
+      method: 'turn/completed',
+      params: {
+        threadId: 'codex-thread-A',
+        turn: { id: 'codex-turn-1', status: 'completed', items: [] },
+      },
+    });
+    await collect({ [Symbol.asyncIterator]: () => runA });
+
+    const runBContext = executionContext({
+      conversation_id: 'conversation-B',
+      turn_id: 'turn-B',
+      lineage_id: 'lineage-B',
+      lineage: { provider_native_id: 'codex-thread-B' },
+      reportProviderFailure: reportRunBFailure,
+      attempt: { attempt_id: 'attempt-B', attempt_no: 1, lease_epoch: 4 },
+    });
+    const runB = adapter.execute(runBContext)[Symbol.asyncIterator]();
+    const waitingB = runB.next();
+    await waitFor(() => server.received.some((message) => (
+      message.method === 'turn/start' && message.params.threadId === 'codex-thread-B'
+    )));
+    const runATurnStartId = server.received.find((message) => (
+      message.method === 'turn/start' && message.params.threadId === 'codex-thread-A'
+    )).id;
+
+    server.send({
+      method: 'item/agentMessage/delta',
+      params: {
+        threadId: 'codex-thread-A',
+        turnId: 'codex-turn-1',
+        itemId: 'late-message',
+        delta: 'late',
+      },
+    });
+    server.send({
+      id: 'late-run-a-request',
+      method: 'item/fileChange/requestApproval',
+      params: {
+        threadId: 'codex-thread-A',
+        turnId: 'codex-turn-1',
+        itemId: 'late-file-change',
+        startedAtMs: 2,
+      },
+    });
+    server.send({
+      method: 'serverRequest/resolved',
+      params: { threadId: 'codex-thread-A', requestId: 'run-a-approval' },
+    });
+    server.send({ id: runATurnStartId, result: { turn: { id: 'codex-turn-1' } } });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(reportRunBFailure).not.toHaveBeenCalled();
+    expect(server.child.kill).not.toHaveBeenCalled();
+    server.send({
+      method: 'turn/completed',
+      params: {
+        threadId: 'codex-thread-B',
+        turn: { id: 'codex-turn-2', status: 'completed', items: [] },
+      },
+    });
+    await expect(waitingB).resolves.toEqual({ done: true, value: undefined });
+  });
+
   test('reports recovery when transport is lost after turn/start write but before its response', async () => {
     const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
     const server = createFakeAppServer({ respondToTurnStart: false });
@@ -270,6 +385,74 @@ describe('Codex app-server provider adapter', () => {
       providerError: { code: 'side_effect_unknown', side_effect_status: 'unknown' },
     });
     expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+  });
+
+  test('retires the connection when a successful turn/start response has no usable turn fence', async () => {
+    const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
+    const server = createFakeAppServer({ respondToTurnStart: false });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const waiting = adapter.execute(executionContext({
+      lineage: { provider_native_id: 'codex-thread-1' },
+      reportProviderFailure,
+    }))[Symbol.asyncIterator]().next();
+    await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
+    const request = server.received.find(({ method }) => method === 'turn/start');
+
+    server.send({ id: request.id, result: { turn: { status: 'inProgress', items: [] } } });
+
+    await expect(waiting).rejects.toMatchObject({
+      providerError: { code: 'side_effect_unknown' },
+    });
+    expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
+  test('retires the shared connection when turn/start cannot be written synchronously', async () => {
+    const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
+    const server = createFakeAppServer();
+    const originalWrite = server.child.stdin.write.bind(server.child.stdin);
+    server.child.stdin.write = jest.fn((chunk) => {
+      if (String(chunk).includes('"method":"turn/start"')) {
+        throw new Error('forced synchronous turn/start EPIPE');
+      }
+      return originalWrite(chunk);
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(adapter.execute(executionContext({
+      lineage: { provider_native_id: 'codex-thread-1' },
+      reportProviderFailure,
+    }))[Symbol.asyncIterator]().next()).rejects.toMatchObject({
+      providerError: { side_effect_status: 'unknown' },
+    });
+    expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
+  test('retires the shared connection when a later control request cannot be written', async () => {
+    const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
+    const server = createFakeAppServer({ afterTurnStart() {} });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const context = executionContext({
+      lineage: { provider_native_id: 'codex-thread-1' },
+      reportProviderFailure,
+    });
+    const waiting = adapter.execute(context)[Symbol.asyncIterator]().next();
+    await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
+    server.child.stdin.write = jest.fn(() => {
+      throw new Error('forced synchronous control EPIPE');
+    });
+
+    await expect(adapter.interrupt({
+      turn_id: context.turn_id,
+      attempt: context.attempt,
+      reason: 'stop',
+    })).rejects.toMatchObject({ providerError: { side_effect_status: 'unknown' } });
+    await expect(waiting).rejects.toMatchObject({
+      providerError: { side_effect_status: 'unknown' },
+    });
+    expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
   });
 
   test('normalizes text and tool notifications without exposing app-server method names', async () => {
@@ -403,6 +586,41 @@ describe('Codex app-server provider adapter', () => {
     expect(spawnProcess).toHaveBeenCalledTimes(1);
     server.child.emit('close', 1, null);
     await expect(replacement).resolves.toEqual([]);
+    expect(spawnProcess).toHaveBeenCalledTimes(2);
+  });
+
+  test('does not replace a closed app-server while its supervised process group is alive', async () => {
+    const firstServer = createFakeAppServer();
+    firstServer.child.pid = 42_426;
+    const replacementServer = createFakeAppServer();
+    let processGroupAlive = true;
+    const signalProcessGroup = jest.fn((_processGroupId, _child, signal) => {
+      if (signal === 'SIGKILL') processGroupAlive = false;
+      return true;
+    });
+    const spawnProcess = jest.fn()
+      .mockImplementationOnce(() => firstServer.child)
+      .mockImplementationOnce(() => replacementServer.child);
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess,
+      processTerminationGraceMs: 5,
+      signalProcessGroup,
+      isProcessGroupAlive: () => processGroupAlive,
+    });
+    await collect(adapter.execute(executionContext()));
+
+    firstServer.child.emit('close', 1, null);
+    const replacement = collect(adapter.execute(executionContext({
+      turn_id: 'turn-after-group-exit',
+      lineage: { provider_native_id: 'codex-thread-1' },
+      attempt: { attempt_id: 'attempt-after-group-exit', attempt_no: 1, lease_epoch: 4 },
+    })));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(spawnProcess).toHaveBeenCalledTimes(1);
+
+    await expect(replacement).resolves.toEqual([]);
+    expect(signalProcessGroup.mock.calls.map(([, , signal]) => signal))
+      .toEqual(['SIGTERM', 'SIGKILL']);
     expect(spawnProcess).toHaveBeenCalledTimes(2);
   });
 
@@ -1510,6 +1728,72 @@ describe('Codex app-server provider adapter', () => {
     });
   });
 
+  test('proves abort isolation only after the exact provider turn reaches terminal', async () => {
+    const server = createFakeAppServer({ afterTurnStart() {} });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const context = executionContext({ lineage: { provider_native_id: 'codex-thread-1' } });
+    const waiting = adapter.execute(context)[Symbol.asyncIterator]().next();
+    await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
+
+    const aborting = adapter.abort(context);
+    await waitFor(() => server.received.some(({ method }) => method === 'turn/interrupt'));
+    let settled = false;
+    aborting.finally(() => { settled = true; }).catch(() => {});
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+
+    server.send({
+      method: 'turn/completed',
+      params: {
+        threadId: 'codex-thread-1',
+        turn: { id: 'codex-turn-1', status: 'interrupted', items: [] },
+      },
+    });
+    await expect(aborting).resolves.toEqual({
+      status: 'provider_stopped',
+      provider_status: 'interrupted',
+    });
+    await expect(waiting).rejects.toMatchObject({
+      providerError: { code: 'side_effect_unknown' },
+    });
+    expect(server.child.kill).not.toHaveBeenCalled();
+  });
+
+  test('proves abort isolation by terminating and observing the full supervised process group', async () => {
+    const server = createFakeAppServer({ afterTurnStart() {} });
+    server.child.pid = 42_424;
+    let processGroupAlive = true;
+    const signalProcessGroup = jest.fn((_processGroupId, _child, signal) => {
+      if (signal === 'SIGTERM') {
+        queueMicrotask(() => server.child.emit('close', 0, signal));
+      } else if (signal === 'SIGKILL') {
+        processGroupAlive = false;
+      }
+      return true;
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      interruptConfirmationTimeoutMs: 5,
+      processTerminationGraceMs: 5,
+      signalProcessGroup,
+      isProcessGroupAlive: () => processGroupAlive,
+    });
+    const context = executionContext({ lineage: { provider_native_id: 'codex-thread-1' } });
+    const waiting = adapter.execute(context)[Symbol.asyncIterator]().next();
+    const waitingFailure = expect(waiting).rejects.toMatchObject({
+      providerError: { side_effect_status: 'unknown' },
+    });
+    await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
+
+    await expect(adapter.abort(context)).resolves.toEqual({
+      status: 'provider_stopped',
+      provider_status: 'process_exited',
+    });
+    expect(signalProcessGroup.mock.calls.map(([, , signal]) => signal))
+      .toEqual(['SIGTERM', 'SIGKILL']);
+    await waitingFailure;
+  });
+
   test('waits for the matching provider completion before confirming a timeout interrupt', async () => {
     const server = createFakeAppServer({ afterTurnStart() {} });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
@@ -1552,6 +1836,7 @@ describe('Codex app-server provider adapter', () => {
     const adapter = createCodexAppServerAdapter({
       spawnProcess: () => server.child,
       interruptConfirmationTimeoutMs: 250,
+      processTerminationGraceMs: 250,
       setTimeoutFn(callback, delay) {
         expect(delay).toBe(250);
         confirmTimeout = callback;
@@ -1759,10 +2044,85 @@ describe('Codex app-server provider adapter', () => {
 
   test('closes only its supervised app-server child during service shutdown', async () => {
     const server = createFakeAppServer();
+    server.child.kill.mockImplementation((signal) => {
+      if (signal === 'SIGTERM') queueMicrotask(() => server.child.emit('close', 0, signal));
+      return true;
+    });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     await collect(adapter.execute(executionContext()));
 
-    await expect(adapter.close()).resolves.toEqual({ status: 'signalled' });
+    await expect(adapter.close()).resolves.toEqual([]);
     expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
+  test('reports the conversation whose active provider turn was closed with the service', async () => {
+    const server = createFakeAppServer({ afterTurnStart() {} });
+    server.child.kill.mockImplementation((signal) => {
+      if (signal === 'SIGTERM') queueMicrotask(() => server.child.emit('close', 0, signal));
+      return true;
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const context = executionContext({ conversation_id: 'conversation-active-close' });
+    const waiting = adapter.execute(context)[Symbol.asyncIterator]().next();
+    await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
+
+    await expect(adapter.close()).resolves.toEqual(['conversation-active-close']);
+    await expect(waiting).rejects.toMatchObject({
+      providerError: { side_effect_status: 'unknown' },
+    });
+  });
+
+  test('escalates supervised shutdown and waits for observed child exit', async () => {
+    const server = createFakeAppServer();
+    server.child.kill.mockImplementation((signal) => {
+      if (signal === 'SIGKILL') queueMicrotask(() => server.child.emit('close', null, signal));
+      return true;
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      processTerminationGraceMs: 5,
+    });
+    await collect(adapter.execute(executionContext()));
+
+    await expect(adapter.close()).resolves.toEqual([]);
+    expect(server.child.kill.mock.calls.map(([signal]) => signal)).toEqual(['SIGTERM', 'SIGKILL']);
+  });
+
+  test('fails closed when forced app-server termination is not observed', async () => {
+    const server = createFakeAppServer();
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      processTerminationGraceMs: 5,
+    });
+    await collect(adapter.execute(executionContext()));
+
+    await expect(adapter.close()).rejects.toMatchObject({
+      providerError: { side_effect_status: 'unknown' },
+      closedConversationIds: [],
+    });
+    expect(server.child.kill.mock.calls.map(([signal]) => signal)).toEqual(['SIGTERM', 'SIGKILL']);
+  });
+
+  test('fails closed when the app-server process exits but its supervised group survives', async () => {
+    const server = createFakeAppServer();
+    server.child.pid = 42_425;
+    const signalProcessGroup = jest.fn((_processGroupId, _child, signal) => {
+      if (signal === 'SIGTERM') queueMicrotask(() => server.child.emit('close', 0, signal));
+      return true;
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      processTerminationGraceMs: 5,
+      signalProcessGroup,
+      isProcessGroupAlive: () => true,
+    });
+    await collect(adapter.execute(executionContext()));
+
+    await expect(adapter.close()).rejects.toMatchObject({
+      providerError: { side_effect_status: 'unknown' },
+      closedConversationIds: [],
+    });
+    expect(signalProcessGroup.mock.calls.map(([, , signal]) => signal))
+      .toEqual(['SIGTERM', 'SIGKILL']);
   });
 });

@@ -1,6 +1,8 @@
 import fs from 'node:fs';
+import { EventEmitter } from 'node:events';
 import os from 'node:os';
 import path from 'node:path';
+import { PassThrough } from 'node:stream';
 
 import { afterEach, describe, expect, test } from '@jest/globals';
 import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/index.js';
@@ -14,6 +16,7 @@ import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { createExecutorService } from '../runtime/executor/service.js';
 import { createExecutorStore } from '../runtime/persistence/executor-store.js';
 import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { createCodexAppServerAdapter } from '../runtime/providers/codex-app-server-adapter.js';
 import { deliveredResult } from './helpers/delivered-result.js';
 
 const inboundFixture = JSON.parse(fs.readFileSync(
@@ -61,6 +64,34 @@ function acceptQueuedTurn(database, suffix = 'canonical') {
     now: () => '2026-07-19T07:00:00Z',
     generateId: deterministicIds(`inbound-${suffix}`),
   });
+}
+
+function malformedTurnStartAppServer() {
+  const child = new EventEmitter();
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => true;
+  let buffer = '';
+  const send = (message) => child.stdout.write(`${JSON.stringify(message)}\n`);
+  child.stdin.on('data', (chunk) => {
+    buffer += chunk.toString('utf8');
+    while (buffer.includes('\n')) {
+      const newline = buffer.indexOf('\n');
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      if (line.length === 0) continue;
+      const message = JSON.parse(line);
+      if (message.method === 'initialize') {
+        send({ id: message.id, result: { userAgent: 'codex-test' } });
+      } else if (message.method === 'thread/start') {
+        send({ id: message.id, result: { thread: { id: 'codex-thread-malformed' } } });
+      } else if (message.method === 'turn/start') {
+        send({ id: message.id, result: { turn: { status: 'inProgress', items: [] } } });
+      }
+    }
+  });
+  return child;
 }
 
 function readEvents(database, turnId) {
@@ -478,6 +509,39 @@ describe('runtime executor service', () => {
       WHERE conversation_id = ?
     `).get(accepted.conversation_id)).toEqual({
       lease_owner: 'executor-service-transport-loss-persistence-failure',
+      turn_id: accepted.turn_id,
+    });
+
+    database.close();
+  });
+
+  test('retains authority when app-server accepts turn/start without a usable turn ID', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'malformed-turn-start-response');
+    const child = malformedTurnStartAppServer();
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => child });
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-malformed-turn-start-response',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('malformed-turn-start-response'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'recovering',
+      turn_id: accepted.turn_id,
+    });
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id
+      FROM runtime_executor_leases
+      WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({
+      lease_owner: 'executor-service-malformed-turn-start-response',
       turn_id: accepted.turn_id,
     });
 

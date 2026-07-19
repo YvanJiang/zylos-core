@@ -71,6 +71,34 @@ function rejectProtocol(message, code = 'provider_protocol_invalid') {
   throw new CodexAppServerAdapterError(code, message);
 }
 
+function rememberTombstone(tombstones, key, value = true) {
+  tombstones.set(key, value);
+}
+
+function signalSupervisedProcessGroup(processGroupId, child, signal) {
+  if (processGroupId === null) return child.kill(signal);
+  return process.kill(-processGroupId, signal);
+}
+
+function supervisedProcessGroupIsAlive(processGroupId) {
+  try {
+    process.kill(-processGroupId, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ESRCH') return false;
+    throw error;
+  }
+}
+
+function serverRequestTombstone({ thread_id: threadId, turn_id: turnId, method, params }) {
+  return Object.freeze({
+    thread_id: threadId,
+    turn_id: turnId,
+    method,
+    params_json: JSON.stringify(params),
+  });
+}
+
 function selectEnvironment(source, allowlist) {
   const selected = {};
   for (const name of allowlist) {
@@ -426,6 +454,9 @@ export function createCodexAppServerAdapter({
   approvalPolicy = 'on-request',
   sandbox = 'workspace-write',
   interruptConfirmationTimeoutMs = 5_000,
+  processTerminationGraceMs = 5_000,
+  signalProcessGroup = signalSupervisedProcessGroup,
+  isProcessGroupAlive = supervisedProcessGroupIsAlive,
   setTimeoutFn = setTimeout,
   clearTimeoutFn = clearTimeout,
 } = {}) {
@@ -451,6 +482,12 @@ export function createCodexAppServerAdapter({
   ) {
     throw new TypeError('interruptConfirmationTimeoutMs must be a positive safe integer');
   }
+  if (!Number.isSafeInteger(processTerminationGraceMs) || processTerminationGraceMs <= 0) {
+    throw new TypeError('processTerminationGraceMs must be a positive safe integer');
+  }
+  if (typeof signalProcessGroup !== 'function' || typeof isProcessGroupAlive !== 'function') {
+    throw new TypeError('process-group supervision functions must be callable');
+  }
   if (typeof setTimeoutFn !== 'function' || typeof clearTimeoutFn !== 'function') {
     throw new TypeError('timeout functions must be callable');
   }
@@ -468,11 +505,84 @@ export function createCodexAppServerAdapter({
   let nextConnectionNo = 0;
   let nextInteractionNo = 0;
 
-  function discardProviderRequestsForRun(run, failure) {
+  function supervisedProcessGroupExited(target) {
+    if (!target.closed_observed) return false;
+    if (target.process_group_id === null) return true;
+    try {
+      return !isProcessGroupAlive(target.process_group_id);
+    } catch {
+      return false;
+    }
+  }
+
+  function requestProcessTermination(target) {
+    if (target.termination_requested) return;
+    target.termination_requested = true;
+    if (supervisedProcessGroupExited(target)) return;
+    try {
+      signalProcessGroup(target.process_group_id, target.child, 'SIGTERM');
+    } catch {
+      // Escalation below remains responsible for proving process exit.
+    }
+    if (supervisedProcessGroupExited(target)) return;
+    target.termination_timer = setTimeoutFn(() => {
+      target.termination_timer = null;
+      if (supervisedProcessGroupExited(target)) return;
+      try {
+        signalProcessGroup(target.process_group_id, target.child, 'SIGKILL');
+      } catch {
+        // A missing close event remains a fail-closed supervision result.
+      }
+    }, processTerminationGraceMs);
+    target.termination_timer?.unref?.();
+  }
+
+  function waitForProcessClose(target) {
+    if (supervisedProcessGroupExited(target)) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let settled = false;
+      let pollTimer = null;
+      let pollScheduled = false;
+      const deadlineTimer = setTimeoutFn(() => {
+        if (settled) return;
+        settled = true;
+        if (pollTimer !== null) clearTimeoutFn(pollTimer);
+        resolve(false);
+      }, processTerminationGraceMs * 2);
+      deadlineTimer?.unref?.();
+      const check = () => {
+        if (settled) return;
+        if (supervisedProcessGroupExited(target)) {
+          settled = true;
+          clearTimeoutFn(deadlineTimer);
+          if (pollTimer !== null) clearTimeoutFn(pollTimer);
+          resolve(true);
+          return;
+        }
+        if (pollScheduled) return;
+        pollScheduled = true;
+        pollTimer = setTimeoutFn(() => {
+          pollScheduled = false;
+          pollTimer = null;
+          check();
+        }, Math.min(25, processTerminationGraceMs));
+        pollTimer?.unref?.();
+      };
+      target.closed.then(check);
+      check();
+    });
+  }
+
+  function discardProviderRequestsForRun(target, run, failure) {
     const discardedGroups = new Set();
     for (const [requestKey, group] of providerRequests) {
       if (group.run !== run) continue;
       discardedGroups.add(group);
+      rememberTombstone(
+        target.retired_server_requests,
+        String(group.request_id),
+        serverRequestTombstone(group),
+      );
       group.rejectResolved(failure);
       providerRequests.delete(requestKey);
     }
@@ -495,15 +605,11 @@ export function createCodexAppServerAdapter({
     for (const pending of target.pending.values()) pending.reject(failure);
     target.pending.clear();
     if (terminate && !target.termination_requested) {
-      target.termination_requested = true;
-      try {
-        target.child.kill('SIGTERM');
-      } catch {
-        // The connection is already failed; process termination is best-effort here.
-      }
+      requestProcessTermination(target);
     }
     for (const [runKey, run] of activeRuns) {
       if (run.connection_id !== target.connection_id) continue;
+      target.affected_conversation_ids.add(run.context.conversation_id);
       try {
         run.context.reportProviderFailure?.(failure);
       } catch {
@@ -515,6 +621,7 @@ export function createCodexAppServerAdapter({
     }
     for (const [runKey, run] of startingRuns) {
       if (run.connection_id !== target.connection_id) continue;
+      target.affected_conversation_ids.add(run.context.conversation_id);
       try {
         run.context.reportProviderFailure?.(failure);
       } catch {
@@ -526,6 +633,7 @@ export function createCodexAppServerAdapter({
     }
     for (const run of inFlightTurnStarts) {
       if (run.connection_id !== target.connection_id) continue;
+      target.affected_conversation_ids.add(run.context.conversation_id);
       try {
         run.context.reportProviderFailure?.(failure);
       } catch {
@@ -551,8 +659,17 @@ export function createCodexAppServerAdapter({
     const { method, params } = message;
     if (method === 'thread/started') return;
     if (method === 'serverRequest/resolved') {
-      const group = providerRequests.get(`${target.connection_id}:${String(params?.requestId)}`);
-      if (!group || group.thread_id !== params?.threadId || group.connection_id !== target.connection_id) {
+      const requestId = String(params?.requestId);
+      const group = providerRequests.get(`${target.connection_id}:${requestId}`);
+      if (!group) {
+        if (target.retired_server_requests.get(requestId)?.thread_id === params?.threadId) return;
+        failConnection(target, new CodexAppServerAdapterError(
+          'provider_protocol_invalid',
+          'Codex app-server resolved a stale or mismatched server request.',
+        ));
+        return;
+      }
+      if (group.thread_id !== params?.threadId || group.connection_id !== target.connection_id) {
         failConnection(target, new CodexAppServerAdapterError(
           'provider_protocol_invalid',
           'Codex app-server resolved a stale or mismatched server request.',
@@ -566,6 +683,11 @@ export function createCodexAppServerAdapter({
         ));
         return;
       }
+      rememberTombstone(
+        target.retired_server_requests,
+        requestId,
+        serverRequestTombstone(group),
+      );
       group.resolveResolved();
       return;
     }
@@ -576,6 +698,7 @@ export function createCodexAppServerAdapter({
     if (method === 'turn/started') {
       const startingRun = startingRuns.get(runKey);
       if (!startingRun || startingRun.connection_id !== target.connection_id) {
+        if (target.retired_run_keys.has(runKey)) return;
         failConnection(target, new CodexAppServerAdapterError(
           'provider_protocol_invalid',
           'Codex app-server started a stale or mismatched turn.',
@@ -592,6 +715,7 @@ export function createCodexAppServerAdapter({
     }
     const run = activeRuns.get(runKey);
     if (!run || run.connection_id !== target.connection_id) {
+      if (target.retired_run_keys.has(runKey)) return;
       failConnection(target, new CodexAppServerAdapterError(
         'provider_protocol_invalid',
         'Codex app-server emitted a stale or mismatched turn notification.',
@@ -773,7 +897,8 @@ export function createCodexAppServerAdapter({
         'provider_execution_failed',
         `Codex app-server completed the turn with status ${String(status)}.`,
       );
-      const discardedRequestCount = discardProviderRequestsForRun(run, failure);
+      rememberTombstone(target.retired_run_keys, runKey);
+      const discardedRequestCount = discardProviderRequestsForRun(target, run, failure);
       const completionIsInvalid = status !== 'completed' || discardedRequestCount > 0;
       const failureOutcome = discardedRequestCount > 0
         ? run.context.reportProviderFailure?.(failure)
@@ -1268,6 +1393,12 @@ export function createCodexAppServerAdapter({
     const requestId = String(message.id);
     if (target.server_request_ids.has(requestId)) {
       sendServerError(target, message.id, 'Duplicate app-server request ID.');
+      const retired = target.retired_server_requests.get(requestId);
+      if (
+        retired
+        && retired.method === message.method
+        && retired.params_json === JSON.stringify(message.params)
+      ) return;
       failConnection(target, new CodexAppServerAdapterError(
         'provider_protocol_invalid',
         'Codex app-server reused a server request ID on the same connection.',
@@ -1278,6 +1409,23 @@ export function createCodexAppServerAdapter({
     const run = findServerRequestRun(target, message.method, message.params);
     if (!run || run.connection_id !== target.connection_id) {
       sendServerError(target, message.id, 'Unsupported or stale app-server request.');
+      const retiredRunKey = typeof message.params?.threadId === 'string'
+        && typeof message.params?.turnId === 'string'
+        ? activeRunKey(message.params.threadId, message.params.turnId)
+        : null;
+      if (retiredRunKey !== null && target.retired_run_keys.has(retiredRunKey)) {
+        rememberTombstone(
+          target.retired_server_requests,
+          requestId,
+          Object.freeze({
+            thread_id: message.params.threadId,
+            turn_id: message.params.turnId,
+            method: message.method,
+            params_json: JSON.stringify(message.params),
+          }),
+        );
+        return;
+      }
       failConnection(target, new CodexAppServerAdapterError(
         'provider_protocol_invalid',
         'Codex app-server emitted a stale or mismatched server request.',
@@ -1350,6 +1498,7 @@ export function createCodexAppServerAdapter({
     if (Object.hasOwn(message, 'id') && !Object.hasOwn(message, 'method')) {
       const pending = target.pending.get(String(message.id));
       if (!pending) {
+        if (target.settled_client_request_ids.has(String(message.id))) return;
         failConnection(target, new CodexAppServerAdapterError(
           'provider_protocol_invalid',
           'Codex app-server returned an unknown request ID.',
@@ -1357,6 +1506,7 @@ export function createCodexAppServerAdapter({
         return;
       }
       target.pending.delete(String(message.id));
+      rememberTombstone(target.settled_client_request_ids, String(message.id));
       if (Object.hasOwn(message, 'error')) {
         pending.reject(new CodexAppServerAdapterError(
           'provider_request_failed',
@@ -1369,6 +1519,7 @@ export function createCodexAppServerAdapter({
         pending.resolve(message.result);
       } catch (error) {
         pending.reject(error);
+        failConnection(target, error);
       }
       return;
     }
@@ -1402,12 +1553,13 @@ export function createCodexAppServerAdapter({
       try {
         target.child.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
       } catch (error) {
-        target.pending.delete(id);
-        reject(new CodexAppServerAdapterError(
+        const failure = new CodexAppServerAdapterError(
           'provider_connection_lost',
           `Could not send ${method} to Codex app-server.`,
           { cause: error },
-        ));
+        );
+        failConnection(target, failure);
+        reject(failure);
       }
     });
   }
@@ -1418,22 +1570,35 @@ export function createCodexAppServerAdapter({
     const closed = new Promise((resolve) => {
       resolveClosed = resolve;
     });
+    const detachedProcessGroup = process.platform !== 'win32';
+    const child = spawnProcess(codexExecutable, ['app-server', '--stdio'], {
+      cwd,
+      detached: detachedProcessGroup,
+      env: childEnvironment,
+      shell: false,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
     const target = {
       connection_id: `codex-app-server-${nextConnectionNo}`,
-      child: spawnProcess(codexExecutable, ['app-server', '--stdio'], {
-        cwd,
-        env: childEnvironment,
-        shell: false,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      }),
+      child,
       failed: false,
+      affected_conversation_ids: new Set(),
       closed,
       closed_observed: false,
       resolveClosed,
       termination_requested: false,
+      termination_timer: null,
       next_request_no: 1,
       pending: new Map(),
+      process_group_id: detachedProcessGroup
+        && Number.isSafeInteger(child.pid)
+        && child.pid > 0
+        ? child.pid
+        : null,
+      retired_run_keys: new Map(),
+      retired_server_requests: new Map(),
       server_request_ids: new Set(),
+      settled_client_request_ids: new Map(),
     };
     connection = target;
     loadedThreads.clear();
@@ -1452,12 +1617,16 @@ export function createCodexAppServerAdapter({
     });
     target.child.once('error', (error) => failConnection(target, error));
     target.child.once('close', () => {
-      if (!target.closed_observed) {
-        target.closed_observed = true;
-        target.resolveClosed();
+      target.closed_observed = true;
+      if (
+        target.termination_timer !== null
+        && supervisedProcessGroupExited(target)
+      ) {
+        clearTimeoutFn(target.termination_timer);
+        target.termination_timer = null;
       }
-      failConnection(target, undefined, { terminate: false });
-      if (connection === target) connection = null;
+      target.resolveClosed();
+      failConnection(target, undefined);
     });
     try {
       await sendRequest(target, 'initialize', {
@@ -1481,7 +1650,12 @@ export function createCodexAppServerAdapter({
     if (connection && !connection.failed) return connection;
     if (connection?.failed) {
       const failedConnection = connection;
-      await failedConnection.closed;
+      if (!await waitForProcessClose(failedConnection)) {
+        throw new CodexAppServerAdapterError(
+          'provider_connection_lost',
+          'The failed Codex app-server process did not exit after forced termination.',
+        );
+      }
       if (connection === failedConnection) connection = null;
     }
     if (!connecting) {
@@ -1831,17 +2005,105 @@ export function createCodexAppServerAdapter({
     return result;
   }
 
+  async function abort(context) {
+    const attempt = context?.attempt;
+    const coreTurnId = context?.turn_id;
+    const terminalRun = terminalRuns.get(coreAttemptKey(coreTurnId, attempt));
+    if (terminalRun && terminalRun.terminal_status !== null) {
+      return Object.freeze({
+        status: 'provider_stopped',
+        provider_status: terminalRun.terminal_status,
+      });
+    }
+    const run = [
+      ...activeRuns.values(),
+      ...startingRuns.values(),
+      ...inFlightTurnStarts,
+    ].find((candidate) => (
+      candidate.context.turn_id === coreTurnId
+      && sameAttempt(candidate.context.attempt, attempt)
+    ));
+    const target = connection;
+    if (!run || !target || run.connection_id !== target.connection_id) {
+      if (
+        target?.failed
+        && target.affected_conversation_ids.has(context?.conversation_id)
+        && await waitForProcessClose(target)
+      ) {
+        return Object.freeze({ status: 'provider_stopped', provider_status: 'process_exited' });
+      }
+      throw new CodexAppServerAdapterError(
+        'side_effect_unknown',
+        'Codex app-server cannot prove isolation for a non-current provider turn.',
+      );
+    }
+    if (run.turn_id === null) {
+      failConnection(target, new CodexAppServerAdapterError(
+        'provider_connection_lost',
+        'Codex app-server lost protocol control while the turn start was in flight.',
+      ));
+      if (await waitForProcessClose(target)) {
+        return Object.freeze({ status: 'provider_stopped', provider_status: 'process_exited' });
+      }
+      throw new CodexAppServerAdapterError(
+        'side_effect_unknown',
+        'Codex app-server did not exit after an in-flight turn lost protocol control.',
+      );
+    }
+    let terminalStatus;
+    try {
+      terminalStatus = await waitForInterruptConfirmation((async () => {
+        await sendRequest(target, 'turn/interrupt', {
+          threadId: run.thread_id,
+          turnId: run.turn_id,
+        });
+        return run.terminal;
+      })());
+    } catch (error) {
+      if (target.failed && await waitForProcessClose(target)) {
+        return Object.freeze({ status: 'provider_stopped', provider_status: 'process_exited' });
+      }
+      throw error;
+    }
+    if (terminalStatus !== null) {
+      return Object.freeze({ status: 'provider_stopped', provider_status: terminalStatus });
+    }
+    failConnection(target, new CodexAppServerAdapterError(
+      'provider_connection_lost',
+      'Codex app-server did not confirm abort before its deadline.',
+    ));
+    if (await waitForProcessClose(target)) {
+      return Object.freeze({ status: 'provider_stopped', provider_status: 'process_exited' });
+    }
+    throw new CodexAppServerAdapterError(
+      'side_effect_unknown',
+      'Codex app-server abort could not prove provider isolation.',
+    );
+  }
+
   async function close() {
     const target = connection;
-    if (!target || target.failed) return Object.freeze({ status: 'not_current' });
-    target.termination_requested = true;
-    const signalled = target.child.kill('SIGTERM');
+    if (!target) return [];
+    for (const run of [...activeRuns.values(), ...startingRuns.values(), ...inFlightTurnStarts]) {
+      if (run.connection_id === target.connection_id) {
+        target.affected_conversation_ids.add(run.context.conversation_id);
+      }
+    }
+    requestProcessTermination(target);
     failConnection(target, new CodexAppServerAdapterError(
       'provider_connection_lost',
       'Codex app-server was stopped with its executor service.',
     ), { terminate: false });
-    return Object.freeze({ status: signalled === false ? 'not_current' : 'signalled' });
+    if (!await waitForProcessClose(target)) {
+      const error = new CodexAppServerAdapterError(
+        'provider_connection_lost',
+        'Codex app-server did not exit after forced termination.',
+      );
+      error.closedConversationIds = [];
+      throw error;
+    }
+    return [...target.affected_conversation_ids];
   }
 
-  return Object.freeze({ cancel, close, execute, handleInteractionAnswer, interrupt });
+  return Object.freeze({ abort, cancel, close, execute, handleInteractionAnswer, interrupt });
 }

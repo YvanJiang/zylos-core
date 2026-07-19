@@ -1194,6 +1194,42 @@ describe('runtime interaction happy path', () => {
     database.close();
   });
 
+  test('rejects an out-of-domain choice before creating durable answer or handoff state', () => {
+    const database = openTestDatabase();
+    const { store, turnContext } = createRunningTurn(database, 'choice-domain');
+    const request = store.requestInteraction(turnContext, {
+      provider_interaction_ref: 'provider-choice-domain',
+      tool_use_id: 'tool-choice-domain',
+      kind: 'choice',
+      prompt: 'Choose a safe path.',
+      choices: [{ choice_id: 'safe', label: 'Safe path' }],
+      authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+      allowed_sources: ['card_action'],
+    });
+    const invalidAnswer = interactionAnswer(request, 'choice-domain', {
+      value: { kind: 'choice', choice_id: 'unknown' },
+    });
+
+    expect(store.commitInteractionAnswer(invalidAnswer)).toMatchObject({
+      status: 'rejected',
+      interaction_state: 'pending',
+      interaction_version: request.version,
+      handoff_state: 'not_applicable',
+      error: { code: 'validation_error' },
+    });
+    expect(readInteractionAuthority(database, request.turn_id)).toMatchObject({
+      interactions: [{
+        interaction_id: request.interaction_id,
+        state: 'pending',
+        handoff_state: 'not_started',
+      }],
+      answers: [],
+      handoffs: [],
+    });
+
+    database.close();
+  });
+
   test('rolls back the complete request transaction when its user projection cannot persist', () => {
     const database = openTestDatabase();
     const { accepted, store, turnContext } = createRunningTurn(database, 'request-rollback');
