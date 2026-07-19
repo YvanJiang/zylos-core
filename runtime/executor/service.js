@@ -117,6 +117,7 @@ export function createExecutorService({
   }
 
   function scheduleInteractionDeadline(request) {
+    if (lifecycle !== 'open') return;
     clearInteractionDeadline(request.interaction_id);
     const interactionVersion = request.interaction_version ?? request.version;
     const delay = Math.max(0, Date.parse(request.expires_at) - Date.parse(now()));
@@ -137,6 +138,7 @@ export function createExecutorService({
   }
 
   function reschedulePendingInteractionDeadlines() {
+    if (lifecycle !== 'open') return;
     const deadlines = store.listPendingInteractionDeadlines();
     const scheduledInteractionIds = new Set(
       deadlines.map(({ interaction_id: interactionId }) => interactionId),
@@ -170,8 +172,12 @@ export function createExecutorService({
   }
 
   function start() {
+    if (lifecycle !== 'open') {
+      throw new Error(`Executor service is ${lifecycle}; it cannot be started.`);
+    }
+    if (started) return snapshot();
     store.reconcileExpiredResidents();
-    if (provider === 'claude' && residentHeartbeat === null) {
+    if (residentHeartbeat === null) {
       residentHeartbeat = scheduleResidentHeartbeat(() => {
         try {
           store.heartbeatOwnedResidents();
@@ -301,11 +307,11 @@ export function createExecutorService({
         user_message: 'The provider stream ended before the turn completed.',
       },
     });
-    reschedulePendingInteractionDeadlines();
     activeRun.durableSettled = true;
     refresh();
     cleanupActiveRun(activeRun);
     releaseAbsentResident(turnContext);
+    reschedulePendingInteractionDeadlines();
     return resultFor(activeRun, terminalState);
   }
 
@@ -336,11 +342,11 @@ export function createExecutorService({
         } : null,
       },
     ));
-    reschedulePendingInteractionDeadlines();
     activeRun.durableSettled = true;
     refresh();
     cleanupActiveRun(activeRun);
     releaseAbsentResident(activeRun.turnContext);
+    reschedulePendingInteractionDeadlines();
     return resultFor(activeRun, failure ? 'failed' : terminalState);
   }
 
@@ -352,6 +358,7 @@ export function createExecutorService({
         const record = next.value;
         if (record?.type === 'interaction_persisted') {
           reschedulePendingInteractionDeadlines();
+          if (cancelledTurnIds.has(activeRun.turnContext.turn_id)) continue;
           activeRun.pauseKind = 'interaction';
           refresh();
           return resultFor(activeRun, 'waiting_user', { request: record.request });
@@ -534,6 +541,7 @@ export function createExecutorService({
       resolveSettlement,
       settled: false,
       settlement,
+      timedOutExpiration: null,
       turnContext,
       usesManagedRecords: false,
     };
@@ -663,6 +671,7 @@ export function createExecutorService({
     clearInteractionDeadline(result.interaction_id);
 
     const timedOutRun = activeRuns.get(result.turn_id);
+    if (timedOutRun) timedOutRun.timedOutExpiration = result;
     if (!timedOutRun || typeof timedOutRun.iterator.return !== 'function') {
       reschedulePendingInteractionDeadlines();
       return { ...result, lease_released: false };
@@ -682,6 +691,7 @@ export function createExecutorService({
       cleanupFailures.push(error);
     }
     timedOutRun.durableSettled = true;
+    timedOutRun.timedOutExpiration = null;
     cleanupActiveRun(timedOutRun);
     try {
       releaseAbsentResident(timedOutRun.turnContext);
@@ -750,62 +760,91 @@ export function createExecutorService({
   async function close() {
     if (closePromise) return closePromise;
     lifecycle = 'closing';
-    clearAllInteractionDeadlines();
-    closePromise = (async () => {
+    const closing = (async () => {
       try {
-        let closeError = null;
+        clearAllInteractionDeadlines();
+        const shutdownFailures = [];
         let closedConversationIds = [];
         try {
           if (typeof adapter.close === 'function') {
             closedConversationIds = await adapter.close() ?? [];
           }
         } catch (error) {
-          closeError = error;
+          shutdownFailures.push(error);
           closedConversationIds = error.closedConversationIds ?? [];
         }
+        const closedConversationIdSet = new Set(closedConversationIds);
+        const skippedSettlements = new Set();
         for (const activeRun of activeRuns.values()) {
+          if (activeRun.timedOutExpiration) {
+            if (closedConversationIdSet.has(activeRun.turnContext.conversation_id)) {
+              const expiration = activeRun.timedOutExpiration;
+              activeRun.timedOutExpiration = null;
+              activeRun.durableSettled = true;
+              cleanupActiveRun(activeRun);
+              timedOutLeaseReleases.set(activeRun.turnContext.turn_id, expiration);
+            } else {
+              skippedSettlements.add(activeRun.settlement);
+              shutdownFailures.push(new Error(
+                `Provider close did not prove isolation for timed-out turn ${activeRun.turnContext.turn_id}.`,
+              ));
+            }
+            continue;
+          }
           if (activeRun.pauseKind === 'interaction') {
             transitionToRecovery(activeRun, 'executor_shutdown_uncertain');
           } else if (!activeRun.advancing && activeRun.iterator) {
             advanceRun(activeRun);
           }
         }
-        await Promise.allSettled([...activeRunSettlements]);
+        await Promise.allSettled(
+          [...activeRunSettlements].filter((settlement) => !skippedSettlements.has(settlement)),
+        );
         for (const conversationId of closedConversationIds) {
-          store.releaseExecutorResident(conversationId);
-          endedResidentFences.delete(conversationId);
+          if (!endedResidentFences.has(conversationId)) {
+            endedResidentFences.set(conversationId, null);
+          }
         }
-        const leaseReleaseFailures = [];
+        for (const [conversationId, ownerEpoch] of endedResidentFences) {
+          try {
+            store.releaseExecutorResident(conversationId, ownerEpoch);
+            endedResidentFences.delete(conversationId);
+          } catch (error) {
+            shutdownFailures.push(error);
+          }
+        }
         for (const [turnId, expiration] of timedOutLeaseReleases) {
           try {
             store.releaseTimedOutExecutorLease(expiration);
             timedOutLeaseReleases.delete(turnId);
           } catch (error) {
-            leaseReleaseFailures.push(error);
+            shutdownFailures.push(error);
           }
         }
-        if (leaseReleaseFailures.length > 0) {
-          closeError = closeError === null
-            ? new AggregateError(leaseReleaseFailures, 'Timed-out executor leases failed to release.')
-            : new AggregateError(
-              [closeError, ...leaseReleaseFailures],
-              'Executor shutdown did not release all durable ownership.',
-            );
-        }
-        if (closeError) {
-          lifecycle = 'close_failed';
-          throw closeError;
+        if (shutdownFailures.length === 1) throw shutdownFailures[0];
+        if (shutdownFailures.length > 1) {
+          throw new AggregateError(
+            shutdownFailures,
+            'Executor shutdown did not release all durable ownership.',
+          );
         }
         lifecycle = 'closed';
+      } catch (error) {
+        lifecycle = 'close_failed';
+        throw error;
       } finally {
         clearAllInteractionDeadlines();
         if (lifecycle === 'closed' && residentHeartbeat !== null) {
           cancelResidentHeartbeat(residentHeartbeat);
           residentHeartbeat = null;
         }
+        if (lifecycle === 'close_failed' && closePromise === closing) {
+          closePromise = null;
+        }
       }
     })();
-    return closePromise;
+    closePromise = closing;
+    return closing;
   }
 
   return Object.freeze({

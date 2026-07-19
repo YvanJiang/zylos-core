@@ -495,7 +495,7 @@ function createParallelPermissionQuery({ sessionId }) {
         yield idleSession(sessionId);
       }
     }());
-    stream.interrupt = async () => {};
+    stream.interrupt = async () => ({ still_queued: [] });
     stream.close = () => {};
     return stream;
   }
@@ -1452,6 +1452,80 @@ describe('Claude conversation executor', () => {
     database.close();
   });
 
+  test('cancels a turn with buffered parallel permission notifications', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'permission-parallel-cancel');
+    const fake = createParallelPermissionQuery({
+      sessionId: 'claude-session-permission-parallel-cancel',
+    });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-permission-parallel-cancel',
+      now: () => '2026-07-19T09:03:48Z',
+      generateId: deterministicIds('permission-parallel-cancel'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ status: 'waiting_user' });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_interactions WHERE turn_id = ? AND state = 'pending'
+    `).get(accepted.turn_id)).toEqual({ count: 2 });
+
+    await expect(service.cancel(accepted.conversation_id)).resolves.toMatchObject({
+      status: 'cancellation_requested',
+      execution: { status: 'stopped' },
+    });
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'stopped' });
+    expect(database.prepare(`
+      SELECT ordinal, state FROM runtime_interactions WHERE turn_id = ? ORDER BY ordinal
+    `).all(accepted.turn_id)).toEqual([
+      { ordinal: 1, state: 'cancelled' },
+      { ordinal: 2, state: 'cancelled' },
+    ]);
+
+    await service.close();
+    database.close();
+  });
+
+  test('cleans a durably stopped cancellation despite timer projection failure', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'permission-cancel-timer-failure');
+    const fake = createPermissionQuery({
+      sessionId: 'claude-session-permission-cancel-timer-failure',
+    });
+    let failTimerProjection = false;
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-permission-cancel-timer-failure',
+      now: () => '2026-07-19T09:03:49Z',
+      generateId: deterministicIds('permission-cancel-timer-failure'),
+      setTimeoutFn: () => ({ unref() {} }),
+      clearTimeoutFn() {
+        if (failTimerProjection) throw new Error('forced timer projection failure');
+      },
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ status: 'waiting_user' });
+    failTimerProjection = true;
+    await expect(service.cancel(accepted.conversation_id)).rejects.toThrow(
+      /forced timer projection failure/,
+    );
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'stopped' });
+    await expect(service.cancel(accepted.conversation_id)).resolves.toEqual({
+      status: 'idle',
+      conversation_id: accepted.conversation_id,
+    });
+
+    failTimerProjection = false;
+    await service.close();
+    database.close();
+  });
+
   test('keeps every parallel SDK permission durable across service shutdown', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'permission-parallel-restart');
@@ -2323,6 +2397,46 @@ describe('Claude conversation executor', () => {
     }]);
     expect(adapter.hasResident(accepted.conversation_id)).toBe(true);
     expect(heartbeatCancelled).toBe(false);
+
+    database.close();
+  });
+
+  test('retries resident deletion after provider close was already confirmed', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'close-resident-delete-retry');
+    const fake = createFakeQuery({ sessionId: 'claude-session-close-resident-delete-retry' });
+    let heartbeatCancelled = false;
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-close-resident-delete-retry',
+      now: () => '2026-07-19T09:14:45Z',
+      generateId: deterministicIds('close-resident-delete-retry'),
+      scheduleResidentHeartbeat: () => ({ unref() {} }),
+      cancelResidentHeartbeat() { heartbeatCancelled = true; },
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: accepted.turn_id,
+    });
+    database.exec(`
+      CREATE TRIGGER fail_close_resident_delete
+      BEFORE DELETE ON runtime_executor_residents
+      BEGIN
+        SELECT RAISE(ABORT, 'forced close resident delete failure');
+      END;
+    `);
+
+    await expect(service.close()).rejects.toThrow(/forced close resident delete failure/);
+    expect(heartbeatCancelled).toBe(false);
+    database.exec('DROP TRIGGER fail_close_resident_delete');
+    await expect(service.close()).resolves.toBeUndefined();
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_executor_residents WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({ count: 0 });
+    expect(heartbeatCancelled).toBe(true);
 
     database.close();
   });
