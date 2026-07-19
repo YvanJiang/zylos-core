@@ -35,6 +35,13 @@ const ANSWER_CONFLICT_CODES = new Set([
   'version_conflict',
 ]);
 
+const BLOCKING_INTERACTION_STATES_SQL = [
+  'pending',
+  'answer_committed',
+  'answer_delivering',
+  'delivery_unknown',
+].map((state) => `'${state}'`).join(', ');
+
 export class ExecutorPersistenceError extends Error {
   constructor(code, message) {
     super(message);
@@ -453,9 +460,7 @@ export function createExecutorStore({
           FROM runtime_interactions AS blocker
           WHERE blocker.turn_id = candidate.turn_id
             AND blocker.ordinal < candidate.ordinal
-            AND blocker.state IN (
-              'pending', 'answer_committed', 'answer_delivering', 'delivery_unknown'
-            )
+            AND blocker.state IN (${BLOCKING_INTERACTION_STATES_SQL})
         )
       ORDER BY json_extract(candidate.request_json, '$.expires_at'), candidate.interaction_id
     `).all().map(({ request_json: requestJson }) => {
@@ -1195,7 +1200,7 @@ export function createExecutorStore({
         SELECT interaction_id
         FROM runtime_interactions
         WHERE turn_id = ?
-          AND state IN ('pending', 'answer_committed', 'answer_delivering', 'delivery_unknown')
+          AND state IN (${BLOCKING_INTERACTION_STATES_SQL})
         ORDER BY ordinal ASC
         LIMIT 1
       `).get(request.turn_id);
@@ -1658,7 +1663,7 @@ export function createExecutorStore({
         SELECT 1
         FROM runtime_interactions
         WHERE turn_id = ? AND interaction_id != ?
-          AND state IN ('pending', 'answer_committed', 'answer_delivering', 'delivery_unknown')
+          AND state IN (${BLOCKING_INTERACTION_STATES_SQL})
         LIMIT 1
       `).get(turn.turn_id, request.interaction_id) !== undefined;
       let currentTurn = turn;
