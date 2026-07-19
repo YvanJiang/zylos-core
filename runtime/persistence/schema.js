@@ -60,9 +60,14 @@ const RUNTIME_SCHEMA = `
     queue_sequence INTEGER NOT NULL CHECK (queue_sequence > 0),
     turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
     status TEXT NOT NULL,
+    wait_reason TEXT,
     enqueued_at TEXT NOT NULL,
     PRIMARY KEY (conversation_id, queue_sequence)
   );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS runtime_turns_one_active_per_conversation
+    ON runtime_turns(conversation_id)
+    WHERE state IN ('starting', 'running', 'waiting_user', 'redirecting', 'recovering');
 
   CREATE TABLE IF NOT EXISTS runtime_executor_leases (
     conversation_id TEXT PRIMARY KEY REFERENCES runtime_conversations(conversation_id),
@@ -160,4 +165,5 @@ export function initializeRuntimePersistence(database) {
     'lease_epoch',
     'INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0)',
   );
+  addColumnIfMissing(database, 'runtime_turn_queue', 'wait_reason', 'TEXT');
 }

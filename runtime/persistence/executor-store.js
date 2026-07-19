@@ -338,7 +338,7 @@ export function createExecutorStore({
 
   function rebuildExecutorCache() {
     const rows = database.prepare(`
-      SELECT conversation_id, turn_id, status, queue_sequence
+      SELECT conversation_id, turn_id, status, wait_reason, queue_sequence
       FROM runtime_turn_queue
       WHERE status IN ('queued', 'claimed')
       ORDER BY conversation_id ASC, queue_sequence ASC
@@ -351,22 +351,80 @@ export function createExecutorStore({
           conversation_id: row.conversation_id,
           active_turn_id: null,
           queued_turn_ids: [],
+          wait_reason: null,
         };
         executors.set(row.conversation_id, projection);
       }
       if (row.status === 'claimed') projection.active_turn_id = row.turn_id;
-      else projection.queued_turn_ids.push(row.turn_id);
+      else {
+        projection.queued_turn_ids.push(row.turn_id);
+        projection.wait_reason ??= row.wait_reason;
+      }
     }
     return [...executors.values()];
   }
 
-  function claimNextQueuedTurn() {
+  function listClaimableQueuedTurns() {
+    return database.prepare(`
+      SELECT
+        turn.turn_id,
+        turn.conversation_id,
+        conversation.bot_id,
+        turn.created_at,
+        queue.queue_sequence
+      FROM runtime_turn_queue AS queue
+      JOIN runtime_turns AS turn ON turn.turn_id = queue.turn_id
+      JOIN runtime_conversations AS conversation
+        ON conversation.conversation_id = turn.conversation_id
+      WHERE queue.status = 'queued' AND turn.state = 'queued'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM runtime_turn_queue AS earlier
+          WHERE earlier.conversation_id = queue.conversation_id
+            AND earlier.queue_sequence < queue.queue_sequence
+            AND earlier.status IN ('queued', 'claimed')
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM runtime_executor_leases AS lease
+          WHERE lease.conversation_id = queue.conversation_id
+            AND lease.lease_owner IS NOT NULL
+        )
+      ORDER BY turn.created_at ASC, turn.conversation_id ASC, queue.queue_sequence ASC
+    `).all();
+  }
+
+  function markCapacityWait(turnId) {
+    const mark = database.transaction(() => {
+      const turn = database.prepare(`
+        SELECT turn.turn_id, turn.conversation_id
+        FROM runtime_turns AS turn
+        JOIN runtime_turn_queue AS queue ON queue.turn_id = turn.turn_id
+        WHERE turn.turn_id = ? AND turn.state = 'queued' AND queue.status = 'queued'
+      `).get(turnId);
+      if (!turn) return null;
+      database.prepare(`
+        UPDATE runtime_turn_queue
+        SET wait_reason = 'executor_capacity'
+        WHERE turn_id = ? AND status = 'queued'
+      `).run(turnId);
+      return {
+        conversation_id: turn.conversation_id,
+        turn_id: turn.turn_id,
+        wait_reason: 'executor_capacity',
+      };
+    });
+    return mark.immediate();
+  }
+
+  function claimNextQueuedTurn({ conversationId = null } = {}) {
     const claim = database.transaction(() => {
       const turn = database.prepare(`
         SELECT turn.turn_id
         FROM runtime_turn_queue AS queue
         JOIN runtime_turns AS turn ON turn.turn_id = queue.turn_id
         WHERE queue.status = 'queued' AND turn.state = 'queued'
+          AND (? IS NULL OR queue.conversation_id = ?)
           AND NOT EXISTS (
             SELECT 1
             FROM runtime_turn_queue AS earlier
@@ -382,7 +440,7 @@ export function createExecutorStore({
           )
         ORDER BY turn.created_at ASC, turn.conversation_id ASC, queue.queue_sequence ASC
         LIMIT 1
-      `).get();
+      `).get(conversationId, conversationId);
       if (!turn) return null;
 
       const claimedAt = now();
@@ -439,7 +497,7 @@ export function createExecutorStore({
       );
       const queueUpdate = database.prepare(`
         UPDATE runtime_turn_queue
-        SET status = 'claimed'
+        SET status = 'claimed', wait_reason = NULL
         WHERE turn_id = ? AND status = 'queued'
       `).run(current.turn_id);
       if (turnUpdate.changes !== 1 || queueUpdate.changes !== 1) {
@@ -519,6 +577,8 @@ export function createExecutorStore({
   return Object.freeze({
     appendAdapterEvent,
     claimNextQueuedTurn,
+    listClaimableQueuedTurns,
+    markCapacityWait,
     rebuildExecutorCache,
     transitionTurn,
   });

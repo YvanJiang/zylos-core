@@ -36,6 +36,8 @@ const INBOUND_ENVELOPE_KNOWN_FIELDS = Object.freeze([
   'source',
 ]);
 
+export const DEFAULT_MAX_QUEUED_TURNS = 5;
+
 function defaultGenerateId(kind) {
   return `${kind}-${crypto.randomUUID()}`;
 }
@@ -67,6 +69,7 @@ function buildLifecycleEvent({
   fromState,
   reasonCode,
   causationEventId,
+  error = null,
 }) {
   return {
     contract: 'zylos.normalized-event',
@@ -93,7 +96,7 @@ function buildLifecycleEvent({
       reason_code: reasonCode,
     },
     causation_event_id: causationEventId,
-    error: null,
+    error,
   };
 }
 
@@ -105,6 +108,12 @@ function buildInitialDeliveryCommand({
   lineageId,
   committedAt,
   generateId,
+  aggregateVersion = 1,
+  eventSequenceThrough = 1,
+  phase = 'received',
+  text = 'Message received.',
+  error = null,
+  terminal = false,
 }) {
   const outboxId = generateId('outbox');
   const deliveryId = generateId('delivery');
@@ -130,8 +139,8 @@ function buildInitialDeliveryCommand({
     aggregate_type: 'turn_main',
     aggregate_id: turnId,
     operation: 'create_main',
-    aggregate_version: 1,
-    event_sequence_through: 1,
+    aggregate_version: aggregateVersion,
+    event_sequence_through: eventSequenceThrough,
     idempotency_key: createIdempotencyKey('delivery', {
       channel: envelope.channel,
       target,
@@ -139,12 +148,12 @@ function buildInitialDeliveryCommand({
     }),
     render_model: {
       title: 'Zylos',
-      phase: 'received',
-      text: 'Message received.',
-      error: null,
+      phase,
+      text,
+      error,
       tools: [],
       interactions: [],
-      terminal: false,
+      terminal,
       user_action_required: false,
     },
     mapping: {
@@ -221,8 +230,12 @@ export function acceptNormalInbound(
   {
     now = () => new Date().toISOString(),
     generateId = defaultGenerateId,
+    maxQueuedTurns = DEFAULT_MAX_QUEUED_TURNS,
   } = {},
 ) {
+  if (!Number.isSafeInteger(maxQueuedTurns) || maxQueuedTurns <= 0) {
+    throw new TypeError('maxQueuedTurns must be a positive safe integer');
+  }
   const validated = validateInboundEnvelope(envelope);
   const payloadHash = createPayloadHash(envelope, {
     scope: 'inbound',
@@ -309,6 +322,22 @@ export function acceptNormalInbound(
       generateId,
     );
 
+    const queuedTurnCount = database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM runtime_turn_queue
+      WHERE conversation_id = ? AND status = 'queued'
+    `).get(conversation.conversation_id).count;
+    const queueFull = queuedTurnCount >= maxQueuedTurns;
+    const queueFullError = queueFull
+      ? createContractError({
+        code: 'queue_full',
+        category: 'capacity',
+        retryable: true,
+        userMessage: 'The conversation queue is full.',
+        occurredAt: committedAt,
+      })
+      : null;
+
     const turnId = generateId('turn');
     database.prepare(`
       UPDATE runtime_conversations
@@ -341,21 +370,24 @@ export function acceptNormalInbound(
       INSERT INTO runtime_turns (
         turn_id, conversation_id, lineage_id, inbound_event_id, state,
         turn_version, queue_sequence, created_at, committed_at
-      ) VALUES (?, ?, ?, ?, 'queued', 2, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, 2, ?, ?, ?)
     `).run(
       turnId,
       conversation.conversation_id,
       lineage.lineage_id,
       envelope.inbound_event_id,
+      queueFull ? 'failed' : 'queued',
       queueSequence,
       committedAt,
       committedAt,
     );
-    database.prepare(`
-      INSERT INTO runtime_turn_queue (
-        conversation_id, queue_sequence, turn_id, status, enqueued_at
-      ) VALUES (?, ?, ?, 'queued', ?)
-    `).run(conversation.conversation_id, queueSequence, turnId, committedAt);
+    if (!queueFull) {
+      database.prepare(`
+        INSERT INTO runtime_turn_queue (
+          conversation_id, queue_sequence, turn_id, status, enqueued_at
+        ) VALUES (?, ?, ?, 'queued', ?)
+      `).run(conversation.conversation_id, queueSequence, turnId, committedAt);
+    }
 
     const receivedEvent = buildLifecycleEvent({
       eventId: generateId('event'),
@@ -372,7 +404,7 @@ export function acceptNormalInbound(
       reasonCode: 'inbound_committed',
       causationEventId: null,
     });
-    const queuedEvent = buildLifecycleEvent({
+    const admissionEvent = buildLifecycleEvent({
       eventId: generateId('event'),
       traceId: envelope.trace_id,
       conversationId: conversation.conversation_id,
@@ -380,14 +412,15 @@ export function acceptNormalInbound(
       lineageId: lineage.lineage_id,
       eventSequence: 2,
       turnVersion: 2,
-      phase: 'queued',
+      phase: queueFull ? 'failed' : 'queued',
       occurredAt: committedAt,
       persistedAt: committedAt,
       fromState: 'received',
-      reasonCode: 'queue_sequence_allocated',
+      reasonCode: queueFull ? 'queue_full' : 'queue_sequence_allocated',
       causationEventId: receivedEvent.event_id,
+      error: queueFullError,
     });
-    for (const event of [receivedEvent, queuedEvent]) {
+    for (const event of [receivedEvent, admissionEvent]) {
       validateNormalizedEvent(event);
       database.prepare(`
         INSERT INTO runtime_normalized_events (
@@ -411,6 +444,12 @@ export function acceptNormalInbound(
       lineageId: lineage.lineage_id,
       committedAt,
       generateId,
+      aggregateVersion: queueFull ? 2 : 1,
+      eventSequenceThrough: queueFull ? 2 : 1,
+      phase: queueFull ? 'failed' : 'received',
+      text: queueFull ? queueFullError.user_message : 'Message received.',
+      error: queueFullError,
+      terminal: queueFull,
     });
     validateDeliveryCommand(deliveryCommand);
     database.prepare(`
@@ -435,7 +474,7 @@ export function acceptNormalInbound(
       trace_id: envelope.trace_id,
       inbound_event_id: envelope.inbound_event_id,
       idempotency_key: envelope.idempotency_key,
-      status: 'accepted',
+      status: queueFull ? 'rejected' : 'accepted',
       conversation_id: conversation.conversation_id,
       turn_id: turnId,
       lineage_id: lineage.lineage_id,
@@ -443,7 +482,7 @@ export function acceptNormalInbound(
       turn_version: 2,
       lineage_resolution_state: 'bound',
       deduplicated: false,
-      error: null,
+      error: queueFullError,
       committed_at: committedAt,
     };
     validateInboundResult(result);
