@@ -1,5 +1,15 @@
 const RFC3339_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 
+export function isPlainJsonObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype === null || prototype === Object.prototype) return true;
+  const constructor = Object.getOwnPropertyDescriptor(prototype, 'constructor')?.value;
+  return Object.getPrototypeOf(prototype) === null
+    && typeof constructor === 'function'
+    && constructor.name === 'Object';
+}
+
 export function isWellFormedUnicode(value) {
   for (let index = 0; index < value.length; index += 1) {
     const codeUnit = value.charCodeAt(index);

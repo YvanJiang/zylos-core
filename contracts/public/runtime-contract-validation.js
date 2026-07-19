@@ -1,97 +1,48 @@
-import { ContractKernelError, createContractError } from './errors.js';
 import { canonicalizeJson } from './jcs.js';
-import { isWellFormedUnicode } from './scalars.js';
+import {
+  rejectContract as rejectRuntimeContract,
+  requireArray,
+  requireBoolean,
+  requireCriticalEnum as requireEnum,
+  requireDisplayString,
+  requireExactFields,
+  requireNullableOpaqueId,
+  requireNullableTimestamp,
+  requireOpaqueId,
+  requireOwnFields,
+  requirePlainObject as requireRecord,
+  requireTimestamp,
+} from './contract-utils.js';
 import {
   validateContractError,
   validateContractDocument,
-  validateOpaqueId,
   validatePublicNumber,
-  validateRfc3339Timestamp,
-  validateSafetyCriticalEnum,
 } from './validation.js';
 
-export function rejectRuntimeContract(
-  code,
-  userMessage,
-  { category = 'validation', occurredAt } = {},
-) {
-  throw new ContractKernelError(createContractError({
-    code,
-    category,
-    userMessage,
-    occurredAt,
-  }));
-}
-
-export function requireRecord(path, value, options) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    rejectRuntimeContract('validation_error', `${path} must be a JSON object.`, options);
-  }
-  return value;
-}
-
-export function requireArray(path, value, options) {
-  if (!Array.isArray(value)) {
-    rejectRuntimeContract('validation_error', `${path} must be an array.`, options);
-  }
-  return value;
-}
+export {
+  rejectRuntimeContract,
+  requireArray,
+  requireBoolean,
+  requireEnum,
+  requireExactFields,
+  requireNullableOpaqueId,
+  requireNullableTimestamp,
+  requireOpaqueId,
+  requireRecord,
+  requireTimestamp,
+};
 
 export function requireFields(path, value, fields, options) {
   requireRecord(path, value, options);
-  for (const field of fields) {
-    if (!Object.hasOwn(value, field)) {
-      rejectRuntimeContract('validation_error', `${path}.${field} is required.`, options);
-    }
-  }
-}
-
-export function requireExactFields(path, value, fields, options) {
-  requireFields(path, value, fields, options);
-  const allowed = new Set(fields);
-  for (const field of Object.keys(value)) {
-    if (!allowed.has(field)) {
-      rejectRuntimeContract('validation_error', `${path}.${field} is not allowed.`, options);
-    }
-  }
-}
-
-export function requireBoolean(path, value, options) {
-  if (typeof value !== 'boolean') {
-    rejectRuntimeContract('validation_error', `${path} must be a boolean.`, options);
-  }
-  return value;
+  requireOwnFields(path, value, fields, options);
 }
 
 export function requireText(path, value, { nonEmpty = true, ...options } = {}) {
-  if (
-    typeof value !== 'string'
-    || (nonEmpty && value.trim().length === 0)
-    || !isWellFormedUnicode(value)
-  ) {
-    rejectRuntimeContract('validation_error', `${path} must be a displayable string.`, options);
-  }
-  return value;
+  return requireDisplayString(path, value, { nonEmpty, ...options });
 }
 
 export function requireNullableText(path, value, options) {
   return value === null ? null : requireText(path, value, options);
-}
-
-export function requireOpaqueId(path, value, options) {
-  return validateOpaqueId(path, value, options);
-}
-
-export function requireNullableOpaqueId(path, value, options) {
-  return value === null ? null : requireOpaqueId(path, value, options);
-}
-
-export function requireTimestamp(path, value, options) {
-  return validateRfc3339Timestamp(path, value, options);
-}
-
-export function requireNullableTimestamp(path, value, options) {
-  return value === null ? null : requireTimestamp(path, value, options);
 }
 
 export function requireInteger(path, value, { min, nullable = false, ...options } = {}) {
@@ -101,10 +52,6 @@ export function requireInteger(path, value, { min, nullable = false, ...options 
     rejectRuntimeContract('validation_error', `${path} must be at least ${min}.`, options);
   }
   return value;
-}
-
-export function requireEnum(path, value, values, options) {
-  return validateSafetyCriticalEnum(path, value, values, options);
 }
 
 export function requireNullableEnum(path, value, values, options) {

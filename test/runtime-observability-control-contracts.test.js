@@ -161,6 +161,43 @@ describe('operations control v1 contracts', () => {
     expect(() => validateControlRequest(missingCas)).toThrow(ContractKernelError);
   });
 
+  test('requires an action capability grant whose scope covers auth context and target', () => {
+    const recoveryScopedInspect = structuredClone(controlFixture.requests.inspect);
+    recoveryScopedInspect.target = {
+      aggregate_type: 'recovery',
+      recovery_id: 'recovery-A',
+    };
+    recoveryScopedInspect.actor.capabilities[0].scope = structuredClone(
+      controlFixture.requests.confirm_recovery.actor.capabilities[0].scope,
+    );
+    expect(validateControlRequest(recoveryScopedInspect).known.target)
+      .toEqual(recoveryScopedInspect.target);
+
+    const wrongCapability = structuredClone(controlFixture.requests.stop_active_turn);
+    wrongCapability.actor.capabilities[0].capability = 'runtime.inspect';
+    expect(() => validateControlRequest(wrongCapability)).toThrow(ContractKernelError);
+
+    const wrongConversation = structuredClone(controlFixture.requests.stop_active_turn);
+    wrongConversation.actor.capabilities[0].scope.conversation_id = 'conversation-B';
+    expect(() => validateControlRequest(wrongConversation)).toThrow(ContractKernelError);
+
+    const wrongTenant = structuredClone(controlFixture.requests.stop_active_turn);
+    wrongTenant.actor.capabilities[0].scope.tenant_id = 'tenant-B';
+    expect(() => validateControlRequest(wrongTenant)).toThrow(ContractKernelError);
+
+    const wrongBot = structuredClone(controlFixture.requests.clear_unstarted_queue);
+    wrongBot.actor.capabilities[0].scope.bot_id = 'bot-B';
+    expect(() => validateControlRequest(wrongBot)).toThrow(ContractKernelError);
+
+    const wrongService = structuredClone(controlFixture.requests.reconcile);
+    wrongService.actor.capabilities[0].scope.service_instance_id = 'core-service-B';
+    expect(() => validateControlRequest(wrongService)).toThrow(ContractKernelError);
+
+    const wrongRecovery = structuredClone(controlFixture.requests.confirm_recovery);
+    wrongRecovery.actor.capabilities[0].scope.recovery_id = 'recovery-B';
+    expect(() => validateControlRequest(wrongRecovery)).toThrow(ContractKernelError);
+  });
+
   test('publishes fenced result versions for synchronous and asynchronous controls', () => {
     for (const result of Object.values(controlFixture.results)) {
       expect(validateControlResult(result).known.control_result_version).toBeGreaterThan(0);

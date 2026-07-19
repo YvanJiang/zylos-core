@@ -1,4 +1,5 @@
 import { ContractKernelError, createContractError } from './errors.js';
+import { isPlainJsonObject, isWellFormedUnicode } from './scalars.js';
 
 function reject(message) {
   throw new ContractKernelError(createContractError({
@@ -8,18 +9,7 @@ function reject(message) {
 }
 
 function assertWellFormedUnicode(value) {
-  for (let index = 0; index < value.length; index += 1) {
-    const codeUnit = value.charCodeAt(index);
-    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
-      if (!Number.isInteger(next) || next < 0xdc00 || next > 0xdfff) {
-        reject('JCS input contains invalid Unicode.');
-      }
-      index += 1;
-    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
-      reject('JCS input contains invalid Unicode.');
-    }
-  }
+  if (!isWellFormedUnicode(value)) reject('JCS input contains invalid Unicode.');
 }
 
 function serializePrimitive(value) {
@@ -36,15 +26,7 @@ function serializePrimitive(value) {
 }
 
 function assertPlainJsonObject(value) {
-  const prototype = Object.getPrototypeOf(value);
-  const constructor = prototype === null
-    ? null
-    : Object.getOwnPropertyDescriptor(prototype, 'constructor')?.value;
-  const isCrossRealmPlainObject = prototype !== null
-    && Object.getPrototypeOf(prototype) === null
-    && typeof constructor === 'function'
-    && constructor.name === 'Object';
-  if (prototype !== Object.prototype && prototype !== null && !isCrossRealmPlainObject) {
+  if (!isPlainJsonObject(value)) {
     reject('JCS objects must be plain JSON objects.');
   }
   if (Object.getOwnPropertySymbols(value).length > 0) {

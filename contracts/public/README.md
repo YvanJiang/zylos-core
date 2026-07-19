@@ -165,9 +165,11 @@ contracts do not maintain a second compatibility path around the public kernel.
 - `validateControlRequest`, `validateControlResult`, and the two control schema descriptors
   define the registered caller namespace, transport-injected actor/auth context, versioned
   capability grants and scopes, discriminated action targets, mutation CAS, and asynchronous
-  `control_result_version`. Validation does not authorize a request: Core must still resolve the
-  target's authoritative namespace and re-check the current policy, grant, revocation, expiry,
-  capability, and scope in the control transaction. Because `zylos.control-result` does not carry
+  `control_result_version`. Request validation requires an action-specific capability grant whose
+  declared tenant/bot/aggregate scope covers the trusted auth context and target. This structural
+  check does not authorize a request: Core must still resolve the target's authoritative namespace
+  and re-check the current policy, grant, revocation, expiry, capability, and scope in the control
+  transaction. Because `zylos.control-result` does not carry
   a duplicate top-level action field, consumers pass the correlated request action as
   `validateControlResult(value, { action })` when target/result shape alone is ambiguous, and pass
   the same context to `resolveControlResultUpdate`; the returned `metadata.action` is diagnostic

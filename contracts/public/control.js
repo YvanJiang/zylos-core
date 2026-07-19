@@ -370,6 +370,50 @@ function validateActor(value, authContext, options) {
   });
 }
 
+function scopeCoversControlTarget(scope, target, authContext) {
+  if (scope.tenant_id !== authContext.tenant_id) return false;
+
+  switch (scope.scope_type) {
+    case 'tenant':
+      return true;
+    case 'bot':
+      return authContext.bot_id !== null
+        && scope.bot_id === authContext.bot_id
+        && target.aggregate_type !== 'service';
+    case 'conversation':
+      return scope.bot_id === authContext.bot_id
+        && target.conversation_id === scope.conversation_id;
+    case 'service':
+      return target.aggregate_type === 'service'
+        && target.service_instance_id === scope.service_instance_id;
+    case 'recovery':
+      return scope.bot_id === authContext.bot_id
+        && target.aggregate_type === 'recovery'
+        && (
+          !Object.hasOwn(target, 'conversation_id')
+          || target.conversation_id === scope.conversation_id
+        )
+        && target.recovery_id === scope.recovery_id;
+    default:
+      return false;
+  }
+}
+
+function requireActionCapabilityGrant(actor, action, target, authContext, options) {
+  const requiredCapability = ACTION_DEFINITIONS[action].capability;
+  const hasCoveringGrant = actor.capabilities.some(
+    (grant) => grant.capability === requiredCapability
+      && scopeCoversControlTarget(grant.scope, target, authContext),
+  );
+  if (!hasCoveringGrant) {
+    rejectRuntimeContract(
+      'unsupported_capability',
+      `${action} requires a ${requiredCapability} grant whose scope covers the auth context and target.`,
+      { category: 'authorization', ...options },
+    );
+  }
+}
+
 function validateTargetFields(target, aggregateType, definition, options) {
   const fields = ['aggregate_type', ...definition.fields];
   requireExactFields('target', target, fields, options);
@@ -455,6 +499,13 @@ export function validateControlRequest(value, { occurredAt } = {}) {
   );
   validateAuthContext(value.auth_context, options);
   validateActor(value.actor, value.auth_context, options);
+  requireActionCapabilityGrant(
+    value.actor,
+    value.action,
+    value.target,
+    value.auth_context,
+    options,
+  );
   requireText('reason', value.reason, options);
   requireOpaqueId('idempotency_key', value.idempotency_key, options);
   requireTimestamp('created_at', value.created_at, options);
