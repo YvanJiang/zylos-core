@@ -15,6 +15,7 @@ export function createExecutorService({
   generateId = defaultGenerateId,
   leaseDurationMs,
   permissionHandler = null,
+  maxResidentExecutorsPerBot = 20,
 }) {
   if (!database || typeof database.transaction !== 'function') {
     throw new TypeError('database must be a better-sqlite3 connection');
@@ -33,6 +34,12 @@ export function createExecutorService({
   }
   if (permissionHandler !== null && typeof permissionHandler !== 'function') {
     throw new TypeError('permissionHandler must be a function or null');
+  }
+  if (
+    !Number.isSafeInteger(maxResidentExecutorsPerBot)
+    || maxResidentExecutorsPerBot <= 0
+  ) {
+    throw new TypeError('maxResidentExecutorsPerBot must be a positive safe integer');
   }
 
   const store = createExecutorStore({
@@ -93,8 +100,19 @@ export function createExecutorService({
       throw new Error(`Executor service is ${lifecycle}; it cannot claim another turn.`);
     }
     if (!started) start();
-    const turnContext = store.claimNextQueuedTurn();
-    if (!turnContext) return { status: 'idle' };
+    const reservation = store.reserveNextExecutor({ maxResidentExecutorsPerBot });
+    if (reservation.status === 'idle') return reservation;
+    if (reservation.status === 'capacity_wait') {
+      refresh();
+      return reservation;
+    }
+    const turnContext = store.claimNextQueuedTurn({
+      conversationId: reservation.conversation_id,
+    });
+    if (!turnContext) {
+      refresh();
+      return { status: 'idle' };
+    }
     let resolveRunSettlement;
     const runSettlement = new Promise((resolve) => {
       resolveRunSettlement = resolve;

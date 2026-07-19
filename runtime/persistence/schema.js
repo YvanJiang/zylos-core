@@ -96,9 +96,25 @@ const RUNTIME_SCHEMA = `
     queue_sequence INTEGER NOT NULL CHECK (queue_sequence > 0),
     turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
     status TEXT NOT NULL,
+    wait_reason TEXT,
     enqueued_at TEXT NOT NULL,
     PRIMARY KEY (conversation_id, queue_sequence)
   );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS runtime_turns_one_active_per_conversation
+    ON runtime_turns(conversation_id)
+    WHERE state IN ('starting', 'running', 'waiting_user', 'redirecting', 'recovering');
+
+  CREATE TABLE IF NOT EXISTS runtime_executor_residents (
+    conversation_id TEXT PRIMARY KEY REFERENCES runtime_conversations(conversation_id),
+    bot_id TEXT NOT NULL,
+    provider TEXT NOT NULL CHECK (provider IN ('claude', 'codex')),
+    admitted_at TEXT NOT NULL,
+    last_used_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS runtime_executor_residents_by_bot
+    ON runtime_executor_residents(bot_id, provider);
 
   CREATE TABLE IF NOT EXISTS runtime_executor_leases (
     conversation_id TEXT PRIMARY KEY REFERENCES runtime_conversations(conversation_id),
@@ -350,6 +366,7 @@ export function initializeRuntimePersistence(database) {
     'provider_native_id_bound_at',
     'TEXT',
   );
+  addColumnIfMissing(database, 'runtime_turn_queue', 'wait_reason', 'TEXT');
   addColumnIfMissing(
     database,
     'runtime_outbox',

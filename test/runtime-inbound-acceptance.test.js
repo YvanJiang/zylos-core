@@ -12,10 +12,12 @@ import {
   validateInboundResult,
   validateNormalizedEvent,
 } from '../contracts/public/index.js';
+import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import {
   acceptNormalInbound,
   initializeRuntimePersistence,
 } from '../runtime/persistence/inbound-acceptance.js';
+import { deliveredResult } from './helpers/delivered-result.js';
 
 const inboundFixture = JSON.parse(fs.readFileSync(
   new URL('../contracts/public/fixtures/inbound-envelope-v1.json', import.meta.url),
@@ -193,6 +195,167 @@ describe('acceptNormalInbound', () => {
         mapping_version: 1,
       },
     });
+
+    database.close();
+  });
+
+  test('persists queue-full admission as received then failed with a user notification', () => {
+    const database = openTestDatabase();
+    const envelope = normalEnvelope();
+    const dependencies = deterministicOptions();
+    const first = acceptNormalInbound(database, envelope, {
+      ...dependencies,
+      maxQueuedTurns: 1,
+    });
+    const rejected = acceptNormalInbound(
+      database,
+      nextEnvelope(envelope, 'queue-full'),
+      {
+        ...dependencies,
+        maxQueuedTurns: 1,
+      },
+    );
+
+    expect(first.status).toBe('accepted');
+    expect(validateInboundResult(rejected).forwarded).toEqual(rejected);
+    expect(rejected).toMatchObject({
+      status: 'rejected',
+      conversation_id: first.conversation_id,
+      lineage_id: first.lineage_id,
+      turn_version: 2,
+      lineage_resolution_state: 'bound',
+      deduplicated: false,
+      error: {
+        code: 'queue_full',
+        category: 'capacity',
+        retryable: true,
+        side_effect_status: 'none',
+        user_message: 'The conversation queue is full.',
+      },
+      committed_at: '2026-07-19T06:00:00Z',
+    });
+    expect(rejected.turn_id).not.toBe(first.turn_id);
+
+    expect(readTableCounts(database)).toEqual({
+      runtime_conversations: 1,
+      runtime_lineages: 1,
+      runtime_inbound_events: 2,
+      runtime_inbound_idempotency: 2,
+      runtime_turns: 2,
+      runtime_turn_queue: 1,
+      runtime_normalized_events: 4,
+      runtime_outbox: 2,
+      runtime_delivery_lanes: 2,
+      runtime_projection_snapshots: 1,
+      runtime_message_mappings: 0,
+    });
+    expect(database.prepare(`
+      SELECT state, turn_version, queue_sequence, attempt_id
+      FROM runtime_turns
+      WHERE turn_id = ?
+    `).get(rejected.turn_id)).toEqual({
+      state: 'failed',
+      turn_version: 2,
+      queue_sequence: 2,
+      attempt_id: null,
+    });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM runtime_turn_queue
+      WHERE turn_id = ?
+    `).get(rejected.turn_id).count).toBe(0);
+
+    const events = database.prepare(`
+      SELECT event_json
+      FROM runtime_normalized_events
+      WHERE turn_id = ?
+      ORDER BY event_sequence ASC
+    `).all(rejected.turn_id).map(({ event_json: eventJson }) => JSON.parse(eventJson));
+    expect(events.map((event) => event.phase)).toEqual(['received', 'failed']);
+    expect(events[0].error).toBeNull();
+    expect(events[1]).toMatchObject({
+      turn_version: 2,
+      error: rejected.error,
+      payload: {
+        from_state: 'received',
+        to_state: 'failed',
+        reason_code: 'queue_full',
+      },
+    });
+    for (const event of events) {
+      expect(validateNormalizedEvent(event).forwarded).toEqual(event);
+    }
+
+    const outbox = database.prepare(`
+      SELECT aggregate_version, status, terminal, command_json
+      FROM runtime_outbox
+      WHERE turn_id = ?
+    `).get(rejected.turn_id);
+    const command = JSON.parse(outbox.command_json);
+    expect(outbox).toMatchObject({
+      aggregate_version: 2,
+      status: 'pending',
+      terminal: 1,
+    });
+    expect(validateDeliveryCommand(command).forwarded).toEqual(command);
+    expect(command).toMatchObject({
+      aggregate_type: 'turn_main',
+      aggregate_id: rejected.turn_id,
+      operation: 'create_main',
+      aggregate_version: 2,
+      event_sequence_through: 2,
+      render_model: {
+        phase: 'failed',
+        text: 'The conversation queue is full.',
+        error: rejected.error,
+        terminal: true,
+      },
+      mapping: {
+        conversation_id: first.conversation_id,
+        turn_id: rejected.turn_id,
+        lineage_id: first.lineage_id,
+        binding_state: 'bound',
+      },
+    });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM runtime_projection_snapshots
+      WHERE turn_id = ?
+    `).get(rejected.turn_id).count).toBe(0);
+
+    const deliveryIdCounts = new Map();
+    const deliveryService = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-service-queue-full',
+      now: () => '2026-07-19T06:00:01Z',
+      generateId(kind) {
+        const next = (deliveryIdCounts.get(kind) ?? 0) + 1;
+        deliveryIdCounts.set(kind, next);
+        return `${kind}-queue-full-delivery-${next}`;
+      },
+      throttleMs: 0,
+    });
+    let deliveredQueueFull = null;
+    while (deliveredQueueFull === null) {
+      const claimed = deliveryService.claimNext();
+      expect(claimed).not.toBeNull();
+      if (!claimed) break;
+      expect(deliveryService.recordResult(deliveredResult(
+        claimed,
+        '2026-07-19T06:00:01Z',
+      ))).toEqual({ status: 'applied', outbox_status: 'delivered' });
+      if (claimed.mapping.turn_id === rejected.turn_id) deliveredQueueFull = claimed;
+    }
+    expect(deliveredQueueFull).toMatchObject({
+      operation: 'create_main',
+      aggregate_version: 2,
+      render_model: { phase: 'failed', terminal: true },
+    });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM runtime_outbox
+      WHERE turn_id = ?
+    `).get(rejected.turn_id).count).toBe(1);
 
     database.close();
   });

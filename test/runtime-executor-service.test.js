@@ -10,9 +10,11 @@ import {
   validateDeliveryCommand,
   validateNormalizedEvent,
 } from '../contracts/public/index.js';
+import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { createExecutorService } from '../runtime/executor/service.js';
 import { createExecutorStore } from '../runtime/persistence/executor-store.js';
 import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { deliveredResult } from './helpers/delivered-result.js';
 
 const inboundFixture = JSON.parse(fs.readFileSync(
   new URL('../contracts/public/fixtures/inbound-envelope-v1.json', import.meta.url),
@@ -162,6 +164,7 @@ describe('runtime executor service', () => {
         conversation_id: accepted.conversation_id,
         active_turn_id: null,
         queued_turn_ids: [accepted.turn_id],
+        wait_reason: null,
       },
     ]);
 
@@ -294,6 +297,394 @@ describe('runtime executor service', () => {
       text: 'provider-neutral result',
       terminal: true,
     });
+
+    database.close();
+  });
+
+  test('keeps a turn durably queued with a visible capacity reason without duplicate execution', async () => {
+    const database = openTestDatabase();
+    const first = acceptQueuedTurn(database, 'capacity-first');
+    const secondEnvelope = normalEnvelope('capacity-second');
+    secondEnvelope.chat_id = 'chat-capacity-second';
+    const second = acceptNormalInbound(database, secondEnvelope, {
+      now: () => '2026-07-19T07:00:01Z',
+      generateId: deterministicIds('inbound-capacity-second'),
+    });
+    const thirdEnvelope = normalEnvelope('capacity-third');
+    thirdEnvelope.chat_id = 'chat-capacity-third';
+    const third = acceptNormalInbound(database, thirdEnvelope, {
+      now: () => '2026-07-19T07:00:02Z',
+      generateId: deterministicIds('inbound-capacity-third'),
+    });
+    const adapterCalls = [];
+    let markFirstStarted;
+    const firstStarted = new Promise((resolve) => { markFirstStarted = resolve; });
+    let releaseFirst;
+    const firstCanFinish = new Promise((resolve) => { releaseFirst = resolve; });
+    const adapter = {
+      async *execute(context) {
+        adapterCalls.push(context.turn_id);
+        if (context.turn_id === first.turn_id) {
+          markFirstStarted();
+          await firstCanFinish;
+        }
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-capacity',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('capacity'),
+      maxResidentExecutorsPerBot: 1,
+    });
+    const competingService = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-capacity-competing',
+      now: () => '2026-07-19T07:01:01Z',
+      generateId: deterministicIds('capacity-competing'),
+      maxResidentExecutorsPerBot: 1,
+    });
+
+    const firstRun = service.runNext();
+    await firstStarted;
+    await expect(competingService.runNext()).resolves.toEqual({
+      status: 'capacity_wait',
+      conversation_id: second.conversation_id,
+      turn_id: second.turn_id,
+      wait_reason: 'executor_capacity',
+    });
+    expect(adapterCalls).toEqual([first.turn_id]);
+    expect(database.prepare(`
+      SELECT turn.state, turn.attempt_id, queue.status, queue.wait_reason
+      FROM runtime_turns AS turn
+      JOIN runtime_turn_queue AS queue ON queue.turn_id = turn.turn_id
+      WHERE turn.turn_id = ?
+    `).get(second.turn_id)).toEqual({
+      state: 'queued',
+      attempt_id: null,
+      status: 'queued',
+      wait_reason: 'executor_capacity',
+    });
+    expect(database.prepare(`
+      SELECT turn_id, wait_reason
+      FROM runtime_turn_queue
+      WHERE turn_id IN (?, ?)
+      ORDER BY turn_id ASC
+    `).all(second.turn_id, third.turn_id)).toEqual([
+      { turn_id: second.turn_id, wait_reason: 'executor_capacity' },
+      { turn_id: third.turn_id, wait_reason: 'executor_capacity' },
+    ]);
+    const capacityEvents = readEvents(database, second.turn_id);
+    expect(capacityEvents).toHaveLength(3);
+    expect(validateNormalizedEvent(capacityEvents[2]).forwarded).toEqual(capacityEvents[2]);
+    expect(capacityEvents[2]).toMatchObject({
+      attempt_id: null,
+      attempt_no: null,
+      lease_epoch: null,
+      provider: null,
+      phase: 'queued',
+      payload: {
+        from_state: 'queued',
+        to_state: 'queued',
+        reason_code: 'executor_capacity',
+      },
+    });
+    const capacityProjection = database.prepare(`
+      SELECT aggregate_version, event_sequence_through, render_model_json, status
+      FROM runtime_projection_snapshots
+      WHERE turn_id = ? AND aggregate_version = 3
+    `).get(second.turn_id);
+    expect(capacityProjection).toMatchObject({
+      aggregate_version: 3,
+      event_sequence_through: 3,
+      status: 'staged',
+    });
+    expect(JSON.parse(capacityProjection.render_model_json)).toMatchObject({
+      phase: 'queued',
+      text: 'Waiting for executor capacity.',
+      terminal: false,
+    });
+
+    const deliveryService = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-service-capacity',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('delivery-capacity'),
+      throttleMs: 0,
+    });
+    let capacityDelivery = null;
+    while (capacityDelivery === null) {
+      const command = deliveryService.claimNext();
+      expect(command).not.toBeNull();
+      if (!command) break;
+      expect(deliveryService.recordResult(deliveredResult(
+        command,
+        '2026-07-19T07:02:00Z',
+      ))).toEqual({
+        status: 'applied',
+        outbox_status: 'delivered',
+      });
+      if (
+        command.operation === 'update_main'
+        && command.mapping.turn_id === second.turn_id
+      ) capacityDelivery = command;
+    }
+    expect(capacityDelivery).toBeDefined();
+    expect(validateDeliveryCommand(capacityDelivery).forwarded).toEqual(capacityDelivery);
+    expect(capacityDelivery).toMatchObject({
+      operation: 'update_main',
+      aggregate_version: 3,
+      event_sequence_through: 3,
+      render_model: {
+        phase: 'queued',
+        text: 'Waiting for executor capacity.',
+        terminal: false,
+      },
+    });
+    expect(service.snapshot().executors).toEqual([
+      {
+        conversation_id: first.conversation_id,
+        active_turn_id: first.turn_id,
+        queued_turn_ids: [],
+        wait_reason: null,
+      },
+      {
+        conversation_id: second.conversation_id,
+        active_turn_id: null,
+        queued_turn_ids: [second.turn_id],
+        wait_reason: 'executor_capacity',
+      },
+      {
+        conversation_id: third.conversation_id,
+        active_turn_id: null,
+        queued_turn_ids: [third.turn_id],
+        wait_reason: 'executor_capacity',
+      },
+    ]);
+    expect(database.prepare(`
+      SELECT conversation_id, bot_id, provider
+      FROM runtime_executor_residents
+    `).all()).toEqual([{
+      conversation_id: first.conversation_id,
+      bot_id: normalEnvelope('capacity-first').bot_id,
+      provider: 'claude',
+    }]);
+
+    const duplicate = structuredClone(secondEnvelope);
+    duplicate.trace_id = 'trace-capacity-second-duplicate';
+    duplicate.received_at = '2026-07-19T07:01:01Z';
+    const replayed = acceptNormalInbound(database, duplicate, {
+      now: () => {
+        throw new Error('a duplicate capacity-wait webhook must not commit again');
+      },
+      generateId: () => {
+        throw new Error('a duplicate capacity-wait webhook must not reserve capacity');
+      },
+    });
+    expect(replayed).toEqual({
+      ...second,
+      trace_id: duplicate.trace_id,
+      deduplicated: true,
+    });
+    expect(database.prepare('SELECT COUNT(*) AS count FROM runtime_turns').get().count).toBe(3);
+    expect(adapterCalls).toEqual([first.turn_id]);
+
+    releaseFirst();
+    await expect(firstRun).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: first.turn_id,
+    });
+    await expect(competingService.runNext()).resolves.toMatchObject({
+      status: 'capacity_wait',
+      turn_id: second.turn_id,
+    });
+    expect(adapterCalls).toEqual([first.turn_id]);
+    expect(readEvents(database, second.turn_id)).toHaveLength(3);
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM runtime_executor_residents
+      WHERE conversation_id = ?
+    `).get(first.conversation_id).count).toBe(1);
+    expect(database.prepare(`
+      SELECT status, wait_reason
+      FROM runtime_turn_queue
+      WHERE turn_id = ?
+    `).get(second.turn_id)).toEqual({
+      status: 'queued',
+      wait_reason: 'executor_capacity',
+    });
+
+    database.close();
+  });
+
+  test('executes one conversation FIFO across lineages without two active turns', async () => {
+    const database = openTestDatabase();
+    const firstEnvelope = normalEnvelope('fifo-first');
+    const first = acceptNormalInbound(database, firstEnvelope, {
+      now: () => '2026-07-19T07:10:00Z',
+      generateId: deterministicIds('inbound-fifo-first'),
+    });
+    const alternateLineageId = 'lineage-fifo-alternate';
+    database.prepare(`
+      INSERT INTO runtime_lineages (
+        lineage_id, conversation_id, lineage_kind, is_default, created_at
+      ) VALUES (?, ?, 'normal', 0, ?)
+    `).run(alternateLineageId, first.conversation_id, first.committed_at);
+    database.prepare(`
+      INSERT INTO runtime_message_mappings (
+        region, tenant_id, channel, bot_id, platform_message_id,
+        conversation_id, turn_id, lineage_id, binding_state, reason,
+        mapping_id, mapping_version, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'bound', NULL, ?, 1, ?)
+    `).run(
+      firstEnvelope.region,
+      firstEnvelope.tenant_id,
+      firstEnvelope.channel,
+      firstEnvelope.bot_id,
+      'model-message-fifo-alternate',
+      first.conversation_id,
+      first.turn_id,
+      alternateLineageId,
+      'mapping-fifo-alternate',
+      first.committed_at,
+    );
+    const replyEnvelope = normalEnvelope('fifo-reply');
+    replyEnvelope.reply = {
+      root_message_id: 'model-message-fifo-root',
+      parent_message_id: 'model-message-fifo-alternate',
+      reply_to_message_id: 'model-message-fifo-alternate',
+    };
+    const reply = acceptNormalInbound(database, replyEnvelope, {
+      now: () => '2026-07-19T07:10:01Z',
+      generateId: deterministicIds('inbound-fifo-reply'),
+    });
+    expect(reply).toMatchObject({
+      conversation_id: first.conversation_id,
+      lineage_id: alternateLineageId,
+    });
+
+    const adapterCalls = [];
+    let markFirstStarted;
+    const firstStarted = new Promise((resolve) => { markFirstStarted = resolve; });
+    let releaseFirst;
+    const firstCanFinish = new Promise((resolve) => { releaseFirst = resolve; });
+    const adapter = {
+      async *execute(context) {
+        adapterCalls.push({
+          turn_id: context.turn_id,
+          lineage_id: context.lineage_id,
+        });
+        if (context.turn_id === first.turn_id) {
+          markFirstStarted();
+          await firstCanFinish;
+        }
+      },
+    };
+    const firstService = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-fifo-A',
+      now: () => '2026-07-19T07:11:00Z',
+      generateId: deterministicIds('fifo-A'),
+    });
+    const competingService = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-fifo-B',
+      now: () => '2026-07-19T07:11:01Z',
+      generateId: deterministicIds('fifo-B'),
+    });
+
+    const firstRun = firstService.runNext();
+    await firstStarted;
+    await expect(competingService.runNext()).resolves.toEqual({ status: 'idle' });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM runtime_turns
+      WHERE conversation_id = ? AND state IN (
+        'starting', 'running', 'waiting_user', 'redirecting', 'recovering'
+      )
+    `).get(first.conversation_id).count).toBe(1);
+    expect(database.prepare(`
+      SELECT state, attempt_id
+      FROM runtime_turns
+      WHERE turn_id = ?
+    `).get(reply.turn_id)).toEqual({ state: 'queued', attempt_id: null });
+    expect(adapterCalls).toEqual([
+      { turn_id: first.turn_id, lineage_id: first.lineage_id },
+    ]);
+
+    releaseFirst();
+    await firstRun;
+    await expect(competingService.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: reply.turn_id,
+    });
+    expect(adapterCalls).toEqual([
+      { turn_id: first.turn_id, lineage_id: first.lineage_id },
+      { turn_id: reply.turn_id, lineage_id: alternateLineageId },
+    ]);
+
+    database.close();
+  });
+
+  test('never invokes the provider for a queue-full failed turn or its duplicate webhook', async () => {
+    const database = openTestDatabase();
+    const dependencies = {
+      now: () => '2026-07-19T07:20:00Z',
+      generateId: deterministicIds('inbound-queue-full'),
+      maxQueuedTurns: 1,
+    };
+    const firstEnvelope = normalEnvelope('queue-full-first');
+    const first = acceptNormalInbound(database, firstEnvelope, dependencies);
+    const rejectedEnvelope = normalEnvelope('queue-full-rejected');
+    const rejected = acceptNormalInbound(database, rejectedEnvelope, dependencies);
+    expect(rejected).toMatchObject({
+      status: 'rejected',
+      error: { code: 'queue_full' },
+    });
+
+    const duplicate = structuredClone(rejectedEnvelope);
+    duplicate.trace_id = 'trace-queue-full-rejected-duplicate';
+    duplicate.received_at = '2026-07-19T07:20:01Z';
+    expect(acceptNormalInbound(database, duplicate, dependencies)).toEqual({
+      ...rejected,
+      trace_id: duplicate.trace_id,
+      deduplicated: true,
+    });
+    expect(database.prepare('SELECT COUNT(*) AS count FROM runtime_turns').get().count).toBe(2);
+    expect(database.prepare('SELECT COUNT(*) AS count FROM runtime_turn_queue').get().count).toBe(1);
+
+    const adapterCalls = [];
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute(context) {
+          adapterCalls.push(context.turn_id);
+        },
+      },
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-queue-full',
+      now: () => '2026-07-19T07:21:00Z',
+      generateId: deterministicIds('queue-full'),
+    });
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: first.turn_id,
+    });
+    await expect(service.runNext()).resolves.toEqual({ status: 'idle' });
+    expect(adapterCalls).toEqual([first.turn_id]);
+    expect(database.prepare(`
+      SELECT state, attempt_id
+      FROM runtime_turns
+      WHERE turn_id = ?
+    `).get(rejected.turn_id)).toEqual({ state: 'failed', attempt_id: null });
 
     database.close();
   });
@@ -517,6 +908,7 @@ describe('runtime executor service', () => {
         conversation_id: first.conversation_id,
         active_turn_id: null,
         queued_turn_ids: [first.turn_id, second.turn_id],
+        wait_reason: null,
       },
     ]);
     await firstService.runNext();
@@ -536,6 +928,7 @@ describe('runtime executor service', () => {
         conversation_id: second.conversation_id,
         active_turn_id: null,
         queued_turn_ids: [second.turn_id],
+        wait_reason: null,
       },
     ]);
     await expect(secondService.runNext()).resolves.toMatchObject({
