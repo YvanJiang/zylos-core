@@ -101,6 +101,7 @@ const UNCERTAIN_TURN_STATES = Object.freeze(new Set([
   'waiting_user',
   'redirecting',
   'recovering',
+  'timed_out',
 ]));
 
 export function createWorkspaceLeaseCoordinator({
@@ -215,6 +216,31 @@ export function createWorkspaceLeaseCoordinator({
     return row;
   }
 
+  function loadHeldOrUncertainFence(fence) {
+    if (!fence || typeof fence.workspace_lease_id !== 'string') {
+      workspaceConflict('stale_workspace_lease', 'A workspace lease fence is required.');
+    }
+    const row = database.prepare(`
+      SELECT * FROM runtime_workspace_leases
+      WHERE workspace_lease_id = ?
+    `).get(fence.workspace_lease_id);
+    if (
+      !row
+      || !['active', 'uncertain'].includes(row.state)
+      || row.holder_service_instance_id !== serviceInstanceId
+      || row.workspace_root !== fence.workspace_root
+      || row.holder_conversation_id !== fence.holder_conversation_id
+      || row.holder_turn_id !== fence.holder_turn_id
+      || row.lease_epoch !== fence.lease_epoch
+    ) {
+      workspaceConflict(
+        'stale_workspace_lease',
+        'The workspace isolation fence no longer matches its durable holder and epoch.',
+      );
+    }
+    return row;
+  }
+
   function acquire({
     workspace_root: workspaceRoot,
     mode,
@@ -309,6 +335,20 @@ export function createWorkspaceLeaseCoordinator({
     return projectLease(row, 'current');
   }
 
+  function assertHeldOrUncertain(fence) {
+    const row = loadHeldOrUncertainFence(fence);
+    return projectLease(row, row.state);
+  }
+
+  function isRecoveryRequired(fence) {
+    try {
+      return loadHeldOrUncertainFence(fence).state === 'uncertain';
+    } catch (error) {
+      if (error instanceof WorkspaceLeaseError) return false;
+      throw error;
+    }
+  }
+
   function inspect({ workspace_root: workspaceRoot, mode }) {
     if (!['writable', 'read_only'].includes(mode)) {
       throw new TypeError('workspace lease mode must be writable or read_only');
@@ -332,17 +372,6 @@ export function createWorkspaceLeaseCoordinator({
       const heartbeatAt = now();
       parseNow(heartbeatAt);
       expireElapsedLeases(heartbeatAt);
-      const uncertain = database.prepare(`
-        SELECT 1 FROM runtime_workspace_leases
-        WHERE holder_service_instance_id = ? AND state = 'uncertain'
-        LIMIT 1
-      `).get(serviceInstanceId);
-      if (uncertain) {
-        workspaceConflict(
-          'stale_workspace_lease',
-          'A workspace writer expired before its ownership heartbeat.',
-        );
-      }
       const leaseExpiresAt = new Date(parseNow(heartbeatAt) + leaseDurationMs).toISOString();
       const renewed = database.prepare(`
         UPDATE runtime_workspace_leases
@@ -350,9 +379,20 @@ export function createWorkspaceLeaseCoordinator({
         WHERE holder_service_instance_id = ? AND state = 'active'
           AND lease_expires_at > ?
       `).run(leaseExpiresAt, heartbeatAt, serviceInstanceId, heartbeatAt);
-      return renewed.changes;
+      const uncertain = database.prepare(`
+        SELECT COUNT(*) AS count FROM runtime_workspace_leases
+        WHERE holder_service_instance_id = ? AND state = 'uncertain'
+      `).get(serviceInstanceId).count;
+      return { renewed: renewed.changes, uncertain };
     });
-    return database.inTransaction ? heartbeat() : heartbeat.immediate();
+    const result = database.inTransaction ? heartbeat() : heartbeat.immediate();
+    if (result.uncertain > 0) {
+      workspaceConflict(
+        'stale_workspace_lease',
+        'A workspace writer expired before its ownership heartbeat.',
+      );
+    }
+    return result.renewed;
   }
 
   function renew(fence) {
@@ -485,6 +525,76 @@ export function createWorkspaceLeaseCoordinator({
     return releaseAfterIsolation(projectLease(row), { reason });
   }
 
+  function listRecoveryCandidates() {
+    const listedAt = now();
+    const list = database.transaction(() => {
+      expireElapsedLeases(listedAt);
+      return database.prepare(`
+        SELECT * FROM runtime_workspace_leases
+        WHERE state = 'uncertain' AND holder_service_instance_id != ?
+        ORDER BY updated_at, workspace_lease_id
+      `).all(serviceInstanceId).map((row) => projectLease(row, 'uncertain'));
+    });
+    return database.inTransaction ? list() : list.immediate();
+  }
+
+  function adoptUncertainForRecovery(fence) {
+    const adopt = database.transaction(() => {
+      const adoptedAt = now();
+      parseNow(adoptedAt);
+      const row = database.prepare(`
+        SELECT * FROM runtime_workspace_leases WHERE workspace_lease_id = ?
+      `).get(fence?.workspace_lease_id);
+      if (
+        !row
+        || row.state !== 'uncertain'
+        || row.holder_service_instance_id === serviceInstanceId
+        || row.holder_service_instance_id !== fence.holder_service_instance_id
+        || row.workspace_root !== fence.workspace_root
+        || row.holder_conversation_id !== fence.holder_conversation_id
+        || row.holder_turn_id !== fence.holder_turn_id
+        || row.lease_epoch !== fence.lease_epoch
+      ) {
+        workspaceConflict(
+          'stale_workspace_lease',
+          'The orphaned workspace recovery fence is no longer current.',
+        );
+      }
+      database.prepare(`
+        INSERT INTO runtime_workspace_lease_fences (workspace_root, last_epoch, updated_at)
+        VALUES (?, 1, ?)
+        ON CONFLICT(workspace_root) DO UPDATE SET
+          last_epoch = runtime_workspace_lease_fences.last_epoch + 1,
+          updated_at = excluded.updated_at
+      `).run(row.workspace_root, adoptedAt);
+      const leaseEpoch = database.prepare(`
+        SELECT last_epoch FROM runtime_workspace_lease_fences WHERE workspace_root = ?
+      `).get(row.workspace_root).last_epoch;
+      const leaseExpiresAt = new Date(parseNow(adoptedAt) + leaseDurationMs).toISOString();
+      const adopted = database.prepare(`
+        UPDATE runtime_workspace_leases
+        SET holder_service_instance_id = ?, lease_epoch = ?, lease_expires_at = ?, updated_at = ?
+        WHERE workspace_lease_id = ? AND state = 'uncertain'
+          AND holder_service_instance_id = ? AND lease_epoch = ?
+      `).run(
+        serviceInstanceId,
+        leaseEpoch,
+        leaseExpiresAt,
+        adoptedAt,
+        row.workspace_lease_id,
+        row.holder_service_instance_id,
+        row.lease_epoch,
+      );
+      if (adopted.changes !== 1) {
+        workspaceConflict('stale_workspace_lease', 'The orphaned workspace adoption lost its CAS.');
+      }
+      return projectLease(database.prepare(`
+        SELECT * FROM runtime_workspace_leases WHERE workspace_lease_id = ?
+      `).get(row.workspace_lease_id), 'uncertain');
+    });
+    return database.inTransaction ? adopt() : adopt.immediate();
+  }
+
   function startBackgroundWork(fence, { provider_task_id: providerTaskId }) {
     if (typeof providerTaskId !== 'string' || providerTaskId.length === 0) {
       throw new TypeError('provider_task_id must be a non-empty string');
@@ -610,6 +720,7 @@ export function createWorkspaceLeaseCoordinator({
       JOIN runtime_workspace_leases AS lease
         ON lease.workspace_lease_id = background.workspace_lease_id
       WHERE lease.holder_conversation_id = ?
+        AND lease.state IN ('active', 'uncertain')
         AND background.state IN ('active', 'unknown')
       LIMIT 1
     `).get(conversationId) !== undefined;
@@ -655,15 +766,37 @@ export function createWorkspaceLeaseCoordinator({
     return database.inTransaction ? list() : list.immediate();
   }
 
+  function listObservability() {
+    return Object.freeze({
+      complete: true,
+      items: Object.freeze(listActive().map((lease) => Object.freeze({
+        workspace_root: lease.workspace_root,
+        mode: lease.mode === 'writable' ? 'write' : 'read',
+        holder_conversation_id: lease.holder_conversation_id,
+        holder_turn_id: lease.holder_turn_id,
+        holder_background_work_id: lease.holder_background_work_ids[0] ?? null,
+        expires_at: lease.lease_expires_at,
+        epoch: lease.lease_epoch,
+        waiter_count: lease.waiters.length,
+      }))),
+      error: null,
+    });
+  }
+
   return Object.freeze({
     acquire,
+    adoptUncertainForRecovery,
     assertCurrent,
+    assertHeldOrUncertain,
     assertWritable,
     finishBackgroundWork,
     hasBlockingBackgroundWork,
     heartbeatOwned,
     inspect,
+    isRecoveryRequired,
     listActive,
+    listObservability,
+    listRecoveryCandidates,
     release,
     releaseAfterIsolation,
     releaseTurnAfterIsolation,

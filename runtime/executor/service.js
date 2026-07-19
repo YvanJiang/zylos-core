@@ -24,6 +24,7 @@ export function createExecutorService({
   cancelResidentHeartbeat = clearInterval,
   scheduleWorkspaceHeartbeat = setInterval,
   cancelWorkspaceHeartbeat = clearInterval,
+  isolateOrphanedWorkspace = null,
   permissionHandler = null,
   interactionTimeoutMs,
   maxResidentExecutorsPerBot = 20,
@@ -86,6 +87,9 @@ export function createExecutorService({
   if (typeof cancelWorkspaceHeartbeat !== 'function') {
     throw new TypeError('cancelWorkspaceHeartbeat must be a function');
   }
+  if (isolateOrphanedWorkspace !== null && typeof isolateOrphanedWorkspace !== 'function') {
+    throw new TypeError('isolateOrphanedWorkspace must be a function or null');
+  }
   if (
     !Number.isSafeInteger(maxResidentExecutorsPerBot)
     || maxResidentExecutorsPerBot <= 0
@@ -117,6 +121,7 @@ export function createExecutorService({
   const endedResidentFences = new Map();
   const pendingInteractionRecoveries = new Map();
   const pendingRecoveryIsolations = new Map();
+  const orphanedWorkspaceRecoveryTurnIds = new Set();
   const recoveringOwnershipReleases = new Map();
   const timedOutLeaseReleases = new Map();
   const uncertainTurnIds = new Set();
@@ -126,6 +131,7 @@ export function createExecutorService({
   let workspaceHeartbeat = null;
   let residentHeartbeatFailure = null;
   let workspaceHeartbeatFailure = null;
+  let workspaceRecoveryFlight = null;
 
   function persistenceFailure(cause) {
     const error = new Error(`Runtime persistence failed: ${cause.message}`, { cause });
@@ -196,13 +202,14 @@ export function createExecutorService({
   }
 
   function snapshot() {
+    refresh();
     return {
       service_instance_id: serviceInstanceId,
       executors: executors.map((executor) => ({
         ...executor,
         queued_turn_ids: [...executor.queued_turn_ids],
       })),
-      workspace_leases: store.listActiveWorkspaceLeases(),
+      workspace_leases: store.listWorkspaceLeaseObservability(),
     };
   }
 
@@ -212,6 +219,7 @@ export function createExecutorService({
     }
     if (started) return snapshot();
     store.reconcileExpiredResidents();
+    adoptOrphanedWorkspaceRecoveries();
     if (residentHeartbeat === null) {
       residentHeartbeat = scheduleResidentHeartbeat(() => {
         try {
@@ -249,9 +257,22 @@ export function createExecutorService({
       residentHeartbeat?.unref?.();
     }
     if (workspaceHeartbeat === null) {
-      workspaceHeartbeat = scheduleWorkspaceHeartbeat(() => {
+      workspaceHeartbeat = scheduleWorkspaceHeartbeat(async () => {
+        if (lifecycle !== 'open') return;
         try {
           store.heartbeatOwnedWorkspaceLeases();
+          workspaceHeartbeatFailure = null;
+        } catch (error) {
+          try {
+            await recoverExpiredWorkspaceRuns(error);
+          } catch (recoveryError) {
+            workspaceHeartbeatFailure = recoveryError;
+            return;
+          }
+        }
+        try {
+          adoptOrphanedWorkspaceRecoveries();
+          await reconcileWorkspaceRecoveries();
           workspaceHeartbeatFailure = null;
         } catch (error) {
           workspaceHeartbeatFailure = error;
@@ -315,6 +336,7 @@ export function createExecutorService({
     const result = store.releaseRecoveringExecutorOwnership(turnContext);
     recoveringOwnershipReleases.delete(turnContext.turn_id);
     pendingRecoveryIsolations.delete(turnContext.turn_id);
+    orphanedWorkspaceRecoveryTurnIds.delete(turnContext.turn_id);
     endedResidentFences.delete(turnContext.conversation_id);
     return result;
   }
@@ -345,27 +367,163 @@ export function createExecutorService({
     activeRun,
     reasonCode = 'provider_execution_uncertain',
     error = null,
+    { allowUncertainWorkspace = false } = {},
   ) {
-    const { state } = store.assertCurrentFence(activeRun.turnContext);
+    const { state } = allowUncertainWorkspace
+      ? store.assertRecoverableFence(activeRun.turnContext)
+      : store.assertCurrentFence(activeRun.turnContext);
     persist(() => store.transitionTurn(activeRun.turnContext, state, 'recovering', {
+      allowUncertainWorkspace,
       error: null,
       reasonCode,
-      recovery: error === null ? null : { error },
+      recovery: error === null ? null : {
+        error,
+        waitForDecision: error.side_effect_status === 'unknown',
+      },
     }));
     activeRun.durableSettled = true;
+    activeRun.forcedResult = resultFor(activeRun, 'recovering');
     refresh();
     cleanupActiveRun(activeRun);
     pendingRecoveryIsolations.set(activeRun.turnContext.turn_id, activeRun.turnContext);
-    return resultFor(activeRun, 'recovering');
+    return activeRun.forcedResult;
+  }
+
+  async function recoverExpiredWorkspaceRuns(heartbeatError) {
+    const affectedRuns = [...activeRuns.values()].filter(
+      (activeRun) => !activeRun.durableSettled
+        && store.isWorkspaceRecoveryRequired(activeRun.turnContext),
+    );
+    if (affectedRuns.length === 0) {
+      if (heartbeatError?.code === 'stale_workspace_lease') return;
+      throw heartbeatError;
+    }
+    for (const activeRun of affectedRuns) {
+      const { turnContext } = activeRun;
+      try {
+        transitionToRecovery(
+          activeRun,
+          'workspace_lease_expired',
+          {
+            code: 'workspace_lease_expired',
+            category: 'conflict',
+            retryable: false,
+            side_effect_status: 'unknown',
+            user_message: 'Workspace ownership expired while provider work was still active.',
+          },
+          { allowUncertainWorkspace: true },
+        );
+      } catch (recoveryFailure) {
+        workspaceHeartbeatFailure = recoveryFailure;
+        continue;
+      }
+    }
+    if (workspaceHeartbeatFailure === heartbeatError) workspaceHeartbeatFailure = null;
+  }
+
+  function adoptOrphanedWorkspaceRecoveries() {
+    for (const turnContext of store.claimOrphanedWorkspaceRecoveries()) {
+      pendingRecoveryIsolations.set(turnContext.turn_id, turnContext);
+      orphanedWorkspaceRecoveryTurnIds.add(turnContext.turn_id);
+    }
+  }
+
+  async function performWorkspaceRecoveryReconciliation() {
+    adoptOrphanedWorkspaceRecoveries();
+    const result = { isolated: [], notification_pending: [], isolation_pending: [] };
+    for (const [turnId, turnContext] of pendingRecoveryIsolations) {
+      if (!turnContext.workspace) continue;
+      if (!store.isRecoveryNotificationDelivered(turnContext)) {
+        result.notification_pending.push(turnId);
+        continue;
+      }
+      const orphaned = orphanedWorkspaceRecoveryTurnIds.has(turnId);
+      if (orphaned) {
+        if (isolateOrphanedWorkspace === null) {
+          result.isolation_pending.push(turnId);
+          continue;
+        }
+        const isolation = await isolateOrphanedWorkspace(Object.freeze({
+          conversation_id: turnContext.conversation_id,
+          turn_id: turnContext.turn_id,
+          workspace: Object.freeze({ ...turnContext.workspace }),
+          attempt: Object.freeze({ ...turnContext.attempt }),
+        }));
+        if (isolation !== true && isolation?.isolated !== true) {
+          result.isolation_pending.push(turnId);
+          continue;
+        }
+      } else {
+        if (typeof adapter.abort !== 'function') {
+          result.isolation_pending.push(turnId);
+          continue;
+        }
+        await adapter.abort(turnContext);
+      }
+      releaseRecoveringOwnership(turnContext);
+      result.isolated.push(turnId);
+    }
+    refresh();
+    return result;
+  }
+
+  function reconcileWorkspaceRecoveries() {
+    if (workspaceRecoveryFlight) return workspaceRecoveryFlight;
+    if (lifecycle !== 'open') {
+      return Promise.reject(new Error(
+        `Executor service is ${lifecycle}; it cannot reconcile workspace recovery.`,
+      ));
+    }
+    const flight = performWorkspaceRecoveryReconciliation();
+    workspaceRecoveryFlight = flight;
+    const clearFlight = () => {
+      if (workspaceRecoveryFlight === flight) workspaceRecoveryFlight = null;
+    };
+    flight.then(clearFlight, clearFlight);
+    return flight;
+  }
+
+  function beginUnknownBackgroundRecovery(activeRun) {
+    return transitionToRecovery(
+      activeRun,
+      'provider_background_work_unknown',
+      {
+        code: 'provider_background_work_unknown',
+        category: 'provider',
+        retryable: false,
+        side_effect_status: 'unknown',
+        user_message: 'Background workspace work ended without a confirmed outcome.',
+      },
+    );
   }
 
   async function handleRunFailure(activeRun, error) {
     const { turnContext } = activeRun;
     if (activeRun.durableSettled) {
       cleanupActiveRun(activeRun);
+      if (activeRun.forcedResult) return activeRun.forcedResult;
       throw error;
     }
     if (error.persistenceFailure) {
+      try {
+        store.listActiveWorkspaceLeases();
+        if (store.isWorkspaceRecoveryRequired(turnContext)) {
+          return transitionToRecovery(
+            activeRun,
+            'workspace_lease_expired',
+            {
+              code: 'workspace_lease_expired',
+              category: 'conflict',
+              retryable: false,
+              side_effect_status: 'unknown',
+              user_message: 'Workspace ownership expired while provider work was still active.',
+            },
+            { allowUncertainWorkspace: true },
+          );
+        }
+      } catch (recoveryFailure) {
+        error.recoveryFailure = recoveryFailure;
+      }
       if (typeof adapter.abort === 'function') {
         await adapter.abort(turnContext);
       }
@@ -378,24 +536,7 @@ export function createExecutorService({
       controller.abort();
     }
     if (activeRun.backgroundUncertain) {
-      const recovery = transitionToRecovery(
-        activeRun,
-        'provider_background_work_unknown',
-        {
-          code: 'provider_background_work_unknown',
-          category: 'provider',
-          retryable: false,
-          side_effect_status: 'unknown',
-          user_message: 'Background workspace work ended without a confirmed outcome.',
-        },
-      );
-      try {
-        if (typeof adapter.abort === 'function') await adapter.abort(turnContext);
-        releaseRecoveringOwnership(turnContext);
-      } catch (isolationFailure) {
-        residentHeartbeatFailure = isolationFailure;
-      }
-      return recovery;
+      return beginUnknownBackgroundRecovery(activeRun);
     }
     if (uncertainTurnIds.has(turnContext.turn_id)) {
       const isolationProven = cancellationSettlements.get(turnContext.turn_id)?.isolationProven;
@@ -430,6 +571,9 @@ export function createExecutorService({
   }
 
   async function finishRun(activeRun) {
+    if (activeRun.durableSettled && activeRun.forcedResult) {
+      return activeRun.forcedResult;
+    }
     await awaitCancellationSettlement(activeRun.turnContext.turn_id);
     if (uncertainTurnIds.has(activeRun.turnContext.turn_id)) {
       const { turnContext } = activeRun;
@@ -445,25 +589,7 @@ export function createExecutorService({
       return recovery;
     }
     if (activeRun.backgroundUncertain) {
-      const { turnContext } = activeRun;
-      const recovery = transitionToRecovery(
-        activeRun,
-        'provider_background_work_unknown',
-        {
-          code: 'provider_background_work_unknown',
-          category: 'provider',
-          retryable: false,
-          side_effect_status: 'unknown',
-          user_message: 'Background workspace work ended without a confirmed outcome.',
-        },
-      );
-      try {
-        if (typeof adapter.abort === 'function') await adapter.abort(turnContext);
-        releaseRecoveringOwnership(turnContext);
-      } catch (isolationFailure) {
-        residentHeartbeatFailure = isolationFailure;
-      }
-      return recovery;
+      return beginUnknownBackgroundRecovery(activeRun);
     }
     const terminalState = activeRun.outcome === 'cancelled'
       ? 'stopped'
@@ -716,21 +842,36 @@ export function createExecutorService({
       refresh();
       return reservation;
     }
-    const turnContext = store.claimNextQueuedTurn({
-      conversationId: reservation.conversation_id,
-      requireResident: provider === 'claude',
-      workspaceAccess: reserved.workspaceAccessByConversation.get(
-        reservation.conversation_id,
-      ) ?? resolveProviderWorkspaceAccess(adapter, {
-        conversation_id: reservation.conversation_id,
-        provider,
-      }, { defaultRoot: workspaceRoot }),
-    });
+    let turnContext;
+    try {
+      turnContext = store.claimNextQueuedTurn({
+        conversationId: reservation.conversation_id,
+        requireResident: provider === 'claude',
+        workspaceAccess: reserved.workspaceAccessByConversation.get(
+          reservation.conversation_id,
+        ) ?? resolveProviderWorkspaceAccess(adapter, {
+          conversation_id: reservation.conversation_id,
+          provider,
+        }, { defaultRoot: workspaceRoot }),
+        workspaceLease: reservation.workspace ?? null,
+      });
+    } catch (error) {
+      if (reservation.workspace) {
+        try {
+          store.releaseWorkspaceReservation(reservation.workspace);
+        } catch {
+          // The original claim failure remains authoritative; expiry reconciles a lost fence.
+        }
+      }
+      throw error;
+    }
     if (turnContext?.status === 'workspace_wait') {
+      if (reservation.workspace) store.releaseWorkspaceReservation(reservation.workspace);
       refresh();
       return turnContext;
     }
     if (!turnContext) {
+      if (reservation.workspace) store.releaseWorkspaceReservation(reservation.workspace);
       refresh();
       return { status: 'idle' };
     }
@@ -743,6 +884,7 @@ export function createExecutorService({
       advancing: null,
       backgroundUncertain: false,
       durableSettled: false,
+      forcedResult: null,
       iterator: null,
       outcome: null,
       pauseKind: null,
@@ -1041,6 +1183,13 @@ export function createExecutorService({
       try {
         clearAllInteractionDeadlines();
         const shutdownFailures = [];
+        if (workspaceRecoveryFlight) {
+          try {
+            await workspaceRecoveryFlight;
+          } catch (error) {
+            shutdownFailures.push(error);
+          }
+        }
         const providerClosing = (async () => {
           if (typeof adapter.close !== 'function') return [];
           return await adapter.close() ?? [];
@@ -1221,6 +1370,7 @@ export function createExecutorService({
     deliverInteractionAnswer,
     evictIdleExecutors,
     expireInteraction,
+    reconcileWorkspaceRecoveries,
     runNext,
     snapshot,
     start,

@@ -464,6 +464,39 @@ async function requestToolPermission(executor, toolName, input, sdkContext) {
   };
 }
 
+export async function enforceWorkspaceFenceBeforeTool(executor, input) {
+  if (
+    input?.hook_event_name !== 'PreToolUse'
+    || PROVIDER_READ_ONLY_TOOLS.has(input.tool_name)
+  ) return {};
+  const activeTurn = executor.providerTurn;
+  if (!activeTurn || activeTurn.resultSeen) {
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: 'The provider attempt is no longer active.',
+      },
+    };
+  }
+  try {
+    if (typeof activeTurn.controls.assertWorkspaceWrite !== 'function') {
+      throw new Error('Core workspace write fencing is unavailable for this provider attempt.');
+    }
+    await activeTurn.controls.assertWorkspaceWrite();
+    return {};
+  } catch (error) {
+    settleTurn(activeTurn, { error });
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: 'Core rejected a stale workspace write fence.',
+      },
+    };
+  }
+}
+
 function backgroundOutcome(message) {
   return message?.status === 'completed' && message?.success !== false
     ? 'completed'
@@ -591,6 +624,15 @@ function createResidentExecutor({
       input,
       sdkContext,
     );
+    options.hooks = {
+      ...(options.hooks ?? {}),
+      PreToolUse: [
+        {
+          hooks: [(input) => enforceWorkspaceFenceBeforeTool(executor, input)],
+        },
+        ...(options.hooks?.PreToolUse ?? []),
+      ],
+    };
     executor.query = executor.queryFactory({
       prompt: executor.input,
       options,

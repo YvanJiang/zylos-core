@@ -22,13 +22,18 @@ import { createWorkspaceLeaseCoordinator } from '../workspace/lease-coordinator.
 
 const CANONICAL_TRANSITIONS = Object.freeze({
   queued: Object.freeze(['starting']),
-  starting: Object.freeze(['running', 'stopped', 'failed']),
+  starting: Object.freeze(['running', 'recovering', 'stopped', 'failed']),
   running: Object.freeze(['waiting_user', 'recovering', 'completed', 'stopped', 'failed']),
   waiting_user: Object.freeze(['running', 'recovering', 'stopped', 'timed_out', 'failed']),
   recovering: Object.freeze(['running', 'stopped', 'failed', 'interrupted']),
 });
 
 const TERMINAL_STATES = new Set(['completed', 'stopped', 'failed', 'interrupted', 'timed_out']);
+const WORKSPACE_NOTIFICATION_BARRIER_CODES = new Set([
+  'provider_background_work_unknown',
+  'workspace_lease_expired',
+  'workspace_lease_orphaned',
+]);
 
 const ANSWER_CONFLICT_CODES = new Set([
   'idempotency_conflict',
@@ -421,6 +426,14 @@ export function createExecutorStore({
     }
   }
 
+  function assertTurnContextIsolationFence(turn, turnContext) {
+    assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
+    assertResidentOwner(turn.conversation_id, turnContext.resident?.owner_epoch ?? null);
+    if (turnContext.workspace !== null && turnContext.workspace !== undefined) {
+      workspaceLeases.assertHeldOrUncertain(turnContext.workspace);
+    }
+  }
+
   function rejectedInteractionAnswerResult(answer, persistenceError) {
     const interaction = typeof answer?.interaction_id === 'string'
       ? database.prepare(`
@@ -561,6 +574,12 @@ export function createExecutorStore({
           FROM runtime_executor_leases AS lease
           WHERE lease.conversation_id = queue.conversation_id
             AND lease.lease_owner IS NOT NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM runtime_workspace_leases AS workspace
+          WHERE workspace.holder_turn_id = turn.turn_id
+            AND workspace.state IN ('active', 'uncertain')
         )
       ORDER BY turn.created_at ASC, turn.conversation_id ASC, queue.queue_sequence ASC
     `).all();
@@ -789,9 +808,21 @@ export function createExecutorStore({
         return workspaceWaits[0] ?? { status: 'idle' };
       }
       if (provider !== 'claude') {
+        const selected = candidates[0];
+        const workspaceAccess = workspaceAccessByConversation?.get(selected.conversation_id);
+        const workspace = workspaceAccess ? workspaceLeases.acquire({
+          workspace_root: workspaceAccess.workspace_root,
+          mode: workspaceAccess.mode,
+          holder_conversation_id: selected.conversation_id,
+          holder_turn_id: selected.turn_id,
+        }) : null;
+        if (workspace?.status === 'wait') {
+          return markWorkspaceWaitInTransaction(selected.turn_id, workspace, now());
+        }
         return {
           status: 'ready',
-          conversation_id: candidates[0].conversation_id,
+          conversation_id: selected.conversation_id,
+          workspace,
         };
       }
 
@@ -850,6 +881,16 @@ export function createExecutorStore({
         }
       }
       if (selected) {
+        const workspaceAccess = workspaceAccessByConversation?.get(selected.conversation_id);
+        const workspace = workspaceAccess ? workspaceLeases.acquire({
+          workspace_root: workspaceAccess.workspace_root,
+          mode: workspaceAccess.mode,
+          holder_conversation_id: selected.conversation_id,
+          holder_turn_id: selected.turn_id,
+        }) : null;
+        if (workspace?.status === 'wait') {
+          return markWorkspaceWaitInTransaction(selected.turn_id, workspace, now());
+        }
         const usedAt = now();
         database.prepare(`
           UPDATE runtime_executor_residents
@@ -862,6 +903,11 @@ export function createExecutorStore({
           selected.conversation_id,
           serviceInstanceId,
         );
+        return {
+          status: 'ready',
+          conversation_id: selected.conversation_id,
+          workspace,
+        };
       }
 
       const waits = [];
@@ -886,9 +932,6 @@ export function createExecutorStore({
         }
       }
 
-      if (selected) {
-        return { status: 'ready', conversation_id: selected.conversation_id };
-      }
       if (waits.length > 0) return { status: 'capacity_wait', ...waits[0] };
       if (blocked.length > 0) {
         return {
@@ -907,6 +950,7 @@ export function createExecutorStore({
     conversationId = null,
     requireResident = false,
     workspaceAccess = null,
+    workspaceLease = null,
   } = {}) {
     const claim = database.transaction(() => {
       const turn = database.prepare(`
@@ -955,14 +999,29 @@ export function createExecutorStore({
       ) {
         conflict('stale_attempt', 'The queued turn lost its resident executor reservation.');
       }
-      const workspace = workspaceAccess === null ? null : workspaceLeases.acquire({
-        workspace_root: workspaceAccess.workspace_root,
-        mode: workspaceAccess.mode,
-        holder_conversation_id: current.conversation_id,
-        holder_turn_id: current.turn_id,
-      });
+      const workspace = workspaceLease === null
+        ? (workspaceAccess === null ? null : workspaceLeases.acquire({
+          workspace_root: workspaceAccess.workspace_root,
+          mode: workspaceAccess.mode,
+          holder_conversation_id: current.conversation_id,
+          holder_turn_id: current.turn_id,
+        }))
+        : workspaceLeases.assertCurrent(workspaceLease);
       if (workspace?.status === 'wait') {
         return markWorkspaceWaitInTransaction(current.turn_id, workspace, claimedAt);
+      }
+      if (
+        workspace !== null
+        && (
+          workspace.holder_conversation_id !== current.conversation_id
+          || workspace.holder_turn_id !== current.turn_id
+          || workspaceAccess !== null && (
+            workspace.workspace_root !== workspaceAccess.workspace_root
+            || workspace.mode !== workspaceAccess.mode
+          )
+        )
+      ) {
+        conflict('stale_workspace_lease', 'The workspace reservation does not match this turn.');
       }
       const existingLease = database.prepare(`
         SELECT lease_epoch
@@ -1161,11 +1220,17 @@ export function createExecutorStore({
     turnContext,
     fromState,
     toState,
-    { error = null, reasonCode = null, recovery = null } = {},
+    {
+      allowUncertainWorkspace = false,
+      error = null,
+      reasonCode = null,
+      recovery = null,
+    } = {},
   ) {
     const transition = database.transaction(() => {
       let turn = loadTurn(database, turnContext.turn_id);
-      assertTurnContextFence(turn, turnContext);
+      if (allowUncertainWorkspace) assertTurnContextIsolationFence(turn, turnContext);
+      else assertTurnContextFence(turn, turnContext);
       const occurredAt = now();
       if (toState === 'stopped') {
         turn = cancelUnsentInteractions(turnContext, turn, occurredAt);
@@ -1190,6 +1255,7 @@ export function createExecutorStore({
           );
         }
         turn = loadTurn(database, turnContext.turn_id);
+        const recoveryId = generateId('recovery');
         event = buildEvent({
           turn,
           lastEvent: loadLastEvent(database, turn.turn_id),
@@ -1199,7 +1265,7 @@ export function createExecutorStore({
             kind: 'recovery_started',
             phase: 'recovering',
             payload: {
-              recovery_id: generateId('recovery'),
+              recovery_id: recoveryId,
               recovery_of_turn_id: turn.turn_id,
               recovery_of_lineage_id: turn.lineage_id,
               side_effect_status: recovery.error.side_effect_status,
@@ -1220,6 +1286,39 @@ export function createExecutorStore({
           staleMessage: 'The recovery notification lost its provider attempt fence.',
           generateId,
         });
+        if (recovery.waitForDecision === true) {
+          turn = loadTurn(database, turnContext.turn_id);
+          event = buildEvent({
+            turn,
+            lastEvent: loadLastEvent(database, turn.turn_id),
+            fence: turnContext.attempt,
+            provider,
+            descriptor: {
+              kind: 'recovery_waiting_decision',
+              phase: 'recovering',
+              payload: {
+                recovery_id: recoveryId,
+                recovery_of_turn_id: turn.turn_id,
+                recovery_of_lineage_id: turn.lineage_id,
+                side_effect_status: recovery.error.side_effect_status,
+              },
+              error: {
+                ...recovery.error,
+                occurred_at: recovery.error.occurred_at ?? occurredAt,
+              },
+            },
+            occurredAt,
+            generateId,
+          });
+          commitTurnEvent(database, {
+            turn,
+            event,
+            fence: turnContext.attempt,
+            nextState: 'recovering',
+            staleMessage: 'The recovery decision boundary lost its provider attempt fence.',
+            generateId,
+          });
+        }
       }
       if (TERMINAL_STATES.has(toState) && toState !== 'timed_out' && turnContext.workspace) {
         workspaceLeases.release(turnContext.workspace);
@@ -1233,6 +1332,251 @@ export function createExecutorStore({
     const turn = loadTurn(database, turnContext.turn_id);
     assertTurnContextFence(turn, turnContext);
     return Object.freeze({ state: turn.state });
+  }
+
+  function assertRecoverableFence(turnContext) {
+    const turn = loadTurn(database, turnContext.turn_id);
+    assertTurnContextIsolationFence(turn, turnContext);
+    return Object.freeze({ state: turn.state });
+  }
+
+  function isWorkspaceRecoveryRequired(turnContext) {
+    return Boolean(turnContext.workspace)
+      && workspaceLeases.isRecoveryRequired(turnContext.workspace);
+  }
+
+  function isRecoveryNotificationDelivered(turnContext) {
+    const turn = loadTurn(database, turnContext.turn_id);
+    if (turn.state === 'timed_out') {
+      const timedOutTerminal = database.prepare(`
+        SELECT event_sequence
+        FROM runtime_normalized_events
+        WHERE turn_id = ?
+          AND json_extract(event_json, '$.kind') = 'turn_state_changed'
+          AND json_extract(event_json, '$.payload.to_state') = 'timed_out'
+        ORDER BY event_sequence DESC
+        LIMIT 1
+      `).get(turnContext.turn_id);
+      if (!timedOutTerminal) return false;
+      return database.prepare(`
+        SELECT 1
+        FROM runtime_outbox
+        WHERE turn_id = ? AND aggregate_type = 'turn_main' AND status = 'delivered'
+          AND CAST(json_extract(command_json, '$.event_sequence_through') AS INTEGER) >= ?
+        LIMIT 1
+      `).get(turnContext.turn_id, timedOutTerminal.event_sequence) !== undefined;
+    }
+    const recovery = database.prepare(`
+      SELECT event_sequence, json_extract(event_json, '$.error.code') AS error_code
+      FROM runtime_normalized_events
+      WHERE turn_id = ?
+        AND json_extract(event_json, '$.kind') IN (
+          'recovery_started', 'recovery_waiting_decision'
+        )
+      ORDER BY event_sequence DESC
+      LIMIT 1
+    `).get(turnContext.turn_id);
+    if (!recovery) return true;
+    if (!WORKSPACE_NOTIFICATION_BARRIER_CODES.has(recovery.error_code)) return true;
+    return database.prepare(`
+      SELECT 1
+      FROM runtime_outbox
+      WHERE turn_id = ? AND aggregate_type = 'turn_main' AND status = 'delivered'
+        AND CAST(json_extract(command_json, '$.event_sequence_through') AS INTEGER) >= ?
+      LIMIT 1
+    `).get(turnContext.turn_id, recovery.event_sequence) !== undefined;
+  }
+
+  function claimOrphanedWorkspaceRecoveries() {
+    const recoveries = [];
+    for (const candidate of workspaceLeases.listRecoveryCandidates()) {
+      const claim = database.transaction(() => {
+        const claimedAt = now();
+        const turn = loadTurn(database, candidate.holder_turn_id);
+        if (!['starting', 'running', 'waiting_user', 'recovering', 'timed_out'].includes(turn.state)) {
+          return null;
+        }
+        const executorLease = database.prepare(`
+          SELECT * FROM runtime_executor_leases
+          WHERE conversation_id = ? AND turn_id = ?
+        `).get(turn.conversation_id, turn.turn_id);
+        if (
+          !executorLease
+          || executorLease.lease_owner !== candidate.holder_service_instance_id
+          || executorLease.attempt_id !== turn.attempt_id
+          || executorLease.attempt_no !== turn.attempt_no
+          || executorLease.lease_epoch !== turn.lease_epoch
+          || executorLease.lease_expires_at > claimedAt
+        ) return null;
+
+        let resident = provider === 'claude'
+          ? isResidentConversation(turn.conversation_id)
+          : null;
+        if (
+          resident
+          && resident.owner_service_instance_id !== null
+          && resident.owner_service_instance_id !== candidate.holder_service_instance_id
+        ) return null;
+        if (resident?.owner_expires_at && resident.owner_expires_at > claimedAt) return null;
+
+        const executorClaimed = database.prepare(`
+          UPDATE runtime_executor_leases
+          SET lease_owner = ?, lease_expires_at = ?, updated_at = ?
+          WHERE conversation_id = ? AND turn_id = ? AND lease_owner = ?
+            AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+            AND lease_expires_at <= ?
+        `).run(
+          serviceInstanceId,
+          new Date(Date.parse(claimedAt) + leaseDurationMs).toISOString(),
+          claimedAt,
+          turn.conversation_id,
+          turn.turn_id,
+          candidate.holder_service_instance_id,
+          turn.attempt_id,
+          turn.attempt_no,
+          turn.lease_epoch,
+          claimedAt,
+        );
+        if (executorClaimed.changes !== 1) return null;
+
+        if (resident) {
+          const residentClaimed = database.prepare(`
+            UPDATE runtime_executor_residents
+            SET owner_service_instance_id = ?, owner_epoch = owner_epoch + 1,
+              owner_expires_at = ?, last_used_at = ?
+            WHERE conversation_id = ? AND provider = 'claude' AND owner_epoch = ?
+              AND (
+                owner_service_instance_id IS NULL
+                OR (
+                  owner_service_instance_id = ?
+                  AND (owner_expires_at IS NULL OR owner_expires_at <= ?)
+                )
+              )
+          `).run(
+            serviceInstanceId,
+            residentOwnerExpiresAt(claimedAt),
+            claimedAt,
+            turn.conversation_id,
+            resident.owner_epoch,
+            candidate.holder_service_instance_id,
+            claimedAt,
+          );
+          if (residentClaimed.changes !== 1) {
+            conflict('stale_attempt', 'The orphaned resident recovery lost its owner fence.');
+          }
+          resident = isResidentConversation(turn.conversation_id);
+        }
+
+        const workspace = workspaceLeases.adoptUncertainForRecovery(candidate);
+        const attempt = Object.freeze({
+          attempt_id: turn.attempt_id,
+          attempt_no: turn.attempt_no,
+          lease_epoch: turn.lease_epoch,
+        });
+        const envelope = JSON.parse(turn.envelope_json);
+        const recoveryContext = Object.freeze({
+          conversation_id: turn.conversation_id,
+          turn_id: turn.turn_id,
+          lineage_id: turn.lineage_id,
+          provider_native_id: turn.provider_native_id,
+          trace_id: envelope.trace_id,
+          input: envelope.content,
+          interaction_authority: envelope.actor?.authenticated === true
+            ? [{ type: 'actor', actor_id: envelope.actor.actor_id }]
+            : [],
+          resident: resident === null ? null : Object.freeze({
+            owner_epoch: resident.owner_epoch,
+          }),
+          workspace,
+          attempt,
+        });
+        if (turn.state === 'timed_out') {
+          return recoveryContext;
+        }
+        if (!['recovering', 'timed_out'].includes(turn.state)) {
+          transitionInTransaction(database, {
+            turnId: turn.turn_id,
+            fromState: turn.state,
+            toState: 'recovering',
+            fence: attempt,
+            provider,
+            serviceInstanceId,
+            occurredAt: claimedAt,
+            generateId,
+            reasonCode: 'workspace_lease_orphaned',
+          });
+        }
+        const recoveringTurn = loadTurn(database, turn.turn_id);
+        const recoveryError = {
+          code: 'workspace_lease_orphaned',
+          category: 'conflict',
+          retryable: false,
+          side_effect_status: 'unknown',
+          user_message: 'Workspace ownership expired during a service restart.',
+          occurred_at: claimedAt,
+        };
+        const recoveryId = generateId('recovery');
+        let event = buildEvent({
+          turn: recoveringTurn,
+          lastEvent: loadLastEvent(database, turn.turn_id),
+          fence: attempt,
+          provider,
+          descriptor: {
+            kind: 'recovery_started',
+            phase: 'recovering',
+            payload: {
+              recovery_id: recoveryId,
+              recovery_of_turn_id: turn.turn_id,
+              recovery_of_lineage_id: turn.lineage_id,
+              side_effect_status: 'unknown',
+            },
+            error: recoveryError,
+          },
+          occurredAt: claimedAt,
+          generateId,
+        });
+        commitTurnEvent(database, {
+          turn: recoveringTurn,
+          event,
+          fence: attempt,
+          nextState: recoveringTurn.state,
+          staleMessage: 'The orphaned workspace recovery lost its adopted fence.',
+          generateId,
+        });
+        const waitingTurn = loadTurn(database, turn.turn_id);
+        event = buildEvent({
+          turn: waitingTurn,
+          lastEvent: loadLastEvent(database, turn.turn_id),
+          fence: attempt,
+          provider,
+          descriptor: {
+            kind: 'recovery_waiting_decision',
+            phase: 'recovering',
+            payload: {
+              recovery_id: recoveryId,
+              recovery_of_turn_id: turn.turn_id,
+              recovery_of_lineage_id: turn.lineage_id,
+              side_effect_status: 'unknown',
+            },
+            error: recoveryError,
+          },
+          occurredAt: claimedAt,
+          generateId,
+        });
+        commitTurnEvent(database, {
+          turn: waitingTurn,
+          event,
+          fence: attempt,
+          nextState: waitingTurn.state,
+          staleMessage: 'The orphaned recovery decision boundary lost its adopted fence.',
+          generateId,
+        });
+        return recoveryContext;
+      });
+      const recovered = claim.immediate();
+      if (recovered) recoveries.push(recovered);
+    }
+    return recoveries;
   }
 
   function assertWorkspaceWritable(turnContext) {
@@ -2062,11 +2406,21 @@ export function createExecutorStore({
     const release = database.transaction(() => {
       const releasedAt = now();
       const turn = loadTurn(database, turnContext.turn_id);
-      assertTurnContextFence(turn, turnContext);
-      if (turn.state !== 'recovering') {
+      assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
+      assertResidentOwner(turn.conversation_id, turnContext.resident?.owner_epoch ?? null);
+      if (turnContext.workspace) {
+        workspaceLeases.assertHeldOrUncertain(turnContext.workspace);
+      }
+      if (!['recovering', 'timed_out'].includes(turn.state)) {
         conflict(
           'illegal_transition',
-          `Turn ${turn.turn_id} is ${turn.state}; expected recovering before ownership release.`,
+          `Turn ${turn.turn_id} is ${turn.state}; expected recovering or timed_out before ownership release.`,
+        );
+      }
+      if (turnContext.workspace && !isRecoveryNotificationDelivered(turnContext)) {
+        conflict(
+          'recovery_notification_pending',
+          'Workspace recovery must wait for a delivered user notification.',
         );
       }
       const workspaceReleased = turnContext.workspace
@@ -2640,22 +2994,28 @@ export function createExecutorStore({
     acknowledgeInteractionHandoff,
     appendAdapterEvent,
     assertCurrentFence,
+    assertRecoverableFence,
     assertWorkspaceWritable,
     bindProviderNativeId,
     claimNextQueuedTurn,
+    claimOrphanedWorkspaceRecoveries,
     claimInteractionHandoff,
     commitInteractionAnswer,
     heartbeatOwnedResidents,
     heartbeatOwnedWorkspaceLeases: workspaceLeases.heartbeatOwned,
     isConversationEvictable,
+    isRecoveryNotificationDelivered,
+    isWorkspaceRecoveryRequired,
     markInteractionHandoffDeliveryUnknown,
     releaseExecutorResident,
+    releaseWorkspaceReservation: workspaceLeases.release,
     releaseRecoveringExecutorOwnership,
     reconcileExpiredResidents,
     expireInteraction,
     finishWorkspaceBackgroundWork,
     listPendingInteractionDeadlines,
     listActiveWorkspaceLeases: workspaceLeases.listActive,
+    listWorkspaceLeaseObservability: workspaceLeases.listObservability,
     listWorkspaceReservationCandidates: listClaimableQueuedTurns,
     rebuildExecutorCache,
     releaseTimedOutExecutorLease,
