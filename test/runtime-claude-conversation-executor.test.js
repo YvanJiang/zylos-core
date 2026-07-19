@@ -877,6 +877,14 @@ describe('Claude conversation executor', () => {
       query: () => {},
       queryOptions: { resume: 'caller-owned-session' },
     })).toThrow(/managed by Core lineage authority/);
+    expect(() => createClaudeConversationAdapter({
+      query: () => {},
+      queryOptions: { extraArgs: { '--session-id': 'caller-owned-session' } },
+    })).toThrow(/managed by Core lineage authority/);
+    expect(() => createClaudeConversationAdapter({
+      query: () => {},
+      queryOptions: { extraArgs: { continue: null } },
+    })).toThrow(/managed by Core lineage authority/);
   });
 
   test('removes static tokens when native credentials are detected', async () => {
@@ -908,6 +916,38 @@ describe('Claude conversation executor', () => {
 
     await expect(service.runNext()).resolves.toMatchObject({ turn_id: accepted.turn_id });
     expect(fake.calls[0].options.env).toEqual({ HOME: nativeHome, PATH: '/test/bin' });
+    await service.close();
+    database.close();
+  });
+
+  test('uses injectable native-auth detection for keychain-backed Claude login', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'native-auth-keychain');
+    const fake = createFakeQuery({ sessionId: 'claude-session-native-auth-keychain' });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({
+        query: fake.query,
+        detectNativeAuthentication: () => true,
+        queryOptions: {
+          env: {
+            HOME: '/Users/keychain-user',
+            PATH: '/test/bin',
+            ANTHROPIC_AUTH_TOKEN: 'stale-static-token',
+          },
+        },
+      }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-native-auth-keychain',
+      now: () => '2026-07-19T09:00:45Z',
+      generateId: deterministicIds('native-auth-keychain'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({ turn_id: accepted.turn_id });
+    expect(fake.calls[0].options.env).toEqual({
+      HOME: '/Users/keychain-user',
+      PATH: '/test/bin',
+    });
     await service.close();
     database.close();
   });
@@ -1689,6 +1729,75 @@ describe('Claude conversation executor', () => {
     database.close();
   });
 
+  test('releases capacity promptly when a provider stream ends', async () => {
+    const database = openTestDatabase();
+    const first = acceptQueuedTurn(database, 'ended-capacity-first');
+    const secondEnvelope = normalEnvelope('ended-capacity-second');
+    secondEnvelope.chat_id = 'chat-ended-capacity-second';
+    const second = acceptNormalInbound(database, secondEnvelope, {
+      now: () => '2026-07-19T09:11:30Z',
+      generateId: deterministicIds('inbound-ended-capacity-second'),
+    });
+    let calls = 0;
+    const finishFirstQuery = deferred();
+    const adapter = createClaudeConversationAdapter({
+      query({ prompt }) {
+        calls += 1;
+        const queryNo = calls;
+        const sessionId = `claude-session-ended-capacity-${queryNo}`;
+        const stream = (async function* generateSdkMessages() {
+          for await (const input of prompt) {
+            yield { type: 'system', subtype: 'init', session_id: sessionId };
+            if (queryNo === 1) {
+              yield { type: 'result', subtype: 'success', session_id: sessionId, result: 'ok' };
+              yield idleSession(sessionId);
+              await finishFirstQuery.promise;
+              return;
+            }
+            yield {
+              type: 'assistant',
+              session_id: sessionId,
+              message: { content: [{ type: 'text', text: input.message.content }] },
+              parent_tool_use_id: null,
+            };
+            yield { type: 'result', subtype: 'success', session_id: sessionId, result: 'ok' };
+            yield idleSession(sessionId);
+          }
+        }());
+        stream.interrupt = async () => {};
+        stream.close = () => {};
+        return stream;
+      },
+    });
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-ended-capacity',
+      now: () => '2026-07-19T09:11:30Z',
+      generateId: deterministicIds('ended-capacity'),
+      maxResidentExecutorsPerBot: 1,
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: first.turn_id,
+    });
+    expect(database.prepare(`SELECT conversation_id FROM runtime_executor_residents`).all())
+      .toEqual([{ conversation_id: first.conversation_id }]);
+    finishFirstQuery.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(database.prepare(`SELECT conversation_id FROM runtime_executor_residents`).all())
+      .toEqual([]);
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: second.turn_id,
+    });
+
+    await service.close();
+    database.close();
+  });
+
   test('cancels a turn whose input has not yet been consumed by the SDK', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'cancel-before-consume');
@@ -2014,5 +2123,107 @@ describe('Claude conversation executor', () => {
     }]);
 
     database.close();
+  });
+
+  test('evicts least-recently-used idle queries only up to the requested capacity', async () => {
+    let clock = 0;
+    let queryNo = 0;
+    const adapter = createClaudeConversationAdapter({
+      idleTimeoutMs: 100,
+      now: () => clock,
+      query({ prompt }) {
+        queryNo += 1;
+        const sessionId = `claude-session-lru-${queryNo}`;
+        const stream = (async function* generateSdkMessages() {
+          for await (const input of prompt) {
+            yield { type: 'system', subtype: 'init', session_id: sessionId };
+            yield { type: 'result', subtype: 'success', session_id: sessionId, result: 'ok' };
+            yield idleSession(sessionId);
+          }
+        }());
+        stream.interrupt = async () => {};
+        stream.close = () => {};
+        return stream;
+      },
+    });
+    const controls = { requestPermission: async () => ({ behavior: 'deny' }) };
+    const consume = async (conversationId) => {
+      const records = [];
+      for await (const record of adapter.execute({
+        conversation_id: conversationId,
+        turn_id: `turn-${conversationId}`,
+        lineage_id: `lineage-${conversationId}`,
+        provider_native_id: null,
+        trace_id: `trace-${conversationId}`,
+        input: { text: conversationId },
+        attempt: { attempt_id: `attempt-${conversationId}`, attempt_no: 1, lease_epoch: 1 },
+      }, controls)) {
+        records.push(record);
+        if (record.type === 'provider_native_id') record.acknowledge();
+      }
+      return records;
+    };
+
+    await consume('conversation-lru-oldest');
+    clock = 10;
+    await consume('conversation-lru-newest');
+    await new Promise((resolve) => setImmediate(resolve));
+    clock = 1_000;
+    await expect(adapter.evictIdle({
+      canEvict: async () => true,
+      maxCount: 1,
+    })).resolves.toEqual(['conversation-lru-oldest']);
+    expect(adapter.hasResident('conversation-lru-newest')).toBe(true);
+
+    await adapter.close();
+  });
+
+  test('does not create a query after close wins a lineage-switch race', async () => {
+    const closeStarted = deferred();
+    const releaseClose = deferred();
+    let queryCalls = 0;
+    const adapter = createClaudeConversationAdapter({
+      query({ prompt }) {
+        queryCalls += 1;
+        const sessionId = `claude-session-close-race-${queryCalls}`;
+        const stream = (async function* generateSdkMessages() {
+          for await (const input of prompt) {
+            yield { type: 'system', subtype: 'init', session_id: sessionId };
+            yield { type: 'result', subtype: 'success', session_id: sessionId, result: 'ok' };
+            yield idleSession(sessionId);
+          }
+        }());
+        stream.interrupt = async () => {};
+        stream.close = async () => {
+          closeStarted.resolve();
+          await releaseClose.promise;
+        };
+        return stream;
+      },
+    });
+    const controls = { requestPermission: async () => ({ behavior: 'deny' }) };
+    const context = (turnId, lineageId) => ({
+      conversation_id: 'conversation-close-race',
+      turn_id: turnId,
+      lineage_id: lineageId,
+      provider_native_id: null,
+      trace_id: `trace-${turnId}`,
+      input: { text: turnId },
+      attempt: { attempt_id: `attempt-${turnId}`, attempt_no: 1, lease_epoch: 1 },
+    });
+    const consume = async (turnId, lineageId) => {
+      for await (const record of adapter.execute(context(turnId, lineageId), controls)) {
+        if (record.type === 'provider_native_id') record.acknowledge();
+      }
+    };
+
+    await consume('turn-close-race-1', 'lineage-close-race-1');
+    await new Promise((resolve) => setImmediate(resolve));
+    const switching = consume('turn-close-race-2', 'lineage-close-race-2');
+    await closeStarted.promise;
+    await adapter.close();
+    releaseClose.resolve();
+    await expect(switching).rejects.toThrow(/closing|closed/);
+    expect(queryCalls).toBe(1);
   });
 });

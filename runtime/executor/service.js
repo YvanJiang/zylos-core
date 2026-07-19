@@ -14,6 +14,10 @@ export function createExecutorService({
   now = () => new Date().toISOString(),
   generateId = defaultGenerateId,
   leaseDurationMs,
+  residentLeaseDurationMs = 60_000,
+  residentHeartbeatIntervalMs = 20_000,
+  scheduleResidentHeartbeat = setInterval,
+  cancelResidentHeartbeat = clearInterval,
   permissionHandler = null,
   maxResidentExecutorsPerBot = 20,
 }) {
@@ -35,6 +39,22 @@ export function createExecutorService({
   if (permissionHandler !== null && typeof permissionHandler !== 'function') {
     throw new TypeError('permissionHandler must be a function or null');
   }
+  if (!Number.isFinite(residentLeaseDurationMs) || residentLeaseDurationMs <= 0) {
+    throw new TypeError('residentLeaseDurationMs must be a positive finite number');
+  }
+  if (
+    !Number.isFinite(residentHeartbeatIntervalMs)
+    || residentHeartbeatIntervalMs <= 0
+    || residentHeartbeatIntervalMs >= residentLeaseDurationMs
+  ) {
+    throw new TypeError('residentHeartbeatIntervalMs must be positive and below the resident lease');
+  }
+  if (typeof scheduleResidentHeartbeat !== 'function') {
+    throw new TypeError('scheduleResidentHeartbeat must be a function');
+  }
+  if (typeof cancelResidentHeartbeat !== 'function') {
+    throw new TypeError('cancelResidentHeartbeat must be a function');
+  }
   if (
     !Number.isSafeInteger(maxResidentExecutorsPerBot)
     || maxResidentExecutorsPerBot <= 0
@@ -49,6 +69,7 @@ export function createExecutorService({
     now,
     generateId,
     leaseDurationMs,
+    residentLeaseDurationMs,
   });
   let executors = [];
   let started = false;
@@ -62,6 +83,8 @@ export function createExecutorService({
   const uncertainTurnIds = new Set();
   let lifecycle = 'open';
   let closePromise = null;
+  let residentHeartbeat = null;
+  let residentHeartbeatFailure = null;
 
   function persistenceFailure(cause) {
     const error = new Error(`Runtime persistence failed: ${cause.message}`, { cause });
@@ -93,6 +116,17 @@ export function createExecutorService({
 
   function start() {
     store.reconcileExpiredResidents();
+    if (provider === 'claude' && residentHeartbeat === null) {
+      residentHeartbeat = scheduleResidentHeartbeat(() => {
+        try {
+          store.heartbeatOwnedResidents();
+          residentHeartbeatFailure = null;
+        } catch (error) {
+          residentHeartbeatFailure = error;
+        }
+      }, residentHeartbeatIntervalMs);
+      residentHeartbeat?.unref?.();
+    }
     refresh();
     started = true;
     return snapshot();
@@ -131,12 +165,15 @@ export function createExecutorService({
     }
   }
 
-  function releaseAbsentResident(conversationId) {
+  function releaseAbsentResident(turnContext) {
     if (
       typeof adapter.hasResident === 'function'
-      && !adapter.hasResident(conversationId)
+      && !adapter.hasResident(turnContext.conversation_id)
     ) {
-      store.releaseExecutorResident(conversationId);
+      store.releaseExecutorResident(
+        turnContext.conversation_id,
+        turnContext.resident?.owner_epoch,
+      );
     }
   }
 
@@ -145,10 +182,11 @@ export function createExecutorService({
     if (settlement) await settlement.promise;
   }
 
-  function transitionToRecovery(activeRun) {
+  function transitionToRecovery(activeRun, reasonCode = 'provider_execution_uncertain') {
     const { state } = store.assertCurrentFence(activeRun.turnContext);
     persist(() => store.transitionTurn(activeRun.turnContext, state, 'recovering', {
       error: null,
+      reasonCode,
     }));
     activeRun.durableSettled = true;
     refresh();
@@ -192,7 +230,7 @@ export function createExecutorService({
     activeRun.durableSettled = true;
     refresh();
     cleanupActiveRun(activeRun);
-    releaseAbsentResident(turnContext.conversation_id);
+    releaseAbsentResident(turnContext);
     return resultFor(activeRun, terminalState);
   }
 
@@ -226,7 +264,7 @@ export function createExecutorService({
     activeRun.durableSettled = true;
     refresh();
     cleanupActiveRun(activeRun);
-    releaseAbsentResident(activeRun.turnContext.conversation_id);
+    releaseAbsentResident(activeRun.turnContext);
     return resultFor(activeRun, failure ? 'failed' : terminalState);
   }
 
@@ -295,6 +333,12 @@ export function createExecutorService({
           turnContext.interaction_authority.map((subject) => Object.freeze({ ...subject })),
         ),
       }),
+      residentEnded(context) {
+        store.releaseExecutorResident(
+          context.conversation_id,
+          turnContext.resident?.owner_epoch,
+        );
+      },
       async requestPermission(request, { signal } = {}) {
         if (permissionHandler === null) {
           return Object.freeze({
@@ -360,6 +404,7 @@ export function createExecutorService({
       throw new Error(`Executor service is ${lifecycle}; it cannot claim another turn.`);
     }
     if (!started) start();
+    if (residentHeartbeatFailure) throw persistenceFailure(residentHeartbeatFailure);
     let reservation = store.reserveNextExecutor({
       maxResidentExecutorsPerBot,
       markCapacityWait: false,
@@ -378,6 +423,7 @@ export function createExecutorService({
     }
     const turnContext = store.claimNextQueuedTurn({
       conversationId: reservation.conversation_id,
+      requireResident: provider === 'claude',
     });
     if (!turnContext) {
       refresh();
@@ -494,6 +540,7 @@ export function createExecutorService({
     if (typeof adapter.evictIdle !== 'function') return [];
     const evicted = await adapter.evictIdle({
       canEvict: (conversationId) => store.isConversationEvictable(conversationId),
+      maxCount: 1,
     });
     for (const conversationId of evicted) {
       store.releaseExecutorResident(conversationId);
@@ -513,15 +560,16 @@ export function createExecutorService({
     const handlerAcknowledgement = await adapter.handleInteractionAnswer(
       Object.freeze(delivery),
     );
-    const pendingPermissions = permissionControllers.get(delivery.request.turn_id)?.size ?? 0;
+    const managedPermissions = permissionControllers.get(delivery.request.turn_id)?.size ?? 0;
     const acknowledgement = store.acknowledgeInteractionHandoff(handlerAcknowledgement, {
-      holdForPermission: pendingPermissions > 0,
+      holdForPermission: managedPermissions > 0
+        || handlerAcknowledgement.blocking_interactions_remaining === true,
     });
     const activeRun = activeRuns.get(delivery.request.turn_id);
-    if (acknowledgement.resumed && activeRun) activeRun.pauseKind = null;
-    const execution = acknowledgement.resumed && activeRun
-      ? await advanceRun(activeRun)
-      : null;
+    const shouldAdvance = acknowledgement.resumed
+      || handlerAcknowledgement.blocking_interactions_remaining === true;
+    if (activeRun && shouldAdvance) activeRun.pauseKind = null;
+    const execution = activeRun && shouldAdvance ? await advanceRun(activeRun) : null;
     return { acknowledgement, execution };
   }
 
@@ -529,29 +577,36 @@ export function createExecutorService({
     if (closePromise) return closePromise;
     lifecycle = 'closing';
     closePromise = (async () => {
-      let closeError = null;
-      let closedConversationIds = [];
       try {
-        if (typeof adapter.close === 'function') {
-          closedConversationIds = await adapter.close() ?? [];
+        let closeError = null;
+        let closedConversationIds = [];
+        try {
+          if (typeof adapter.close === 'function') {
+            closedConversationIds = await adapter.close() ?? [];
+          }
+        } catch (error) {
+          closeError = error;
+          closedConversationIds = error.closedConversationIds ?? [];
         }
-      } catch (error) {
-        closeError = error;
-        closedConversationIds = error.closedConversationIds ?? [];
-      }
-      for (const activeRun of activeRuns.values()) {
-        if (activeRun.pauseKind === 'interaction') {
-          cleanupActiveRun(activeRun);
-        } else if (!activeRun.advancing && activeRun.iterator) {
-          advanceRun(activeRun);
+        for (const activeRun of activeRuns.values()) {
+          if (activeRun.pauseKind === 'interaction') {
+            transitionToRecovery(activeRun, 'executor_shutdown_uncertain');
+          } else if (!activeRun.advancing && activeRun.iterator) {
+            advanceRun(activeRun);
+          }
+        }
+        await Promise.allSettled([...activeRunSettlements]);
+        for (const conversationId of closedConversationIds) {
+          store.releaseExecutorResident(conversationId);
+        }
+        lifecycle = 'closed';
+        if (closeError) throw closeError;
+      } finally {
+        if (residentHeartbeat !== null) {
+          cancelResidentHeartbeat(residentHeartbeat);
+          residentHeartbeat = null;
         }
       }
-      await Promise.allSettled([...activeRunSettlements]);
-      for (const conversationId of closedConversationIds) {
-        store.releaseExecutorResident(conversationId);
-      }
-      lifecycle = 'closed';
-      if (closeError) throw closeError;
     })();
     return closePromise;
   }

@@ -672,7 +672,11 @@ describe('runtime interaction happy path', () => {
     await expect(service.close()).resolves.toBeUndefined();
     expect(advancedPastQuestion).toBe(false);
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
-      .get(accepted.turn_id)).toEqual({ state: 'waiting_user' });
+      .get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    expect(readEvents(database, accepted.turn_id).at(-1)).toMatchObject({
+      kind: 'turn_state_changed',
+      payload: { reason_code: 'executor_shutdown_uncertain' },
+    });
 
     database.close();
   });

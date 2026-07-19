@@ -297,9 +297,32 @@ export function createExecutorStore({
   now,
   generateId,
   leaseDurationMs = 10_000,
+  residentLeaseDurationMs = 60_000,
   interactionTimeoutMs = 10 * 60_000,
 }) {
   initializeRuntimePersistence(database);
+
+  function assertResidentOwner(conversationId, expectedEpoch = null) {
+    if (provider !== 'claude') return;
+    const resident = database.prepare(`
+      SELECT owner_service_instance_id, owner_epoch
+      FROM runtime_executor_residents
+      WHERE conversation_id = ? AND provider = 'claude'
+    `).get(conversationId);
+    if (!resident && expectedEpoch === null) return;
+    if (
+      !resident
+      || resident.owner_service_instance_id !== serviceInstanceId
+      || expectedEpoch !== null && resident.owner_epoch !== expectedEpoch
+    ) {
+      conflict('stale_attempt', 'The resident executor owner no longer matches this fence.');
+    }
+  }
+
+  function assertTurnContextFence(turn, turnContext) {
+    assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
+    assertResidentOwner(turn.conversation_id, turnContext.resident?.owner_epoch ?? null);
+  }
 
   function rebuildExecutorCache() {
     const rows = database.prepare(`
@@ -422,7 +445,18 @@ export function createExecutorStore({
     if (!Number.isFinite(timestamp)) {
       throw new TypeError('now must return an ISO timestamp for resident ownership');
     }
-    return new Date(timestamp + leaseDurationMs).toISOString();
+    return new Date(timestamp + residentLeaseDurationMs).toISOString();
+  }
+
+  function heartbeatOwnedResidents() {
+    if (provider !== 'claude') return 0;
+    const heartbeatAt = now();
+    const heartbeat = database.prepare(`
+      UPDATE runtime_executor_residents
+      SET owner_expires_at = ?
+      WHERE provider = 'claude' AND owner_service_instance_id = ?
+    `).run(residentOwnerExpiresAt(heartbeatAt), serviceInstanceId);
+    return heartbeat.changes;
   }
 
   function reconcileExpiredResidents() {
@@ -579,7 +613,7 @@ export function createExecutorStore({
     return reserve.immediate();
   }
 
-  function claimNextQueuedTurn({ conversationId = null } = {}) {
+  function claimNextQueuedTurn({ conversationId = null, requireResident = false } = {}) {
     const claim = database.transaction(() => {
       const turn = database.prepare(`
         SELECT turn.turn_id
@@ -607,6 +641,26 @@ export function createExecutorStore({
 
       const claimedAt = now();
       const current = loadTurn(database, turn.turn_id);
+      const resident = provider === 'claude'
+        ? isResidentConversation(current.conversation_id)
+        : null;
+      if (
+        provider === 'claude'
+        && requireResident
+        && resident === null
+      ) {
+        conflict('stale_attempt', 'The queued turn lost its resident executor reservation.');
+      }
+      if (
+        resident !== null
+        && (
+          resident.owner_service_instance_id !== serviceInstanceId
+          || resident.owner_expires_at === null
+          || resident.owner_expires_at <= claimedAt
+        )
+      ) {
+        conflict('stale_attempt', 'The queued turn lost its resident executor reservation.');
+      }
       const existingLease = database.prepare(`
         SELECT lease_epoch
         FROM runtime_executor_leases
@@ -686,30 +740,42 @@ export function createExecutorStore({
         interaction_authority: envelope.actor?.authenticated === true
           ? [{ type: 'actor', actor_id: envelope.actor.actor_id }]
           : [],
+        resident: resident === null ? null : Object.freeze({
+          owner_epoch: resident.owner_epoch,
+        }),
         attempt: fence,
       };
     });
     return claim.immediate();
   }
 
-  function transitionTurn(turnContext, fromState, toState, { error = null } = {}) {
-    const transition = database.transaction(() => transitionInTransaction(database, {
-      turnId: turnContext.turn_id,
-      fromState,
-      toState,
-      fence: turnContext.attempt,
-      provider,
-      serviceInstanceId,
-      occurredAt: now(),
-      generateId,
-      error,
-    }));
+  function transitionTurn(
+    turnContext,
+    fromState,
+    toState,
+    { error = null, reasonCode = null } = {},
+  ) {
+    const transition = database.transaction(() => {
+      assertTurnContextFence(loadTurn(database, turnContext.turn_id), turnContext);
+      return transitionInTransaction(database, {
+        turnId: turnContext.turn_id,
+        fromState,
+        toState,
+        fence: turnContext.attempt,
+        provider,
+        serviceInstanceId,
+        occurredAt: now(),
+        generateId,
+        error,
+        reasonCode: reasonCode ?? undefined,
+      });
+    });
     return transition.immediate();
   }
 
   function assertCurrentFence(turnContext) {
     const turn = loadTurn(database, turnContext.turn_id);
-    assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
+    assertTurnContextFence(turn, turnContext);
     return Object.freeze({ state: turn.state });
   }
 
@@ -719,7 +785,7 @@ export function createExecutorStore({
     }
     const bind = database.transaction(() => {
       const turn = loadTurn(database, turnContext.turn_id);
-      assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
+      assertTurnContextFence(turn, turnContext);
       if (turn.lineage_id === null) {
         conflict('lineage_resolution_pending', 'A provider native ID requires a bound lineage.');
       }
@@ -780,7 +846,7 @@ export function createExecutorStore({
       if (turn.state !== 'running') {
         conflict('illegal_transition', `Adapter output is invalid while turn is ${turn.state}.`);
       }
-      assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
+      assertTurnContextFence(turn, turnContext);
       if (descriptor.provider_native_id !== null) {
         assertBoundProviderNativeId(turn, provider, descriptor.provider_native_id);
       }
@@ -838,7 +904,7 @@ export function createExecutorStore({
     return blockingTurn === undefined;
   }
 
-  function releaseExecutorResident(conversationId) {
+  function releaseExecutorResident(conversationId, ownerEpoch = null) {
     if (typeof conversationId !== 'string' || conversationId.length === 0) {
       throw new TypeError('conversationId must be a non-empty string');
     }
@@ -846,6 +912,7 @@ export function createExecutorStore({
       DELETE FROM runtime_executor_residents
       WHERE conversation_id = ? AND provider = ?
         AND (owner_service_instance_id = ? OR owner_service_instance_id IS NULL)
+        AND (? IS NULL OR owner_epoch = ?)
         AND NOT EXISTS (
           SELECT 1
           FROM runtime_turns
@@ -855,7 +922,14 @@ export function createExecutorStore({
               'redirecting', 'recovering', 'retrying'
             )
         )
-    `).run(conversationId, provider, serviceInstanceId, conversationId);
+    `).run(
+      conversationId,
+      provider,
+      serviceInstanceId,
+      ownerEpoch,
+      ownerEpoch,
+      conversationId,
+    );
     return released.changes === 1;
   }
 
@@ -866,7 +940,7 @@ export function createExecutorStore({
       if (!['running', 'waiting_user'].includes(turn.state)) {
         conflict('illegal_transition', `Interaction requests are invalid while turn is ${turn.state}.`);
       }
-      assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
+      assertTurnContextFence(turn, turnContext);
       const ordinal = database.prepare(`
         SELECT COALESCE(MAX(ordinal), 0) + 1 AS ordinal
         FROM runtime_interactions
@@ -1003,6 +1077,7 @@ export function createExecutorStore({
         conflict('stale_attempt', 'The interaction no longer matches the current runtime fence.');
       }
       assertActiveFence(database, turn, fence, serviceInstanceId);
+      assertResidentOwner(turn.conversation_id);
 
       validateInteractionTransition({
         from: 'pending',
@@ -1169,6 +1244,7 @@ export function createExecutorStore({
         conflict('stale_attempt', 'The pending handoff no longer matches the current runtime fence.');
       }
       assertActiveFence(database, turn, fence, serviceInstanceId);
+      assertResidentOwner(turn.conversation_id);
       validateInteractionTransition({
         from: 'answer_committed',
         to: 'answer_delivering',
@@ -1295,6 +1371,7 @@ export function createExecutorStore({
         conflict('stale_attempt', 'The handler acknowledgement does not match the delivering handoff fence.');
       }
       assertActiveFence(database, turn, fence, serviceInstanceId);
+      assertResidentOwner(turn.conversation_id);
       validateInteractionTransition({
         from: 'answer_delivering',
         to: 'answered',
@@ -1436,7 +1513,7 @@ export function createExecutorStore({
   function resumeTurnAfterPermission(turnContext) {
     const resume = database.transaction(() => {
       const turn = loadTurn(database, turnContext.turn_id);
-      assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
+      assertTurnContextFence(turn, turnContext);
       if (turn.state !== 'waiting_user') {
         return { resumed: turn.state === 'running', turn_state: turn.state };
       }
@@ -1474,6 +1551,7 @@ export function createExecutorStore({
     claimNextQueuedTurn,
     claimInteractionHandoff,
     commitInteractionAnswer,
+    heartbeatOwnedResidents,
     isConversationEvictable,
     releaseExecutorResident,
     reconcileExpiredResidents,
