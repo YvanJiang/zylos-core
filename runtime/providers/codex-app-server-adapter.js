@@ -71,8 +71,10 @@ function rejectProtocol(message, code = 'provider_protocol_invalid') {
   throw new CodexAppServerAdapterError(code, message);
 }
 
-function rememberTombstone(tombstones, key, value = true) {
-  tombstones.set(key, value);
+function requestIdKey(value) {
+  if (typeof value === 'string') return `s:${value}`;
+  if (Number.isSafeInteger(value) && !Object.is(value, -0)) return `n:${value}`;
+  rejectProtocol('Codex app-server emitted an invalid JSON-RPC request ID.');
 }
 
 function signalSupervisedProcessGroup(processGroupId, child, signal) {
@@ -455,6 +457,7 @@ export function createCodexAppServerAdapter({
   sandbox = 'workspace-write',
   interruptConfirmationTimeoutMs = 5_000,
   processTerminationGraceMs = 5_000,
+  maxConnectionFenceEntries = 4_096,
   signalProcessGroup = signalSupervisedProcessGroup,
   isProcessGroupAlive = supervisedProcessGroupIsAlive,
   setTimeoutFn = setTimeout,
@@ -485,6 +488,9 @@ export function createCodexAppServerAdapter({
   if (!Number.isSafeInteger(processTerminationGraceMs) || processTerminationGraceMs <= 0) {
     throw new TypeError('processTerminationGraceMs must be a positive safe integer');
   }
+  if (!Number.isSafeInteger(maxConnectionFenceEntries) || maxConnectionFenceEntries <= 0) {
+    throw new TypeError('maxConnectionFenceEntries must be a positive safe integer');
+  }
   if (typeof signalProcessGroup !== 'function' || typeof isProcessGroupAlive !== 'function') {
     throw new TypeError('process-group supervision functions must be callable');
   }
@@ -504,6 +510,17 @@ export function createCodexAppServerAdapter({
   let connecting = null;
   let nextConnectionNo = 0;
   let nextInteractionNo = 0;
+
+  function rememberConnectionFence(target, fences, key, value = true) {
+    if (!fences.has(key) && fences.size >= maxConnectionFenceEntries) {
+      throw new CodexAppServerAdapterError(
+        'provider_connection_lost',
+        'Codex app-server connection reached its safe late-fence retention bound.',
+      );
+    }
+    if (fences instanceof Map) fences.set(key, value);
+    else fences.add(key);
+  }
 
   function supervisedProcessGroupExited(target) {
     if (!target.closed_observed) return false;
@@ -534,7 +551,6 @@ export function createCodexAppServerAdapter({
         // A missing close event remains a fail-closed supervision result.
       }
     }, processTerminationGraceMs);
-    target.termination_timer?.unref?.();
   }
 
   function waitForProcessClose(target) {
@@ -549,7 +565,6 @@ export function createCodexAppServerAdapter({
         if (pollTimer !== null) clearTimeoutFn(pollTimer);
         resolve(false);
       }, processTerminationGraceMs * 2);
-      deadlineTimer?.unref?.();
       const check = () => {
         if (settled) return;
         if (supervisedProcessGroupExited(target)) {
@@ -566,7 +581,6 @@ export function createCodexAppServerAdapter({
           pollTimer = null;
           check();
         }, Math.min(25, processTerminationGraceMs));
-        pollTimer?.unref?.();
       };
       target.closed.then(check);
       check();
@@ -578,9 +592,10 @@ export function createCodexAppServerAdapter({
     for (const [requestKey, group] of providerRequests) {
       if (group.run !== run) continue;
       discardedGroups.add(group);
-      rememberTombstone(
+      rememberConnectionFence(
+        target,
         target.retired_server_requests,
-        String(group.request_id),
+        requestIdKey(group.request_id),
         serverRequestTombstone(group),
       );
       group.rejectResolved(failure);
@@ -659,7 +674,7 @@ export function createCodexAppServerAdapter({
     const { method, params } = message;
     if (method === 'thread/started') return;
     if (method === 'serverRequest/resolved') {
-      const requestId = String(params?.requestId);
+      const requestId = requestIdKey(params?.requestId);
       const group = providerRequests.get(`${target.connection_id}:${requestId}`);
       if (!group) {
         if (target.retired_server_requests.get(requestId)?.thread_id === params?.threadId) return;
@@ -683,7 +698,8 @@ export function createCodexAppServerAdapter({
         ));
         return;
       }
-      rememberTombstone(
+      rememberConnectionFence(
+        target,
         target.retired_server_requests,
         requestId,
         serverRequestTombstone(group),
@@ -897,7 +913,7 @@ export function createCodexAppServerAdapter({
         'provider_execution_failed',
         `Codex app-server completed the turn with status ${String(status)}.`,
       );
-      rememberTombstone(target.retired_run_keys, runKey);
+      rememberConnectionFence(target, target.retired_run_keys, runKey);
       const discardedRequestCount = discardProviderRequestsForRun(target, run, failure);
       const completionIsInvalid = status !== 'completed' || discardedRequestCount > 0;
       const failureOutcome = discardedRequestCount > 0
@@ -1242,7 +1258,7 @@ export function createCodexAppServerAdapter({
       (minLength !== null && (!Number.isSafeInteger(minLength) || minLength < 0))
       || (maxLength !== null && (!Number.isSafeInteger(maxLength) || maxLength < 0))
       || (minLength !== null && maxLength !== null && minLength > maxLength)
-      || (values === null && (minLength === null || minLength < 1))
+      || (values === null && (minLength !== 1 || maxLength !== null))
       || (values !== null && values.some((value) => (
         (minLength !== null && value.length < minLength)
         || (maxLength !== null && value.length > maxLength)
@@ -1390,7 +1406,7 @@ export function createCodexAppServerAdapter({
       ));
       return;
     }
-    const requestId = String(message.id);
+    const requestId = requestIdKey(message.id);
     if (target.server_request_ids.has(requestId)) {
       sendServerError(target, message.id, 'Duplicate app-server request ID.');
       const retired = target.retired_server_requests.get(requestId);
@@ -1405,7 +1421,7 @@ export function createCodexAppServerAdapter({
       ));
       return;
     }
-    target.server_request_ids.add(requestId);
+    rememberConnectionFence(target, target.server_request_ids, requestId);
     const run = findServerRequestRun(target, message.method, message.params);
     if (!run || run.connection_id !== target.connection_id) {
       sendServerError(target, message.id, 'Unsupported or stale app-server request.');
@@ -1414,7 +1430,8 @@ export function createCodexAppServerAdapter({
         ? activeRunKey(message.params.threadId, message.params.turnId)
         : null;
       if (retiredRunKey !== null && target.retired_run_keys.has(retiredRunKey)) {
-        rememberTombstone(
+        rememberConnectionFence(
+          target,
           target.retired_server_requests,
           requestId,
           Object.freeze({
@@ -1496,17 +1513,18 @@ export function createCodexAppServerAdapter({
       return;
     }
     if (Object.hasOwn(message, 'id') && !Object.hasOwn(message, 'method')) {
-      const pending = target.pending.get(String(message.id));
+      const responseId = requestIdKey(message.id);
+      const pending = target.pending.get(responseId);
       if (!pending) {
-        if (target.settled_client_request_ids.has(String(message.id))) return;
+        if (target.settled_client_request_ids.has(responseId)) return;
         failConnection(target, new CodexAppServerAdapterError(
           'provider_protocol_invalid',
           'Codex app-server returned an unknown request ID.',
         ));
         return;
       }
-      target.pending.delete(String(message.id));
-      rememberTombstone(target.settled_client_request_ids, String(message.id));
+      rememberConnectionFence(target, target.settled_client_request_ids, responseId);
+      target.pending.delete(responseId);
       if (Object.hasOwn(message, 'error')) {
         pending.reject(new CodexAppServerAdapterError(
           'provider_request_failed',
@@ -1547,9 +1565,10 @@ export function createCodexAppServerAdapter({
       ));
     }
     const id = `${target.connection_id}:${target.next_request_no}`;
+    const pendingId = requestIdKey(id);
     target.next_request_no += 1;
     return new Promise((resolve, reject) => {
-      target.pending.set(id, { method, onResult, resolve, reject });
+      target.pending.set(pendingId, { method, onResult, resolve, reject });
       try {
         target.child.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
       } catch (error) {

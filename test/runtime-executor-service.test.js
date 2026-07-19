@@ -71,7 +71,10 @@ function malformedTurnStartAppServer() {
   child.stdin = new PassThrough();
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
-  child.kill = () => true;
+  child.kill = (signal) => {
+    if (signal === 'SIGTERM') queueMicrotask(() => child.emit('close', 0, signal));
+    return true;
+  };
   let buffer = '';
   const send = (message) => child.stdout.write(`${JSON.stringify(message)}\n`);
   child.stdin.on('data', (chunk) => {

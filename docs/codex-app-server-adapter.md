@@ -46,7 +46,7 @@ Private app-server method and item names remain inside the adapter:
 | command/file approval | durable `tool_approval` interaction with bounded command/cwd or path/diff/grant details |
 | permissions approval | durable `permission_approval` interaction with bounded cwd/environment/permission scope |
 | single-question `requestUserInput` | durable `question` or fixed `choice` interaction with answer constraints preserved |
-| single-field required MCP typed string/enum form | durable `question` or `choice` interaction; accepted content is reconstructed as the schema-keyed object |
+| single-field required MCP typed string/enum form | durable `question` or `choice` interaction; accepted content is reconstructed as the schema-keyed object; free text is accepted only for the provider-neutral contract's exact non-empty/unbounded shape |
 
 Answers are accepted only through Core's durable interaction-answer and handoff records. The
 adapter verifies the current connection, provider request, thread, turn, Core turn, attempt, lease,
@@ -57,7 +57,7 @@ never reusable within one connection, including after acknowledgement.
 Multi-question, secret, provider-auto-resolving, and fixed-choice-plus-Other `requestUserInput`
 requests,
 multi-field/non-string/optional/formatted
-MCP typed forms, `openai/form`, URL elicitation, unknown server requests, duplicate request IDs,
+MCP typed forms, tighter free-text length constraints, `openai/form`, URL elicitation, unknown server requests, duplicate request IDs,
 unsupported item or notification types, incomplete fixed-version request shapes, duplicate or
 unfinished tool lifecycles, cross-tool progress, unrenderable approval details, and stale or
 mismatched traffic fail closed. Image-generation status is opaque in the fixed-version protocol;
@@ -79,8 +79,12 @@ is drained without persistence and stdio errors fail the fenced connection rathe
 unhandled stream errors. Fatal run-scoped protocol/capability failures retire the shared connection.
 On POSIX, the app-server leader is launched in a detached process group; loss of protocol control
 signals that exact group with `SIGTERM`, escalates to `SIGKILL`, and waits for both leader `close`
-and process-group disappearance. A replacement connection is not started while any member of the
-prior group can still be observed.
+and process-group disappearance. The termination, escalation, and group-observation timers remain
+referenced so service-process exit cannot bypass that isolation barrier. A replacement connection
+is not started while any member of the prior group can still be observed. JSON-RPC request IDs are
+keyed with their protocol type intact, so numeric `1` and string `"1"` cannot share a fence. Each
+connection's late-traffic fence collections have a fixed bound; reaching it retires the connection
+before any tombstone can be evicted and uncertain active work enters recovery.
 
 ## Control and reconnect
 

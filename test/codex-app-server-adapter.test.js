@@ -1,4 +1,6 @@
 import { EventEmitter } from 'node:events';
+import { spawn as spawnSubprocess } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { PassThrough } from 'node:stream';
 
 import { describe, expect, jest, test } from '@jest/globals';
@@ -16,7 +18,10 @@ function createFakeAppServer({
   child.stdin = new PassThrough();
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
-  child.kill = jest.fn();
+  child.kill = jest.fn((signal) => {
+    if (signal === 'SIGTERM') queueMicrotask(() => child.emit('close', 0, signal));
+    return true;
+  });
   const received = [];
   let buffer = '';
   let turnNumber = 0;
@@ -566,6 +571,7 @@ describe('Codex app-server provider adapter', () => {
         });
       },
     });
+    server.child.kill = jest.fn(() => true);
     const replacementServer = createFakeAppServer();
     const spawnProcess = jest.fn()
       .mockImplementationOnce(() => server.child)
@@ -621,6 +627,40 @@ describe('Codex app-server provider adapter', () => {
     await expect(replacement).resolves.toEqual([]);
     expect(signalProcessGroup.mock.calls.map(([, , signal]) => signal))
       .toEqual(['SIGTERM', 'SIGKILL']);
+    expect(spawnProcess).toHaveBeenCalledTimes(2);
+  });
+
+  test('retires a connection before its late-fence retention bound can be exceeded', async () => {
+    const firstServer = createFakeAppServer();
+    firstServer.child.kill = jest.fn(() => true);
+    const replacementServer = createFakeAppServer();
+    const spawnProcess = jest.fn()
+      .mockImplementationOnce(() => firstServer.child)
+      .mockImplementationOnce(() => replacementServer.child);
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess,
+      maxConnectionFenceEntries: 3,
+    });
+    await collect(adapter.execute(executionContext()));
+
+    await expect(collect(adapter.execute(executionContext({
+      turn_id: 'turn-fence-capacity',
+      lineage: { provider_native_id: 'codex-thread-1' },
+      attempt: { attempt_id: 'attempt-fence-capacity', attempt_no: 1, lease_epoch: 4 },
+    })))).rejects.toMatchObject({
+      providerError: { side_effect_status: 'unknown' },
+    });
+    expect(firstServer.child.kill).toHaveBeenCalledWith('SIGTERM');
+
+    const replacement = collect(adapter.execute(executionContext({
+      turn_id: 'turn-after-fence-rotation',
+      lineage: { provider_native_id: 'codex-thread-1' },
+      attempt: { attempt_id: 'attempt-after-fence-rotation', attempt_no: 1, lease_epoch: 5 },
+    })));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(spawnProcess).toHaveBeenCalledTimes(1);
+    firstServer.child.emit('close', 1, null);
+    await expect(replacement).resolves.toEqual([]);
     expect(spawnProcess).toHaveBeenCalledTimes(2);
   });
 
@@ -1419,6 +1459,21 @@ describe('Codex app-server provider adapter', () => {
       },
     },
     {
+      label: 'tighter free-text length constraints',
+      params: {
+        mode: 'form',
+        message: 'Provide a long environment name.',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            environment: { type: 'string', minLength: 2, maxLength: 20 },
+          },
+          required: ['environment'],
+        },
+        _meta: null,
+      },
+    },
+    {
       label: 'formatted typed string',
       params: {
         mode: 'form',
@@ -1557,6 +1612,98 @@ describe('Codex app-server provider adapter', () => {
       providerError: { code: 'side_effect_unknown' },
     });
     expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+  });
+
+  test('keeps numeric and string server request IDs distinct across tombstone retention', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart(details) {
+        sendStartedFileChange(details, 'typed-request-first');
+        details.send({
+          id: 1,
+          method: 'item/fileChange/requestApproval',
+          params: {
+            threadId: details.threadId,
+            turnId: details.turnId,
+            itemId: 'typed-request-first',
+            startedAtMs: 1,
+          },
+        });
+      },
+      onClientResponse({ message, send }) {
+        send({
+          method: 'serverRequest/resolved',
+          params: { threadId: 'codex-thread-1', requestId: message.id },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const iterator = adapter.execute(executionContext())[Symbol.asyncIterator]();
+    const first = await nextInteraction(iterator);
+    await adapter.handleInteractionAnswer(handoffDelivery(
+      first.value.payload.provider_interaction_ref,
+      { kind: 'decision', decision: 'approve' },
+      { handoffId: 'handoff-numeric', handoffAttemptId: 'attempt-numeric' },
+    ));
+    server.send({
+      method: 'item/completed',
+      params: {
+        threadId: 'codex-thread-1',
+        turnId: 'codex-turn-1',
+        item: {
+          type: 'fileChange',
+          id: 'typed-request-first',
+          status: 'completed',
+          changes: [],
+        },
+      },
+    });
+    sendStartedFileChange({
+      send: server.send,
+      threadId: 'codex-thread-1',
+      turnId: 'codex-turn-1',
+    }, 'typed-request-second');
+    server.send({
+      id: '1',
+      method: 'item/fileChange/requestApproval',
+      params: {
+        threadId: 'codex-thread-1',
+        turnId: 'codex-turn-1',
+        itemId: 'typed-request-second',
+        startedAtMs: 2,
+      },
+    });
+
+    const second = await nextInteraction(iterator);
+    await adapter.handleInteractionAnswer(handoffDelivery(
+      second.value.payload.provider_interaction_ref,
+      { kind: 'decision', decision: 'deny' },
+      { handoffId: 'handoff-string', handoffAttemptId: 'attempt-string' },
+    ));
+    server.send({
+      method: 'item/completed',
+      params: {
+        threadId: 'codex-thread-1',
+        turnId: 'codex-turn-1',
+        item: {
+          type: 'fileChange',
+          id: 'typed-request-second',
+          status: 'declined',
+          changes: [],
+        },
+      },
+    });
+    server.send({
+      method: 'turn/completed',
+      params: {
+        threadId: 'codex-thread-1',
+        turn: { id: 'codex-turn-1', status: 'completed', items: [] },
+      },
+    });
+
+    await expect(collect({ [Symbol.asyncIterator]: () => iterator })).resolves.toEqual(
+      expect.any(Array),
+    );
+    expect(server.child.kill).not.toHaveBeenCalled();
   });
 
   test('fails an active turn closed when transport becomes uncertain and reloads on reconnect', async () => {
@@ -2090,6 +2237,7 @@ describe('Codex app-server provider adapter', () => {
 
   test('fails closed when forced app-server termination is not observed', async () => {
     const server = createFakeAppServer();
+    server.child.kill = jest.fn(() => true);
     const adapter = createCodexAppServerAdapter({
       spawnProcess: () => server.child,
       processTerminationGraceMs: 5,
@@ -2124,5 +2272,28 @@ describe('Codex app-server provider adapter', () => {
     });
     expect(signalProcessGroup.mock.calls.map(([, , signal]) => signal))
       .toEqual(['SIGTERM', 'SIGKILL']);
+  });
+
+  test('keeps the shutdown barrier alive after the detached app-server leader exits', async () => {
+    const helperPath = fileURLToPath(new URL(
+      './helpers/codex-process-group-barrier-child.js',
+      import.meta.url,
+    ));
+    const result = await new Promise((resolve, reject) => {
+      const subprocess = spawnSubprocess(process.execPath, [helperPath], {
+        cwd: process.cwd(),
+        env: process.env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      subprocess.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
+      subprocess.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+      subprocess.once('error', reject);
+      subprocess.once('close', (code, signal) => resolve({ code, signal, stderr, stdout }));
+    });
+
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: '' });
+    expect(result.stdout).toContain('PROCESS_GROUP_BARRIER_COMPLETED');
   });
 });
