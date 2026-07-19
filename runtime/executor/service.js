@@ -41,6 +41,7 @@ export function createExecutorService({
   });
   let executors = [];
   let started = false;
+  const activeRuns = new Map();
 
   function refresh() {
     executors = store.rebuildExecutorCache();
@@ -62,6 +63,36 @@ export function createExecutorService({
     return snapshot();
   }
 
+  async function advanceRun(activeRun) {
+    while (true) {
+      const next = await activeRun.iterator.next();
+      if (next.done) {
+        store.transitionTurn(activeRun.turnContext, 'running', 'completed');
+        activeRuns.delete(activeRun.turnContext.turn_id);
+        refresh();
+        return {
+          status: 'completed',
+          conversation_id: activeRun.turnContext.conversation_id,
+          turn_id: activeRun.turnContext.turn_id,
+          ...activeRun.turnContext.attempt,
+        };
+      }
+      const event = next.value;
+      if (event?.kind === 'interaction_requested') {
+        const request = store.requestInteraction(activeRun.turnContext, event.payload);
+        refresh();
+        return {
+          status: 'waiting_user',
+          conversation_id: activeRun.turnContext.conversation_id,
+          turn_id: activeRun.turnContext.turn_id,
+          ...activeRun.turnContext.attempt,
+          request,
+        };
+      }
+      store.appendAdapterEvent(activeRun.turnContext, event);
+    }
+  }
+
   async function runNext() {
     if (!started) start();
     const turnContext = store.claimNextQueuedTurn();
@@ -76,18 +107,42 @@ export function createExecutorService({
       input: turnContext.input,
       attempt: Object.freeze({ ...turnContext.attempt }),
     }));
-    for await (const event of events) {
-      store.appendAdapterEvent(turnContext, event);
+    if (!events || typeof events[Symbol.asyncIterator] !== 'function') {
+      throw new TypeError('adapter.execute must return an async iterable');
     }
-    store.transitionTurn(turnContext, 'running', 'completed');
-    refresh();
-    return {
-      status: 'completed',
-      conversation_id: turnContext.conversation_id,
-      turn_id: turnContext.turn_id,
-      ...turnContext.attempt,
+    const activeRun = {
+      turnContext,
+      iterator: events[Symbol.asyncIterator](),
     };
+    activeRuns.set(turnContext.turn_id, activeRun);
+    return advanceRun(activeRun);
   }
 
-  return Object.freeze({ runNext, snapshot, start });
+  function submitInteractionAnswer(answer) {
+    return store.commitInteractionAnswer(answer);
+  }
+
+  async function deliverInteractionAnswer(handoffId) {
+    if (typeof adapter.handleInteractionAnswer !== 'function') {
+      throw new TypeError('adapter.handleInteractionAnswer must be a function');
+    }
+    const delivery = store.claimInteractionHandoff(handoffId);
+    const handlerAcknowledgement = await adapter.handleInteractionAnswer(
+      Object.freeze(delivery),
+    );
+    const acknowledgement = store.acknowledgeInteractionHandoff(handlerAcknowledgement);
+    const activeRun = activeRuns.get(delivery.request.turn_id);
+    const execution = acknowledgement.resumed && activeRun
+      ? await advanceRun(activeRun)
+      : null;
+    return { acknowledgement, execution };
+  }
+
+  return Object.freeze({
+    deliverInteractionAnswer,
+    runNext,
+    snapshot,
+    start,
+    submitInteractionAnswer,
+  });
 }
