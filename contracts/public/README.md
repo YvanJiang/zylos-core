@@ -24,6 +24,52 @@ list and its function declarations are the authoritative signatures.
 Unknown optional fields are data to preserve, not capabilities to execute. Callers must list
 every security, lifecycle, terminal, interaction, and control enum in a `critical_enum` rule.
 
+## Inbound, result, and normalized-event contracts
+
+Issue 02 publishes three portable JSON Schema artifacts under `schemas/` and matching golden
+fixtures under `fixtures/`:
+
+| Contract | Authoritative validator | Portable schema | Golden fixture |
+|---|---|---|---|
+| `zylos.inbound-envelope` | `validateInboundEnvelope` | `inbound-envelope-v1.schema.json` | `inbound-envelope-v1.json` |
+| `zylos.inbound-result` | `validateInboundResult` | `inbound-result-v1.schema.json` | `inbound-result-v1.json` |
+| `zylos.normalized-event` | `validateNormalizedEvent` | `normalized-event-v1.schema.json` | `normalized-event-v1.json` |
+
+The JSON Schemas describe portable document shape and conditional fields. The JavaScript
+validators are authoritative for semantic checks that JSON Schema cannot express safely,
+including idempotency-key recomputation, scheduler synthetic identity, result required/null
+matrices, event-kind payload rules, and fixture secret safety.
+
+`validateInboundEnvelope` preserves additive same-major top-level extensions while enforcing the
+six-part conversation namespace, real thread/topic identity, reply-only mapping fields,
+authenticated actor shape, attachments, and the mutually exclusive platform, scheduler, and
+legacy sources. A scheduler synthetic conversation uses
+`scheduler:<bot_id>:<task_id>` and scheduler-scope idempotency; its required
+`bound_conversation` flag does not change that identity. Legacy compatibility alone uses the
+exact `legacy-c4:<legacy_record_id>` exception.
+
+`validateInboundResult` enforces the authoritative result matrix for a normal bound turn,
+control, pending lineage recovery, persisted queue-full failure, and nullable or persisted
+non-queue-full rejection.
+`deduplicated=true` does not define a new result shape: the producer must replay the first
+business result and commit time, changing only the response trace and deduplication marker.
+
+Use `createNormalizedEventStreamState` plus `admitNormalizedEvent` when consuming a turn stream.
+Admission requires continuous `event_sequence`, strictly increasing `turn_version`, current
+`attempt_id`/`attempt_no`/`lease_epoch` fencing, and immutable terminal state. A retry may advance
+the fence only through `retry_attempt_started` with the next attempt number and a newer lease
+epoch. The first admitted event establishes lifecycle state through `turn_state_changed`;
+provider output is rejected without a current fenced attempt or before a compatible
+`starting`/`running` state. Late events after a terminal transition are rejected with
+`turn_terminal`.
+
+Known lifecycle, interaction, retry, recovery, permission, and delivery kinds are fixed exports.
+An additive same-major unknown kind is rejected by default. A consumer may pass it through
+`unknownProgressKinds` only after capability negotiation and only as opaque, non-terminal,
+error-free `starting` or `running` progress. Reserved lifecycle/security prefixes and payload
+fields that could change state, permission, interaction, control, terminal, or side-effect
+semantics remain rejected.
+
 ## Canonicalization and idempotency
 
 `canonicalizeJson` implements the JSON Canonicalization Scheme from
@@ -55,6 +101,10 @@ canonical JCS strings, keys, payload projections, and payload hashes for inbound
 interaction, control, delivery, and legacy C4. Each consuming repository must calculate and
 assert these values with its own implementation. Comparing a copied Core result without
 recalculation is not a contract test.
+
+The idempotency vectors are hashing-only projections from the issue 01 kernel. Use the issue 02
+contract fixtures above—not the intentionally minimal hashing vectors—as document acceptance
+fixtures.
 
 Run `validatePublicFixtureSafety` on fixture changes. Fixtures must not contain secrets or raw
 provider/channel private objects; only redacted `detail_ref` and `source_ref` references may
