@@ -1155,6 +1155,38 @@ describe('Codex app-server provider adapter', () => {
       answer: { kind: 'choice', choice_id: 'staging' },
       result: { action: 'accept', content: { environment: 'staging' }, _meta: null },
     },
+    {
+      label: 'MCP astral choice using JSON Schema code-point length',
+      method: 'mcpServer/elicitation/request',
+      params: {
+        turnId: null,
+        serverName: 'provider-private',
+        mode: 'form',
+        message: 'Choose the symbol.',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            symbol: {
+              type: 'string',
+              enum: ['😀'],
+              enumNames: ['Face'],
+              default: '😀',
+              minLength: 1,
+              maxLength: 1,
+            },
+          },
+          required: ['symbol'],
+        },
+        _meta: null,
+      },
+      expected: {
+        kind: 'choice',
+        prompt: 'Choose the symbol.',
+        choices: [{ choice_id: '😀', label: 'Face' }],
+      },
+      answer: { kind: 'choice', choice_id: '😀' },
+      result: { action: 'accept', content: { symbol: '😀' }, _meta: null },
+    },
   ])('maps $label through a fenced provider-neutral interaction', async ({
     method,
     params,
@@ -1651,6 +1683,21 @@ describe('Codex app-server provider adapter', () => {
             },
           },
           required: ['environment'],
+        },
+        _meta: null,
+      },
+    },
+    {
+      label: 'astral enum below its code-point minLength',
+      params: {
+        mode: 'form',
+        message: 'Choose a two-code-point value.',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            symbol: { type: 'string', enum: ['😀'], minLength: 2 },
+          },
+          required: ['symbol'],
         },
         _meta: null,
       },

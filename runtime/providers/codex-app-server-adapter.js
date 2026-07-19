@@ -283,6 +283,10 @@ function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function jsonSchemaStringLength(value) {
+  return Array.from(value).length;
+}
+
 function hasOnlyKeys(value, allowedKeys) {
   return isRecord(value) && Object.keys(value).every((key) => allowedKeys.has(key));
 }
@@ -1367,14 +1371,16 @@ export function createCodexAppServerAdapter({
       || (minLength !== null && maxLength !== null && minLength > maxLength)
       || (values === null && (minLength !== 1 || maxLength !== null))
       || (values !== null && values.some((value) => (
-        (minLength !== null && value.length < minLength)
-        || (maxLength !== null && value.length > maxLength)
+        (minLength !== null && jsonSchemaStringLength(value) < minLength)
+        || (maxLength !== null && jsonSchemaStringLength(value) > maxLength)
       )))
       || (propertySchema.default !== undefined
         && propertySchema.default !== null
         && ((values !== null && !values.includes(propertySchema.default))
-          || (minLength !== null && propertySchema.default.length < minLength)
-          || (maxLength !== null && propertySchema.default.length > maxLength)))
+          || (minLength !== null
+            && jsonSchemaStringLength(propertySchema.default) < minLength)
+          || (maxLength !== null
+            && jsonSchemaStringLength(propertySchema.default) > maxLength)))
     ) {
       rejectProtocol(
         'Codex app-server supplied MCP form constraints that Core cannot represent safely.',
@@ -2057,9 +2063,9 @@ export function createCodexAppServerAdapter({
         (group.mcp_form.allowed_values !== null
           && !group.mcp_form.allowed_values.includes(answer))
         || (group.mcp_form.min_length !== null
-          && answer.length < group.mcp_form.min_length)
+          && jsonSchemaStringLength(answer) < group.mcp_form.min_length)
         || (group.mcp_form.max_length !== null
-          && answer.length > group.mcp_form.max_length)
+          && jsonSchemaStringLength(answer) > group.mcp_form.max_length)
       ) {
         rejectProtocol('The persisted answer does not satisfy the MCP form schema.');
       }
