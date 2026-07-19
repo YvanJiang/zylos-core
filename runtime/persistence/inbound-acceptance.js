@@ -12,6 +12,10 @@ import {
   validateInboundResult,
   validateNormalizedEvent,
 } from '../../contracts/public/index.js';
+import {
+  initializeMainProjection,
+  stageMainProjection,
+} from './main-projection.js';
 import { initializeRuntimePersistence } from './schema.js';
 
 const INBOUND_ENVELOPE_KNOWN_FIELDS = Object.freeze([
@@ -413,21 +417,28 @@ export function acceptNormalInbound(
       generateId,
     });
     validateDeliveryCommand(deliveryCommand);
+    const laneKey = initializeMainProjection(database, deliveryCommand);
     database.prepare(`
       INSERT INTO runtime_outbox (
         outbox_id, delivery_id, aggregate_type, aggregate_id, turn_id, control_id,
-        aggregate_version, status, command_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, NULL, ?, 'pending', ?, ?)
+        lane_key, predecessor_delivery_id, aggregate_version, status, command_json,
+        priority, supersedable, terminal, next_attempt_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, 'pending', ?, ?, 0, 0, ?, ?, ?)
     `).run(
       deliveryCommand.outbox_id,
       deliveryCommand.delivery_id,
       deliveryCommand.aggregate_type,
       deliveryCommand.aggregate_id,
       turnId,
+      laneKey,
       deliveryCommand.aggregate_version,
       JSON.stringify(deliveryCommand),
+      deliveryCommand.priority,
+      deliveryCommand.not_before,
+      committedAt,
       committedAt,
     );
+    stageMainProjection(database, { turn_id: turnId }, queuedEvent, { generateId });
 
     const result = {
       contract: 'zylos.inbound-result',
