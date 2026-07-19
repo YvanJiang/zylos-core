@@ -115,7 +115,7 @@
       "key_input": ["zylos-idempotency-v1", "interaction", "interaction-A", "action-A"],
       "key_input_jcs": "[\"zylos-idempotency-v1\",\"interaction\",\"interaction-A\",\"action-A\"]",
       "idempotency_key": "zid:v1:interaction:5b22b318e0011f774e272d311c77fa26381d5eb165a618c029e59bcf7b93e224",
-      "known_payload_fields": ["contract", "contract_version", "trace_id", "interaction_id", "answer_id", "source_event_or_action_id", "actor", "source", "value", "answered_at", "idempotency_key"],
+      "known_payload_fields": ["contract", "contract_version", "trace_id", "interaction_id", "interaction_version", "answer_id", "source_event_or_action_id", "actor", "source_context", "source", "value", "answered_at", "idempotency_key"],
       "optional_extension_fields": ["future_optional"],
       "decimal_paths": [],
       "payload": {
@@ -123,10 +123,12 @@
         "contract_version": "1.0",
         "trace_id": "trace-interaction-retry",
         "interaction_id": "interaction-A",
+        "interaction_version": 1,
         "answer_id": "answer-A",
         "source_event_or_action_id": "action-A",
         "actor": { "type": "user", "actor_id": "user-A", "authenticated": true, "roles": ["member"] },
-        "source": { "kind": "card_action", "source_ref": "diagnostic:action" },
+        "source_context": { "region": "cn", "tenant_id": "tenant-A", "channel": "feishu", "bot_id": "bot-A", "chat_id": "chat-A", "native_thread_or_topic_id": null, "platform_message_or_action_id": "action-A" },
+        "source": "card_action",
         "value": { "kind": "decision", "decision": "approve" },
         "answered_at": "2026-07-19T04:05:00Z",
         "idempotency_key": "zid:v1:interaction:5b22b318e0011f774e272d311c77fa26381d5eb165a618c029e59bcf7b93e224",
@@ -136,15 +138,17 @@
         "contract": "zylos.interaction-answer",
         "contract_version": "1.0",
         "interaction_id": "interaction-A",
+        "interaction_version": 1,
         "answer_id": "answer-A",
         "source_event_or_action_id": "action-A",
         "actor": { "type": "user", "actor_id": "user-A", "authenticated": true, "roles": ["member"] },
-        "source": { "kind": "card_action" },
+        "source_context": { "region": "cn", "tenant_id": "tenant-A", "channel": "feishu", "bot_id": "bot-A", "chat_id": "chat-A", "native_thread_or_topic_id": null, "platform_message_or_action_id": "action-A" },
+        "source": "card_action",
         "value": { "kind": "decision", "decision": "approve" },
         "answered_at": "2026-07-19T04:05:00Z"
       },
-      "payload_projection_jcs": "{\"actor\":{\"actor_id\":\"user-A\",\"authenticated\":true,\"roles\":[\"member\"],\"type\":\"user\"},\"answer_id\":\"answer-A\",\"answered_at\":\"2026-07-19T04:05:00Z\",\"contract\":\"zylos.interaction-answer\",\"contract_version\":\"1.0\",\"interaction_id\":\"interaction-A\",\"source\":{\"kind\":\"card_action\"},\"source_event_or_action_id\":\"action-A\",\"value\":{\"decision\":\"approve\",\"kind\":\"decision\"}}",
-      "payload_hash": "c8912142de511feeefa0ef5865d793e83e0dacc4d6e82b11d03c42951504b6fb"
+      "payload_projection_jcs": "{\"actor\":{\"actor_id\":\"user-A\",\"authenticated\":true,\"roles\":[\"member\"],\"type\":\"user\"},\"answer_id\":\"answer-A\",\"answered_at\":\"2026-07-19T04:05:00Z\",\"contract\":\"zylos.interaction-answer\",\"contract_version\":\"1.0\",\"interaction_id\":\"interaction-A\",\"interaction_version\":1,\"source\":\"card_action\",\"source_context\":{\"bot_id\":\"bot-A\",\"channel\":\"feishu\",\"chat_id\":\"chat-A\",\"native_thread_or_topic_id\":null,\"platform_message_or_action_id\":\"action-A\",\"region\":\"cn\",\"tenant_id\":\"tenant-A\"},\"source_event_or_action_id\":\"action-A\",\"value\":{\"decision\":\"approve\",\"kind\":\"decision\"}}",
+      "payload_hash": "bfd0ce75df1cc6932c90abf42e17154597ee5574c5ed4712f583ee4b2af19471"
     },
     {
       "scope": "control",

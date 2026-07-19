@@ -70,6 +70,37 @@ error-free `starting` or `running` progress. Reserved lifecycle/security prefixe
 fields that could change state, permission, interaction, control, terminal, or side-effect
 semantics remain rejected.
 
+## Interaction answer and durable handoff
+
+`interaction.js` is the authoritative v1 contract package for interaction requests, answers,
+answer results, and the Core-owned durable answer handoff record. Import its public schema
+descriptors, transition tables, and validators through `contracts/public/index.js`:
+
+- `validateInteractionRequest` enforces provider-turn, security-control, and recovery-control
+  parent identity; positive `ordinal`; authorized actor/capability subjects; allowed answer
+  sources; runtime fencing; and coherent interaction/handoff projections.
+- `validateInteractionRequestSequence` enforces unique ordinals that are contiguous from one
+  within each turn or control parent. `validateInteractionAnswerAgainstRequest` binds a
+  standalone answer to its request, rejects sources outside `allowed_sources`, restricts
+  `magic_command_repeat` to permission confirmations, verifies actor/capability membership and
+  the Core-resolved request scope, and accepts only the smallest blocking ordinal. Its
+  `requestScope` and `actorCapabilities` options must come from Core's authenticated
+  conversation/policy state, not from channel payloads.
+- `validateInteractionAnswer` validates the provider-neutral answer value, authenticated actor,
+  source context, and the recomputed interaction idempotency key.
+- `validateInteractionAnswerResult` keeps `accepted` distinct from provider acknowledgement:
+  accepted and duplicate results can only expose `answer_committed` with a pending durable
+  handoff. `validateInteractionAnswerResultReplay` proves a duplicate preserved the first
+  immutable business result while allowing a new response trace.
+- `validateInteractionHandoff` validates the durable handoff record and its send/ack evidence.
+  `validateInteractionTransition` and `validateInteractionHandoffTransition` enforce the only
+  allowed edges, including pre-send retry/cancel guards, delivery-unknown proof, terminal
+  immutability, and late-ack rejection.
+
+The handoff is a Core persistence record, not a new transport payload, so it deliberately is not
+added to `PUBLIC_CONTRACTS`. Channels consume interaction request/answer/result documents;
+Dashboard observes the redacted handoff projection through its separate observability contract.
+
 ## Canonicalization and idempotency
 
 `canonicalizeJson` implements the JSON Canonicalization Scheme from
@@ -134,6 +165,13 @@ recalculation is not a contract test.
 The idempotency vectors are hashing-only projections from the issue 01 kernel. Use the issue 02
 contract fixtures above—not the intentionally minimal hashing vectors—as document acceptance
 fixtures.
+
+`fixtures/interaction-handoff-v1.json` publishes ordered provider-turn questions,
+security-control and recovery-control requests; every allowed answer source and answer-result
+status; executable request/source and smallest-blocking-ordinal adjudication examples; every
+durable handoff state; the complete allowed transition tables; and explicit send-before-ack,
+post-send retry prohibition, delivery-unknown, rejected/cancelled, and late-ack examples.
+Consumers must treat every omitted state edge as prohibited.
 
 `fixtures/delivery-mapping-v1.json` contains valid and rejected create/update/text/fallback
 commands, every delivery result status with fencing/error/side-effect combinations, mapping
