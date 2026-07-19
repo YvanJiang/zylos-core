@@ -552,6 +552,152 @@ describe('runtime interaction happy path', () => {
     database.close();
   });
 
+  test('uses iterator return to prove isolation when a failed handler has no abort primitive', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'service-handler-no-abort');
+    let iteratorReturnCalls = 0;
+    const adapter = {
+      async *execute() {
+        try {
+          yield {
+            kind: 'interaction_requested',
+            payload: {
+              provider_interaction_ref: 'provider-handler-no-abort',
+              tool_use_id: 'tool-handler-no-abort',
+              kind: 'tool_approval',
+              prompt: 'Allow the uncertain handler?',
+              choices: [],
+              authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+              allowed_sources: ['card_action'],
+            },
+          };
+        } finally {
+          iteratorReturnCalls += 1;
+        }
+      },
+      async handleInteractionAnswer() {
+        throw new Error('uncertain handler send');
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-handler-no-abort',
+      now: () => '2026-07-19T07:02:01Z',
+      generateId: deterministicIds('handler-no-abort'),
+    });
+
+    const waiting = await service.runNext();
+    const answer = service.submitInteractionAnswer(
+      interactionAnswer(waiting.request, 'handler-no-abort'),
+    );
+    await expect(service.deliverInteractionAnswer(answer.handoff_id)).rejects.toThrow(
+      /uncertain handler send/,
+    );
+
+    expect(iteratorReturnCalls).toBe(1);
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    expect(database.prepare(`
+      SELECT lease_owner FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({ lease_owner: null });
+
+    await service.close();
+    database.close();
+  });
+
+  test('retries atomic delivery-unknown recovery after persistence and abort failures', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'service-handler-recovery-retry');
+    let abortCalls = 0;
+    const adapter = {
+      async *execute() {
+        yield {
+          kind: 'interaction_requested',
+          payload: {
+            provider_interaction_ref: 'provider-handler-recovery-retry',
+            tool_use_id: 'tool-handler-recovery-retry',
+            kind: 'tool_approval',
+            prompt: 'Allow the retrying handler?',
+            choices: [],
+            authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+            allowed_sources: ['card_action'],
+          },
+        };
+      },
+      async handleInteractionAnswer() {
+        throw new Error('uncertain retrying send');
+      },
+      async abort() {
+        abortCalls += 1;
+        throw new Error('forced recovery abort failure');
+      },
+      async close() { return [accepted.conversation_id]; },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-handler-recovery-retry',
+      now: () => '2026-07-19T07:02:02Z',
+      generateId: deterministicIds('handler-recovery-retry'),
+    });
+    const waiting = await service.runNext();
+    const answer = service.submitInteractionAnswer(
+      interactionAnswer(waiting.request, 'handler-recovery-retry'),
+    );
+    database.exec(`
+      CREATE TRIGGER fail_delivery_unknown_audit
+      BEFORE INSERT ON runtime_interaction_audit
+      WHEN NEW.outcome = 'delivery_unknown'
+      BEGIN
+        SELECT RAISE(ABORT, 'forced delivery unknown audit failure');
+      END;
+    `);
+
+    await expect(service.deliverInteractionAnswer(answer.handoff_id)).rejects.toThrow(
+      /uncertain retrying send/,
+    );
+    expect(abortCalls).toBe(1);
+    expect(database.prepare(`
+      SELECT interaction.state, handoff.state AS handoff_state, turn.state AS turn_state
+      FROM runtime_interactions AS interaction
+      JOIN runtime_interaction_handoffs AS handoff
+        ON handoff.interaction_id = interaction.interaction_id
+      JOIN runtime_turns AS turn ON turn.turn_id = interaction.turn_id
+      WHERE interaction.interaction_id = ?
+    `).get(waiting.request.interaction_id)).toEqual({
+      state: 'answer_delivering',
+      handoff_state: 'delivering',
+      turn_state: 'waiting_user',
+    });
+    await expect(service.runNext()).rejects.toThrow(/close_failed/);
+
+    database.exec('DROP TRIGGER fail_delivery_unknown_audit');
+    await expect(service.close()).resolves.toBeUndefined();
+    expect(database.prepare(`
+      SELECT interaction.state, handoff.state AS handoff_state, turn.state AS turn_state
+      FROM runtime_interactions AS interaction
+      JOIN runtime_interaction_handoffs AS handoff
+        ON handoff.interaction_id = interaction.interaction_id
+      JOIN runtime_turns AS turn ON turn.turn_id = interaction.turn_id
+      WHERE interaction.interaction_id = ?
+    `).get(waiting.request.interaction_id)).toEqual({
+      state: 'delivery_unknown',
+      handoff_state: 'delivery_unknown',
+      turn_state: 'recovering',
+    });
+    expect(database.prepare(`
+      SELECT lease_owner FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({ lease_owner: null });
+    expect(database.prepare(`
+      SELECT owner_service_instance_id FROM runtime_executor_residents WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({ owner_service_instance_id: null });
+
+    database.close();
+  });
+
   test('does not advance an unanswered interaction while closing the service', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'service-close-waiting');
