@@ -52,6 +52,7 @@ export function createExecutorService({
   });
   let executors = [];
   let started = false;
+  const activeRuns = new Map();
   const activeTurns = new Map();
   const cancelledTurnIds = new Set();
   const closingPermissionTurnIds = new Set();
@@ -95,6 +96,233 @@ export function createExecutorService({
     return snapshot();
   }
 
+  function resultFor(activeRun, status, extra = {}) {
+    return {
+      status,
+      conversation_id: activeRun.turnContext.conversation_id,
+      turn_id: activeRun.turnContext.turn_id,
+      ...activeRun.turnContext.attempt,
+      ...extra,
+    };
+  }
+
+  function cleanupActiveRun(activeRun) {
+    const { turnContext } = activeRun;
+    if (activeRuns.get(turnContext.turn_id) === activeRun) {
+      activeRuns.delete(turnContext.turn_id);
+    }
+    if (activeTurns.get(turnContext.conversation_id) === turnContext) {
+      activeTurns.delete(turnContext.conversation_id);
+    }
+    cancelledTurnIds.delete(turnContext.turn_id);
+    uncertainTurnIds.delete(turnContext.turn_id);
+    const controllers = permissionControllers.get(turnContext.turn_id);
+    if (!controllers || controllers.size === 0) {
+      permissionControllers.delete(turnContext.turn_id);
+      closingPermissionTurnIds.delete(turnContext.turn_id);
+    }
+    if (!activeRun.settled) {
+      activeRun.settled = true;
+      activeRunSettlements.delete(activeRun.settlement);
+      activeRun.resolveSettlement();
+    }
+  }
+
+  function transitionToRecovery(activeRun) {
+    const { state } = store.assertCurrentFence(activeRun.turnContext);
+    persist(() => store.transitionTurn(activeRun.turnContext, state, 'recovering', {
+      error: null,
+    }));
+    activeRun.durableSettled = true;
+    refresh();
+    cleanupActiveRun(activeRun);
+    return resultFor(activeRun, 'recovering');
+  }
+
+  async function handleRunFailure(activeRun, error) {
+    const { turnContext } = activeRun;
+    if (activeRun.durableSettled) {
+      cleanupActiveRun(activeRun);
+      throw error;
+    }
+    if (error.persistenceFailure) {
+      if (typeof adapter.abort === 'function') {
+        await adapter.abort(turnContext);
+      }
+      cleanupActiveRun(activeRun);
+      throw error;
+    }
+    closingPermissionTurnIds.add(turnContext.turn_id);
+    for (const controller of permissionControllers.get(turnContext.turn_id) ?? []) {
+      controller.abort();
+    }
+    if (uncertainTurnIds.has(turnContext.turn_id)) {
+      return transitionToRecovery(activeRun);
+    }
+    const cancelled = cancelledTurnIds.has(turnContext.turn_id);
+    const terminalState = cancelled ? 'stopped' : 'failed';
+    const { state } = store.assertCurrentFence(turnContext);
+    store.transitionTurn(turnContext, state, terminalState, {
+      error: cancelled ? null : {
+        code: 'provider_stream_failed',
+        category: 'provider',
+        retryable: false,
+        side_effect_status: 'unknown',
+        user_message: 'The provider stream ended before the turn completed.',
+      },
+    });
+    activeRun.durableSettled = true;
+    refresh();
+    cleanupActiveRun(activeRun);
+    return resultFor(activeRun, terminalState);
+  }
+
+  async function finishRun(activeRun) {
+    if (uncertainTurnIds.has(activeRun.turnContext.turn_id)) {
+      return transitionToRecovery(activeRun);
+    }
+    const terminalState = activeRun.outcome === 'cancelled'
+      ? 'stopped'
+      : (activeRun.outcome === 'failed' ? 'failed' : 'completed');
+    const failure = activeRun.outcome === 'failed'
+      || (activeRun.usesManagedRecords && activeRun.outcome === null);
+    const { state } = store.assertCurrentFence(activeRun.turnContext);
+    persist(() => store.transitionTurn(
+      activeRun.turnContext,
+      state,
+      failure ? 'failed' : terminalState,
+      {
+        error: failure ? {
+          code: activeRun.outcome === null
+            ? 'provider_stream_ended'
+            : 'provider_execution_failed',
+          category: 'provider',
+          retryable: false,
+          side_effect_status: 'unknown',
+          user_message: 'The provider turn did not complete successfully.',
+        } : null,
+      },
+    ));
+    activeRun.durableSettled = true;
+    refresh();
+    cleanupActiveRun(activeRun);
+    return resultFor(activeRun, failure ? 'failed' : terminalState);
+  }
+
+  async function driveRun(activeRun) {
+    try {
+      while (true) {
+        const next = await activeRun.iterator.next();
+        if (next.done) return await finishRun(activeRun);
+        const record = next.value;
+        if (record?.kind === 'interaction_requested') {
+          const request = persist(() => store.requestInteraction(
+            activeRun.turnContext,
+            record.payload,
+          ));
+          refresh();
+          return resultFor(activeRun, 'waiting_user', { request });
+        }
+        if (record?.type === 'provider_native_id') {
+          activeRun.usesManagedRecords = true;
+          try {
+            persist(() => store.bindProviderNativeId(
+              activeRun.turnContext,
+              record.provider_native_id,
+            ));
+            record.acknowledge();
+          } catch (error) {
+            record.acknowledge(error);
+            throw error;
+          }
+          continue;
+        }
+        if (record?.type === 'normalized_event') {
+          activeRun.usesManagedRecords = true;
+          persist(() => store.appendAdapterEvent(activeRun.turnContext, record.event));
+          continue;
+        }
+        if (record?.type === 'turn_result') {
+          activeRun.usesManagedRecords = true;
+          activeRun.outcome = record.outcome;
+          continue;
+        }
+        persist(() => store.appendAdapterEvent(activeRun.turnContext, record));
+      }
+    } catch (error) {
+      return handleRunFailure(activeRun, error);
+    }
+  }
+
+  function advanceRun(activeRun) {
+    if (activeRun.advancing) return activeRun.advancing;
+    const advancing = driveRun(activeRun);
+    activeRun.advancing = advancing;
+    advancing.finally(() => {
+      if (activeRun.advancing === advancing) activeRun.advancing = null;
+    }).catch(() => {});
+    return advancing;
+  }
+
+  function createPermissionControls(activeRun, adapterContext) {
+    const { turnContext } = activeRun;
+    return Object.freeze({
+      async requestPermission(request, { signal } = {}) {
+        if (permissionHandler === null) {
+          return Object.freeze({
+            behavior: 'deny',
+            message: 'No permission handler is configured for this executor service.',
+            interrupt: false,
+          });
+        }
+        let controllers = permissionControllers.get(turnContext.turn_id);
+        if (!controllers) {
+          controllers = new Set();
+          permissionControllers.set(turnContext.turn_id, controllers);
+          persist(() => store.transitionTurn(turnContext, 'running', 'waiting_user'));
+        }
+        const controller = new AbortController();
+        controllers.add(controller);
+        const abort = () => controller.abort();
+        signal?.addEventListener?.('abort', abort, { once: true });
+        let decision;
+        try {
+          decision = await Promise.race([
+            permissionHandler(
+              Object.freeze({ ...request }),
+              adapterContext,
+              Object.freeze({ signal: controller.signal }),
+            ),
+            new Promise((resolve, reject) => {
+              controller.signal.addEventListener('abort', () => {
+                const error = new Error('Permission request was cancelled.');
+                error.name = 'AbortError';
+                reject(error);
+              }, { once: true });
+            }),
+          ]);
+        } finally {
+          signal?.removeEventListener?.('abort', abort);
+          controllers.delete(controller);
+          if (controllers.size === 0) {
+            permissionControllers.delete(turnContext.turn_id);
+            if (
+              !cancelledTurnIds.has(turnContext.turn_id)
+              && !closingPermissionTurnIds.has(turnContext.turn_id)
+            ) {
+              persist(() => store.transitionTurn(turnContext, 'waiting_user', 'running'));
+            }
+            closingPermissionTurnIds.delete(turnContext.turn_id);
+          }
+        }
+        if (!decision || !['allow', 'deny'].includes(decision.behavior)) {
+          throw new TypeError('permissionHandler must return an allow or deny decision');
+        }
+        return Object.freeze({ ...decision });
+      },
+    });
+  }
+
   async function runNext() {
     if (lifecycle !== 'open') {
       throw new Error(`Executor service is ${lifecycle}; it cannot claim another turn.`);
@@ -113,13 +341,24 @@ export function createExecutorService({
       refresh();
       return { status: 'idle' };
     }
-    let resolveRunSettlement;
-    const runSettlement = new Promise((resolve) => {
-      resolveRunSettlement = resolve;
+    let resolveSettlement;
+    const settlement = new Promise((resolve) => {
+      resolveSettlement = resolve;
     });
-    activeRunSettlements.add(runSettlement);
+    const activeRun = {
+      advancing: null,
+      durableSettled: false,
+      iterator: null,
+      outcome: null,
+      resolveSettlement,
+      settled: false,
+      settlement,
+      turnContext,
+      usesManagedRecords: false,
+    };
+    activeRunSettlements.add(settlement);
+    activeRuns.set(turnContext.turn_id, activeRun);
     activeTurns.set(turnContext.conversation_id, turnContext);
-    let durableSettled = false;
     try {
       refresh();
       persist(() => store.transitionTurn(turnContext, 'starting', 'running'));
@@ -132,182 +371,18 @@ export function createExecutorService({
         input: turnContext.input,
         attempt: Object.freeze({ ...turnContext.attempt }),
       });
-      const events = adapter.execute(adapterContext, Object.freeze({
-        async requestPermission(request, { signal } = {}) {
-          if (permissionHandler === null) {
-            return Object.freeze({
-              behavior: 'deny',
-              message: 'No permission handler is configured for this executor service.',
-              interrupt: false,
-            });
-          }
-          let controllers = permissionControllers.get(turnContext.turn_id);
-          if (!controllers) {
-            controllers = new Set();
-            permissionControllers.set(turnContext.turn_id, controllers);
-            persist(() => store.transitionTurn(turnContext, 'running', 'waiting_user'));
-          }
-          const controller = new AbortController();
-          controllers.add(controller);
-          const abort = () => controller.abort();
-          signal?.addEventListener?.('abort', abort, { once: true });
-          let decision;
-          try {
-            decision = await Promise.race([
-              permissionHandler(
-                Object.freeze({ ...request }),
-                adapterContext,
-                Object.freeze({ signal: controller.signal }),
-              ),
-              new Promise((resolve, reject) => {
-                controller.signal.addEventListener('abort', () => {
-                  const error = new Error('Permission request was cancelled.');
-                  error.name = 'AbortError';
-                  reject(error);
-                }, { once: true });
-              }),
-            ]);
-          } finally {
-            signal?.removeEventListener?.('abort', abort);
-            controllers.delete(controller);
-            if (controllers.size === 0) {
-              permissionControllers.delete(turnContext.turn_id);
-              if (
-                !cancelledTurnIds.has(turnContext.turn_id)
-                && !closingPermissionTurnIds.has(turnContext.turn_id)
-              ) {
-                persist(() => store.transitionTurn(turnContext, 'waiting_user', 'running'));
-              }
-              closingPermissionTurnIds.delete(turnContext.turn_id);
-            }
-          }
-          if (!decision || !['allow', 'deny'].includes(decision.behavior)) {
-            throw new TypeError('permissionHandler must return an allow or deny decision');
-          }
-          return Object.freeze({ ...decision });
-        },
-      }));
-      let outcome = null;
-      let usesManagedRecords = false;
-      for await (const record of events) {
-        if (record?.type === 'provider_native_id') {
-          usesManagedRecords = true;
-          try {
-            persist(() => store.bindProviderNativeId(turnContext, record.provider_native_id));
-            record.acknowledge();
-          } catch (error) {
-            record.acknowledge(error);
-            throw error;
-          }
-          continue;
-        }
-        if (record?.type === 'normalized_event') {
-          usesManagedRecords = true;
-          persist(() => store.appendAdapterEvent(turnContext, record.event));
-          continue;
-        }
-        if (record?.type === 'turn_result') {
-          usesManagedRecords = true;
-          outcome = record.outcome;
-          continue;
-        }
-        persist(() => store.appendAdapterEvent(turnContext, record));
+      const events = adapter.execute(
+        adapterContext,
+        createPermissionControls(activeRun, adapterContext),
+      );
+      if (!events || typeof events[Symbol.asyncIterator] !== 'function') {
+        throw new TypeError('adapter.execute must return an async iterable');
       }
-      if (uncertainTurnIds.has(turnContext.turn_id)) {
-        const { state } = store.assertCurrentFence(turnContext);
-        persist(() => store.transitionTurn(turnContext, state, 'recovering', {
-          error: null,
-        }));
-        durableSettled = true;
-        refresh();
-        return {
-          status: 'recovering',
-          conversation_id: turnContext.conversation_id,
-          turn_id: turnContext.turn_id,
-          ...turnContext.attempt,
-        };
-      }
-      const terminalState = outcome === 'cancelled'
-        ? 'stopped'
-        : (outcome === 'failed' ? 'failed' : 'completed');
-      const failure = outcome === 'failed' || (usesManagedRecords && outcome === null);
-      const { state } = store.assertCurrentFence(turnContext);
-      persist(() => store.transitionTurn(turnContext, state, failure ? 'failed' : terminalState, {
-        error: failure ? {
-          code: outcome === null ? 'provider_stream_ended' : 'provider_execution_failed',
-          category: 'provider',
-          retryable: false,
-          side_effect_status: 'unknown',
-          user_message: 'The provider turn did not complete successfully.',
-        } : null,
-      }));
-      durableSettled = true;
-      refresh();
-      return {
-        status: failure ? 'failed' : terminalState,
-        conversation_id: turnContext.conversation_id,
-        turn_id: turnContext.turn_id,
-        ...turnContext.attempt,
-      };
+      activeRun.iterator = events[Symbol.asyncIterator]();
     } catch (error) {
-      if (durableSettled) throw error;
-      if (error.persistenceFailure) {
-        if (typeof adapter.abort === 'function') {
-          await adapter.abort(turnContext);
-        }
-        throw error;
-      }
-      closingPermissionTurnIds.add(turnContext.turn_id);
-      for (const controller of permissionControllers.get(turnContext.turn_id) ?? []) {
-        controller.abort();
-      }
-      const cancelled = cancelledTurnIds.has(turnContext.turn_id);
-      const { state } = store.assertCurrentFence(turnContext);
-      if (uncertainTurnIds.has(turnContext.turn_id)) {
-        store.transitionTurn(turnContext, state, 'recovering', {
-          error: null,
-        });
-        durableSettled = true;
-        refresh();
-        return {
-          status: 'recovering',
-          conversation_id: turnContext.conversation_id,
-          turn_id: turnContext.turn_id,
-          ...turnContext.attempt,
-        };
-      }
-      const terminalState = cancelled ? 'stopped' : 'failed';
-      store.transitionTurn(turnContext, state, terminalState, {
-        error: cancelled ? null : {
-          code: 'provider_stream_failed',
-          category: 'provider',
-          retryable: false,
-          side_effect_status: 'unknown',
-          user_message: 'The provider stream ended before the turn completed.',
-        },
-      });
-      durableSettled = true;
-      refresh();
-      return {
-        status: terminalState,
-        conversation_id: turnContext.conversation_id,
-        turn_id: turnContext.turn_id,
-        ...turnContext.attempt,
-      };
-    } finally {
-      if (activeTurns.get(turnContext.conversation_id) === turnContext) {
-        activeTurns.delete(turnContext.conversation_id);
-      }
-      cancelledTurnIds.delete(turnContext.turn_id);
-      uncertainTurnIds.delete(turnContext.turn_id);
-      const controllers = permissionControllers.get(turnContext.turn_id);
-      if (!controllers || controllers.size === 0) {
-        permissionControllers.delete(turnContext.turn_id);
-        closingPermissionTurnIds.delete(turnContext.turn_id);
-      }
-      activeRunSettlements.delete(runSettlement);
-      resolveRunSettlement();
+      return handleRunFailure(activeRun, error);
     }
+    return advanceRun(activeRun);
   }
 
   async function cancel(conversationId) {
@@ -353,10 +428,29 @@ export function createExecutorService({
     return evicted;
   }
 
+  function submitInteractionAnswer(answer) {
+    return store.commitInteractionAnswer(answer);
+  }
+
+  async function deliverInteractionAnswer(handoffId) {
+    if (typeof adapter.handleInteractionAnswer !== 'function') {
+      throw new TypeError('adapter.handleInteractionAnswer must be a function');
+    }
+    const delivery = store.claimInteractionHandoff(handoffId);
+    const handlerAcknowledgement = await adapter.handleInteractionAnswer(
+      Object.freeze(delivery),
+    );
+    const acknowledgement = store.acknowledgeInteractionHandoff(handlerAcknowledgement);
+    const activeRun = activeRuns.get(delivery.request.turn_id);
+    const execution = acknowledgement.resumed && activeRun
+      ? await advanceRun(activeRun)
+      : null;
+    return { acknowledgement, execution };
+  }
+
   async function close() {
     if (closePromise) return closePromise;
     lifecycle = 'closing';
-    const settlements = [...activeRunSettlements];
     closePromise = (async () => {
       let closeError = null;
       try {
@@ -364,12 +458,24 @@ export function createExecutorService({
       } catch (error) {
         closeError = error;
       }
-      await Promise.allSettled(settlements);
+      for (const activeRun of activeRuns.values()) {
+        if (!activeRun.advancing && activeRun.iterator) advanceRun(activeRun);
+      }
+      await Promise.allSettled([...activeRunSettlements]);
       lifecycle = 'closed';
       if (closeError) throw closeError;
     })();
     return closePromise;
   }
 
-  return Object.freeze({ cancel, close, evictIdleExecutors, runNext, snapshot, start });
+  return Object.freeze({
+    cancel,
+    close,
+    deliverInteractionAnswer,
+    evictIdleExecutors,
+    runNext,
+    snapshot,
+    start,
+    submitInteractionAnswer,
+  });
 }

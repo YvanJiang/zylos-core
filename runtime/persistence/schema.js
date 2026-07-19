@@ -148,6 +148,58 @@ const RUNTIME_SCHEMA = `
     UNIQUE (turn_id, turn_version)
   );
 
+  CREATE TABLE IF NOT EXISTS runtime_interactions (
+    interaction_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),
+    lineage_id TEXT NOT NULL REFERENCES runtime_lineages(lineage_id),
+    ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+    state TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK (version > 0),
+    handoff_state TEXT NOT NULL,
+    handoff_version INTEGER CHECK (handoff_version IS NULL OR handoff_version > 0),
+    request_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (turn_id, ordinal)
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_interaction_answers (
+    answer_id TEXT PRIMARY KEY,
+    interaction_id TEXT NOT NULL UNIQUE REFERENCES runtime_interactions(interaction_id),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    answer_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    committed_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_interaction_handoffs (
+    handoff_id TEXT PRIMARY KEY,
+    interaction_id TEXT NOT NULL UNIQUE REFERENCES runtime_interactions(interaction_id),
+    answer_id TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL,
+    provider_attempt_id TEXT NOT NULL,
+    handoff_attempt_id TEXT,
+    handoff_attempt_no INTEGER CHECK (
+      handoff_attempt_no IS NULL OR handoff_attempt_no > 0
+    ),
+    lease_epoch INTEGER NOT NULL CHECK (lease_epoch > 0),
+    record_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_interaction_audit (
+    audit_id TEXT PRIMARY KEY,
+    interaction_id TEXT NOT NULL REFERENCES runtime_interactions(interaction_id),
+    handoff_id TEXT NOT NULL REFERENCES runtime_interaction_handoffs(handoff_id),
+    outcome TEXT NOT NULL,
+    provider_attempt_id TEXT NOT NULL,
+    lease_epoch INTEGER NOT NULL CHECK (lease_epoch > 0),
+    acknowledgement_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS runtime_outbox ${OUTBOX_TABLE_SCHEMA};
 
   CREATE TABLE IF NOT EXISTS runtime_delivery_lanes (
