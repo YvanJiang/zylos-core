@@ -7,6 +7,7 @@ import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/inde
 
 import {
   createIdempotencyKey,
+  validateDeliveryCommand,
   validateNormalizedEvent,
 } from '../contracts/public/index.js';
 import { createExecutorService } from '../runtime/executor/service.js';
@@ -96,6 +97,12 @@ function readAuthority(database, turnId, conversationId) {
       FROM runtime_outbox
       WHERE turn_id = ?
     `).get(turnId).count,
+    outbox: database.prepare(`
+      SELECT aggregate_type, aggregate_version, status, command_json
+      FROM runtime_outbox
+      WHERE turn_id = ?
+      ORDER BY aggregate_type ASC, aggregate_version ASC
+    `).all(turnId),
   };
 }
 
@@ -236,15 +243,26 @@ describe('runtime executor service', () => {
       lease_epoch: 1,
     })));
 
-    const eventOutbox = database.prepare(`
+    const turnOutbox = database.prepare(`
       SELECT aggregate_version, command_json
       FROM runtime_outbox
-      WHERE turn_id = ? AND aggregate_type = 'turn_event'
-      ORDER BY aggregate_version ASC
-    `).all(accepted.turn_id);
-    expect(eventOutbox.map(({ aggregate_version: version }) => version)).toEqual([3, 4, 5, 6]);
-    expect(eventOutbox.map(({ command_json: eventJson }) => JSON.parse(eventJson)))
-      .toEqual(events.slice(2));
+      WHERE turn_id = ? AND aggregate_type = 'turn_main'
+    `).get(accepted.turn_id);
+    expect(turnOutbox.aggregate_version).toBe(6);
+    const deliveryCommand = JSON.parse(turnOutbox.command_json);
+    expect(validateDeliveryCommand(deliveryCommand).forwarded).toEqual(deliveryCommand);
+    expect(deliveryCommand).toEqual(expect.objectContaining({
+      aggregate_type: 'turn_main',
+      aggregate_id: accepted.turn_id,
+      operation: 'create_main',
+      aggregate_version: 6,
+      event_sequence_through: 6,
+      render_model: expect.objectContaining({
+        phase: 'completed',
+        text: 'provider-neutral result',
+        terminal: true,
+      }),
+    }));
 
     database.close();
   });
@@ -319,8 +337,8 @@ describe('runtime executor service', () => {
     const before = readAuthority(database, accepted.turn_id, accepted.conversation_id);
     database.exec(`
       CREATE TRIGGER force_executor_outbox_failure
-      BEFORE INSERT ON runtime_outbox
-      WHEN NEW.aggregate_type = 'turn_event'
+      BEFORE UPDATE ON runtime_outbox
+      WHEN OLD.aggregate_type = 'turn_main' AND NEW.aggregate_version = 3
       BEGIN
         SELECT RAISE(ABORT, 'forced executor outbox failure');
       END;
@@ -341,8 +359,8 @@ describe('runtime executor service', () => {
     const before = readAuthority(database, accepted.turn_id, accepted.conversation_id);
     database.exec(`
       CREATE TRIGGER force_completion_outbox_failure
-      BEFORE INSERT ON runtime_outbox
-      WHEN NEW.aggregate_type = 'turn_event' AND NEW.aggregate_version = 5
+      BEFORE UPDATE ON runtime_outbox
+      WHEN OLD.aggregate_type = 'turn_main' AND NEW.aggregate_version = 5
       BEGIN
         SELECT RAISE(ABORT, 'forced completion outbox failure');
       END;
@@ -350,6 +368,32 @@ describe('runtime executor service', () => {
 
     expect(() => store.transitionTurn(turnContext, 'running', 'completed'))
       .toThrow(/forced completion outbox failure/);
+    expect(readAuthority(database, accepted.turn_id, accepted.conversation_id)).toEqual(before);
+
+    database.close();
+  });
+
+  test('rolls back adapter event version, event, and outbox projection as one commit', () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'atomic-adapter-event');
+    const store = createTestStore(database, 'atomic-adapter-event');
+    const turnContext = store.claimNextQueuedTurn();
+    store.transitionTurn(turnContext, 'starting', 'running');
+    const before = readAuthority(database, accepted.turn_id, accepted.conversation_id);
+    database.exec(`
+      CREATE TRIGGER force_adapter_event_outbox_failure
+      BEFORE UPDATE ON runtime_outbox
+      WHEN OLD.aggregate_type = 'turn_main' AND NEW.aggregate_version = 5
+      BEGIN
+        SELECT RAISE(ABORT, 'forced adapter event outbox failure');
+      END;
+    `);
+
+    expect(() => store.appendAdapterEvent(turnContext, {
+      kind: 'text_snapshot',
+      payload: { text: 'must roll back', end_offset: 14 },
+      provider_native_id: null,
+    })).toThrow(/forced adapter event outbox failure/);
     expect(readAuthority(database, accepted.turn_id, accepted.conversation_id)).toEqual(before);
 
     database.close();

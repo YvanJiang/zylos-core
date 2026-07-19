@@ -1,6 +1,7 @@
 import {
   admitNormalizedEvent,
   createNormalizedEventStreamState,
+  validateDeliveryCommand,
   validateNormalizedEvent,
 } from '../../contracts/public/index.js';
 import { initializeRuntimePersistence } from './schema.js';
@@ -130,7 +131,77 @@ function buildEvent({
   return event;
 }
 
-function persistEvent(database, turn, event, generateId) {
+function projectRenderModel(renderModel, event) {
+  let text = renderModel.text;
+  if (event.kind === 'text_snapshot') {
+    text = event.payload.text;
+  } else if (event.kind === 'text_delta') {
+    const currentText = event.payload.start_offset === 0 ? '' : (renderModel.text ?? '');
+    text = `${currentText.slice(0, event.payload.start_offset)}${event.payload.text}`;
+  }
+  return {
+    ...renderModel,
+    phase: event.phase,
+    text,
+    error: event.error,
+    terminal: event.phase === 'completed',
+  };
+}
+
+function projectPendingDelivery(database, turn, event) {
+  const pending = database.prepare(`
+    SELECT outbox_id, aggregate_version, command_json
+    FROM runtime_outbox
+    WHERE turn_id = ?
+      AND aggregate_type = 'turn_main'
+      AND status = 'pending'
+    ORDER BY aggregate_version DESC
+    LIMIT 1
+  `).get(turn.turn_id);
+  if (!pending) {
+    conflict(
+      'outbox_not_pending',
+      `Turn ${turn.turn_id} has no pending main delivery to project.`,
+    );
+  }
+  const currentCommand = JSON.parse(pending.command_json);
+  if (
+    currentCommand.contract !== 'zylos.delivery-command'
+    || currentCommand.aggregate_type !== 'turn_main'
+    || currentCommand.aggregate_id !== turn.turn_id
+    || currentCommand.operation !== 'create_main'
+  ) {
+    conflict(
+      'outbox_contract_mismatch',
+      `Turn ${turn.turn_id} has an incompatible pending main delivery.`,
+    );
+  }
+  const projectedCommand = {
+    ...currentCommand,
+    aggregate_version: event.turn_version,
+    event_sequence_through: event.event_sequence,
+    render_model: projectRenderModel(currentCommand.render_model, event),
+  };
+  validateDeliveryCommand(projectedCommand);
+  const projected = database.prepare(`
+    UPDATE runtime_outbox
+    SET aggregate_version = ?, command_json = ?
+    WHERE outbox_id = ?
+      AND aggregate_type = 'turn_main'
+      AND status = 'pending'
+      AND aggregate_version = ?
+  `).run(
+    event.turn_version,
+    JSON.stringify(projectedCommand),
+    pending.outbox_id,
+    pending.aggregate_version,
+  );
+  if (projected.changes !== 1) {
+    conflict('outbox_version_conflict', 'The pending main delivery changed concurrently.');
+  }
+}
+
+function persistEvent(database, turn, event) {
   const streamState = loadStreamState(database, turn.turn_id);
   admitNormalizedEvent(streamState, event);
   database.prepare(`
@@ -145,20 +216,33 @@ function persistEvent(database, turn, event, generateId) {
     JSON.stringify(event),
     event.persisted_at,
   );
-  database.prepare(`
-    INSERT INTO runtime_outbox (
-      outbox_id, delivery_id, aggregate_type, aggregate_id, turn_id, control_id,
-      aggregate_version, status, command_json, created_at
-    ) VALUES (?, ?, 'turn_event', ?, ?, NULL, ?, 'pending', ?, ?)
+  projectPendingDelivery(database, turn, event);
+}
+
+function commitTurnEvent(database, {
+  turn,
+  event,
+  fence,
+  nextState,
+  staleMessage,
+}) {
+  const updated = database.prepare(`
+    UPDATE runtime_turns
+    SET state = ?, turn_version = ?, committed_at = ?
+    WHERE turn_id = ? AND state = ?
+      AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
   `).run(
-    generateId('outbox'),
-    generateId('delivery'),
-    turn.turn_id,
-    turn.turn_id,
+    nextState,
     event.turn_version,
-    JSON.stringify(event),
     event.persisted_at,
+    turn.turn_id,
+    turn.state,
+    fence.attempt_id,
+    fence.attempt_no,
+    fence.lease_epoch,
   );
+  if (updated.changes !== 1) conflict('stale_attempt', staleMessage);
+  persistEvent(database, turn, event);
 }
 
 function transitionInTransaction(database, {
@@ -199,25 +283,13 @@ function transitionInTransaction(database, {
     occurredAt,
     generateId,
   });
-  const updated = database.prepare(`
-    UPDATE runtime_turns
-    SET state = ?, turn_version = ?, committed_at = ?
-    WHERE turn_id = ? AND state = ?
-      AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
-  `).run(
-    toState,
-    event.turn_version,
-    occurredAt,
-    turnId,
-    fromState,
-    fence.attempt_id,
-    fence.attempt_no,
-    fence.lease_epoch,
-  );
-  if (updated.changes !== 1) {
-    conflict('stale_attempt', 'The canonical turn transition lost its attempt fence.');
-  }
-  persistEvent(database, turn, event, generateId);
+  commitTurnEvent(database, {
+    turn,
+    event,
+    fence,
+    nextState: toState,
+    staleMessage: 'The canonical turn transition lost its attempt fence.',
+  });
   if (toState === 'completed') {
     const completedQueueEntry = database.prepare(`
       UPDATE runtime_turn_queue
@@ -432,23 +504,13 @@ export function createExecutorStore({
         occurredAt: now(),
         generateId,
       });
-      const updated = database.prepare(`
-        UPDATE runtime_turns
-        SET turn_version = ?, committed_at = ?
-        WHERE turn_id = ? AND state = 'running'
-          AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
-      `).run(
-        event.turn_version,
-        event.persisted_at,
-        turn.turn_id,
-        turnContext.attempt.attempt_id,
-        turnContext.attempt.attempt_no,
-        turnContext.attempt.lease_epoch,
-      );
-      if (updated.changes !== 1) {
-        conflict('stale_attempt', 'The adapter event lost its provider attempt fence.');
-      }
-      persistEvent(database, turn, event, generateId);
+      commitTurnEvent(database, {
+        turn,
+        event,
+        fence: turnContext.attempt,
+        nextState: 'running',
+        staleMessage: 'The adapter event lost its provider attempt fence.',
+      });
       return event;
     });
     return append.immediate();
