@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 
 import { ContractKernelError, createContractError } from './errors.js';
 import { canonicalizeJsonBytes } from './jcs.js';
+import { isPlainJsonObject } from './scalars.js';
 import { validateOpaqueId } from './validation.js';
 
 const KEY_PREFIX = 'zylos-idempotency-v1';
@@ -84,7 +85,7 @@ function projectValue(value, { scope, path, decimalPaths }) {
       decimalPaths,
     }));
   }
-  if (!value || typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) {
+  if (!isPlainJsonObject(value)) {
     rejectPayload(`${path || 'payload'} must contain JSON values only.`);
   }
 

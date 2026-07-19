@@ -1,4 +1,5 @@
 import { ContractKernelError, createContractError } from './errors.js';
+import { isPlainJsonObject, isWellFormedUnicode } from './scalars.js';
 import {
   validateContractHeader,
   validateOpaqueId,
@@ -28,12 +29,7 @@ export function rejectContract(
 }
 
 export function requirePlainObject(fieldName, value, { occurredAt } = {}) {
-  if (
-    !value
-    || typeof value !== 'object'
-    || Array.isArray(value)
-    || Object.getPrototypeOf(value) !== Object.prototype
-  ) {
+  if (!isPlainJsonObject(value)) {
     rejectContract('validation_error', `${fieldName} must be a JSON object.`, { occurredAt });
   }
   return value;
@@ -56,18 +52,26 @@ export function requireBoolean(fieldName, value, { occurredAt } = {}) {
 export function requireDisplayString(
   fieldName,
   value,
-  { nullable = false, occurredAt } = {},
+  { nullable = false, nonEmpty = true, occurredAt } = {},
 ) {
   if (nullable && value === null) return value;
-  if (typeof value !== 'string' || value.trim().length === 0) {
-    rejectContract('validation_error', `${fieldName} must be a non-empty string.`, { occurredAt });
+  if (
+    typeof value !== 'string'
+    || (nonEmpty && value.trim().length === 0)
+    || !isWellFormedUnicode(value)
+  ) {
+    rejectContract('validation_error', `${fieldName} must be a displayable string.`, { occurredAt });
   }
   return value;
 }
 
+export function requireOpaqueId(fieldName, value, { occurredAt } = {}) {
+  return validateOpaqueId(fieldName, value, { occurredAt });
+}
+
 export function requireNullableOpaqueId(fieldName, value, { occurredAt } = {}) {
   if (value === null) return value;
-  return validateOpaqueId(fieldName, value, { occurredAt });
+  return requireOpaqueId(fieldName, value, { occurredAt });
 }
 
 export function requirePositiveInteger(fieldName, value, { occurredAt } = {}) {
@@ -94,10 +98,30 @@ export function requireTimestamp(fieldName, value, { occurredAt } = {}) {
   return validateRfc3339Timestamp(fieldName, value, { occurredAt });
 }
 
+export function requireNullableTimestamp(fieldName, value, { occurredAt } = {}) {
+  if (value === null) return value;
+  return requireTimestamp(fieldName, value, { occurredAt });
+}
+
 export function requireOwnFields(fieldName, value, fieldNames, { occurredAt } = {}) {
   for (const childName of fieldNames) {
     if (!Object.hasOwn(value, childName)) {
       rejectContract('validation_error', `${fieldName}.${childName} is required.`, { occurredAt });
+    }
+  }
+}
+
+export function requireExactFields(fieldName, value, fieldNames, { occurredAt } = {}) {
+  requirePlainObject(fieldName, value, { occurredAt });
+  requireOwnFields(fieldName, value, fieldNames, { occurredAt });
+  const allowed = new Set(fieldNames);
+  for (const childName of Object.keys(value)) {
+    if (!allowed.has(childName)) {
+      rejectContract(
+        'validation_error',
+        `${fieldName}.${childName} is not allowed.`,
+        { occurredAt },
+      );
     }
   }
 }
