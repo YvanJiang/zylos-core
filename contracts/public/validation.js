@@ -14,6 +14,10 @@ const EXPLICIT_SECRET_FIELD_SUFFIXES = Object.freeze([
   'private_key',
   'access_key',
 ]);
+const PUBLIC_AUTHORIZATION_METADATA_FIELDS = new Set([
+  'authorization_policy_id',
+  'authorization_policy_version',
+]);
 const PRIVATE_PAYLOAD_FIELD_PATTERN = /^(?:raw_provider|raw_channel|provider_payload|channel_payload|provider_private|channel_private)(?:_|$)/i;
 const SECRET_VALUE_PATTERNS = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
@@ -103,6 +107,7 @@ function normalizeFixtureFieldName(fieldName) {
 
 function isSecretFixtureField(fieldName) {
   const normalized = normalizeFixtureFieldName(fieldName);
+  if (PUBLIC_AUTHORIZATION_METADATA_FIELDS.has(normalized)) return false;
   return SECRET_FIELD_PATTERN.test(normalized)
     || EXPLICIT_SECRET_FIELD_SUFFIXES.some(
       (secretName) => normalized === secretName || normalized.endsWith(`_${secretName}`),
@@ -204,6 +209,37 @@ function validateField(fieldName, value, rule, occurredAt) {
       });
     case 'critical_enum':
       return validateSafetyCriticalEnum(fieldName, value, rule.values ?? [], { occurredAt });
+    case 'text':
+      if (
+        typeof value !== 'string'
+        || (rule.nonEmpty !== false && value.trim().length === 0)
+        || !isWellFormedUnicode(value)
+      ) {
+        reject('validation_error', `${fieldName} must be a displayable string.`, occurredAt);
+      }
+      return value;
+    case 'boolean':
+      if (typeof value !== 'boolean') {
+        reject('validation_error', `${fieldName} must be a boolean.`, occurredAt);
+      }
+      return value;
+    case 'nullable_opaque_id':
+      return value === null
+        ? null
+        : validateOpaqueId(fieldName, value, { occurredAt });
+    case 'nullable_rfc3339':
+      return value === null
+        ? null
+        : validateRfc3339Timestamp(fieldName, value, { occurredAt });
+    case 'nullable_number':
+      return value === null
+        ? null
+        : validatePublicNumber(fieldName, value, {
+          allowDecimal: Boolean(rule.allowDecimal),
+          occurredAt,
+        });
+    case 'prevalidated':
+      return value;
     default:
       throw new TypeError(`unsupported contract field rule: ${String(rule.kind)}`);
   }

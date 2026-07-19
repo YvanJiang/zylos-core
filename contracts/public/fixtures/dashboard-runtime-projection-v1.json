@@ -1,0 +1,207 @@
+{
+  "fixture_version": "1.0",
+  "cases": {
+    "initial_full": {
+      "contract": "zylos.dashboard-runtime-projection",
+      "contract_version": "1.0",
+      "projection_id": "projection-A-10",
+      "dashboard_instance_id": "dashboard-A",
+      "projection_sequence": 10,
+      "generated_at": "2026-07-19T06:20:00Z",
+      "source_core_service_instance_id": "core-service-A",
+      "source_snapshot_version": 8,
+      "service": {
+        "health": "degraded",
+        "maintenance": false,
+        "reconciling": false,
+        "last_update_at": "2026-07-19T06:19:59Z"
+      },
+      "runtimes": [
+        {
+          "runtime_id": "runtime-conversation-A",
+          "conversation_id": "conversation-A",
+          "display_label": "Support group",
+          "provider": "claude",
+          "executor_health": "degraded",
+          "active_turn_state": "recovering",
+          "queue_length": 2,
+          "wait_reason": "interaction_delivery_unknown",
+          "side_effect_status": "unknown",
+          "last_changed_at": "2026-07-19T06:19:58Z"
+        }
+      ],
+      "capabilities": {
+        "supported_fields": ["service", "runtimes", "queue_length", "wait_reason", "side_effect_status"],
+        "supported_states": ["queued", "running", "waiting_user", "recovering", "completed", "stopped", "failed"],
+        "control": false,
+        "core_direct_access": false
+      },
+      "complete": true,
+      "error": null
+    },
+    "next": {
+      "contract": "zylos.dashboard-runtime-projection",
+      "contract_version": "1.0",
+      "projection_id": "projection-A-11",
+      "dashboard_instance_id": "dashboard-A",
+      "projection_sequence": 11,
+      "generated_at": "2026-07-19T06:20:02Z",
+      "source_core_service_instance_id": "core-service-A",
+      "source_snapshot_version": 9,
+      "service": {
+        "health": "healthy",
+        "maintenance": false,
+        "reconciling": false,
+        "last_update_at": "2026-07-19T06:20:01Z"
+      },
+      "runtimes": [
+        {
+          "runtime_id": "runtime-conversation-A",
+          "conversation_id": "conversation-A",
+          "display_label": "Support group",
+          "provider": "claude",
+          "executor_health": "healthy",
+          "active_turn_state": "running",
+          "queue_length": 2,
+          "wait_reason": null,
+          "side_effect_status": "none",
+          "last_changed_at": "2026-07-19T06:20:01Z"
+        }
+      ],
+      "capabilities": {
+        "supported_fields": ["service", "runtimes", "queue_length", "wait_reason", "side_effect_status"],
+        "supported_states": ["queued", "running", "waiting_user", "recovering", "completed", "stopped", "failed"],
+        "control": false,
+        "core_direct_access": false
+      },
+      "complete": true,
+      "error": null
+    },
+    "gap": {
+      "contract": "zylos.dashboard-runtime-projection",
+      "contract_version": "1.0",
+      "projection_id": "projection-A-13",
+      "dashboard_instance_id": "dashboard-A",
+      "projection_sequence": 13,
+      "generated_at": "2026-07-19T06:20:06Z",
+      "source_core_service_instance_id": "core-service-A",
+      "source_snapshot_version": 11,
+      "service": {
+        "health": "healthy",
+        "maintenance": false,
+        "reconciling": false,
+        "last_update_at": "2026-07-19T06:20:05Z"
+      },
+      "runtimes": [],
+      "capabilities": {
+        "supported_fields": ["service", "runtimes", "queue_length", "wait_reason", "side_effect_status"],
+        "supported_states": ["queued", "running", "waiting_user", "recovering", "completed", "stopped", "failed"],
+        "control": false,
+        "core_direct_access": false
+      },
+      "complete": true,
+      "error": null
+    },
+    "degraded": {
+      "contract": "zylos.dashboard-runtime-projection",
+      "contract_version": "1.0",
+      "projection_id": "projection-A-14",
+      "dashboard_instance_id": "dashboard-A",
+      "projection_sequence": 14,
+      "generated_at": "2026-07-19T06:20:08Z",
+      "source_core_service_instance_id": "core-service-A",
+      "source_snapshot_version": 12,
+      "service": {
+        "health": "degraded",
+        "maintenance": false,
+        "reconciling": true,
+        "last_update_at": "2026-07-19T06:20:07Z"
+      },
+      "runtimes": [],
+      "capabilities": {
+        "supported_fields": ["service", "runtimes", "queue_length", "wait_reason", "side_effect_status"],
+        "supported_states": ["queued", "running", "waiting_user", "recovering", "completed", "stopped", "failed"],
+        "control": false,
+        "core_direct_access": false
+      },
+      "complete": false,
+      "error": {
+        "code": "observability_degraded",
+        "category": "storage",
+        "retryable": true,
+        "side_effect_status": "none",
+        "user_message": "The projection is partial; missing runtimes must not be shown as idle.",
+        "detail_ref": "diagnostic:projection-A-14",
+        "occurred_at": "2026-07-19T06:20:08Z"
+      }
+    },
+    "replacement_instance": {
+      "contract": "zylos.dashboard-runtime-projection",
+      "contract_version": "1.0",
+      "projection_id": "projection-B-1",
+      "dashboard_instance_id": "dashboard-B",
+      "projection_sequence": 1,
+      "generated_at": "2026-07-19T06:21:00Z",
+      "source_core_service_instance_id": "core-service-B",
+      "source_snapshot_version": 1,
+      "service": {
+        "health": "healthy",
+        "maintenance": false,
+        "reconciling": false,
+        "last_update_at": "2026-07-19T06:20:59Z"
+      },
+      "runtimes": [],
+      "capabilities": {
+        "supported_fields": ["service", "runtimes", "queue_length", "wait_reason", "side_effect_status"],
+        "supported_states": ["queued", "running", "waiting_user", "recovering", "completed", "stopped", "failed"],
+        "control": false,
+        "core_direct_access": false
+      },
+      "complete": true,
+      "error": null
+    },
+    "unsupported_major": {
+      "contract": "zylos.dashboard-runtime-projection",
+      "contract_version": "2.0",
+      "projection_id": "projection-A-major-2",
+      "dashboard_instance_id": "dashboard-A",
+      "projection_sequence": 15,
+      "generated_at": "2026-07-19T06:20:10Z",
+      "source_core_service_instance_id": "core-service-A",
+      "source_snapshot_version": 13,
+      "service": { "health": "healthy", "maintenance": false, "reconciling": false, "last_update_at": "2026-07-19T06:20:09Z" },
+      "runtimes": [],
+      "capabilities": { "supported_fields": ["service", "runtimes"], "supported_states": ["running"], "control": false, "core_direct_access": false },
+      "complete": true,
+      "error": null
+    },
+    "unknown_state": {
+      "contract": "zylos.dashboard-runtime-projection",
+      "contract_version": "1.0",
+      "projection_id": "projection-A-unknown-state",
+      "dashboard_instance_id": "dashboard-A",
+      "projection_sequence": 15,
+      "generated_at": "2026-07-19T06:20:10Z",
+      "source_core_service_instance_id": "core-service-A",
+      "source_snapshot_version": 13,
+      "service": { "health": "healthy", "maintenance": false, "reconciling": false, "last_update_at": "2026-07-19T06:20:09Z" },
+      "runtimes": [
+        {
+          "runtime_id": "runtime-conversation-A",
+          "conversation_id": "conversation-A",
+          "display_label": "Support group",
+          "provider": "claude",
+          "executor_health": "healthy",
+          "active_turn_state": "retrying",
+          "queue_length": 0,
+          "wait_reason": null,
+          "side_effect_status": "none",
+          "last_changed_at": "2026-07-19T06:20:09Z"
+        }
+      ],
+      "capabilities": { "supported_fields": ["service", "runtimes"], "supported_states": ["running"], "control": false, "core_direct_access": false },
+      "complete": true,
+      "error": null
+    }
+  }
+}

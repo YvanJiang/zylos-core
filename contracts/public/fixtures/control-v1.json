@@ -1,0 +1,349 @@
+{
+  "fixture_version": "1.0",
+  "requests": {
+    "inspect": {
+      "contract": "zylos.control-request",
+      "contract_version": "1.0",
+      "trace_id": "trace-inspect-A",
+      "caller_namespace": "dashboard.prod",
+      "control_id": "inspect-A",
+      "action": "inspect",
+      "target": { "aggregate_type": "conversation", "conversation_id": "conversation-A" },
+      "expected_version": null,
+      "actor": {
+        "type": "user",
+        "actor_id": "operator-A",
+        "authenticated": true,
+        "roles": ["observability-operator"],
+        "capabilities": [
+          {
+            "capability": "runtime.inspect",
+            "scope": { "scope_type": "bot", "region": "cn", "tenant_id": "tenant-A", "bot_id": "bot-A", "conversation_id": null, "service_instance_id": null, "recovery_id": null },
+            "policy_id": "runtime-operations",
+            "policy_version": 3,
+            "grant_id": "grant-inspect-A",
+            "expires_at": null
+          }
+        ]
+      },
+      "auth_context": {
+        "source": "dashboard_session",
+        "auth_subject_id": "subject-A",
+        "tenant_id": "tenant-A",
+        "bot_id": "bot-A",
+        "authorization_policy_id": "runtime-operations",
+        "authorization_policy_version": 3,
+        "authenticated_at": "2026-07-19T05:00:00Z"
+      },
+      "reason": "Inspect the selected conversation runtime.",
+      "idempotency_key": "zid:v1:control:ef9ee856628a2cdef23f42fc6094340776a95688028f6ba72fc7913fe00821c1",
+      "created_at": "2026-07-19T06:10:00Z"
+    },
+    "stop_active_turn": {
+      "contract": "zylos.control-request",
+      "contract_version": "1.0",
+      "trace_id": "trace-stop-A",
+      "caller_namespace": "dashboard.prod",
+      "control_id": "stop-A",
+      "action": "stop_active_turn",
+      "target": { "aggregate_type": "turn", "conversation_id": "conversation-A", "turn_id": "turn-A" },
+      "expected_version": { "aggregate_type": "turn", "aggregate_id": "turn-A", "version": 19 },
+      "actor": {
+        "type": "user",
+        "actor_id": "operator-A",
+        "authenticated": true,
+        "roles": ["conversation-operator"],
+        "capabilities": [
+          {
+            "capability": "turn.stop",
+            "scope": { "scope_type": "conversation", "region": "cn", "tenant_id": "tenant-A", "bot_id": "bot-A", "conversation_id": "conversation-A", "service_instance_id": null, "recovery_id": null },
+            "policy_id": "runtime-operations",
+            "policy_version": 3,
+            "grant_id": "grant-stop-A",
+            "expires_at": "2026-07-19T07:00:00Z"
+          }
+        ]
+      },
+      "auth_context": {
+        "source": "dashboard_session",
+        "auth_subject_id": "subject-A",
+        "tenant_id": "tenant-A",
+        "bot_id": "bot-A",
+        "authorization_policy_id": "runtime-operations",
+        "authorization_policy_version": 3,
+        "authenticated_at": "2026-07-19T05:00:00Z"
+      },
+      "reason": "Stop the active turn after operator review.",
+      "idempotency_key": "zid:v1:control:8ecfbfc3ac106b5b92548e285f2d0c400530efea90a5d4d91222419f94644767",
+      "created_at": "2026-07-19T06:11:00Z"
+    },
+    "clear_unstarted_queue": {
+      "contract": "zylos.control-request",
+      "contract_version": "1.0",
+      "trace_id": "trace-clear-A",
+      "caller_namespace": "dashboard.prod",
+      "control_id": "clear-A",
+      "action": "clear_unstarted_queue",
+      "target": { "aggregate_type": "queue", "conversation_id": "conversation-A", "through_queue_sequence": 42 },
+      "expected_version": { "aggregate_type": "queue", "aggregate_id": "conversation-A", "version": 8 },
+      "actor": {
+        "type": "service",
+        "actor_id": "dashboard-service-A",
+        "authenticated": true,
+        "roles": ["conversation-operator"],
+        "capabilities": [
+          {
+            "capability": "queue.clear",
+            "scope": { "scope_type": "bot", "region": "cn", "tenant_id": "tenant-A", "bot_id": "bot-A", "conversation_id": null, "service_instance_id": null, "recovery_id": null },
+            "policy_id": "runtime-operations",
+            "policy_version": 3,
+            "grant_id": "grant-clear-A",
+            "expires_at": null
+          }
+        ]
+      },
+      "auth_context": {
+        "source": "service_credential",
+        "auth_subject_id": "subject-dashboard-service-A",
+        "tenant_id": "tenant-A",
+        "bot_id": "bot-A",
+        "authorization_policy_id": "runtime-operations",
+        "authorization_policy_version": 3,
+        "authenticated_at": "2026-07-19T05:00:00Z"
+      },
+      "reason": "Clear only the queued turns through the fenced sequence.",
+      "idempotency_key": "zid:v1:control:6d5c153901580c67f4a43d2628ef6a1be9b690d93379eea47e3104d73b0decac",
+      "created_at": "2026-07-19T06:12:00Z"
+    },
+    "reconcile": {
+      "contract": "zylos.control-request",
+      "contract_version": "1.0",
+      "trace_id": "trace-reconcile-A",
+      "caller_namespace": "dashboard.prod",
+      "control_id": "reconcile-A",
+      "action": "reconcile",
+      "target": { "aggregate_type": "service", "service_instance_id": "core-service-A" },
+      "expected_version": { "aggregate_type": "service", "aggregate_id": "core-service-A", "version": 12 },
+      "actor": {
+        "type": "service",
+        "actor_id": "runtime-operator-A",
+        "authenticated": true,
+        "roles": ["runtime-operator"],
+        "capabilities": [
+          {
+            "capability": "service.reconcile",
+            "scope": { "scope_type": "service", "region": "cn", "tenant_id": "tenant-A", "bot_id": null, "conversation_id": null, "service_instance_id": "core-service-A", "recovery_id": null },
+            "policy_id": "runtime-operations",
+            "policy_version": 3,
+            "grant_id": "grant-reconcile-A",
+            "expires_at": null
+          }
+        ]
+      },
+      "auth_context": {
+        "source": "service_credential",
+        "auth_subject_id": "subject-runtime-operator-A",
+        "tenant_id": "tenant-A",
+        "bot_id": null,
+        "authorization_policy_id": "runtime-operations",
+        "authorization_policy_version": 3,
+        "authenticated_at": "2026-07-19T05:00:00Z"
+      },
+      "reason": "Register a fenced reconciliation intent.",
+      "idempotency_key": "zid:v1:control:e9cffb79bcd41ef04f327b6b17401d354ebdf93eca352e354bcae7463583ae71",
+      "created_at": "2026-07-19T06:13:00Z"
+    },
+    "evict_idle_executor": {
+      "contract": "zylos.control-request",
+      "contract_version": "1.0",
+      "trace_id": "trace-evict-A",
+      "caller_namespace": "dashboard.prod",
+      "control_id": "evict-A",
+      "action": "evict_idle_executor",
+      "target": { "aggregate_type": "executor", "conversation_id": "conversation-B", "executor_instance_id": "executor-B" },
+      "expected_version": { "aggregate_type": "executor", "aggregate_id": "executor-B", "version": 5 },
+      "actor": {
+        "type": "user",
+        "actor_id": "runtime-operator-A",
+        "authenticated": true,
+        "roles": ["runtime-operator"],
+        "capabilities": [
+          {
+            "capability": "executor.evict",
+            "scope": { "scope_type": "bot", "region": "cn", "tenant_id": "tenant-A", "bot_id": "bot-A", "conversation_id": null, "service_instance_id": null, "recovery_id": null },
+            "policy_id": "runtime-operations",
+            "policy_version": 3,
+            "grant_id": "grant-evict-A",
+            "expires_at": null
+          }
+        ]
+      },
+      "auth_context": {
+        "source": "dashboard_session",
+        "auth_subject_id": "subject-runtime-operator-A",
+        "tenant_id": "tenant-A",
+        "bot_id": "bot-A",
+        "authorization_policy_id": "runtime-operations",
+        "authorization_policy_version": 3,
+        "authenticated_at": "2026-07-19T05:00:00Z"
+      },
+      "reason": "Evict a verified idle executor without deleting its lineage.",
+      "idempotency_key": "zid:v1:control:6d4a53aaf8324452c856ad6f6d8e8dd2b771125c2c3b584df0cc8b2e82eae240",
+      "created_at": "2026-07-19T06:14:00Z"
+    },
+    "confirm_recovery": {
+      "contract": "zylos.control-request",
+      "contract_version": "1.0",
+      "trace_id": "trace-confirm-A",
+      "caller_namespace": "dashboard.prod",
+      "control_id": "confirm-A",
+      "action": "confirm_recovery",
+      "target": { "aggregate_type": "recovery", "recovery_id": "recovery-A", "conversation_id": "conversation-A", "turn_id": "turn-A" },
+      "expected_version": { "aggregate_type": "recovery", "aggregate_id": "recovery-A", "version": 2 },
+      "actor": {
+        "type": "user",
+        "actor_id": "recovery-approver-A",
+        "authenticated": true,
+        "roles": ["recovery-approver"],
+        "capabilities": [
+          {
+            "capability": "recovery.decide",
+            "scope": { "scope_type": "recovery", "region": "cn", "tenant_id": "tenant-A", "bot_id": "bot-A", "conversation_id": "conversation-A", "service_instance_id": null, "recovery_id": "recovery-A" },
+            "policy_id": "runtime-operations",
+            "policy_version": 3,
+            "grant_id": "grant-confirm-A",
+            "expires_at": "2026-07-19T06:30:00Z"
+          }
+        ]
+      },
+      "auth_context": {
+        "source": "platform_admin_bridge",
+        "auth_subject_id": "subject-recovery-approver-A",
+        "tenant_id": "tenant-A",
+        "bot_id": "bot-A",
+        "authorization_policy_id": "runtime-operations",
+        "authorization_policy_version": 3,
+        "authenticated_at": "2026-07-19T06:00:00Z"
+      },
+      "reason": "Confirm creation of one related recovery turn.",
+      "idempotency_key": "zid:v1:control:20fee57d2136ceb67de6c3f8e8a214ef98b253faa927e7495b0e7a8b1d3d4114",
+      "created_at": "2026-07-19T06:15:00Z"
+    },
+    "reject_recovery": {
+      "contract": "zylos.control-request",
+      "contract_version": "1.0",
+      "trace_id": "trace-reject-A",
+      "caller_namespace": "dashboard.prod",
+      "control_id": "reject-A",
+      "action": "reject_recovery",
+      "target": { "aggregate_type": "recovery", "recovery_id": "recovery-B", "conversation_id": "conversation-B", "turn_id": "turn-B" },
+      "expected_version": { "aggregate_type": "recovery", "aggregate_id": "recovery-B", "version": 4 },
+      "actor": {
+        "type": "user",
+        "actor_id": "recovery-approver-A",
+        "authenticated": true,
+        "roles": ["recovery-approver"],
+        "capabilities": [
+          {
+            "capability": "recovery.decide",
+            "scope": { "scope_type": "recovery", "region": "cn", "tenant_id": "tenant-A", "bot_id": "bot-A", "conversation_id": "conversation-B", "service_instance_id": null, "recovery_id": "recovery-B" },
+            "policy_id": "runtime-operations",
+            "policy_version": 3,
+            "grant_id": "grant-reject-A",
+            "expires_at": "2026-07-19T06:30:00Z"
+          }
+        ]
+      },
+      "auth_context": {
+        "source": "platform_admin_bridge",
+        "auth_subject_id": "subject-recovery-approver-A",
+        "tenant_id": "tenant-A",
+        "bot_id": "bot-A",
+        "authorization_policy_id": "runtime-operations",
+        "authorization_policy_version": 3,
+        "authenticated_at": "2026-07-19T06:00:00Z"
+      },
+      "reason": "Reject recovery and keep the original work terminal.",
+      "idempotency_key": "zid:v1:control:ff96974b49efc3dba78b6ea98a89a5823f71e195c3efc80e7e0d614a83102a3a",
+      "created_at": "2026-07-19T06:16:00Z"
+    }
+  },
+  "results": {
+    "stop_completed": {
+      "contract": "zylos.control-result",
+      "contract_version": "1.0",
+      "trace_id": "trace-stop-A",
+      "caller_namespace": "dashboard.prod",
+      "control_id": "stop-A",
+      "control_result_version": 1,
+      "status": "completed",
+      "target": { "aggregate_type": "turn", "conversation_id": "conversation-A", "turn_id": "turn-A" },
+      "previous_target_version": 19,
+      "target_version": 20,
+      "audit_id": "audit-stop-A",
+      "result": { "winner": "stop", "active_turn_id": "turn-A", "active_turn_version": 20, "priority_turn_created": false, "priority_turn_cancelled": false },
+      "error": null,
+      "accepted_at": "2026-07-19T06:11:01Z",
+      "completed_at": "2026-07-19T06:11:02Z"
+    },
+    "reconcile_accepted": {
+      "contract": "zylos.control-result",
+      "contract_version": "1.0",
+      "trace_id": "trace-reconcile-A",
+      "caller_namespace": "dashboard.prod",
+      "control_id": "reconcile-A",
+      "control_result_version": 1,
+      "status": "accepted",
+      "target": { "aggregate_type": "service", "service_instance_id": "core-service-A" },
+      "previous_target_version": 12,
+      "target_version": 13,
+      "audit_id": "audit-reconcile-A",
+      "result": { "intent_id": "reconciliation-intent-A", "state": "pending" },
+      "error": null,
+      "accepted_at": "2026-07-19T06:13:01Z",
+      "completed_at": null
+    },
+    "reconcile_completed": {
+      "contract": "zylos.control-result",
+      "contract_version": "1.0",
+      "trace_id": "trace-reconcile-A",
+      "caller_namespace": "dashboard.prod",
+      "control_id": "reconcile-A",
+      "control_result_version": 2,
+      "status": "completed",
+      "target": { "aggregate_type": "service", "service_instance_id": "core-service-A" },
+      "previous_target_version": 12,
+      "target_version": 14,
+      "audit_id": "audit-reconcile-A",
+      "result": { "intent_id": "reconciliation-intent-A", "state": "completed" },
+      "error": null,
+      "accepted_at": "2026-07-19T06:13:01Z",
+      "completed_at": "2026-07-19T06:13:05Z"
+    },
+    "forbidden_policy": {
+      "contract": "zylos.control-result",
+      "contract_version": "1.0",
+      "trace_id": "trace-forbidden-A",
+      "caller_namespace": "dashboard.prod",
+      "control_id": "forbidden-A",
+      "control_result_version": 1,
+      "status": "forbidden",
+      "target": { "aggregate_type": "service", "service_instance_id": "core-service-A" },
+      "previous_target_version": null,
+      "target_version": null,
+      "audit_id": "audit-forbidden-A",
+      "result": null,
+      "error": {
+        "code": "forbidden",
+        "category": "authorization",
+        "retryable": false,
+        "side_effect_status": "none",
+        "user_message": "The capability grant or policy version is not authorized for this target.",
+        "detail_ref": "diagnostic:control-forbidden-A",
+        "occurred_at": "2026-07-19T06:17:00Z"
+      },
+      "accepted_at": null,
+      "completed_at": "2026-07-19T06:17:00Z"
+    }
+  }
+}
