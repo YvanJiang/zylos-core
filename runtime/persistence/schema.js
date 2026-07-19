@@ -1,0 +1,116 @@
+const RUNTIME_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS runtime_conversations (
+    conversation_id TEXT PRIMARY KEY,
+    conversation_key TEXT NOT NULL UNIQUE,
+    region TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    bot_id TEXT NOT NULL,
+    chat_type TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    native_thread_or_topic_id TEXT,
+    last_queue_sequence INTEGER NOT NULL DEFAULT 0 CHECK (last_queue_sequence >= 0),
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_lineages (
+    lineage_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    lineage_kind TEXT NOT NULL,
+    is_default INTEGER NOT NULL CHECK (is_default IN (0, 1)),
+    created_at TEXT NOT NULL
+  );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS runtime_lineages_one_default
+    ON runtime_lineages(conversation_id)
+    WHERE is_default = 1;
+
+  CREATE TABLE IF NOT EXISTS runtime_inbound_events (
+    inbound_event_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    message_id TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    envelope_json TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    committed_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_turns (
+    turn_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    lineage_id TEXT REFERENCES runtime_lineages(lineage_id),
+    inbound_event_id TEXT NOT NULL UNIQUE REFERENCES runtime_inbound_events(inbound_event_id),
+    state TEXT NOT NULL,
+    turn_version INTEGER NOT NULL CHECK (turn_version > 0),
+    queue_sequence INTEGER NOT NULL CHECK (queue_sequence > 0),
+    created_at TEXT NOT NULL,
+    committed_at TEXT NOT NULL,
+    UNIQUE (conversation_id, queue_sequence)
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_turn_queue (
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    queue_sequence INTEGER NOT NULL CHECK (queue_sequence > 0),
+    turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
+    status TEXT NOT NULL,
+    enqueued_at TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, queue_sequence)
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_normalized_events (
+    event_id TEXT PRIMARY KEY,
+    turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),
+    event_sequence INTEGER NOT NULL CHECK (event_sequence > 0),
+    turn_version INTEGER NOT NULL CHECK (turn_version > 0),
+    event_json TEXT NOT NULL,
+    persisted_at TEXT NOT NULL,
+    UNIQUE (turn_id, event_sequence),
+    UNIQUE (turn_id, turn_version)
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_outbox (
+    outbox_id TEXT PRIMARY KEY,
+    delivery_id TEXT NOT NULL UNIQUE,
+    aggregate_type TEXT NOT NULL,
+    aggregate_id TEXT NOT NULL,
+    turn_id TEXT REFERENCES runtime_turns(turn_id),
+    control_id TEXT,
+    aggregate_version INTEGER NOT NULL CHECK (aggregate_version > 0),
+    status TEXT NOT NULL,
+    command_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (aggregate_type, aggregate_id, aggregate_version)
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_inbound_idempotency (
+    idempotency_key TEXT PRIMARY KEY,
+    inbound_event_id TEXT NOT NULL UNIQUE REFERENCES runtime_inbound_events(inbound_event_id),
+    payload_hash TEXT NOT NULL,
+    first_result_json TEXT NOT NULL,
+    committed_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_message_mappings (
+    region TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    bot_id TEXT NOT NULL,
+    platform_message_id TEXT NOT NULL,
+    conversation_id TEXT REFERENCES runtime_conversations(conversation_id),
+    turn_id TEXT REFERENCES runtime_turns(turn_id),
+    lineage_id TEXT REFERENCES runtime_lineages(lineage_id),
+    binding_state TEXT NOT NULL,
+    reason TEXT,
+    mapping_id TEXT NOT NULL UNIQUE,
+    mapping_version INTEGER NOT NULL CHECK (mapping_version > 0),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (region, tenant_id, channel, bot_id, platform_message_id)
+  );
+`;
+
+export function initializeRuntimePersistence(database) {
+  database.pragma('journal_mode = WAL');
+  database.pragma('busy_timeout = 5000');
+  database.pragma('foreign_keys = ON');
+  database.exec(RUNTIME_SCHEMA);
+}
