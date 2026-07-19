@@ -252,8 +252,31 @@ const IGNORED_SCOPED_NOTIFICATIONS = Object.freeze(new Set([
   'item/reasoning/summaryTextDelta',
   'item/reasoning/textDelta',
   'thread/compacted',
+  'thread/tokenUsage/updated',
   'turn/diff/updated',
+  'turn/moderationMetadata',
   'turn/plan/updated',
+]));
+
+const HOOK_EVENT_NAMES = Object.freeze(new Set([
+  'preToolUse',
+  'permissionRequest',
+  'postToolUse',
+  'preCompact',
+  'postCompact',
+  'sessionStart',
+  'userPromptSubmit',
+  'subagentStart',
+  'subagentStop',
+  'stop',
+]));
+const HOOK_HANDLER_TYPES = Object.freeze(new Set(['command', 'prompt', 'agent']));
+const HOOK_EXECUTION_MODES = Object.freeze(new Set(['sync', 'async']));
+const HOOK_TERMINAL_STATUSES = Object.freeze(new Set([
+  'completed',
+  'failed',
+  'blocked',
+  'stopped',
 ]));
 
 function isRecord(value) {
@@ -367,6 +390,19 @@ function toolDescriptor(run, itemId, specification, kind, verb) {
   };
 }
 
+function hookDescriptor(run, toolUseId, kind, verb) {
+  return {
+    kind,
+    provider_native_id: run.thread_id,
+    payload: {
+      tool_use_id: toolUseId,
+      tool_name: 'provider_hook',
+      summary: `Provider hook ${verb}.`,
+      side_effect_status: 'unknown',
+    },
+  };
+}
+
 function textSnapshot(run) {
   return run.text_item_order.map((itemId) => run.text_by_item.get(itemId) ?? '').join('');
 }
@@ -429,6 +465,25 @@ function requireTurnResult(result) {
     rejectProtocol('Codex app-server returned a turn without an ID.');
   }
   return turnId;
+}
+
+function requireEmptyResult(result, method) {
+  if (!isRecord(result) || Object.keys(result).length !== 0) {
+    rejectProtocol(`Codex app-server returned an invalid ${method} response.`);
+  }
+}
+
+function requireThreadHistory(result) {
+  const turns = result?.thread?.turns;
+  if (!Array.isArray(turns)) {
+    rejectProtocol('Codex app-server reloaded a thread without bounded turn history.');
+  }
+  return turns.map((turn) => {
+    if (typeof turn?.id !== 'string' || turn.id.length === 0) {
+      rejectProtocol('Codex app-server reloaded a thread with an invalid turn fence.');
+    }
+    return turn.id;
+  });
 }
 
 function sameAttempt(left, right) {
@@ -509,6 +564,7 @@ export function createCodexAppServerAdapter({
   let connection = null;
   let connecting = null;
   let nextConnectionNo = 0;
+  let nextHookNo = 0;
   let nextInteractionNo = 0;
 
   function rememberConnectionFence(target, fences, key, value = true) {
@@ -739,6 +795,57 @@ export function createCodexAppServerAdapter({
       return;
     }
     if (IGNORED_SCOPED_NOTIFICATIONS.has(method)) return;
+    if (method === 'hook/started') {
+      const hook = params.run;
+      if (
+        !isRecord(hook)
+        || typeof hook.id !== 'string'
+        || hook.id.length === 0
+        || hook.scope !== 'turn'
+        || hook.status !== 'running'
+        || !HOOK_EVENT_NAMES.has(hook.eventName)
+        || !HOOK_HANDLER_TYPES.has(hook.handlerType)
+        || !HOOK_EXECUTION_MODES.has(hook.executionMode)
+        || run.hook_runs.has(hook.id)
+      ) {
+        failConnection(target, new CodexAppServerAdapterError(
+          'provider_protocol_invalid',
+          'Codex app-server emitted an invalid or duplicate turn hook start.',
+        ));
+        return;
+      }
+      nextHookNo += 1;
+      const started = {
+        event_name: hook.eventName,
+        execution_mode: hook.executionMode,
+        handler_type: hook.handlerType,
+        tool_use_id: `provider-hook-${nextHookNo}`,
+      };
+      run.hook_runs.set(hook.id, started);
+      run.queue.push(hookDescriptor(run, started.tool_use_id, 'tool_started', 'started'));
+      return;
+    }
+    if (method === 'hook/completed') {
+      const hook = params.run;
+      const started = isRecord(hook) ? run.hook_runs.get(hook.id) : null;
+      if (
+        !started
+        || hook.scope !== 'turn'
+        || !HOOK_TERMINAL_STATUSES.has(hook.status)
+        || hook.eventName !== started.event_name
+        || hook.handlerType !== started.handler_type
+        || hook.executionMode !== started.execution_mode
+      ) {
+        failConnection(target, new CodexAppServerAdapterError(
+          'provider_protocol_invalid',
+          'Codex app-server emitted a mismatched turn hook completion.',
+        ));
+        return;
+      }
+      run.hook_runs.delete(hook.id);
+      run.queue.push(hookDescriptor(run, started.tool_use_id, 'tool_finished', hook.status));
+      return;
+    }
     if (method === 'item/agentMessage/delta') {
       if (
         typeof params.itemId !== 'string'
@@ -900,10 +1007,10 @@ export function createCodexAppServerAdapter({
         ));
         return;
       }
-      if (status === 'completed' && run.tool_items.size > 0) {
+      if (status === 'completed' && (run.tool_items.size > 0 || run.hook_runs.size > 0)) {
         failConnection(target, new CodexAppServerAdapterError(
           'provider_protocol_invalid',
-          'Codex app-server completed a turn with unfinished tools.',
+          'Codex app-server completed a turn with unfinished tools or hooks.',
         ));
         return;
       }
@@ -1523,9 +1630,18 @@ export function createCodexAppServerAdapter({
         ));
         return;
       }
+      const hasResult = Object.hasOwn(message, 'result');
+      const hasError = Object.hasOwn(message, 'error');
+      if (hasResult === hasError) {
+        failConnection(target, new CodexAppServerAdapterError(
+          'provider_protocol_invalid',
+          'Codex app-server returned an ambiguous JSON-RPC response.',
+        ));
+        return;
+      }
       rememberConnectionFence(target, target.settled_client_request_ids, responseId);
       target.pending.delete(responseId);
-      if (Object.hasOwn(message, 'error')) {
+      if (hasError) {
         pending.reject(new CodexAppServerAdapterError(
           'provider_request_failed',
           `Codex app-server rejected ${pending.method}.`,
@@ -1706,6 +1822,13 @@ export function createCodexAppServerAdapter({
         sandbox,
       });
       requireThreadResult(result, persistedThreadId);
+      for (const turnId of requireThreadHistory(result)) {
+        rememberConnectionFence(
+          target,
+          target.retired_run_keys,
+          activeRunKey(persistedThreadId, turnId),
+        );
+      }
       loadedThreads.add(persistedThreadId);
     }
     return persistedThreadId;
@@ -1733,6 +1856,7 @@ export function createCodexAppServerAdapter({
       text_by_item: new Map(),
       text_item_order: [],
       tool_items: new Map(),
+      hook_runs: new Map(),
       turn_id: null,
       terminal_status: null,
     };
@@ -1818,6 +1942,8 @@ export function createCodexAppServerAdapter({
       await sendRequest(target, 'turn/interrupt', {
         threadId: run.thread_id,
         turnId: run.turn_id,
+      }, {
+        onResult: (response) => requireEmptyResult(response, 'turn/interrupt'),
       });
       return reason === 'timeout' ? run.terminal : 'interrupt_requested';
     })());

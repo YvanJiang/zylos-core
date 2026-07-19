@@ -1889,7 +1889,7 @@ export function createExecutorStore({
       };
       const command = {
         contract: 'zylos.delivery-command',
-        contract_version: '1.0',
+        contract_version: target.chat_type === 'thread' ? '1.1' : '1.0',
         outbox_id: outboxId,
         delivery_id: deliveryId,
         trace_id: generateId('delivery-trace'),

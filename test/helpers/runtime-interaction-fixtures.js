@@ -35,9 +35,11 @@ export function deterministicIds(namespace) {
   };
 }
 
-export function interactionInboundEnvelope(suffix) {
+export function interactionInboundEnvelope(suffix, {
+  fixtureName = 'authenticated_dm_with_attachment',
+} = {}) {
   const fixture = inboundFixture.valid.find(
-    ({ name }) => name === 'authenticated_dm_with_attachment',
+    ({ name }) => name === fixtureName,
   ).document;
   const envelope = structuredClone(fixture);
   envelope.inbound_event_id = `evt-${suffix}`;
@@ -55,8 +57,9 @@ export function interactionInboundEnvelope(suffix) {
 
 export function acceptQueuedInteractionTurn(database, suffix, {
   acceptedAt = '2026-07-19T07:00:00Z',
+  fixtureName,
 } = {}) {
-  return acceptNormalInbound(database, interactionInboundEnvelope(suffix), {
+  return acceptNormalInbound(database, interactionInboundEnvelope(suffix, { fixtureName }), {
     now: () => acceptedAt,
     generateId: deterministicIds(`inbound-${suffix}`),
   });

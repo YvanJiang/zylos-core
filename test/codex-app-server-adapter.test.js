@@ -10,9 +10,12 @@ import { createCodexAppServerAdapter } from '../runtime/providers/codex-app-serv
 function createFakeAppServer({
   afterTurnStart,
   autoTurnStarted = true,
+  interruptResult = {},
   onClientResponse,
   respondToInterrupt = true,
   respondToTurnStart = true,
+  resumeTurns = [],
+  turnStartResponsePatch = {},
 } = {}) {
   const child = new EventEmitter();
   child.stdin = new PassThrough();
@@ -44,7 +47,10 @@ function createFakeAppServer({
       } else if (message.method === 'thread/start') {
         send({ id: message.id, result: { thread: { id: 'codex-thread-1' } } });
       } else if (message.method === 'thread/resume') {
-        send({ id: message.id, result: { thread: { id: message.params.threadId } } });
+        send({
+          id: message.id,
+          result: { thread: { id: message.params.threadId, turns: resumeTurns } },
+        });
       } else if (message.method === 'turn/start') {
         if (!respondToTurnStart) continue;
         turnNumber += 1;
@@ -52,6 +58,7 @@ function createFakeAppServer({
         send({
           id: message.id,
           result: { turn: { id: turnId, status: 'inProgress', items: [] } },
+          ...turnStartResponsePatch,
         });
         queueMicrotask(() => {
           const details = { message, send, threadId: message.params.threadId, turnId };
@@ -76,7 +83,7 @@ function createFakeAppServer({
           }
         });
       } else if (message.method === 'turn/interrupt') {
-        if (respondToInterrupt) send({ id: message.id, result: {} });
+        if (respondToInterrupt) send({ id: message.id, result: interruptResult });
       } else if (Object.hasOwn(message, 'id') && Object.hasOwn(message, 'result')) {
         onClientResponse?.({ message, send });
       }
@@ -412,6 +419,22 @@ describe('Codex app-server provider adapter', () => {
     expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
   });
 
+  test('retires the connection when a JSON-RPC response has both result and error', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart() {},
+      autoTurnStarted: false,
+      turnStartResponsePatch: {
+        error: { code: -32_000, message: 'ambiguous private response' },
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(adapter.execute(executionContext()))).rejects.toMatchObject({
+      providerError: { code: 'side_effect_unknown' },
+    });
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
   test('retires the shared connection when turn/start cannot be written synchronously', async () => {
     const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
     const server = createFakeAppServer();
@@ -504,6 +527,40 @@ describe('Codex app-server provider adapter', () => {
           },
         });
         send({
+          method: 'hook/started',
+          params: {
+            threadId,
+            turnId,
+            run: {
+              id: 'private-stop-hook-1',
+              eventName: 'stop',
+              handlerType: 'command',
+              executionMode: 'sync',
+              scope: 'turn',
+              status: 'running',
+              sourcePath: '/private/machine/hooks.json',
+              entries: [],
+            },
+          },
+        });
+        send({
+          method: 'hook/completed',
+          params: {
+            threadId,
+            turnId,
+            run: {
+              id: 'private-stop-hook-1',
+              eventName: 'stop',
+              handlerType: 'command',
+              executionMode: 'sync',
+              scope: 'turn',
+              status: 'completed',
+              sourcePath: '/private/machine/hooks.json',
+              entries: [{ kind: 'context', text: 'private hook output' }],
+            },
+          },
+        });
+        send({
           method: 'turn/completed',
           params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
         });
@@ -511,7 +568,8 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
 
-    await expect(collect(adapter.execute(executionContext()))).resolves.toEqual([
+    const events = await collect(adapter.execute(executionContext()));
+    expect(events).toEqual([
       {
         kind: 'text_delta',
         provider_native_id: 'codex-thread-1',
@@ -552,8 +610,80 @@ describe('Codex app-server provider adapter', () => {
         provider_native_id: 'codex-thread-1',
         payload: { text: 'Hello', end_offset: 5 },
       },
+      {
+        kind: 'tool_started',
+        provider_native_id: 'codex-thread-1',
+        payload: {
+          tool_use_id: 'provider-hook-1',
+          tool_name: 'provider_hook',
+          summary: 'Provider hook started.',
+          side_effect_status: 'unknown',
+        },
+      },
+      {
+        kind: 'tool_finished',
+        provider_native_id: 'codex-thread-1',
+        payload: {
+          tool_use_id: 'provider-hook-1',
+          tool_name: 'provider_hook',
+          summary: 'Provider hook completed.',
+          side_effect_status: 'unknown',
+        },
+      },
     ]);
+    expect(JSON.stringify(events)).not.toContain('/private/machine/hooks.json');
+    expect(JSON.stringify(events)).not.toContain('private hook output');
+    expect(JSON.stringify(events)).not.toContain('private-stop-hook-1');
     expect(JSON.stringify(server.received)).not.toContain('exec --json');
+  });
+
+  test('ignores fenced private telemetry that has no provider-neutral event shape', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'thread/tokenUsage/updated',
+          params: {
+            threadId,
+            turnId,
+            tokenUsage: {
+              total: {
+                totalTokens: 21,
+                inputTokens: 13,
+                cachedInputTokens: 8,
+                outputTokens: 8,
+                reasoningOutputTokens: 0,
+              },
+              last: {
+                totalTokens: 21,
+                inputTokens: 13,
+                cachedInputTokens: 8,
+                outputTokens: 8,
+                reasoningOutputTokens: 0,
+              },
+              modelContextWindow: 258_400,
+            },
+          },
+        });
+        send({
+          method: 'turn/moderationMetadata',
+          params: {
+            threadId,
+            turnId,
+            metadata: { privateProviderScores: [0.1, 0.9] },
+          },
+        });
+        send({
+          method: 'turn/completed',
+          params: {
+            threadId,
+            turn: { id: turnId, status: 'completed', items: [] },
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(adapter.execute(executionContext()))).resolves.toEqual([]);
   });
 
   test('fails the supervised connection closed for an unsupported running item', async () => {
@@ -1708,7 +1838,39 @@ describe('Codex app-server provider adapter', () => {
 
   test('fails an active turn closed when transport becomes uncertain and reloads on reconnect', async () => {
     const firstServer = createFakeAppServer({ afterTurnStart() {} });
-    const secondServer = createFakeAppServer();
+    const secondServer = createFakeAppServer({
+      resumeTurns: [{ id: 'codex-turn-historical' }],
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'thread/tokenUsage/updated',
+          params: {
+            threadId,
+            turnId: 'codex-turn-historical',
+            tokenUsage: {
+              total: {
+                totalTokens: 1,
+                inputTokens: 1,
+                cachedInputTokens: 0,
+                outputTokens: 0,
+                reasoningOutputTokens: 0,
+              },
+              last: {
+                totalTokens: 1,
+                inputTokens: 1,
+                cachedInputTokens: 0,
+                outputTokens: 0,
+                reasoningOutputTokens: 0,
+              },
+              modelContextWindow: 258_400,
+            },
+          },
+        });
+        send({
+          method: 'turn/completed',
+          params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
+        });
+      },
+    });
     const spawnProcess = jest.fn()
       .mockImplementationOnce(() => firstServer.child)
       .mockImplementationOnce(() => secondServer.child);
@@ -1845,6 +2007,27 @@ describe('Codex app-server provider adapter', () => {
       });
     },
   );
+
+  test('rejects a non-empty fixed-version turn interrupt response', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart() {},
+      interruptResult: { accepted: true },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const context = executionContext({ lineage: { provider_native_id: 'codex-thread-1' } });
+    const waiting = adapter.execute(context)[Symbol.asyncIterator]().next();
+    await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
+
+    await expect(adapter.interrupt({
+      turn_id: context.turn_id,
+      attempt: context.attempt,
+      reason: 'stop',
+    })).rejects.toMatchObject({ providerError: { code: 'side_effect_unknown' } });
+    await expect(waiting).rejects.toMatchObject({
+      providerError: { code: 'side_effect_unknown' },
+    });
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
 
   test('maps service cancellation to the current fenced app-server turn interrupt', async () => {
     const server = createFakeAppServer({ afterTurnStart() {} });

@@ -40,9 +40,10 @@ Private app-server method and item names remain inside the adapter:
 |---|---|
 | fenced `turn/started` | provider-neutral started signal; Core atomically authors `starting -> running` with `provider_started` |
 | `item/agentMessage/delta` and completed agent message | `text_delta` and `text_snapshot` |
-| command, file, MCP, dynamic, collaboration, web, and image tool lifecycle | `tool_started`, `tool_progress`, `tool_finished`; item IDs, progress methods, and fixed-version statuses are fenced by tool type |
+| command, file, MCP, dynamic, collaboration, web, image, and turn-scoped provider-hook lifecycle | `tool_started`, `tool_progress`, `tool_finished`; item/hook IDs, progress methods, and fixed-version statuses are fenced by type; hook paths/output remain private |
 | completed turn | adapter iterator completion; Core authors the canonical completed state |
 | failed/interrupted turn, error notification, or lost connection | typed provider failure; Core authors the canonical failure or recovery state |
+| fenced token-usage and moderation telemetry | intentionally omitted because the public normalized-event contract has no usage/score event and private provider scores must not escape the adapter |
 | command/file approval | durable `tool_approval` interaction with bounded command/cwd or path/diff/grant details |
 | permissions approval | durable `permission_approval` interaction with bounded cwd/environment/permission scope |
 | single-question `requestUserInput` | durable `question` or fixed `choice` interaction with answer constraints preserved |

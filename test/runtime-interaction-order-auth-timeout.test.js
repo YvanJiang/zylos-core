@@ -647,9 +647,20 @@ describe('runtime interaction order, authorization, and timeout', () => {
     database.close();
   });
 
-  test('executor service retains the timeout lease when app-server cannot confirm provider stop', async () => {
+  test.each([
+    ['direct-message', 'authenticated_dm_with_attachment', '1.0'],
+    ['native-thread', 'native_thread_or_topic', '1.1'],
+  ])('executor service retains the %s timeout lane when app-server cannot confirm provider stop', async (
+    laneKind,
+    fixtureName,
+    expectedContractVersion,
+  ) => {
     const database = openTestDatabase();
-    const accepted = acceptQueuedInteractionTurn(database, 'service-timeout-uncertain');
+    const suffix = `service-timeout-uncertain-${laneKind}`;
+    const accepted = acceptQueuedInteractionTurn(database, suffix, { fixtureName });
+    const durableTarget = JSON.parse(database.prepare(`
+      SELECT target_json FROM runtime_delivery_lanes WHERE turn_id = ?
+    `).get(accepted.turn_id).target_json);
     const clock = { now: '2026-07-19T07:01:00Z' };
     let providerStopped = false;
     const adapter = {
@@ -679,9 +690,9 @@ describe('runtime interaction order, authorization, and timeout', () => {
       database,
       adapter,
       provider: 'codex',
-      serviceInstanceId: 'executor-service-timeout-uncertain',
+      serviceInstanceId: `executor-service-timeout-uncertain-${laneKind}`,
       now: () => clock.now,
-      generateId: deterministicIds('service-timeout-uncertain'),
+      generateId: deterministicIds(suffix),
       interactionTimeoutMs: 1_000,
       setTimeoutFn: () => ({ unref() {} }),
       clearTimeoutFn: () => {},
@@ -704,7 +715,7 @@ describe('runtime interaction order, authorization, and timeout', () => {
       FROM runtime_executor_leases
       WHERE conversation_id = ?
     `).get(accepted.conversation_id)).toEqual({
-      lease_owner: 'executor-service-timeout-uncertain',
+      lease_owner: `executor-service-timeout-uncertain-${laneKind}`,
       turn_id: accepted.turn_id,
     });
     expect(database.prepare(`
@@ -722,6 +733,8 @@ describe('runtime interaction order, authorization, and timeout', () => {
       WHERE aggregate_type = 'text_notice' AND aggregate_id LIKE ?
     `).get(`${accepted.turn_id}-provider-stop-%`);
     expect(JSON.parse(notice.command_json)).toMatchObject({
+      contract_version: expectedContractVersion,
+      target: durableTarget,
       render_model: {
         phase: 'timed_out',
         terminal: true,
@@ -732,6 +745,14 @@ describe('runtime interaction order, authorization, and timeout', () => {
         },
       },
     });
+    if (laneKind === 'native-thread') {
+      expect(durableTarget).toMatchObject({
+        chat_type: 'thread',
+        native_thread_or_topic_id: expect.any(String),
+        native_thread_root_message_id: expect.any(String),
+        native_thread_reply_target_message_id: expect.any(String),
+      });
+    }
 
     database.close();
   });
