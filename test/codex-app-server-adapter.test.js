@@ -8,6 +8,7 @@ import { describe, expect, jest, test } from '@jest/globals';
 import { createCodexAppServerAdapter } from '../runtime/providers/codex-app-server-adapter.js';
 
 function createFakeAppServer({
+  afterThreadResume,
   afterTurnStart,
   autoTurnStarted = true,
   interruptResult = {},
@@ -47,10 +48,12 @@ function createFakeAppServer({
       } else if (message.method === 'thread/start') {
         send({ id: message.id, result: { thread: { id: 'codex-thread-1' } } });
       } else if (message.method === 'thread/resume') {
+        const threadId = message.params.threadId;
         send({
           id: message.id,
-          result: { thread: { id: message.params.threadId, turns: resumeTurns } },
+          result: { thread: { id: threadId, turns: resumeTurns } },
         });
+        afterThreadResume?.({ send, threadId });
       } else if (message.method === 'turn/start') {
         if (!respondToTurnStart) continue;
         turnNumber += 1;
@@ -1840,7 +1843,7 @@ describe('Codex app-server provider adapter', () => {
     const firstServer = createFakeAppServer({ afterTurnStart() {} });
     const secondServer = createFakeAppServer({
       resumeTurns: [{ id: 'codex-turn-historical' }],
-      afterTurnStart({ send, threadId, turnId }) {
+      afterThreadResume({ send, threadId }) {
         send({
           method: 'thread/tokenUsage/updated',
           params: {
@@ -1865,6 +1868,8 @@ describe('Codex app-server provider adapter', () => {
             },
           },
         });
+      },
+      afterTurnStart({ send, threadId, turnId }) {
         send({
           method: 'turn/completed',
           params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },

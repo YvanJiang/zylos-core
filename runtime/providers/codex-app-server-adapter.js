@@ -1815,20 +1815,23 @@ export function createCodexAppServerAdapter({
       return threadId;
     }
     if (!loadedThreads.has(persistedThreadId)) {
-      const result = await sendRequest(target, 'thread/resume', {
+      await sendRequest(target, 'thread/resume', {
         threadId: persistedThreadId,
         cwd,
         approvalPolicy,
         sandbox,
+      }, {
+        onResult: (response) => {
+          requireThreadResult(response, persistedThreadId);
+          for (const turnId of requireThreadHistory(response)) {
+            rememberConnectionFence(
+              target,
+              target.retired_run_keys,
+              activeRunKey(persistedThreadId, turnId),
+            );
+          }
+        },
       });
-      requireThreadResult(result, persistedThreadId);
-      for (const turnId of requireThreadHistory(result)) {
-        rememberConnectionFence(
-          target,
-          target.retired_run_keys,
-          activeRunKey(persistedThreadId, turnId),
-        );
-      }
       loadedThreads.add(persistedThreadId);
     }
     return persistedThreadId;
