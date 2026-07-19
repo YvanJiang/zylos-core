@@ -1,0 +1,46 @@
+import {
+  canonicalizeJson,
+  ContractKernelError,
+  createContractError,
+} from '../../contracts/public/index.js';
+import { createDeliveryLaneKeyFromIdentity } from './delivery-lane-key.js';
+
+function targetVersionConflict(occurredAt) {
+  return new ContractKernelError(createContractError({
+    code: 'version_conflict',
+    category: 'conflict',
+    userMessage: 'The delivery target does not match the durable lane target.',
+    occurredAt,
+  }));
+}
+
+export function parseDurableDeliveryTarget(targetJson, { occurredAt } = {}) {
+  try {
+    return JSON.parse(targetJson);
+  } catch {
+    throw targetVersionConflict(occurredAt);
+  }
+}
+
+export function assertDeliveryTargetIdentity(expected, candidate, { occurredAt } = {}) {
+  try {
+    if (canonicalizeJson(expected) === canonicalizeJson(candidate)) return;
+  } catch {
+    // Invalid persisted or candidate target data is a target identity conflict.
+  }
+  throw targetVersionConflict(occurredAt);
+}
+
+export function assertDeliveryLaneIdentity(lane, target, { occurredAt } = {}) {
+  let expectedLaneKey;
+  try {
+    expectedLaneKey = createDeliveryLaneKeyFromIdentity({
+      target,
+      turnId: lane.turn_id,
+      aggregateType: lane.aggregate_type,
+    });
+  } catch {
+    throw targetVersionConflict(occurredAt);
+  }
+  if (lane.lane_key !== expectedLaneKey) throw targetVersionConflict(occurredAt);
+}

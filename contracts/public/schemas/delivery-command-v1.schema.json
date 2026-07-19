@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.zylos.ai/public/v1/delivery-command.schema.json",
+  "title": "Zylos delivery command v1",
+  "type": "object",
+  "required": [
+    "contract",
+    "contract_version",
+    "outbox_id",
+    "delivery_id",
+    "trace_id",
+    "delivery_attempt_id",
+    "delivery_attempt_no",
+    "outbox_lease_epoch",
+    "target",
+    "aggregate_type",
+    "aggregate_id",
+    "operation",
+    "aggregate_version",
+    "event_sequence_through",
+    "idempotency_key",
+    "render_model",
+    "mapping",
+    "target_platform_message_id",
+    "predecessor_delivery_id",
+    "expected_platform_version",
+    "priority",
+    "not_before",
+    "created_at"
+  ],
+  "properties": {
+    "contract": { "const": "zylos.delivery-command" },
+    "contract_version": { "type": "string", "pattern": "^1\\.(0|[1-9][0-9]*)$" },
+    "outbox_id": { "$ref": "#/$defs/opaque_id" },
+    "delivery_id": { "$ref": "#/$defs/opaque_id" },
+    "trace_id": { "$ref": "#/$defs/opaque_id" },
+    "delivery_attempt_id": { "$ref": "#/$defs/opaque_id" },
+    "delivery_attempt_no": { "type": "integer", "minimum": 1 },
+    "outbox_lease_epoch": { "type": "integer", "minimum": 1 },
+    "target": { "$ref": "#/$defs/target" },
+    "aggregate_type": {
+      "enum": ["turn_main", "interaction", "text_notice", "security_notice", "control_notice"]
+    },
+    "aggregate_id": { "$ref": "#/$defs/opaque_id" },
+    "operation": { "enum": ["create_main", "update_main", "send_text", "send_fallback"] },
+    "aggregate_version": { "type": "integer", "minimum": 1 },
+    "event_sequence_through": {
+      "oneOf": [{ "type": "integer", "minimum": 1 }, { "type": "null" }]
+    },
+    "idempotency_key": { "$ref": "#/$defs/opaque_id" },
+    "render_model": { "$ref": "#/$defs/render_model" },
+    "mapping": { "$ref": "#/$defs/mapping" },
+    "target_platform_message_id": { "$ref": "#/$defs/nullable_id" },
+    "predecessor_delivery_id": { "$ref": "#/$defs/nullable_id" },
+    "expected_platform_version": {
+      "oneOf": [
+        { "$ref": "#/$defs/opaque_id" },
+        { "type": "integer", "minimum": 0 },
+        { "type": "null" }
+      ]
+    },
+    "priority": { "type": "integer" },
+    "not_before": { "$ref": "#/$defs/rfc3339" },
+    "created_at": { "$ref": "#/$defs/rfc3339" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "contract_version": { "pattern": "^1\\.([1-9][0-9]*)$" }
+        },
+        "required": ["contract_version"]
+      },
+      "then": {
+        "properties": {
+          "target": {
+            "required": [
+              "native_thread_root_message_id",
+              "native_thread_reply_target_message_id"
+            ],
+            "allOf": [
+              {
+                "if": {
+                  "properties": { "chat_type": { "const": "thread" } },
+                  "required": ["chat_type"]
+                },
+                "then": {
+                  "properties": {
+                    "native_thread_or_topic_id": { "$ref": "#/$defs/opaque_id" },
+                    "native_thread_root_message_id": { "$ref": "#/$defs/opaque_id" },
+                    "native_thread_reply_target_message_id": { "$ref": "#/$defs/opaque_id" }
+                  }
+                },
+                "else": {
+                  "properties": {
+                    "native_thread_or_topic_id": { "type": "null" },
+                    "native_thread_root_message_id": { "type": "null" },
+                    "native_thread_reply_target_message_id": { "type": "null" }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "contract_version": { "const": "1.0" },
+          "operation": { "enum": ["create_main", "send_text", "send_fallback"] },
+          "target": {
+            "properties": { "chat_type": { "const": "thread" } },
+            "required": ["chat_type"]
+          }
+        },
+        "required": ["contract_version", "operation", "target"]
+      },
+      "then": false
+    },
+    {
+      "if": {
+        "properties": { "operation": { "const": "create_main" } },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "target_platform_message_id": { "type": "null" },
+          "predecessor_delivery_id": { "type": "null" },
+          "expected_platform_version": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "operation": { "const": "update_main" } },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "target_platform_message_id": { "$ref": "#/$defs/opaque_id" },
+          "predecessor_delivery_id": { "$ref": "#/$defs/opaque_id" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "operation": { "const": "send_text" } },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "target_platform_message_id": { "type": "null" },
+          "predecessor_delivery_id": { "type": "null" },
+          "expected_platform_version": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "operation": { "const": "send_fallback" } },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "target_platform_message_id": { "type": "null" },
+          "predecessor_delivery_id": { "$ref": "#/$defs/opaque_id" },
+          "expected_platform_version": { "type": "null" }
+        }
+      }
+    }
+  ],
+  "additionalProperties": true,
+  "x-zylos-native-thread-target": {
+    "conversation_identity": "native_thread_or_topic_id",
+    "reply_api_target": "native_thread_reply_target_message_id",
+    "root_scope": "native_thread_root_message_id",
+    "target_change": "version_conflict",
+    "missing_capability": "unsupported_capability",
+    "fallback_inference": false
+  },
+  "$defs": {
+    "opaque_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "nullable_id": {
+      "oneOf": [{ "$ref": "#/$defs/opaque_id" }, { "type": "null" }]
+    },
+    "rfc3339": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "target": {
+      "type": "object",
+      "required": [
+        "region",
+        "tenant_id",
+        "channel",
+        "bot_id",
+        "chat_type",
+        "chat_id",
+        "native_thread_or_topic_id"
+      ],
+      "properties": {
+        "region": { "$ref": "#/$defs/opaque_id" },
+        "tenant_id": { "$ref": "#/$defs/opaque_id" },
+        "channel": { "$ref": "#/$defs/opaque_id" },
+        "bot_id": { "$ref": "#/$defs/opaque_id" },
+        "chat_type": { "enum": ["dm", "group", "thread", "synthetic"] },
+        "chat_id": { "$ref": "#/$defs/opaque_id" },
+        "native_thread_or_topic_id": { "$ref": "#/$defs/nullable_id" },
+        "native_thread_root_message_id": { "$ref": "#/$defs/nullable_id" },
+        "native_thread_reply_target_message_id": { "$ref": "#/$defs/nullable_id" }
+      },
+      "additionalProperties": true
+    },
+    "render_model": {
+      "type": "object",
+      "required": [
+        "title",
+        "phase",
+        "text",
+        "error",
+        "tools",
+        "interactions",
+        "terminal",
+        "user_action_required"
+      ],
+      "properties": {
+        "title": { "type": ["string", "null"] },
+        "phase": { "type": ["string", "null"] },
+        "text": { "type": ["string", "null"] },
+        "error": { "type": ["object", "null"] },
+        "tools": { "type": "array" },
+        "interactions": { "type": "array" },
+        "terminal": { "type": "boolean" },
+        "user_action_required": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "mapping": {
+      "type": "object",
+      "required": [
+        "mapping_id",
+        "conversation_id",
+        "turn_id",
+        "lineage_id",
+        "binding_state",
+        "mapping_version"
+      ],
+      "properties": {
+        "mapping_id": { "$ref": "#/$defs/opaque_id" },
+        "conversation_id": { "$ref": "#/$defs/nullable_id" },
+        "turn_id": { "$ref": "#/$defs/nullable_id" },
+        "lineage_id": { "$ref": "#/$defs/nullable_id" },
+        "binding_state": { "enum": ["pending", "bound", "not_applicable"] },
+        "mapping_version": { "type": "integer", "minimum": 1 },
+        "reason": {
+          "enum": [
+            "mapping_missing",
+            "mapping_corrupt",
+            "mapping_unbound",
+            "provider_lineage_invalid",
+            null
+          ]
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

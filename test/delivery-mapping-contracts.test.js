@@ -5,8 +5,11 @@ import { describe, expect, test } from '@jest/globals';
 import {
   ContractKernelError,
   createIdempotencyKey,
+  DELIVERY_COMMAND_VERSIONS,
   DELIVERY_OPERATIONS,
   DELIVERY_RESULT_STATUSES,
+  DELIVERY_TARGET_FIELDS_V1_0,
+  DELIVERY_TARGET_FIELDS_V1_1,
   MAPPING_BINDING_AUTHORITIES,
   MAPPING_BINDING_STATES,
   MAPPING_RECOVERY_REASONS,
@@ -19,6 +22,21 @@ import {
 
 describe('delivery/mapping v1 vocabulary', () => {
   test('publishes every safety-critical operation, result and binding state', () => {
+    expect(DELIVERY_COMMAND_VERSIONS).toEqual(['1.0', '1.1']);
+    expect(DELIVERY_TARGET_FIELDS_V1_0).toEqual([
+      'region',
+      'tenant_id',
+      'channel',
+      'bot_id',
+      'chat_type',
+      'chat_id',
+      'native_thread_or_topic_id',
+    ]);
+    expect(DELIVERY_TARGET_FIELDS_V1_1).toEqual([
+      ...DELIVERY_TARGET_FIELDS_V1_0,
+      'native_thread_root_message_id',
+      'native_thread_reply_target_message_id',
+    ]);
     expect(DELIVERY_OPERATIONS).toEqual([
       'create_main',
       'update_main',
@@ -206,6 +224,29 @@ function sendFallbackCommand() {
   });
 }
 
+function withDeliveryTarget(command, targetFields, contractVersion = command.contract_version) {
+  const target = { ...command.target, ...targetFields };
+  return {
+    ...command,
+    contract_version: contractVersion,
+    target,
+    idempotency_key: deliveryKey(target, command.delivery_id),
+  };
+}
+
+function nativeThreadCommand(command, contractVersion, {
+  includeDeliveryAnchors = contractVersion === '1.1',
+} = {}) {
+  return withDeliveryTarget(command, {
+    chat_type: 'thread',
+    native_thread_or_topic_id: 'native-thread-A',
+    ...(includeDeliveryAnchors ? {
+      native_thread_root_message_id: 'platform-root-message-A',
+      native_thread_reply_target_message_id: 'platform-inbound-message-A',
+    } : {}),
+  }, contractVersion);
+}
+
 describe('delivery command v1 schema', () => {
   test('validates create/update/text/fallback target, predecessor and mapping conditions', () => {
     const create = createMainCommand();
@@ -229,6 +270,68 @@ describe('delivery command v1 schema', () => {
     ]) {
       expect(() => validateDeliveryCommand(invalid)).toThrow(ContractKernelError);
     }
+  });
+
+  test('keeps v1.0 non-thread commands compatible and enforces the v1.1 non-thread null matrix', () => {
+    expect(validateDeliveryCommand(createMainCommand()).forwarded)
+      .toEqual(createMainCommand());
+
+    const v11 = withDeliveryTarget(createMainCommand(), {
+      native_thread_root_message_id: null,
+      native_thread_reply_target_message_id: null,
+    }, '1.1');
+    expect(validateDeliveryCommand(v11).forwarded).toEqual(v11);
+
+    for (const fieldName of [
+      'native_thread_root_message_id',
+      'native_thread_reply_target_message_id',
+    ]) {
+      const missing = structuredClone(v11);
+      delete missing.target[fieldName];
+      expectContractFailure(() => validateDeliveryCommand(missing), 'unsupported_capability');
+
+      const nonNull = withDeliveryTarget(v11, { [fieldName]: `${fieldName}-unexpected` });
+      expectContractFailure(() => validateDeliveryCommand(nonNull), 'unsupported_capability');
+    }
+  });
+
+  test('requires authoritative v1.1 thread anchors for create, update, text and fallback', () => {
+    for (const command of [
+      createMainCommand(),
+      updateMainCommand(),
+      sendTextCommand(),
+      sendFallbackCommand(),
+    ]) {
+      const v11 = nativeThreadCommand(command, '1.1');
+      expect(validateDeliveryCommand(v11).forwarded).toEqual(v11);
+
+      for (const fieldName of [
+        'native_thread_or_topic_id',
+        'native_thread_root_message_id',
+        'native_thread_reply_target_message_id',
+      ]) {
+        const missing = structuredClone(v11);
+        delete missing.target[fieldName];
+        expectContractFailure(() => validateDeliveryCommand(missing), 'unsupported_capability');
+
+        const nullAnchor = withDeliveryTarget(v11, { [fieldName]: null });
+        expectContractFailure(() => validateDeliveryCommand(nullAnchor), 'unsupported_capability');
+      }
+    }
+  });
+
+  test('fails closed for v1.0 native-thread create, text and fallback without blocking exact updates', () => {
+    for (const command of [createMainCommand(), sendTextCommand(), sendFallbackCommand()]) {
+      expectContractFailure(
+        () => validateDeliveryCommand(nativeThreadCommand(command, '1.0')),
+        'unsupported_capability',
+      );
+    }
+
+    const update = nativeThreadCommand(updateMainCommand(), '1.0', {
+      includeDeliveryAnchors: false,
+    });
+    expect(validateDeliveryCommand(update).forwarded).toEqual(update);
   });
 });
 
@@ -490,5 +593,67 @@ describe('delivery/mapping cross-repository fixtures', () => {
       expect(outcome.mapping).toEqual(vector.expected.mapping);
       expect(outcome.error?.code ?? null).toBe(vector.expected.error_code);
     }
+  });
+
+  test('publishes the portable v1.1 target schema and native-thread golden matrix', () => {
+    const schema = JSON.parse(readFileSync(
+      new URL('../contracts/public/schemas/delivery-command-v1.schema.json', import.meta.url),
+      'utf8',
+    ));
+    expect(schema).toMatchObject({
+      $schema: 'https://json-schema.org/draft/2020-12/schema',
+      $id: 'https://schemas.zylos.ai/public/v1/delivery-command.schema.json',
+      type: 'object',
+      additionalProperties: true,
+    });
+    expect(schema.required).toEqual(expect.arrayContaining([
+      'contract',
+      'contract_version',
+      'target',
+      'operation',
+    ]));
+    expect(schema['x-zylos-native-thread-target']).toEqual({
+      conversation_identity: 'native_thread_or_topic_id',
+      reply_api_target: 'native_thread_reply_target_message_id',
+      root_scope: 'native_thread_root_message_id',
+      target_change: 'version_conflict',
+      missing_capability: 'unsupported_capability',
+      fallback_inference: false,
+    });
+
+    const fixture = JSON.parse(readFileSync(
+      new URL('../contracts/public/fixtures/delivery-native-thread-v1.1.json', import.meta.url),
+      'utf8',
+    ));
+    expect(fixture.fixture_version).toBe('1.1');
+    expect(fixture.contract_versions).toEqual({
+      'zylos.delivery-command': ['1.0', '1.1'],
+    });
+    expect(validatePublicFixtureSafety(fixture)).toBe(true);
+
+    const validOperations = new Set();
+    for (const vector of fixture.command_vectors) {
+      if (vector.valid) {
+        expect(validateDeliveryCommand(vector.document).forwarded).toEqual(vector.document);
+        if (vector.document.target.chat_type === 'thread') {
+          validOperations.add(vector.document.operation);
+        }
+      } else {
+        expectContractFailure(
+          () => validateDeliveryCommand(vector.document),
+          vector.expected_error_code,
+        );
+      }
+    }
+    expect(validOperations).toEqual(new Set(DELIVERY_OPERATIONS));
+    expect(fixture.command_vectors.some(
+      ({ name, valid }) => name === 'v1_0_non_thread_compatible' && valid,
+    )).toBe(true);
+    expect(fixture.command_vectors.filter(({ valid }) => !valid).map(({ expected_error_code }) =>
+      expected_error_code)).toEqual(expect.arrayContaining([
+      'unsupported_capability',
+      'unsupported_capability',
+      'unsupported_capability',
+    ]));
   });
 });

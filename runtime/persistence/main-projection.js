@@ -1,8 +1,14 @@
 import {
   createIdempotencyKey,
+  DELIVERY_COMMAND_CURRENT_VERSION,
   validateDeliveryCommand,
 } from '../../contracts/public/index.js';
 import { createDeliveryLaneKey } from './delivery-lane-key.js';
+import {
+  assertDeliveryLaneIdentity,
+  assertDeliveryTargetIdentity,
+  parseDurableDeliveryTarget,
+} from './delivery-target-identity.js';
 
 const TERMINAL_PHASES = new Set([
   'completed',
@@ -30,6 +36,23 @@ function laterTimestamp(left, right) {
 
 export function initializeMainProjection(database, command) {
   const laneKey = createDeliveryLaneKey(command);
+  const existing = database.prepare(`
+    SELECT lane_key, turn_id, aggregate_type, target_json
+    FROM runtime_delivery_lanes
+    WHERE turn_id = ?
+  `).get(command.mapping.turn_id);
+  if (existing) {
+    const durableTarget = parseDurableDeliveryTarget(existing.target_json, {
+      occurredAt: command.created_at,
+    });
+    assertDeliveryLaneIdentity(existing, durableTarget, { occurredAt: command.created_at });
+    assertDeliveryTargetIdentity(
+      durableTarget,
+      command.target,
+      { occurredAt: command.created_at },
+    );
+    return laneKey;
+  }
   database.prepare(`
     INSERT INTO runtime_delivery_lanes (
       lane_key, turn_id, aggregate_type, delivery_mode, target_json, mapping_json,
@@ -222,7 +245,10 @@ export function materializeNextStagedMainProjection(
   `).get(laneKey);
   if (!snapshot || (!textMode && createFailed && !failedCreate)) return null;
 
-  const target = JSON.parse(lane.target_json);
+  const target = parseDurableDeliveryTarget(lane.target_json, {
+    occurredAt: snapshot.created_at,
+  });
+  assertDeliveryLaneIdentity(lane, target, { occurredAt: snapshot.created_at });
   const outboxId = generateId('outbox');
   const deliveryId = generateId('delivery');
   const critical = snapshot.critical === 1;
@@ -242,7 +268,7 @@ export function materializeNextStagedMainProjection(
     );
   const command = {
     contract: 'zylos.delivery-command',
-    contract_version: '1.0',
+    contract_version: DELIVERY_COMMAND_CURRENT_VERSION,
     outbox_id: outboxId,
     delivery_id: deliveryId,
     trace_id: generateId('delivery-trace'),
@@ -306,11 +332,15 @@ export function stageMainProjection(database, turn, event, {
   throttleMs = 1_500,
 }) {
   const lane = database.prepare(`
-    SELECT lane_key, platform_message_id
+    SELECT lane_key, turn_id, aggregate_type, platform_message_id, target_json
     FROM runtime_delivery_lanes
     WHERE turn_id = ?
   `).get(turn.turn_id);
   if (!lane) throw new Error(`Turn ${turn.turn_id} has no delivery lane.`);
+  const durableTarget = parseDurableDeliveryTarget(lane.target_json, {
+    occurredAt: event.persisted_at,
+  });
+  assertDeliveryLaneIdentity(lane, durableTarget, { occurredAt: event.persisted_at });
 
   const renderModel = projectRenderModel(loadLatestRenderModel(database, lane.lane_key), event);
   const critical = isCriticalProjectionEvent(event);
@@ -330,6 +360,11 @@ export function stageMainProjection(database, turn, event, {
       LIMIT 1
     `).get(lane.lane_key);
     if (pending) {
+      assertDeliveryTargetIdentity(
+        durableTarget,
+        JSON.parse(pending.command_json).target,
+        { occurredAt: event.persisted_at },
+      );
       const command = {
         ...JSON.parse(pending.command_json),
         aggregate_version: event.turn_version,

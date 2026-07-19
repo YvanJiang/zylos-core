@@ -1,6 +1,8 @@
 import {
   DELIVERY_OPERATIONS,
   DELIVERY_RESULT_STATUSES,
+  DELIVERY_TARGET_FIELDS_V1_0,
+  DELIVERY_TARGET_FIELDS_V1_1,
   MAPPING_BINDING_AUTHORITIES,
   MAPPING_BINDING_STATES,
   MAPPING_RECOVERY_REASONS,
@@ -178,17 +180,13 @@ function validateNullablePlatformVersion(fieldName, value, occurredAt) {
   return value;
 }
 
-function validateTarget(value, occurredAt) {
+function rejectUnsupportedThreadTarget(userMessage, occurredAt) {
+  reject('unsupported_capability', userMessage, occurredAt);
+}
+
+function validateTarget(value, { contractMinor, operation, occurredAt }) {
   requireObject('target', value, occurredAt);
-  requireFields('target', value, [
-    'region',
-    'tenant_id',
-    'channel',
-    'bot_id',
-    'chat_type',
-    'chat_id',
-    'native_thread_or_topic_id',
-  ], occurredAt);
+  requireFields('target', value, DELIVERY_TARGET_FIELDS_V1_0.slice(0, -1), occurredAt);
   for (const fieldName of ['region', 'tenant_id', 'channel', 'bot_id', 'chat_id']) {
     validateOpaqueId(`target.${fieldName}`, value[fieldName], { occurredAt });
   }
@@ -198,11 +196,72 @@ function validateTarget(value, occurredAt) {
     DELIVERY_CHAT_TYPES,
     { occurredAt },
   );
-  validateNullableOpaqueId(
-    'target.native_thread_or_topic_id',
-    value.native_thread_or_topic_id,
-    occurredAt,
-  );
+
+  const requiresV11Anchors = contractMinor >= 1;
+  if (requiresV11Anchors) {
+    for (const fieldName of DELIVERY_TARGET_FIELDS_V1_1.slice(-3)) {
+      if (!Object.hasOwn(value, fieldName)) {
+        rejectUnsupportedThreadTarget(
+          `target.${fieldName} is required by zylos.delivery-command@1.1.`,
+          occurredAt,
+        );
+      }
+      validateNullableOpaqueId(`target.${fieldName}`, value[fieldName], occurredAt);
+    }
+  } else {
+    if (!Object.hasOwn(value, 'native_thread_or_topic_id')) {
+      reject('validation_error', 'target.native_thread_or_topic_id is required.', occurredAt);
+    }
+    validateNullableOpaqueId(
+      'target.native_thread_or_topic_id',
+      value.native_thread_or_topic_id,
+      occurredAt,
+    );
+    for (const fieldName of DELIVERY_TARGET_FIELDS_V1_1.slice(-2)) {
+      if (Object.hasOwn(value, fieldName)) {
+        validateNullableOpaqueId(`target.${fieldName}`, value[fieldName], occurredAt);
+      }
+    }
+  }
+
+  if (value.chat_type === 'thread') {
+    if (
+      value.native_thread_or_topic_id === null
+      || (requiresV11Anchors && (
+        value.native_thread_root_message_id === null
+        || value.native_thread_reply_target_message_id === null
+      ))
+    ) {
+      rejectUnsupportedThreadTarget(
+        'Native-thread delivery requires immutable conversation, root-message, and reply-target anchors.',
+        occurredAt,
+      );
+    }
+    if (
+      !requiresV11Anchors
+      && ['create_main', 'send_text', 'send_fallback'].includes(operation)
+    ) {
+      rejectUnsupportedThreadTarget(
+        `${operation} for a native thread requires zylos.delivery-command@1.1.`,
+        occurredAt,
+      );
+    }
+  } else {
+    if (value.native_thread_or_topic_id !== null) {
+      rejectUnsupportedThreadTarget(
+        'target.native_thread_or_topic_id must be null outside native-thread delivery.',
+        occurredAt,
+      );
+    }
+    for (const fieldName of DELIVERY_TARGET_FIELDS_V1_1.slice(-2)) {
+      if (Object.hasOwn(value, fieldName) && value[fieldName] !== null) {
+        rejectUnsupportedThreadTarget(
+          `target.${fieldName} must be null outside native-thread delivery.`,
+          occurredAt,
+        );
+      }
+    }
+  }
 }
 
 function validateNullableText(fieldName, value, occurredAt) {
@@ -356,7 +415,11 @@ export function validateDeliveryCommand(value, { occurredAt } = {}) {
 
   validatePositiveInteger('delivery_attempt_no', value.delivery_attempt_no, occurredAt);
   validatePositiveInteger('outbox_lease_epoch', value.outbox_lease_epoch, occurredAt);
-  validateTarget(value.target, occurredAt);
+  validateTarget(value.target, {
+    contractMinor: document.header.minor,
+    operation: value.operation,
+    occurredAt,
+  });
   validatePositiveInteger('aggregate_version', value.aggregate_version, occurredAt);
   validateNullablePositiveInteger(
     'event_sequence_through',

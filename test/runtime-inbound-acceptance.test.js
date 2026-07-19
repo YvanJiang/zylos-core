@@ -510,6 +510,7 @@ describe('acceptNormalInbound', () => {
       ['native-thread', (candidate) => {
         candidate.chat_type = 'thread';
         candidate.native_thread_or_topic_id = 'thread-other';
+        candidate.reply.root_message_id = 'message-thread-root-other';
       }],
     ];
     const distinctConversationIds = new Set([

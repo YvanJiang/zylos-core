@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 
 import {
   createIdempotencyKey,
+  DELIVERY_COMMAND_CURRENT_VERSION,
   validateDeliveryCommand,
   validateDeliveryResult,
 } from '../../contracts/public/index.js';
@@ -9,6 +10,11 @@ import {
   materializeNextStagedMainProjection,
 } from '../persistence/main-projection.js';
 import { createDeliveryLaneKey } from '../persistence/delivery-lane-key.js';
+import {
+  assertDeliveryLaneIdentity,
+  assertDeliveryTargetIdentity,
+  parseDurableDeliveryTarget,
+} from '../persistence/delivery-target-identity.js';
 import { initializeRuntimePersistence } from '../persistence/schema.js';
 
 const DELIVERY_RETRY_DELAYS_MS = Object.freeze([2_000, 4_000, 8_000]);
@@ -100,7 +106,7 @@ function enqueueInitialTextAcknowledgement(database, command, resultAt, generate
   const deliveryId = generateId('delivery');
   const acknowledgement = {
     contract: 'zylos.delivery-command',
-    contract_version: '1.0',
+    contract_version: DELIVERY_COMMAND_CURRENT_VERSION,
     outbox_id: outboxId,
     delivery_id: deliveryId,
     trace_id: generateId('delivery-trace'),
@@ -140,6 +146,11 @@ function enqueueInitialTextAcknowledgement(database, command, resultAt, generate
     created_at: resultAt,
   };
   validateDeliveryCommand(acknowledgement, { occurredAt: resultAt });
+  const sourceLaneKey = database.prepare(`
+    SELECT lane_key
+    FROM runtime_outbox
+    WHERE outbox_id = ?
+  `).get(command.outbox_id)?.lane_key ?? null;
   database.prepare(`
     INSERT INTO runtime_outbox (
       outbox_id, delivery_id, aggregate_type, aggregate_id, turn_id, control_id,
@@ -152,7 +163,7 @@ function enqueueInitialTextAcknowledgement(database, command, resultAt, generate
     acknowledgement.aggregate_type,
     aggregateId,
     command.mapping.turn_id,
-    createDeliveryLaneKey(acknowledgement),
+    sourceLaneKey ?? createDeliveryLaneKey(acknowledgement),
     JSON.stringify(acknowledgement),
     acknowledgement.priority,
     resultAt,
@@ -259,8 +270,13 @@ export function createOutboxService({
       const claimedAt = now();
       const row = database.prepare(`
         SELECT candidate.outbox_id, candidate.status, candidate.attempt_count,
-          candidate.outbox_lease_epoch, candidate.command_json
+          candidate.outbox_lease_epoch, candidate.command_json,
+          lane.lane_key AS durable_lane_key, lane.turn_id AS lane_turn_id,
+          lane.aggregate_type AS lane_aggregate_type,
+          lane.target_json AS lane_target_json
         FROM runtime_outbox AS candidate
+        LEFT JOIN runtime_delivery_lanes AS lane
+          ON lane.lane_key = candidate.lane_key
         WHERE (
           (
             candidate.status IN ('pending', 'retry_wait')
@@ -303,6 +319,21 @@ export function createOutboxService({
         delivery_attempt_no: deliveryAttemptNo,
         outbox_lease_epoch: outboxLeaseEpoch,
       };
+      if (row.lane_target_json !== null) {
+        const durableTarget = parseDurableDeliveryTarget(row.lane_target_json, {
+          occurredAt: claimedAt,
+        });
+        assertDeliveryLaneIdentity({
+          lane_key: row.durable_lane_key,
+          turn_id: row.lane_turn_id,
+          aggregate_type: row.lane_aggregate_type,
+        }, durableTarget, { occurredAt: claimedAt });
+        assertDeliveryTargetIdentity(
+          durableTarget,
+          command.target,
+          { occurredAt: claimedAt },
+        );
+      }
       validateDeliveryCommand(command, { occurredAt: claimedAt });
       const leaseExpiresAt = new Date(
         Date.parse(claimedAt) + leaseDurationMs,
@@ -340,15 +371,33 @@ export function createOutboxService({
     const apply = database.transaction(() => {
       const row = database.prepare(`
         SELECT status, delivery_attempt_id, delivery_attempt_no, outbox_lease_epoch,
-          command_json, result_json
-        FROM runtime_outbox
-        WHERE outbox_id = ?
+          command_json, result_json, lane.target_json AS lane_target_json
+          , lane.lane_key AS durable_lane_key, lane.turn_id AS lane_turn_id
+          , lane.aggregate_type AS lane_aggregate_type
+        FROM runtime_outbox AS outbox
+        LEFT JOIN runtime_delivery_lanes AS lane ON lane.lane_key = outbox.lane_key
+        WHERE outbox.outbox_id = ?
       `).get(result.outbox_id);
       if (!row) return { status: 'stale' };
+      const command = JSON.parse(row.command_json);
+      if (row.lane_target_json !== null) {
+        const durableTarget = parseDurableDeliveryTarget(row.lane_target_json, {
+          occurredAt: result.result_at,
+        });
+        assertDeliveryLaneIdentity({
+          lane_key: row.durable_lane_key,
+          turn_id: row.lane_turn_id,
+          aggregate_type: row.lane_aggregate_type,
+        }, durableTarget, { occurredAt: result.result_at });
+        assertDeliveryTargetIdentity(
+          durableTarget,
+          command.target,
+          { occurredAt: result.result_at },
+        );
+      }
       if (row.result_json === JSON.stringify(result)) {
         return { status: 'duplicate', outbox_status: row.status };
       }
-      const command = JSON.parse(row.command_json);
       if (
         row.status !== 'delivering'
         || !isCurrentFence(row, result)
