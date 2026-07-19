@@ -14,6 +14,7 @@ import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { createExecutorService } from '../runtime/executor/service.js';
 import { createExecutorStore } from '../runtime/persistence/executor-store.js';
 import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { deliveredResult } from './helpers/delivered-result.js';
 
 const inboundFixture = JSON.parse(fs.readFileSync(
   new URL('../contracts/public/fixtures/inbound-envelope-v1.json', import.meta.url),
@@ -407,7 +408,6 @@ describe('runtime executor service', () => {
       terminal: false,
     });
 
-    const deliveredCommands = [];
     const deliveryService = createOutboxService({
       database,
       serviceInstanceId: 'delivery-service-capacity',
@@ -415,52 +415,23 @@ describe('runtime executor service', () => {
       generateId: deterministicIds('delivery-capacity'),
       throttleMs: 0,
     });
-    for (let deliveryNo = 0; deliveryNo < 8; deliveryNo += 1) {
+    let capacityDelivery = null;
+    while (capacityDelivery === null) {
       const command = deliveryService.claimNext();
+      expect(command).not.toBeNull();
       if (!command) break;
-      deliveredCommands.push(command);
-      const resultAt = '2026-07-19T07:02:00Z';
-      const result = {
-        contract: 'zylos.delivery-result',
-        contract_version: '1.0',
-        trace_id: command.trace_id,
-        outbox_id: command.outbox_id,
-        delivery_id: command.delivery_id,
-        idempotency_key: command.idempotency_key,
-        delivery_attempt_id: command.delivery_attempt_id,
-        delivery_attempt_no: command.delivery_attempt_no,
-        outbox_lease_epoch: command.outbox_lease_epoch,
-        mapping_id: command.mapping.mapping_id,
-        operation: command.operation,
-        aggregate_version: command.aggregate_version,
-        status: 'delivered',
-        platform_message_id: command.operation === 'update_main'
-          ? command.target_platform_message_id
-          : `platform-${command.mapping.turn_id}`,
-        applied_platform_version: null,
-        delivered_at: resultAt,
-        error: null,
-        renderer_capabilities: {
-          supports_update: true,
-          supports_actions: true,
-          supports_platform_idempotency: true,
-          supports_platform_version: false,
-        },
-        result_at: resultAt,
-      };
-      expect(deliveryService.recordResult(result)).toEqual({
+      expect(deliveryService.recordResult(deliveredResult(
+        command,
+        '2026-07-19T07:02:00Z',
+      ))).toEqual({
         status: 'applied',
         outbox_status: 'delivered',
       });
       if (
         command.operation === 'update_main'
         && command.mapping.turn_id === second.turn_id
-      ) break;
+      ) capacityDelivery = command;
     }
-    const capacityDelivery = deliveredCommands.find(
-      (command) => command.operation === 'update_main'
-        && command.mapping.turn_id === second.turn_id,
-    );
     expect(capacityDelivery).toBeDefined();
     expect(validateDeliveryCommand(capacityDelivery).forwarded).toEqual(capacityDelivery);
     expect(capacityDelivery).toMatchObject({

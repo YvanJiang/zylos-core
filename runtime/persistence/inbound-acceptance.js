@@ -462,7 +462,7 @@ export function acceptNormalInbound(
         outbox_id, delivery_id, aggregate_type, aggregate_id, turn_id, control_id,
         lane_key, predecessor_delivery_id, aggregate_version, status, command_json,
         priority, supersedable, terminal, next_attempt_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, 'pending', ?, ?, 0, 0, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, 'pending', ?, ?, 0, ?, ?, ?, ?)
     `).run(
       deliveryCommand.outbox_id,
       deliveryCommand.delivery_id,
@@ -473,11 +473,14 @@ export function acceptNormalInbound(
       deliveryCommand.aggregate_version,
       JSON.stringify(deliveryCommand),
       deliveryCommand.priority,
+      deliveryCommand.render_model.terminal ? 1 : 0,
       deliveryCommand.not_before,
       committedAt,
       committedAt,
     );
-    stageMainProjection(database, { turn_id: turnId }, admissionEvent, { generateId });
+    if (!queueFull) {
+      stageMainProjection(database, { turn_id: turnId }, admissionEvent, { generateId });
+    }
 
     const result = {
       contract: 'zylos.inbound-result',

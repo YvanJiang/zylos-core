@@ -12,10 +12,12 @@ import {
   validateInboundResult,
   validateNormalizedEvent,
 } from '../contracts/public/index.js';
+import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import {
   acceptNormalInbound,
   initializeRuntimePersistence,
 } from '../runtime/persistence/inbound-acceptance.js';
+import { deliveredResult } from './helpers/delivered-result.js';
 
 const inboundFixture = JSON.parse(fs.readFileSync(
   new URL('../contracts/public/fixtures/inbound-envelope-v1.json', import.meta.url),
@@ -244,7 +246,7 @@ describe('acceptNormalInbound', () => {
       runtime_normalized_events: 4,
       runtime_outbox: 2,
       runtime_delivery_lanes: 2,
-      runtime_projection_snapshots: 2,
+      runtime_projection_snapshots: 1,
       runtime_message_mappings: 0,
     });
     expect(database.prepare(`
@@ -285,12 +287,16 @@ describe('acceptNormalInbound', () => {
     }
 
     const outbox = database.prepare(`
-      SELECT aggregate_version, status, command_json
+      SELECT aggregate_version, status, terminal, command_json
       FROM runtime_outbox
       WHERE turn_id = ?
     `).get(rejected.turn_id);
     const command = JSON.parse(outbox.command_json);
-    expect(outbox).toMatchObject({ aggregate_version: 2, status: 'pending' });
+    expect(outbox).toMatchObject({
+      aggregate_version: 2,
+      status: 'pending',
+      terminal: 1,
+    });
     expect(validateDeliveryCommand(command).forwarded).toEqual(command);
     expect(command).toMatchObject({
       aggregate_type: 'turn_main',
@@ -311,6 +317,45 @@ describe('acceptNormalInbound', () => {
         binding_state: 'bound',
       },
     });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM runtime_projection_snapshots
+      WHERE turn_id = ?
+    `).get(rejected.turn_id).count).toBe(0);
+
+    const deliveryIdCounts = new Map();
+    const deliveryService = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-service-queue-full',
+      now: () => '2026-07-19T06:00:01Z',
+      generateId(kind) {
+        const next = (deliveryIdCounts.get(kind) ?? 0) + 1;
+        deliveryIdCounts.set(kind, next);
+        return `${kind}-queue-full-delivery-${next}`;
+      },
+      throttleMs: 0,
+    });
+    let deliveredQueueFull = null;
+    while (deliveredQueueFull === null) {
+      const claimed = deliveryService.claimNext();
+      expect(claimed).not.toBeNull();
+      if (!claimed) break;
+      expect(deliveryService.recordResult(deliveredResult(
+        claimed,
+        '2026-07-19T06:00:01Z',
+      ))).toEqual({ status: 'applied', outbox_status: 'delivered' });
+      if (claimed.mapping.turn_id === rejected.turn_id) deliveredQueueFull = claimed;
+    }
+    expect(deliveredQueueFull).toMatchObject({
+      operation: 'create_main',
+      aggregate_version: 2,
+      render_model: { phase: 'failed', terminal: true },
+    });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM runtime_outbox
+      WHERE turn_id = ?
+    `).get(rejected.turn_id).count).toBe(1);
 
     database.close();
   });
