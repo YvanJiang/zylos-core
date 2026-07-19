@@ -69,6 +69,17 @@ const RUNTIME_SCHEMA = `
     ON runtime_turns(conversation_id)
     WHERE state IN ('starting', 'running', 'waiting_user', 'redirecting', 'recovering');
 
+  CREATE TABLE IF NOT EXISTS runtime_executor_residents (
+    conversation_id TEXT PRIMARY KEY REFERENCES runtime_conversations(conversation_id),
+    bot_id TEXT NOT NULL,
+    provider TEXT NOT NULL CHECK (provider IN ('claude', 'codex')),
+    admitted_at TEXT NOT NULL,
+    last_used_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS runtime_executor_residents_by_bot
+    ON runtime_executor_residents(bot_id, provider);
+
   CREATE TABLE IF NOT EXISTS runtime_executor_leases (
     conversation_id TEXT PRIMARY KEY REFERENCES runtime_conversations(conversation_id),
     lease_owner TEXT,

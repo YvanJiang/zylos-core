@@ -114,9 +114,9 @@ function buildEvent({
     lineage_id: turn.lineage_id,
     event_sequence: lastEvent.event_sequence + 1,
     turn_version: turn.turn_version + 1,
-    attempt_id: fence.attempt_id,
-    attempt_no: fence.attempt_no,
-    lease_epoch: fence.lease_epoch,
+    attempt_id: fence?.attempt_id ?? null,
+    attempt_no: fence?.attempt_no ?? null,
+    lease_epoch: fence?.lease_epoch ?? null,
     kind: descriptor.kind,
     phase: descriptor.phase,
     occurred_at: occurredAt,
@@ -138,6 +138,17 @@ function projectRenderModel(renderModel, event) {
   } else if (event.kind === 'text_delta') {
     const currentText = event.payload.start_offset === 0 ? '' : (renderModel.text ?? '');
     text = `${currentText.slice(0, event.payload.start_offset)}${event.payload.text}`;
+  } else if (
+    event.kind === 'turn_state_changed'
+    && event.payload.reason_code === 'executor_capacity'
+  ) {
+    text = 'Waiting for executor capacity.';
+  } else if (
+    event.kind === 'turn_state_changed'
+    && event.payload.to_state === 'starting'
+    && renderModel.text === 'Waiting for executor capacity.'
+  ) {
+    text = 'Starting execution.';
   }
   return {
     ...renderModel,
@@ -394,27 +405,121 @@ export function createExecutorStore({
     `).all();
   }
 
-  function markCapacityWait(turnId) {
-    const mark = database.transaction(() => {
-      const turn = database.prepare(`
-        SELECT turn.turn_id, turn.conversation_id
-        FROM runtime_turns AS turn
-        JOIN runtime_turn_queue AS queue ON queue.turn_id = turn.turn_id
-        WHERE turn.turn_id = ? AND turn.state = 'queued' AND queue.status = 'queued'
-      `).get(turnId);
-      if (!turn) return null;
-      database.prepare(`
-        UPDATE runtime_turn_queue
-        SET wait_reason = 'executor_capacity'
-        WHERE turn_id = ? AND status = 'queued'
-      `).run(turnId);
-      return {
-        conversation_id: turn.conversation_id,
-        turn_id: turn.turn_id,
-        wait_reason: 'executor_capacity',
-      };
+  function markCapacityWaitInTransaction(turnId, occurredAt) {
+    const queued = database.prepare(`
+      SELECT turn.turn_id, turn.conversation_id, queue.wait_reason
+      FROM runtime_turns AS turn
+      JOIN runtime_turn_queue AS queue ON queue.turn_id = turn.turn_id
+      WHERE turn.turn_id = ? AND turn.state = 'queued' AND queue.status = 'queued'
+    `).get(turnId);
+    if (!queued) return null;
+    const result = {
+      conversation_id: queued.conversation_id,
+      turn_id: queued.turn_id,
+      wait_reason: 'executor_capacity',
+    };
+    if (queued.wait_reason === 'executor_capacity') return result;
+
+    const turn = loadTurn(database, turnId);
+    const event = buildEvent({
+      turn,
+      lastEvent: loadLastEvent(database, turnId),
+      fence: null,
+      provider: null,
+      descriptor: {
+        kind: 'turn_state_changed',
+        phase: 'queued',
+        payload: {
+          from_state: 'queued',
+          to_state: 'queued',
+          reason_code: 'executor_capacity',
+        },
+      },
+      occurredAt,
+      generateId,
     });
-    return mark.immediate();
+    const turnUpdate = database.prepare(`
+      UPDATE runtime_turns
+      SET turn_version = ?, committed_at = ?
+      WHERE turn_id = ? AND state = 'queued' AND turn_version = ?
+    `).run(event.turn_version, occurredAt, turnId, turn.turn_version);
+    const queueUpdate = database.prepare(`
+      UPDATE runtime_turn_queue
+      SET wait_reason = 'executor_capacity'
+      WHERE turn_id = ? AND status = 'queued' AND wait_reason IS NOT 'executor_capacity'
+    `).run(turnId);
+    if (turnUpdate.changes !== 1 || queueUpdate.changes !== 1) {
+      conflict('stale_attempt', 'The capacity-wait projection changed concurrently.');
+    }
+    persistEvent(database, turn, event);
+    return result;
+  }
+
+  function isResidentConversation(conversationId) {
+    return Boolean(database.prepare(`
+      SELECT 1
+      FROM runtime_executor_residents
+      WHERE conversation_id = ? AND provider = 'claude'
+    `).get(conversationId));
+  }
+
+  function residentCountForBot(botId) {
+    return database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM runtime_executor_residents
+      WHERE bot_id = ? AND provider = 'claude'
+    `).get(botId).count;
+  }
+
+  function reserveNextExecutor({ maxResidentExecutorsPerBot }) {
+    const reserve = database.transaction(() => {
+      const candidates = listClaimableQueuedTurns();
+      if (candidates.length === 0) return { status: 'idle' };
+      if (provider !== 'claude') {
+        return {
+          status: 'ready',
+          conversation_id: candidates[0].conversation_id,
+        };
+      }
+
+      let selected = candidates.find(
+        (candidate) => isResidentConversation(candidate.conversation_id),
+      );
+      if (!selected) {
+        for (const candidate of candidates) {
+          if (residentCountForBot(candidate.bot_id) >= maxResidentExecutorsPerBot) continue;
+          const admittedAt = now();
+          database.prepare(`
+            INSERT INTO runtime_executor_residents (
+              conversation_id, bot_id, provider, admitted_at, last_used_at
+            ) VALUES (?, ?, 'claude', ?, ?)
+          `).run(candidate.conversation_id, candidate.bot_id, admittedAt, admittedAt);
+          selected = candidate;
+          break;
+        }
+      } else {
+        database.prepare(`
+          UPDATE runtime_executor_residents
+          SET last_used_at = ?
+          WHERE conversation_id = ? AND provider = 'claude'
+        `).run(now(), selected.conversation_id);
+      }
+
+      const waits = [];
+      for (const candidate of candidates) {
+        if (candidate.conversation_id === selected?.conversation_id) continue;
+        if (isResidentConversation(candidate.conversation_id)) continue;
+        if (residentCountForBot(candidate.bot_id) < maxResidentExecutorsPerBot) continue;
+        const wait = markCapacityWaitInTransaction(candidate.turn_id, now());
+        if (wait) waits.push(wait);
+      }
+
+      if (selected) {
+        return { status: 'ready', conversation_id: selected.conversation_id };
+      }
+      return waits.length > 0 ? { status: 'capacity_wait', ...waits[0] } : { status: 'idle' };
+    });
+    return reserve.immediate();
   }
 
   function claimNextQueuedTurn({ conversationId = null } = {}) {
@@ -577,9 +682,8 @@ export function createExecutorStore({
   return Object.freeze({
     appendAdapterEvent,
     claimNextQueuedTurn,
-    listClaimableQueuedTurns,
-    markCapacityWait,
     rebuildExecutorCache,
+    reserveNextExecutor,
     transitionTurn,
   });
 }

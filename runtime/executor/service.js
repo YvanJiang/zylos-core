@@ -48,18 +48,9 @@ export function createExecutorService({
   });
   let executors = [];
   let started = false;
-  const residentConversations = new Map();
 
   function refresh() {
     executors = store.rebuildExecutorCache();
-    const durableConversationIds = new Set(
-      executors.map((executor) => executor.conversation_id),
-    );
-    for (const conversationId of residentConversations.keys()) {
-      if (!durableConversationIds.has(conversationId)) {
-        residentConversations.delete(conversationId);
-      }
-    }
   }
 
   function snapshot() {
@@ -78,53 +69,18 @@ export function createExecutorService({
     return snapshot();
   }
 
-  function residentCountForBot(botId) {
-    let count = 0;
-    for (const resident of residentConversations.values()) {
-      if (resident.bot_id === botId) count += 1;
-    }
-    return count;
-  }
-
-  function selectCapacityCandidate(candidates) {
-    const existingResident = candidates.find(
-      (candidate) => residentConversations.has(candidate.conversation_id),
-    );
-    if (existingResident) return { candidate: existingResident, admitted: false };
-    if (provider !== 'claude') return { candidate: candidates[0], admitted: false };
-    const available = candidates.find(
-      (candidate) => residentCountForBot(candidate.bot_id) < maxResidentExecutorsPerBot,
-    );
-    if (!available) return { candidate: null, admitted: false };
-    residentConversations.set(available.conversation_id, { bot_id: available.bot_id });
-    return { candidate: available, admitted: true };
-  }
-
   async function runNext() {
     if (!started) start();
-    const candidates = store.listClaimableQueuedTurns();
-    if (candidates.length === 0) return { status: 'idle' };
-    const selected = selectCapacityCandidate(candidates);
-    if (!selected.candidate) {
-      const wait = store.markCapacityWait(candidates[0].turn_id);
+    const reservation = store.reserveNextExecutor({ maxResidentExecutorsPerBot });
+    if (reservation.status === 'idle') return reservation;
+    if (reservation.status === 'capacity_wait') {
       refresh();
-      return wait ? { status: 'capacity_wait', ...wait } : { status: 'idle' };
+      return reservation;
     }
-    let turnContext;
-    try {
-      turnContext = store.claimNextQueuedTurn({
-        conversationId: selected.candidate.conversation_id,
-      });
-    } catch (error) {
-      if (selected.admitted) {
-        residentConversations.delete(selected.candidate.conversation_id);
-      }
-      throw error;
-    }
+    const turnContext = store.claimNextQueuedTurn({
+      conversationId: reservation.conversation_id,
+    });
     if (!turnContext) {
-      if (selected.admitted) {
-        residentConversations.delete(selected.candidate.conversation_id);
-      }
       refresh();
       return { status: 'idle' };
     }

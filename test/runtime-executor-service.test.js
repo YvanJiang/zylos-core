@@ -277,6 +277,12 @@ describe('runtime executor service', () => {
       now: () => '2026-07-19T07:00:01Z',
       generateId: deterministicIds('inbound-capacity-second'),
     });
+    const thirdEnvelope = normalEnvelope('capacity-third');
+    thirdEnvelope.chat_id = 'chat-capacity-third';
+    const third = acceptNormalInbound(database, thirdEnvelope, {
+      now: () => '2026-07-19T07:00:02Z',
+      generateId: deterministicIds('inbound-capacity-third'),
+    });
     const adapterCalls = [];
     let markFirstStarted;
     const firstStarted = new Promise((resolve) => { markFirstStarted = resolve; });
@@ -300,10 +306,19 @@ describe('runtime executor service', () => {
       generateId: deterministicIds('capacity'),
       maxResidentExecutorsPerBot: 1,
     });
+    const competingService = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-capacity-competing',
+      now: () => '2026-07-19T07:01:01Z',
+      generateId: deterministicIds('capacity-competing'),
+      maxResidentExecutorsPerBot: 1,
+    });
 
     const firstRun = service.runNext();
     await firstStarted;
-    await expect(service.runNext()).resolves.toEqual({
+    await expect(competingService.runNext()).resolves.toEqual({
       status: 'capacity_wait',
       conversation_id: second.conversation_id,
       turn_id: second.turn_id,
@@ -321,6 +336,45 @@ describe('runtime executor service', () => {
       status: 'queued',
       wait_reason: 'executor_capacity',
     });
+    expect(database.prepare(`
+      SELECT turn_id, wait_reason
+      FROM runtime_turn_queue
+      WHERE turn_id IN (?, ?)
+      ORDER BY turn_id ASC
+    `).all(second.turn_id, third.turn_id)).toEqual([
+      { turn_id: second.turn_id, wait_reason: 'executor_capacity' },
+      { turn_id: third.turn_id, wait_reason: 'executor_capacity' },
+    ]);
+    const capacityEvents = readEvents(database, second.turn_id);
+    expect(capacityEvents).toHaveLength(3);
+    expect(validateNormalizedEvent(capacityEvents[2]).forwarded).toEqual(capacityEvents[2]);
+    expect(capacityEvents[2]).toMatchObject({
+      attempt_id: null,
+      attempt_no: null,
+      lease_epoch: null,
+      provider: null,
+      phase: 'queued',
+      payload: {
+        from_state: 'queued',
+        to_state: 'queued',
+        reason_code: 'executor_capacity',
+      },
+    });
+    const capacityDelivery = JSON.parse(database.prepare(`
+      SELECT command_json
+      FROM runtime_outbox
+      WHERE turn_id = ? AND aggregate_type = 'turn_main'
+    `).get(second.turn_id).command_json);
+    expect(validateDeliveryCommand(capacityDelivery).forwarded).toEqual(capacityDelivery);
+    expect(capacityDelivery).toMatchObject({
+      aggregate_version: 3,
+      event_sequence_through: 3,
+      render_model: {
+        phase: 'queued',
+        text: 'Waiting for executor capacity.',
+        terminal: false,
+      },
+    });
     expect(service.snapshot().executors).toEqual([
       {
         conversation_id: first.conversation_id,
@@ -334,7 +388,21 @@ describe('runtime executor service', () => {
         queued_turn_ids: [second.turn_id],
         wait_reason: 'executor_capacity',
       },
+      {
+        conversation_id: third.conversation_id,
+        active_turn_id: null,
+        queued_turn_ids: [third.turn_id],
+        wait_reason: 'executor_capacity',
+      },
     ]);
+    expect(database.prepare(`
+      SELECT conversation_id, bot_id, provider
+      FROM runtime_executor_residents
+    `).all()).toEqual([{
+      conversation_id: first.conversation_id,
+      bot_id: normalEnvelope('capacity-first').bot_id,
+      provider: 'claude',
+    }]);
 
     const duplicate = structuredClone(secondEnvelope);
     duplicate.trace_id = 'trace-capacity-second-duplicate';
@@ -352,7 +420,7 @@ describe('runtime executor service', () => {
       trace_id: duplicate.trace_id,
       deduplicated: true,
     });
-    expect(database.prepare('SELECT COUNT(*) AS count FROM runtime_turns').get().count).toBe(2);
+    expect(database.prepare('SELECT COUNT(*) AS count FROM runtime_turns').get().count).toBe(3);
     expect(adapterCalls).toEqual([first.turn_id]);
 
     releaseFirst();
@@ -360,16 +428,25 @@ describe('runtime executor service', () => {
       status: 'completed',
       turn_id: first.turn_id,
     });
-    await expect(service.runNext()).resolves.toMatchObject({
-      status: 'completed',
+    await expect(competingService.runNext()).resolves.toMatchObject({
+      status: 'capacity_wait',
       turn_id: second.turn_id,
     });
-    expect(adapterCalls).toEqual([first.turn_id, second.turn_id]);
+    expect(adapterCalls).toEqual([first.turn_id]);
+    expect(readEvents(database, second.turn_id)).toHaveLength(3);
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM runtime_executor_residents
+      WHERE conversation_id = ?
+    `).get(first.conversation_id).count).toBe(1);
     expect(database.prepare(`
       SELECT status, wait_reason
       FROM runtime_turn_queue
       WHERE turn_id = ?
-    `).get(second.turn_id)).toEqual({ status: 'completed', wait_reason: null });
+    `).get(second.turn_id)).toEqual({
+      status: 'queued',
+      wait_reason: 'executor_capacity',
+    });
 
     database.close();
   });
