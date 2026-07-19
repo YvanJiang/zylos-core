@@ -3,14 +3,18 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, test } from '@jest/globals';
 
 import {
+  CANONICAL_TURN_STATES,
   CONTROL_REQUEST_V1_SCHEMA,
   CONTROL_RESULT_V1_SCHEMA,
   ContractKernelError,
   DASHBOARD_RUNTIME_PROJECTION_V1_SCHEMA,
+  NORMALIZED_EVENT_PHASES,
   OBSERVABILITY_SNAPSHOT_V1_SCHEMA,
   resolveControlResultUpdate,
   resolveDashboardRuntimeProjectionUpdate,
   resolveObservabilitySnapshotUpdate,
+  TURN_PHASES,
+  TURN_STATES,
   validateControlRequest,
   validateControlResult,
   validateDashboardRuntimeProjection,
@@ -32,6 +36,13 @@ const projectionFixture = JSON.parse(readFileSync(
   new URL('../contracts/public/fixtures/dashboard-runtime-projection-v1.json', import.meta.url),
   'utf8',
 ));
+
+describe('shared runtime vocabulary', () => {
+  test('reuses the normalized event turn states and phases by identity', () => {
+    expect(CANONICAL_TURN_STATES).toBe(TURN_STATES);
+    expect(TURN_PHASES).toBe(NORMALIZED_EVENT_PHASES);
+  });
+});
 
 describe('observability snapshot v1 contract', () => {
   test('publishes complete and explicitly degraded collection snapshots', () => {

@@ -1,35 +1,10 @@
-export const CANONICAL_TURN_STATES = Object.freeze([
-  'received',
-  'queued',
-  'starting',
-  'running',
-  'waiting_user',
-  'redirecting',
-  'recovering',
-  'completed',
-  'stopped',
-  'cancelled',
-  'interrupted',
-  'failed',
-  'timed_out',
-]);
+import {
+  NORMALIZED_EVENT_PHASES,
+  TURN_STATES,
+} from './normalized-event.js';
 
-export const TURN_PHASES = Object.freeze([
-  'received',
-  'queued',
-  'starting',
-  'running',
-  'waiting_user',
-  'redirecting',
-  'recovering',
-  'retrying',
-  'completed',
-  'stopped',
-  'cancelled',
-  'interrupted',
-  'failed',
-  'timed_out',
-]);
+export const CANONICAL_TURN_STATES = TURN_STATES;
+export const TURN_PHASES = NORMALIZED_EVENT_PHASES;
 
 export const PROVIDERS = Object.freeze(['claude', 'codex']);
 export const RUNTIME_HEALTH_STATES = Object.freeze([
