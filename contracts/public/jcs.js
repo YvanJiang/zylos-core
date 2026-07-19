@@ -37,7 +37,14 @@ function serializePrimitive(value) {
 
 function assertPlainJsonObject(value) {
   const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
+  const constructor = prototype === null
+    ? null
+    : Object.getOwnPropertyDescriptor(prototype, 'constructor')?.value;
+  const isCrossRealmPlainObject = prototype !== null
+    && Object.getPrototypeOf(prototype) === null
+    && typeof constructor === 'function'
+    && constructor.name === 'Object';
+  if (prototype !== Object.prototype && prototype !== null && !isCrossRealmPlainObject) {
     reject('JCS objects must be plain JSON objects.');
   }
   if (Object.getOwnPropertySymbols(value).length > 0) {

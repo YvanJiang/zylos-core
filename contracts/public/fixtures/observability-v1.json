@@ -1,0 +1,264 @@
+{
+  "fixture_version": "1.0",
+  "cases": {
+    "complete": {
+      "contract": "zylos.observability-snapshot",
+      "contract_version": "1.0",
+      "snapshot_id": "snapshot-complete-A",
+      "core_service_instance_id": "core-service-A",
+      "generated_at": "2026-07-19T06:00:00Z",
+      "snapshot_version": 7,
+      "service": {
+        "complete": true,
+        "service_version": 12,
+        "health": "healthy",
+        "maintenance": false,
+        "draining": false,
+        "reconciling": false,
+        "host_id": "host-A",
+        "service_instance_id": "core-service-A",
+        "started_at": "2026-07-19T05:00:00Z",
+        "last_reconciliation_at": "2026-07-19T05:00:10Z",
+        "error": null
+      },
+      "executors": {
+        "complete": true,
+        "items": [
+          {
+            "conversation_key": {
+              "region": "cn",
+              "tenant_id": "tenant-A",
+              "bot_id": "bot-A",
+              "chat_type": "group",
+              "chat_id": "chat-A",
+              "native_thread_or_topic_id": null
+            },
+            "conversation_id": "conversation-A",
+            "executor_version": 9,
+            "provider": "claude",
+            "lineage_id": "lineage-A",
+            "provider_native_id": "session-A",
+            "executor_instance_id": "executor-A",
+            "health": "degraded",
+            "resident": true,
+            "evictable": false,
+            "active_turn_id": "turn-A",
+            "queue_length": 2,
+            "wait_reason": "interaction_delivery_unknown",
+            "last_event_id": "event-A-19",
+            "last_event_at": "2026-07-19T05:59:58Z",
+            "lease": {
+              "owner": "executor-service-A",
+              "expires_at": "2026-07-19T06:00:08Z",
+              "epoch": 14
+            },
+            "runtime_identity": {
+              "diagnostic_only": true,
+              "pid": 4242,
+              "pgid": 4242,
+              "process_start_time": "2026-07-19T05:55:00Z"
+            }
+          }
+        ],
+        "error": null
+      },
+      "turns": {
+        "complete": true,
+        "items": [
+          {
+            "turn_id": "turn-A",
+            "conversation_id": "conversation-A",
+            "lineage_id": "lineage-A",
+            "turn_version": 19,
+            "state": "recovering",
+            "phase": "recovering",
+            "attempt_count": 1,
+            "retry_count": 0,
+            "queue_position": null,
+            "recovery_of_turn_id": null,
+            "side_effect_status": "unknown",
+            "error": {
+              "code": "interaction_answer_delivery_unknown",
+              "category": "provider",
+              "retryable": false,
+              "side_effect_status": "unknown",
+              "user_message": "The answer was sent, but provider acknowledgement is unknown.",
+              "detail_ref": "diagnostic:handoff-A",
+              "occurred_at": "2026-07-19T05:59:57Z"
+            }
+          }
+        ],
+        "error": null
+      },
+      "interactions": {
+        "complete": true,
+        "items": [
+          {
+            "interaction_id": "interaction-A",
+            "conversation_id": "conversation-A",
+            "turn_id": "turn-A",
+            "blocking_ordinal": 1,
+            "kind": "tool_approval",
+            "state": "delivery_unknown",
+            "interaction_version": 4,
+            "handoff_state": "delivery_unknown",
+            "handoff_deadline_at": "2026-07-19T06:05:00Z",
+            "authorized_subject_summary": {
+              "actor_count": 1,
+              "capability_count": 0
+            },
+            "created_at": "2026-07-19T05:50:00Z",
+            "expires_at": "2026-07-19T06:00:00Z"
+          }
+        ],
+        "error": null
+      },
+      "workspace_leases": {
+        "complete": true,
+        "items": [
+          {
+            "workspace_root": "/srv/zylos/workspace",
+            "mode": "write",
+            "holder_conversation_id": "conversation-A",
+            "holder_turn_id": "turn-A",
+            "holder_background_work_id": null,
+            "expires_at": "2026-07-19T06:00:08Z",
+            "epoch": 22,
+            "waiter_count": 1
+          }
+        ],
+        "error": null
+      },
+      "outbox": {
+        "complete": true,
+        "items": [
+          {
+            "channel": "feishu",
+            "status": "retry_wait",
+            "count": 2,
+            "oldest_age_seconds": 8
+          }
+        ],
+        "retry_count": 1,
+        "dead_letter_count": 0,
+        "error": null
+      },
+      "audit_summary": {
+        "complete": true,
+        "items": [
+          {
+            "category": "recovery",
+            "count": 1,
+            "last_committed_at": "2026-07-19T05:59:57Z"
+          }
+        ],
+        "error": null
+      },
+      "error": null
+    },
+    "degraded": {
+      "contract": "zylos.observability-snapshot",
+      "contract_version": "1.0",
+      "snapshot_id": "snapshot-degraded-A",
+      "core_service_instance_id": "core-service-A",
+      "generated_at": "2026-07-19T06:00:05Z",
+      "snapshot_version": 8,
+      "service": {
+        "complete": true,
+        "service_version": 12,
+        "health": "degraded",
+        "maintenance": false,
+        "draining": false,
+        "reconciling": false,
+        "host_id": "host-A",
+        "service_instance_id": "core-service-A",
+        "started_at": "2026-07-19T05:00:00Z",
+        "last_reconciliation_at": "2026-07-19T05:00:10Z",
+        "error": null
+      },
+      "executors": {
+        "complete": true,
+        "items": [],
+        "error": null
+      },
+      "turns": {
+        "complete": true,
+        "items": [],
+        "error": null
+      },
+      "interactions": {
+        "complete": true,
+        "items": [],
+        "error": null
+      },
+      "workspace_leases": {
+        "complete": true,
+        "items": [],
+        "error": null
+      },
+      "outbox": {
+        "complete": false,
+        "items": [],
+        "retry_count": 0,
+        "dead_letter_count": 0,
+        "error": {
+          "code": "observability_degraded",
+          "category": "storage",
+          "retryable": true,
+          "side_effect_status": "none",
+          "user_message": "Outbox metrics are temporarily unavailable.",
+          "detail_ref": "diagnostic:snapshot-degraded-A",
+          "occurred_at": "2026-07-19T06:00:05Z"
+        }
+      },
+      "audit_summary": {
+        "complete": true,
+        "items": [],
+        "error": null
+      },
+      "error": {
+        "code": "observability_degraded",
+        "category": "storage",
+        "retryable": true,
+        "side_effect_status": "none",
+        "user_message": "The snapshot is partial; unavailable collections are marked incomplete.",
+        "detail_ref": "diagnostic:snapshot-degraded-A",
+        "occurred_at": "2026-07-19T06:00:05Z"
+      }
+    },
+    "replacement_instance": {
+      "contract": "zylos.observability-snapshot",
+      "contract_version": "1.0",
+      "snapshot_id": "snapshot-replacement-B",
+      "core_service_instance_id": "core-service-B",
+      "generated_at": "2026-07-19T06:01:00Z",
+      "snapshot_version": 1,
+      "service": {
+        "complete": true,
+        "service_version": 1,
+        "health": "healthy",
+        "maintenance": false,
+        "draining": false,
+        "reconciling": false,
+        "host_id": "host-A",
+        "service_instance_id": "core-service-B",
+        "started_at": "2026-07-19T06:00:30Z",
+        "last_reconciliation_at": "2026-07-19T06:00:40Z",
+        "error": null
+      },
+      "executors": { "complete": true, "items": [], "error": null },
+      "turns": { "complete": true, "items": [], "error": null },
+      "interactions": { "complete": true, "items": [], "error": null },
+      "workspace_leases": { "complete": true, "items": [], "error": null },
+      "outbox": {
+        "complete": true,
+        "items": [],
+        "retry_count": 0,
+        "dead_letter_count": 0,
+        "error": null
+      },
+      "audit_summary": { "complete": true, "items": [], "error": null },
+      "error": null
+    }
+  }
+}
