@@ -260,7 +260,7 @@ describe('exact-base durable source fencing', () => {
       .toThrow('unowned members before resume');
     expect(signals).toHaveLength(signalsBeforeMissingResume);
     phaseJournal.onPhase('resuming');
-    process.kill(suspended.members.at(-1).pid, 'SIGCONT');
+    process.kill(suspended.pane.pid, 'SIGCONT');
     expect(quiescence.resume(suspended, { phase: 'resuming', ...phaseJournal }))
       .toMatchObject({ resumed: true });
     const signalsAfterResume = signals.length;
