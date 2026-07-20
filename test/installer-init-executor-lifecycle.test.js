@@ -87,5 +87,23 @@ describe('installer and init executor lifecycle', () => {
     ]) {
       expect(files.some((file) => file === retired || file.startsWith(retired))).toBe(false);
     }
+    expect(files.some((file) => file.includes('/node_modules/'))).toBe(false);
+    expect(files.some((file) => file.endsWith('.node'))).toBe(false);
+    for (const packageManifest of [
+      'skills/comm-bridge/package.json', 'skills/comm-bridge/package-lock.json',
+      'skills/scheduler/package.json', 'skills/scheduler/package-lock.json',
+      'skills/web-console/package.json', 'skills/web-console/package-lock.json',
+    ]) expect(files).toContain(packageManifest);
+  });
+
+  test('selectable lifecycle skills cannot enqueue retired session commands', () => {
+    for (const relative of [
+      '../skills/new-session/SKILL.md',
+      '../skills/upgrade-claude/SKILL.md',
+      '../skills/upgrade-claude/scripts/upgrade.js',
+    ]) {
+      const source = fs.readFileSync(new URL(relative, import.meta.url), 'utf8');
+      expect(source).not.toMatch(/c4-control|activity-monitor|tmux|send-keys|--content['"]?,?\s*['"]\/(?:exit|clear)/i);
+    }
   });
 });

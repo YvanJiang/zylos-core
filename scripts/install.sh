@@ -286,31 +286,56 @@ FISH_EOF
 # ── Install Zylos ─────────────────────────────────────────────
 install_zylos() {
   local bootstrap_backup=""
-  local bootstrap_tarball=""
   local use_sudo=false
+  local zylos_dir="${ZYLOS_DIR:-$HOME/zylos}"
+  local bootstrap_manifest="$zylos_dir/runtime/base-executor-bootstrap.json"
+  local installed_bin=""
+  local installed_root=""
   if command -v zylos &>/dev/null; then
     local current_version
     current_version="$(zylos --version 2>/dev/null || echo 'unknown')"
     warn "zylos is already installed (${current_version}). Upgrading..."
-    local installed_bin installed_root
     installed_bin="$(command -v zylos)"
     installed_root="$(node -e 'const fs=require("fs"),path=require("path");process.stdout.write(path.dirname(path.dirname(fs.realpathSync(process.argv[1]))))' "$installed_bin")"
-    local bootstrap_root
-    bootstrap_root="${ZYLOS_DIR:-$HOME/zylos}/runtime"
-    mkdir -p "$bootstrap_root"
-    bootstrap_backup="$(mktemp -d "$bootstrap_root/base-to-executor.XXXXXX")"
-    mkdir -p "$bootstrap_backup/base-release"
-    cp -R "$installed_root/." "$bootstrap_backup/base-release/"
-    bootstrap_tarball="$(cd "$bootstrap_backup/base-release" && npm pack --pack-destination "$bootstrap_backup" --silent)"
-    bootstrap_tarball="$bootstrap_backup/$bootstrap_tarball"
-    git clone --depth 1 --branch "$BRANCH" "$ZYLOS_REPO" "$bootstrap_backup/target-release"
+    if [ -f "$bootstrap_manifest" ]; then
+      local bootstrap_state resume_entry resume_status
+      bootstrap_state="$(node -e 'const fs=require("fs");const m=JSON.parse(fs.readFileSync(process.argv[1]));process.stdout.write(String(m.state||""))' "$bootstrap_manifest")"
+      if [ "$bootstrap_state" != "supervisor_started" ] && [ "$bootstrap_state" != "base_restored" ]; then
+        resume_entry="$(node -e 'const fs=require("fs"),path=require("path");const m=JSON.parse(fs.readFileSync(process.argv[1]));process.stdout.write(path.join(m.target_release_path,"scripts","bootstrap-executor-lifecycle.js"))' "$bootstrap_manifest")"
+        warn "Resuming the durable exact-base executor migration (${bootstrap_state})."
+        resume_status=0
+        node "$resume_entry" --resume --zylos-dir "$zylos_dir" || resume_status=$?
+        return "$resume_status"
+      fi
+    fi
+    local installed_ecosystem="$zylos_dir/pm2/ecosystem.config.cjs"
+    if [ -f "$installed_ecosystem" ] \
+      && [ -f "$installed_root/runtime/executor/launcher.js" ] \
+      && grep -q 'zylos-executor' "$installed_ecosystem"; then
+      info "Existing executor installation detected; delegating upgrade to authoritative Core control."
+      zylos upgrade --self --yes --branch "$BRANCH"
+      return $?
+    fi
+    if [ -f "$installed_ecosystem" ] && grep -q 'zylos-executor' "$installed_ecosystem"; then
+      warn "Executor service configuration does not match the installed package; refusing ambiguous migration."
+      return 1
+    fi
+    if [ -f "$installed_ecosystem" ]; then
+      local bootstrap_root base_name target_name
+      bootstrap_root="$zylos_dir/runtime"
+      mkdir -p "$bootstrap_root"
+      bootstrap_backup="$(mktemp -d "$bootstrap_root/base-to-executor.XXXXXX")"
+      mkdir -p "$bootstrap_backup/base-release" "$bootstrap_backup/target-source" "$bootstrap_backup/target-release"
+      cp -R "$installed_root/." "$bootstrap_backup/base-release/"
+      base_name="$(cd "$bootstrap_backup/base-release" && npm pack --ignore-scripts --pack-destination "$bootstrap_backup" --silent)"
+      mv "$bootstrap_backup/$base_name" "$bootstrap_backup/exact-base-package.tgz"
+      git clone --depth 1 --branch "$BRANCH" "$ZYLOS_REPO" "$bootstrap_backup/target-source"
+      target_name="$(cd "$bootstrap_backup/target-source" && npm pack --ignore-scripts --pack-destination "$bootstrap_backup" --silent)"
+      mv "$bootstrap_backup/$target_name" "$bootstrap_backup/executor-package.tgz"
+      tar -xzf "$bootstrap_backup/executor-package.tgz" -C "$bootstrap_backup/target-release" --strip-components=1
+    fi
   fi
 
-  local install_url="${ZYLOS_REPO}#${BRANCH}"
-  info "Installing zylos from GitHub (${BRANCH})..."
-
-  # If npm global prefix is not user-writable (system-installed node),
-  # use sudo for npm install -g
   local npm_prefix
   npm_prefix="$(npm config get prefix 2>/dev/null || echo "")"
   if ! { [ -n "$npm_prefix" ] && [ -w "$npm_prefix" ]; }; then
@@ -318,57 +343,35 @@ install_zylos() {
     if [ "$(id -u)" -ne 0 ]; then use_sudo=true; fi
   fi
 
-  local install_status=0
-  if [ "$use_sudo" = true ]; then
-    sudo env ZYLOS_PACKAGE_PREPARE=1 npm install -g --install-links "$install_url" || install_status=$?
-  else
-    ZYLOS_PACKAGE_PREPARE=1 npm install -g --install-links "$install_url" || install_status=$?
-  fi
-  if [ "$install_status" -ne 0 ]; then
-    if [ -n "$bootstrap_tarball" ]; then
-      warn "New package installation failed; restoring the previous package."
-      local restore_status=0
-      if [ "$use_sudo" = true ]; then
-        sudo env ZYLOS_PACKAGE_PREPARE=1 npm install -g --install-links "$bootstrap_tarball" || restore_status=$?
-      else
-        ZYLOS_PACKAGE_PREPARE=1 npm install -g --install-links "$bootstrap_tarball" || restore_status=$?
-      fi
-      if [ "$restore_status" -ne 0 ]; then
-        warn "Previous package restoration also failed (exit ${restore_status}); rollback backup remains at ${bootstrap_backup}."
-        return "$restore_status"
-      fi
-    fi
-    return "$install_status"
-  fi
-
   if [ -n "$bootstrap_backup" ]; then
-    local new_bin new_root bootstrap_status
-    new_bin="$(command -v zylos)"
-    new_root="$(node -e 'const fs=require("fs"),path=require("path");process.stdout.write(path.dirname(path.dirname(fs.realpathSync(process.argv[1]))))' "$new_bin")"
+    local bootstrap_status install_mode
+    install_mode="direct"
+    if [ "$use_sudo" = true ]; then install_mode="sudo"; fi
     bootstrap_status=0
-    node "$new_root/scripts/bootstrap-executor-lifecycle.js" \
-      --zylos-dir "${ZYLOS_DIR:-$HOME/zylos}" \
+    node "$bootstrap_backup/target-release/scripts/bootstrap-executor-lifecycle.js" \
+      --zylos-dir "$zylos_dir" \
       --from-release "$bootstrap_backup/base-release" \
-      --target-release "$bootstrap_backup/target-release" || bootstrap_status=$?
+      --target-release "$bootstrap_backup/target-release" \
+      --from-package "$bootstrap_backup/exact-base-package.tgz" \
+      --target-package "$bootstrap_backup/executor-package.tgz" \
+      --install-mode "$install_mode" || bootstrap_status=$?
     if [ "$bootstrap_status" -ne 0 ]; then
       if [ "$bootstrap_status" -eq 2 ]; then
-        warn "Executor migration committed, but post-commit completion failed; the new package remains installed and the durable upgrade will resume on the next executor start."
-        return "$bootstrap_status"
-      fi
-      warn "Executor migration rolled back; restoring the previous package."
-      local restore_status=0
-      if [ "$use_sudo" = true ]; then
-        sudo env ZYLOS_PACKAGE_PREPARE=1 npm install -g --install-links "$bootstrap_tarball" || restore_status=$?
+        warn "Executor migration committed, but completion is pending; rerun this installer to resume it."
       else
-        ZYLOS_PACKAGE_PREPARE=1 npm install -g --install-links "$bootstrap_tarball" || restore_status=$?
-      fi
-      if [ "$restore_status" -ne 0 ]; then
-        warn "Previous package restoration failed (exit ${restore_status}); rollback backup remains at ${bootstrap_backup}."
-        return "$restore_status"
+        warn "Executor migration did not commit; exact-base package/runtime state was restored when rollback was possible."
       fi
       return "$bootstrap_status"
     fi
     find "$bootstrap_backup" -depth -delete
+  else
+    local install_url="${ZYLOS_REPO}#${BRANCH}"
+    info "Installing zylos from GitHub (${BRANCH})..."
+    if [ "$use_sudo" = true ]; then
+      sudo env ZYLOS_PACKAGE_PREPARE=1 npm install -g --install-links "$install_url"
+    else
+      ZYLOS_PACKAGE_PREPARE=1 npm install -g --install-links "$install_url"
+    fi
   fi
 
   ok "zylos: $(zylos --version 2>/dev/null || echo 'installed')"

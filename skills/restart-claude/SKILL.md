@@ -18,7 +18,7 @@ re-establishes it as part of its healthy service generation.
 
 ## Pre-Restart Checklist
 
-Before sending `/exit`, complete these steps **in order**:
+Before restarting the executor, complete these steps **in order**:
 
 ### 1. Stop background tasks
 

@@ -13,6 +13,10 @@ import {
 import { createInstalledRuntimeUpgradeHost } from './installed-runtime-upgrade-host.js';
 import { driveInstalledRuntimeUpgrade } from './executor-upgrade-driver.js';
 import { legacyLifecycleArtifactPaths } from './legacy-lifecycle-artifacts.js';
+import {
+  extractAndFenceLegacyBaseBatch,
+  reconcileLegacyBaseRollback,
+} from './legacy-base-source.js';
 import { findResumableRuntimeUpgrade } from './upgrade-state.js';
 
 const LEGACY_SERVICE_NAMES = Object.freeze([
@@ -263,7 +267,40 @@ function installReleaseDependencies({ releasePath, execFileSyncFn, prepareOnly, 
   fs.rmSync(isolatedHome, { recursive: true, force: true });
 }
 
-function prepareRelease({ source, releaseRef, branch, releaseRoot, execFileSyncFn }) {
+function copyPackagePayload({ sourcePath, releasePath, packlistFn }) {
+  const output = packlistFn('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
+    cwd: sourcePath,
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000,
+  });
+  const payload = JSON.parse(String(output));
+  const files = payload?.[0]?.files;
+  if (!Array.isArray(files) || files.length === 0) throw new Error('Candidate package payload is empty.');
+  fs.mkdirSync(releasePath, { recursive: true });
+  for (const descriptor of files) {
+    const relative = descriptor?.path;
+    if (typeof relative !== 'string' || relative.length === 0 || path.isAbsolute(relative)) {
+      throw new Error('Candidate package payload contains an invalid path.');
+    }
+    const sourceFile = path.resolve(sourcePath, relative);
+    if (sourceFile !== sourcePath && !sourceFile.startsWith(`${sourcePath}${path.sep}`)) {
+      throw new Error('Candidate package payload escaped its source directory.');
+    }
+    const resolvedSource = fs.realpathSync(sourceFile);
+    if (resolvedSource !== sourcePath && !resolvedSource.startsWith(`${sourcePath}${path.sep}`)) {
+      throw new Error('Candidate package payload contains an escaping symbolic link.');
+    }
+    const stat = fs.statSync(resolvedSource);
+    if (!stat.isFile()) throw new Error(`Candidate package payload is not a file: ${relative}`);
+    const destination = path.join(releasePath, relative);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.copyFileSync(resolvedSource, destination, fs.constants.COPYFILE_EXCL);
+    fs.chmodSync(destination, stat.mode & 0o777);
+  }
+}
+
+function prepareRelease({
+  source, releaseRef, branch, releaseRoot, execFileSyncFn, packlistFn,
+}) {
   const sourcePath = requireDirectory('downloaded_source', source);
   const packageVersion = readPackageRelease(sourcePath);
   if (typeof releaseRef !== 'string' || releaseRef.length === 0) {
@@ -275,7 +312,7 @@ function prepareRelease({ source, releaseRef, branch, releaseRoot, execFileSyncF
   const safeRef = releaseRef.replace(/[^A-Za-z0-9._-]/g, '-').slice(0, 80);
   const releasePath = path.join(releaseRoot, `${safeRef}-${crypto.randomUUID()}`);
   fs.mkdirSync(releaseRoot, { recursive: true });
-  fs.cpSync(sourcePath, releasePath, { recursive: true, errorOnExist: true, force: false });
+  copyPackagePayload({ sourcePath, releasePath, packlistFn });
   installReleaseDependencies({ releasePath, execFileSyncFn, prepareOnly: true });
   return Object.freeze({ packageVersion, releasePath, releaseRef });
 }
@@ -285,25 +322,31 @@ function decorateReleaseAdapter(adapter, activeReleaseFile, execFileSyncFn, {
   ecosystemDestination,
   zylosDir,
   targetReleasePath,
+  packageLifecycle,
+  finalizeLegacyExecution,
 }) {
   return Object.freeze({
     async activate(request) {
+      const packageResult = packageLifecycle === null
+        ? null : await packageLifecycle.activate(request);
       const result = await adapter.activate(request);
       atomicJson(activeReleaseFile, {
         release_ref: result.release_ref,
         release_path: result.release_path,
         upgrade_id: request.upgrade_id,
       });
-      return { ...result, upgrade_id: request.upgrade_id };
+      return { ...result, upgrade_id: request.upgrade_id, package_activation: packageResult };
     },
     async restore(request) {
+      const packageResult = packageLifecycle === null
+        ? null : await packageLifecycle.restore(request);
       const result = await adapter.restore(request);
       atomicJson(activeReleaseFile, {
         release_ref: result.release_ref,
         release_path: result.release_path,
         upgrade_id: null,
       });
-      return { ...result, upgrade_id: null };
+      return { ...result, upgrade_id: null, package_restoration: packageResult };
     },
     async cleanup(request) {
       const deployedConfig = deployManagedFile(ecosystemSource, ecosystemDestination);
@@ -327,10 +370,12 @@ function decorateReleaseAdapter(adapter, activeReleaseFile, execFileSyncFn, {
         installRoot: false,
       });
       const result = await adapter.cleanup(request);
+      const legacyExecution = await finalizeLegacyExecution(request);
       const registrations = removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn });
       return Object.freeze({
         ...result,
         ...registrations,
+        legacy_execution: legacyExecution,
         deployed_ecosystem_config: deployedConfig,
       });
     },
@@ -446,6 +491,33 @@ function startTargetHealthProcess({
   });
 }
 
+function createDurableNoticeWaiter(database, { timeoutMs = 30_000, pollMs = 100 } = {}) {
+  return Object.freeze({
+    async deliver({ upgrade_id: upgradeId, notice_ids: noticeIds }) {
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const pending = noticeIds.filter((notice) => {
+          const row = database.prepare(`
+            SELECT outbox.status, outbox.result_json
+            FROM runtime_legacy_migration_notices AS notice
+            JOIN runtime_outbox AS outbox ON outbox.outbox_id = notice.outbox_id
+            WHERE notice.upgrade_id = ? AND notice.legacy_kind = ?
+              AND notice.legacy_record_id = ?
+          `).get(upgradeId, notice.legacy_kind, notice.legacy_record_id);
+          if (!row || row.status !== 'delivered' || row.result_json === null) return true;
+          const proof = JSON.parse(row.result_json);
+          return proof.status !== 'delivered';
+        });
+        if (pending.length === 0) return;
+        if (Date.now() >= deadline) {
+          throw new Error('Legacy uncertainty notices were not durably delivered before migration.');
+        }
+        await new Promise((resolve) => setTimeout(resolve, pollMs));
+      }
+    },
+  });
+}
+
 export function createInstalledExecutorUpgradeHandler({
   database,
   Database,
@@ -455,6 +527,10 @@ export function createInstalledExecutorUpgradeHandler({
   provider,
   allowLegacyFromRelease = false,
   execFileSyncFn = execFileSync,
+  packlistFn = execFileSync,
+  packageLifecycle = null,
+  legacyProviderQuiescence = null,
+  noticeDeliveryTimeoutMs = 30_000,
   startTargetHealth = startTargetHealthProcess,
   targetHealthProofTimeoutMs = 30_000,
   targetHealthTerminationGraceMs = 5_000,
@@ -463,6 +539,18 @@ export function createInstalledExecutorUpgradeHandler({
   const installationRoot = requireDirectory('zylosDir', zylosDir);
   const packageRoot = requireDirectory('currentReleasePath', currentReleasePath);
   if (typeof Database !== 'function') throw new TypeError('Database must be a constructor');
+  if (typeof packlistFn !== 'function') throw new TypeError('packlistFn must be a function');
+  if (packageLifecycle !== null && (typeof packageLifecycle.activate !== 'function'
+    || typeof packageLifecycle.restore !== 'function')) {
+    throw new TypeError('packageLifecycle must expose activate and restore');
+  }
+  if (allowLegacyFromRelease && (legacyProviderQuiescence === null
+    || typeof legacyProviderQuiescence.inspect !== 'function'
+    || typeof legacyProviderQuiescence.suspend !== 'function'
+    || typeof legacyProviderQuiescence.resume !== 'function'
+    || typeof legacyProviderQuiescence.commit !== 'function')) {
+    throw new TypeError('legacyProviderQuiescence is required for exact-base migration');
+  }
   if (typeof startTargetHealth !== 'function') throw new TypeError('startTargetHealth must be a function');
   if (!Number.isSafeInteger(targetHealthProofTimeoutMs) || targetHealthProofTimeoutMs <= 0) {
     throw new TypeError('targetHealthProofTimeoutMs must be a positive safe integer');
@@ -470,11 +558,15 @@ export function createInstalledExecutorUpgradeHandler({
   if (!Number.isSafeInteger(targetHealthTerminationGraceMs) || targetHealthTerminationGraceMs <= 0) {
     throw new TypeError('targetHealthTerminationGraceMs must be a positive safe integer');
   }
+  if (!Number.isSafeInteger(noticeDeliveryTimeoutMs) || noticeDeliveryTimeoutMs <= 0) {
+    throw new TypeError('noticeDeliveryTimeoutMs must be a positive safe integer');
+  }
   initializeRuntimePersistence(database);
   const activeReleaseFile = path.join(installationRoot, 'runtime', 'active-release.json');
   const snapshotDirectory = path.join(installationRoot, 'runtime', 'upgrade-snapshots');
   const releaseRoot = path.join(installationRoot, 'runtime', 'releases');
   const planDirectory = path.join(installationRoot, 'runtime', 'upgrade-plans');
+  const providerQuiescence = allowLegacyFromRelease ? legacyProviderQuiescence : null;
 
   function legacyServiceStateFile(upgradeId) {
     return path.join(installationRoot, 'runtime', 'legacy-upgrade-audit', `${upgradeId}-services.json`);
@@ -498,12 +590,37 @@ export function createInstalledExecutorUpgradeHandler({
           zylosDir: installationRoot,
           execFileSyncFn,
         }),
+        provider_execution: null,
+        provider_suspended: false,
         recorded_at: now(),
       };
+      const activityMonitorOwned = state.services.some(({ name }) => name === 'activity-monitor');
+      const providerExecution = providerQuiescence?.inspect() ?? { active: false };
+      if (allowLegacyFromRelease) {
+        const durablePlan = JSON.parse(fs.readFileSync(
+          upgradePlanPath(planDirectory, upgradeId), 'utf8',
+        ));
+        const expectedActive = durablePlan.legacy_batch.records.some((record) => (
+          record.kind === 'c4' && record.legacy_record_id === `provider-session:${provider}`
+        ));
+        if (providerExecution.active !== expectedActive) {
+          throw new Error('Legacy provider execution changed after durable source fencing.');
+        }
+      }
+      if (providerExecution.active && !activityMonitorOwned) {
+        throw new Error('Refusing to suspend an unowned legacy provider session.');
+      }
+      state.provider_execution = providerExecution;
       atomicJson(stateFile, state);
     }
     if (state.upgrade_id !== upgradeId || !Array.isArray(state.services)) {
       throw new Error('Legacy service ownership record conflicts with the upgrade.');
+    }
+    if (allowLegacyFromRelease && state.provider_execution?.active === true
+      && state.provider_suspended !== true) {
+      state.provider_execution = providerQuiescence.suspend(state.provider_execution);
+      state.provider_suspended = true;
+      atomicJson(stateFile, state);
     }
     // Re-inspect before any destructive command so generic-name collisions
     // always fail closed and remain untouched.
@@ -534,6 +651,13 @@ export function createInstalledExecutorUpgradeHandler({
 
   function restartOwnedLegacyServices({ upgradeId, stepId }) {
     const state = readLegacyServiceState(upgradeId);
+    const sourceQueue = JSON.parse(fs.readFileSync(
+      path.join(installationRoot, 'runtime', 'upgrade-input', `${upgradeId}.json`), 'utf8',
+    ));
+    if (allowLegacyFromRelease) {
+      reconcileLegacyBaseRollback({ database, rollbackBatch: sourceQueue });
+      providerQuiescence.resume(state.provider_execution);
+    }
     const ecosystem = path.join(installationRoot, 'pm2', 'ecosystem.config.cjs');
     inspectLegacyServiceRegistrations({ zylosDir: installationRoot, execFileSyncFn });
     for (const serviceState of state.services) {
@@ -558,6 +682,12 @@ export function createInstalledExecutorUpgradeHandler({
       }
     }
     return Object.freeze({ step_id: stepId, restarted: true, restarted_at: now() });
+  }
+
+  async function finalizeLegacyExecution({ upgrade_id: upgradeId }) {
+    if (!allowLegacyFromRelease) return Object.freeze({ removed: false });
+    const state = readLegacyServiceState(upgradeId);
+    return providerQuiescence.commit(state.provider_execution);
   }
 
   async function executePlan(plan) {
@@ -588,6 +718,8 @@ export function createInstalledExecutorUpgradeHandler({
         ),
         zylosDir: installationRoot,
         targetReleasePath: plan.to_release_path,
+        packageLifecycle,
+        finalizeLegacyExecution,
       },
     );
     const legacySourceAdapter = createLegacySourceQueueAdapter({
@@ -628,6 +760,9 @@ export function createInstalledExecutorUpgradeHandler({
       releaseAdapter,
       legacySourceAdapter,
       executorAdapter,
+      noticeAdapter: createDurableNoticeWaiter(database, {
+        timeoutMs: noticeDeliveryTimeoutMs,
+      }),
       zylosDir: installationRoot,
       now,
     });
@@ -668,18 +803,33 @@ export function createInstalledExecutorUpgradeHandler({
 
   async function resumeBlocking() {
     const blocking = findResumableRuntimeUpgrade(database);
-    if (blocking === null) return null;
-    const planFile = upgradePlanPath(planDirectory, blocking.upgrade_id);
+    let upgradeId = blocking?.upgrade_id ?? null;
+    if (upgradeId === null) {
+      let orphanPlans = [];
+      try {
+        orphanPlans = fs.readdirSync(planDirectory)
+          .filter((entry) => entry.endsWith('.json'))
+          .map((entry) => entry.slice(0, -'.json'.length));
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+      if (orphanPlans.length === 0) return null;
+      if (orphanPlans.length !== 1) {
+        throw new Error('Multiple durable runtime upgrade plans require operator reconciliation.');
+      }
+      [upgradeId] = orphanPlans;
+    }
+    const planFile = upgradePlanPath(planDirectory, upgradeId);
     let plan;
     try {
-      plan = readUpgradePlan(planFile, blocking.upgrade_id, {
+      plan = readUpgradePlan(planFile, upgradeId, {
         installationRoot,
         releaseRoot,
         provider,
       });
     } catch (error) {
       throw new Error(
-        `Runtime upgrade ${blocking.upgrade_id} is ${blocking.state} but cannot resume: ${error.message}`,
+        `Runtime upgrade ${upgradeId} is ${blocking?.state ?? 'prepared'} but cannot resume: ${error.message}`,
       );
     }
     return executePlan(plan);
@@ -709,9 +859,16 @@ export function createInstalledExecutorUpgradeHandler({
       branch: target.branch ?? null,
       releaseRoot,
       execFileSyncFn,
+      packlistFn,
     });
     const upgradeId = `upgrade-${crypto.randomUUID()}`;
-    const legacyBatch = Object.freeze({ batch_id: `${upgradeId}-empty`, records: Object.freeze([]) });
+    const legacyBatch = allowLegacyFromRelease
+      ? extractAndFenceLegacyBaseBatch({
+        database, batchId: `${upgradeId}-legacy-base`, provider,
+        providerActive: providerQuiescence.inspect().active,
+        observedAt: now(),
+      })
+      : Object.freeze({ batch_id: `${upgradeId}-empty`, records: Object.freeze([]) });
     const legacyQueueFile = path.join(installationRoot, 'runtime', 'upgrade-input', `${upgradeId}.json`);
     atomicJson(legacyQueueFile, legacyBatch);
     if (fromRelease === prepared.releaseRef) {

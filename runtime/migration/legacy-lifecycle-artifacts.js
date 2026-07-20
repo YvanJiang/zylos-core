@@ -22,6 +22,7 @@ export function cleanupRetiredRuntimeSkillArtifacts({ skillsDir }) {
   const artifacts = [
     path.join(root, 'comm-bridge', 'scripts', 'c4-dispatcher.js'),
     path.join(root, 'comm-bridge', 'scripts', 'tmux-input-state.js'),
+    path.join(root, 'comm-bridge', 'scripts', 'c4-control.js'),
   ];
   const removed = [];
   for (const artifact of artifacts) {
@@ -45,6 +46,7 @@ export function legacyLifecycleArtifactPaths(zylosDir) {
     path.join(root, 'bin', 'start-tmux-runtime.sh'),
     path.join(root, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-dispatcher.js'),
     path.join(root, '.claude', 'skills', 'comm-bridge', 'scripts', 'tmux-input-state.js'),
+    path.join(root, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-control.js'),
     path.join(root, '.claude', 'skills', 'activity-monitor'),
     path.join(root, '.codex', 'skills', 'activity-monitor'),
   ]);

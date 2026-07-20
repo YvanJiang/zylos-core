@@ -24,7 +24,6 @@ Channels ──► Core ingress/queue ──► executor service ──► provi
 |--------|---------|-----------|
 | `c4-receive.js` | Compatible text/event ingress into Core | [c4-receive](references/c4-receive.md) |
 | `c4-send.js` | Claude → External (route outgoing messages) | [c4-send](references/c4-send.md) |
-| `c4-control.js` | System control plane (heartbeat, maintenance) | [c4-control](references/c4-control.md) |
 | `c4-fetch.js` | Fetch conversations by id range | [c4-fetch](references/c4-fetch.md) |
 | `c4-db.js` | Database module and CLI for querying conversations and checkpoints | [c4-db](references/c4-db.md) |
 | `c4-checkpoint.js` | Create/query checkpoints (sync boundaries) | [c4-checkpoint](references/c4-checkpoint.md) |
@@ -51,7 +50,8 @@ Treat the heredoc wrapper as fixed shell syntax: only the message body goes betw
 SQLite at `~/zylos/comm-bridge/c4.db`:
 - `conversations`: All messages (in/out) with priority, status, retry tracking
 - `checkpoints`: Recovery points with conversation id ranges
-- `control_queue`: System control messages (heartbeat, maintenance) with priority, ack deadlines, and status lifecycle
+- legacy control records are retained only for one-time migration audit and are
+  not a selectable executor control path
 
 ## Health & Service Management
 
