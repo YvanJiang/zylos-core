@@ -169,6 +169,8 @@ describe('runtime interaction schema migration', () => {
     expect(reopened.prepare(`
       SELECT parent_type FROM runtime_interaction_handoffs WHERE interaction_id = ?
     `).get(request.interaction_id)).toEqual({ parent_type: 'provider_turn' });
+    expect(reopened.prepare("PRAGMA table_info('runtime_interactions')").all()
+      .find(({ name }) => name === 'turn_id').notnull).toBe(0);
     expect(reopened.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
 
     initializeRuntimePersistence(reopened);

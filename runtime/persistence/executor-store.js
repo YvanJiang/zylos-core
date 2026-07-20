@@ -551,6 +551,7 @@ export function createExecutorStore({
       SELECT candidate.request_json
       FROM runtime_interactions AS candidate
       WHERE candidate.state = 'pending'
+        AND candidate.parent_type != 'security_control'
         AND NOT EXISTS (
           SELECT 1
           FROM runtime_interactions AS blocker

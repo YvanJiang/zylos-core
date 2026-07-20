@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 
 import { createContractError } from '../../contracts/public/index.js';
+import { createPermissionService } from '../permissions/permission-service.js';
 import { createExecutorStore } from '../persistence/executor-store.js';
 
 function defaultGenerateId(kind) {
@@ -92,6 +93,9 @@ export function createExecutorService({
   residentHeartbeatIntervalMs = 20_000,
   scheduleResidentHeartbeat = setInterval,
   cancelResidentHeartbeat = clearInterval,
+  permissionSweepIntervalMs = 1_000,
+  schedulePermissionSweep = setInterval,
+  cancelPermissionSweep = clearInterval,
   permissionHandler = null,
   interactionHandoffDispositionAuthorizer = null,
   interactionTimeoutMs,
@@ -144,6 +148,15 @@ export function createExecutorService({
   if (typeof cancelResidentHeartbeat !== 'function') {
     throw new TypeError('cancelResidentHeartbeat must be a function');
   }
+  if (!Number.isFinite(permissionSweepIntervalMs) || permissionSweepIntervalMs <= 0) {
+    throw new TypeError('permissionSweepIntervalMs must be a positive finite number');
+  }
+  if (typeof schedulePermissionSweep !== 'function') {
+    throw new TypeError('schedulePermissionSweep must be a function');
+  }
+  if (typeof cancelPermissionSweep !== 'function') {
+    throw new TypeError('cancelPermissionSweep must be a function');
+  }
   if (
     !Number.isSafeInteger(maxResidentExecutorsPerBot)
     || maxResidentExecutorsPerBot <= 0
@@ -161,6 +174,7 @@ export function createExecutorService({
     residentLeaseDurationMs,
     interactionTimeoutMs,
   });
+  const permissionPolicy = createPermissionService({ database, now, generateId });
   let executors = [];
   let started = false;
   const activeRuns = new Map();
@@ -178,6 +192,7 @@ export function createExecutorService({
   let lifecycle = 'open';
   let closePromise = null;
   let residentHeartbeat = null;
+  let permissionSweep = null;
   let residentHeartbeatFailure = null;
 
   function persistenceFailure(cause) {
@@ -264,6 +279,20 @@ export function createExecutorService({
       throw new Error(`Executor service is ${lifecycle}; it cannot be started.`);
     }
     if (started) return snapshot();
+    permissionPolicy.expireDue();
+    if (permissionSweep === null) {
+      permissionSweep = schedulePermissionSweep(() => {
+        try {
+          permissionPolicy.expireDue();
+        } catch (error) {
+          onDeadlineError(error, Object.freeze({
+            kind: 'permission_expiry_sweep',
+            expires_at: now(),
+          }));
+        }
+      }, permissionSweepIntervalMs);
+      permissionSweep?.unref?.();
+    }
     store.reconcileExpiredResidents();
     store.reconcileExpiredStartedInteractionHandoffs();
     if (residentHeartbeat === null) {
@@ -655,6 +684,19 @@ export function createExecutorService({
 
   function createPermissionControls(activeRun, adapterContext) {
     const { turnContext } = activeRun;
+    function authorizeProtectedAction(request) {
+      const actionRef = typeof request?.action_ref === 'string'
+        ? request.action_ref
+        : generateId('protected-action');
+      const actionKind = typeof request?.action_kind === 'string'
+        ? request.action_kind
+        : (typeof request?.tool_name === 'string' ? request.tool_name : 'provider_action');
+      return persist(() => permissionPolicy.authorizeProtectedAction({
+        turn_id: turnContext.turn_id,
+        action_ref: actionRef,
+        action_kind: actionKind,
+      }));
+    }
     return Object.freeze({
       interactionPolicy: Object.freeze({
         allowed_sources: Object.freeze(['main_card_reply', 'card_action']),
@@ -676,7 +718,17 @@ export function createExecutorService({
         );
         if (released) endedResidentFences.delete(context.conversation_id);
       },
+      authorizeProtectedAction(request) {
+        return authorizeProtectedAction(request);
+      },
       async requestPermission(request, { signal } = {}) {
+        const policyDecision = authorizeProtectedAction(request);
+        if (policyDecision.trusted) {
+          return Object.freeze({
+            behavior: 'allow',
+            permission_basis: policyDecision.basis_kind,
+          });
+        }
         if (permissionHandler === null) {
           return Object.freeze({
             behavior: 'deny',
@@ -1089,6 +1141,17 @@ export function createExecutorService({
   }
 
   function submitInteractionAnswer(answer, sourceEvidence) {
+    if (permissionPolicy.handlesInteraction(answer?.interaction_id)) {
+      const result = permissionPolicy.submitConfirmation(answer);
+      if (
+        ['accepted', 'duplicate'].includes(result.status)
+        || (result.interaction_state !== null && result.interaction_state !== 'pending')
+      ) {
+        clearInteractionDeadline(result.interaction_id);
+      }
+      reschedulePendingInteractionDeadlines();
+      return result;
+    }
     const result = store.commitInteractionAnswer(answer, sourceEvidence);
     if (
       ['accepted', 'duplicate'].includes(result.status)
@@ -1101,6 +1164,15 @@ export function createExecutorService({
   }
 
   async function expireInteraction(expiration) {
+    if (permissionPolicy.handlesInteraction(expiration?.interaction_id)) {
+      const result = permissionPolicy.expireDue();
+      clearInteractionDeadline(expiration.interaction_id);
+      reschedulePendingInteractionDeadlines();
+      return {
+        status: result.confirmations_expired > 0 ? 'expired' : 'not_pending',
+        interaction_id: expiration.interaction_id,
+      };
+    }
     const result = store.expireInteraction(expiration);
     if (result.status !== 'expired' || result.turn_state !== 'timed_out') {
       if (result.status === 'not_pending') clearInteractionDeadline(result.interaction_id);
@@ -1548,6 +1620,10 @@ export function createExecutorService({
         if (lifecycle === 'closed' && residentHeartbeat !== null) {
           cancelResidentHeartbeat(residentHeartbeat);
           residentHeartbeat = null;
+        }
+        if (lifecycle === 'closed' && permissionSweep !== null) {
+          cancelPermissionSweep(permissionSweep);
+          permissionSweep = null;
         }
         if (lifecycle === 'close_failed' && closePromise === closing) {
           closePromise = null;
