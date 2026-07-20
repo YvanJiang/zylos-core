@@ -715,16 +715,20 @@ describe('runtime /stop linearization', () => {
         await providerStopped.promise;
         yield { type: 'turn_result', outcome: 'cancelled' };
       },
-      async handleInteractionAnswer(delivery) {
-        handlerEntered.resolve();
-        await allowHandlerAck.promise;
+      async prepareInteractionAnswer() {
         return {
-          status: 'accepted',
-          handoff_id: delivery.handoff.handoff_id,
-          provider_attempt_id: delivery.handoff.provider_attempt_id,
-          handoff_attempt_id: delivery.handoff.handoff_attempt_id,
-          handoff_attempt_no: delivery.handoff.handoff_attempt_no,
-          lease_epoch: delivery.handoff.lease_epoch,
+          async send(delivery) {
+            handlerEntered.resolve();
+            await allowHandlerAck.promise;
+            return {
+              status: 'accepted',
+              handoff_id: delivery.handoff.handoff_id,
+              provider_attempt_id: delivery.handoff.provider_attempt_id,
+              handoff_attempt_id: delivery.handoff.handoff_attempt_id,
+              handoff_attempt_no: delivery.handoff.handoff_attempt_no,
+              lease_epoch: delivery.handoff.lease_epoch,
+            };
+          },
         };
       },
       async cancel() {

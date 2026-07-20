@@ -98,7 +98,10 @@ descriptors, transition tables, and validators through `contracts/public/index.j
 - `validateInteractionHandoff` validates the durable handoff record and its send/ack evidence.
   `validateInteractionTransition` and `validateInteractionHandoffTransition` enforce the only
   allowed edges, including pre-send retry/cancel guards, delivery-unknown proof, terminal
-  immutability, and late-ack rejection.
+  immutability, and late-ack rejection. An authorized terminal disposition after
+  `delivery_unknown` remains `cancelled` but must preserve its claim/send evidence, unknown
+  side-effect error, and null provider acknowledgement; it cannot be rewritten as an unsent
+  cancellation.
 
 The handoff is a Core persistence record, not a new transport payload, so it deliberately is not
 added to `PUBLIC_CONTRACTS`. Channels consume interaction request/answer/result documents;

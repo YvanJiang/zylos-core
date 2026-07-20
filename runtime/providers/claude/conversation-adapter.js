@@ -915,15 +915,22 @@ export function createClaudeConversationAdapter({
     }
   }
 
-  async function handleInteractionAnswer(delivery) {
+  async function prepareInteractionAnswer(delivery) {
     const request = delivery?.request;
     const executor = executors.get(request?.conversation_id);
     const activeTurn = executor?.activeTurn;
     if (
       !activeTurn
       || activeTurn.context.turn_id !== request?.turn_id
+      || activeTurn.context.attempt.attempt_id
+        !== request?.runtime_fence?.provider_attempt_id
+      || activeTurn.context.attempt.lease_epoch !== request?.runtime_fence?.lease_epoch
       || activeTurn.context.attempt.attempt_id !== delivery?.handoff?.provider_attempt_id
       || activeTurn.context.attempt.lease_epoch !== delivery?.handoff?.lease_epoch
+      || typeof delivery?.handoff?.handoff_attempt_id !== 'string'
+      || delivery.handoff.handoff_attempt_id.length === 0
+      || !Number.isSafeInteger(delivery?.handoff?.handoff_attempt_no)
+      || delivery.handoff.handoff_attempt_no < 1
     ) {
       throw new Error('Claude interaction answer does not match the active provider attempt fence.');
     }
@@ -934,24 +941,80 @@ export function createClaudeConversationAdapter({
     }
     const answerDecision = delivery.answer?.value?.decision;
     const allowed = ['allow', 'approve', 'approved', 'yes'].includes(answerDecision);
-    activeTurn.pendingPermissions.delete(providerInteractionRef);
-    pending.permission.resolve(allowed ? {
-      behavior: 'allow',
-      updatedInput: pending.input,
-    } : {
-      behavior: 'deny',
-      message: 'Permission denied by the authorized user.',
-      interrupt: false,
-    });
-    return {
-      status: allowed ? 'accepted' : 'deny',
-      handoff_id: delivery.handoff.handoff_id,
+    const expected = {
+      interaction_id: request.interaction_id,
+      request_version: request.version,
       provider_attempt_id: delivery.handoff.provider_attempt_id,
+      lease_epoch: delivery.handoff.lease_epoch,
+      handoff_id: delivery.handoff.handoff_id,
       handoff_attempt_id: delivery.handoff.handoff_attempt_id,
       handoff_attempt_no: delivery.handoff.handoff_attempt_no,
-      lease_epoch: delivery.handoff.lease_epoch,
-      blocking_interactions_remaining: activeTurn.pendingPermissions.size > 0,
+      answer_value: structuredClone(delivery.answer.value),
     };
+    let sent = false;
+    return Object.freeze({
+      async send(startedDelivery) {
+        const currentExecutor = executors.get(request.conversation_id);
+        const currentTurn = currentExecutor?.activeTurn;
+        const currentPending = currentTurn?.pendingPermissions.get(providerInteractionRef);
+        if (
+          sent
+          || currentExecutor !== executor
+          || currentTurn !== activeTurn
+          || currentPending !== pending
+          || currentTurn.context.turn_id !== startedDelivery?.request?.turn_id
+          || startedDelivery?.request?.interaction_id !== expected.interaction_id
+          || startedDelivery?.request?.version !== expected.request_version
+          || startedDelivery?.request?.runtime_fence?.provider_attempt_id
+            !== expected.provider_attempt_id
+          || startedDelivery?.request?.runtime_fence?.lease_epoch !== expected.lease_epoch
+          || startedDelivery?.handoff?.handoff_id !== expected.handoff_id
+          || startedDelivery?.handoff?.provider_attempt_id !== expected.provider_attempt_id
+          || startedDelivery?.handoff?.lease_epoch !== expected.lease_epoch
+          || startedDelivery?.handoff?.handoff_attempt_id !== expected.handoff_attempt_id
+          || startedDelivery?.handoff?.handoff_attempt_no !== expected.handoff_attempt_no
+          || typeof startedDelivery?.handoff?.last_send_started_at !== 'string'
+          || JSON.stringify(startedDelivery?.answer?.value) !== JSON.stringify(expected.answer_value)
+        ) {
+          throw new Error('The prepared Claude interaction answer lost its provider handoff fence.');
+        }
+        sent = true;
+        activeTurn.pendingPermissions.delete(providerInteractionRef);
+        pending.permission.resolve(allowed ? {
+          behavior: 'allow',
+          updatedInput: pending.input,
+        } : {
+          behavior: 'deny',
+          message: 'Permission denied by the authorized user.',
+          interrupt: false,
+        });
+        return {
+          status: allowed ? 'accepted' : 'deny',
+          handoff_id: startedDelivery.handoff.handoff_id,
+          provider_attempt_id: startedDelivery.handoff.provider_attempt_id,
+          handoff_attempt_id: startedDelivery.handoff.handoff_attempt_id,
+          handoff_attempt_no: startedDelivery.handoff.handoff_attempt_no,
+          lease_epoch: startedDelivery.handoff.lease_epoch,
+          blocking_interactions_remaining: activeTurn.pendingPermissions.size > 0,
+        };
+      },
+    });
+  }
+
+  async function queryInteractionHandoffAcceptance(delivery) {
+    return Object.freeze({
+      status: 'unknown',
+      read_only: true,
+      idempotent: true,
+      handoff_id: delivery?.handoff?.handoff_id,
+      provider_attempt_id: delivery?.handoff?.provider_attempt_id,
+      handoff_attempt_id: delivery?.handoff?.handoff_attempt_id,
+      handoff_attempt_no: delivery?.handoff?.handoff_attempt_no,
+      lease_epoch: delivery?.handoff?.lease_epoch,
+      accepted_at: null,
+      evidence_ref: null,
+      reason_code: 'provider_acceptance_query_unavailable',
+    });
   }
 
   async function evictIdle({ canEvict, maxCount = Number.POSITIVE_INFINITY }) {
@@ -1045,7 +1108,8 @@ export function createClaudeConversationAdapter({
     close,
     evictIdle,
     execute,
-    handleInteractionAnswer,
+    prepareInteractionAnswer,
+    queryInteractionHandoffAcceptance,
     hasResident,
   });
 }

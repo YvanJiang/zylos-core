@@ -7,6 +7,14 @@ function defaultGenerateId(kind) {
   return `${kind}-${crypto.randomUUID()}`;
 }
 
+function deepFreeze(value) {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
+}
+
 function normalizeProviderError(error, occurredAt) {
   const descriptor = error?.providerError;
   if (descriptor && typeof descriptor === 'object') {
@@ -29,6 +37,33 @@ function normalizeProviderError(error, occurredAt) {
     retryable: false,
     sideEffectStatus: 'unknown',
     userMessage: 'The provider execution failed after side effects may have occurred.',
+    occurredAt,
+  });
+}
+
+function normalizePreSendProviderError(error, occurredAt) {
+  const descriptor = error?.providerError;
+  if (descriptor && typeof descriptor === 'object') {
+    try {
+      return createContractError({
+        code: descriptor.code,
+        category: descriptor.category,
+        retryable: descriptor.retryable === true
+          && descriptor.side_effect_status === 'none',
+        sideEffectStatus: descriptor.side_effect_status,
+        userMessage: descriptor.user_message,
+        occurredAt,
+      });
+    } catch {
+      // Invalid adapter metadata is replaced with the safe non-retryable failure below.
+    }
+  }
+  return createContractError({
+    code: 'provider_context_invalid',
+    category: 'provider',
+    retryable: false,
+    sideEffectStatus: 'unknown',
+    userMessage: 'Provider preparation failed without proving that no side effect occurred.',
     occurredAt,
   });
 }
@@ -58,6 +93,7 @@ export function createExecutorService({
   scheduleResidentHeartbeat = setInterval,
   cancelResidentHeartbeat = clearInterval,
   permissionHandler = null,
+  interactionHandoffDispositionAuthorizer = null,
   interactionTimeoutMs,
   providerStopTimeoutMs = 10_000,
   maxResidentExecutorsPerBot = 20,
@@ -82,6 +118,12 @@ export function createExecutorService({
   }
   if (permissionHandler !== null && typeof permissionHandler !== 'function') {
     throw new TypeError('permissionHandler must be a function or null');
+  }
+  if (
+    interactionHandoffDispositionAuthorizer !== null
+    && typeof interactionHandoffDispositionAuthorizer !== 'function'
+  ) {
+    throw new TypeError('interactionHandoffDispositionAuthorizer must be a function or null');
   }
   if (!Number.isFinite(providerStopTimeoutMs) || providerStopTimeoutMs <= 0) {
     throw new TypeError('providerStopTimeoutMs must be a positive finite number');
@@ -142,6 +184,7 @@ export function createExecutorService({
   function persistenceFailure(cause) {
     const error = new Error(`Runtime persistence failed: ${cause.message}`, { cause });
     error.persistenceFailure = true;
+    if (typeof cause?.code === 'string') error.code = cause.code;
     return error;
   }
 
@@ -223,6 +266,7 @@ export function createExecutorService({
     }
     if (started) return snapshot();
     store.reconcileExpiredResidents();
+    store.reconcileExpiredStartedInteractionHandoffs();
     if (residentHeartbeat === null) {
       residentHeartbeat = scheduleResidentHeartbeat(() => {
         try {
@@ -346,6 +390,57 @@ export function createExecutorService({
     return false;
   }
 
+  async function recoverUnknownInteractionDelivery(
+    activeRun,
+    delivery,
+    cause,
+    providerError = null,
+  ) {
+    const recovery = {
+      activeRun,
+      delivery,
+      providerError,
+      deliveryUnknown: null,
+      isolationProven: false,
+      marked: false,
+    };
+    pendingInteractionRecoveries.set(delivery.request.turn_id, recovery);
+    try {
+      recovery.deliveryUnknown = persist(
+        () => store.markInteractionHandoffDeliveryUnknown(delivery, providerError),
+      );
+      recovery.marked = true;
+    } catch (markFailure) {
+      lifecycle = 'close_failed';
+      cause.markFailure = markFailure;
+    }
+    if (activeRun && !activeRun.durableSettled) {
+      try {
+        recovery.isolationProven = await isolateInteractionRecovery(activeRun);
+      } catch (isolationFailure) {
+        lifecycle = 'close_failed';
+        cause.isolationFailure = isolationFailure;
+      }
+    }
+    if (!recovery.isolationProven) lifecycle = 'close_failed';
+    if (recovery.marked && activeRun && !activeRun.durableSettled) {
+      activeRun.durableSettled = true;
+      refresh();
+      cleanupActiveRun(activeRun);
+    }
+    if (recovery.marked && recovery.isolationProven) {
+      try {
+        releaseRecoveringOwnership(activeRun.turnContext);
+      } catch (ownershipFailure) {
+        lifecycle = 'close_failed';
+        cause.ownershipFailure = ownershipFailure;
+      }
+      pendingInteractionRecoveries.delete(delivery.request.turn_id);
+    }
+    reschedulePendingInteractionDeadlines();
+    if (recovery.deliveryUnknown) cause.deliveryUnknown = recovery.deliveryUnknown;
+    return recovery;
+  }
   function transitionToRecovery(activeRun, reasonCode = 'provider_execution_uncertain') {
     const { state } = store.assertCurrentFence(activeRun.turnContext);
     persist(() => store.transitionTurn(activeRun.turnContext, state, 'recovering', {
@@ -1249,15 +1344,49 @@ export function createExecutorService({
   }
 
   async function executeInteractionDelivery(handoffId) {
-    if (typeof adapter.handleInteractionAnswer !== 'function') {
-      throw new TypeError('adapter.handleInteractionAnswer must be a function');
+    if (typeof adapter.prepareInteractionAnswer !== 'function') {
+      throw new TypeError('adapter.prepareInteractionAnswer must be a function');
     }
-    const delivery = store.claimInteractionHandoff(handoffId);
+    const beginning = persist(() => store.beginInteractionHandoff(handoffId));
+    if (beginning.acknowledgement !== null) {
+      reschedulePendingInteractionDeadlines();
+      refresh();
+      return { acknowledgement: beginning.acknowledgement, execution: null };
+    }
+    const { delivery } = beginning;
     const activeRun = activeRuns.get(delivery.request.turn_id);
+    let prepared;
+    try {
+      prepared = await adapter.prepareInteractionAnswer(deepFreeze(delivery));
+      if (!prepared || typeof prepared.send !== 'function') {
+        throw new TypeError('adapter.prepareInteractionAnswer must return a send function');
+      }
+    } catch (error) {
+      const providerError = normalizePreSendProviderError(error, now());
+      const resolution = persist(
+        () => store.markInteractionHandoffPreSendFailure(delivery, providerError),
+      );
+      if (resolution.status === 'recovering' && activeRun && !activeRun.durableSettled) {
+        const isolationProven = await isolateInteractionRecovery(activeRun);
+        if (!isolationProven) {
+          lifecycle = 'close_failed';
+          throw new Error('The non-retryable pre-send failure could not isolate its provider run.');
+        }
+        activeRun.durableSettled = true;
+        cleanupActiveRun(activeRun);
+        releaseRecoveringOwnership(activeRun.turnContext);
+      }
+      reschedulePendingInteractionDeadlines();
+      refresh();
+      return resolution;
+    }
+    const sendingDelivery = persist(
+      () => store.markInteractionHandoffSendStarted(delivery),
+    );
     let handlerAcknowledgement;
     try {
-      handlerAcknowledgement = await adapter.handleInteractionAnswer(
-        Object.freeze(delivery),
+      handlerAcknowledgement = await prepared.send(
+        deepFreeze(sendingDelivery),
       );
     } catch (error) {
       if (activeRun && committedControlStatus(activeRun) !== null) {
@@ -1270,60 +1399,16 @@ export function createExecutorService({
       if (provider === 'codex' && isExplicitProviderError(error)) {
         const providerError = normalizeProviderError(error, now());
         if (providerError.side_effect_status === 'unknown') {
-          const deliveryUnknown = persist(
-            () => store.markInteractionHandoffDeliveryUnknown(delivery, providerError),
+          const recovery = await recoverUnknownInteractionDelivery(
+            activeRun,
+            sendingDelivery,
+            error,
+            providerError,
           );
-          if (activeRun && !activeRun.durableSettled) {
-            activeRun.durableSettled = true;
-            cleanupActiveRun(activeRun);
-          }
-          reschedulePendingInteractionDeadlines();
-          refresh();
-          return deliveryUnknown;
+          if (recovery.deliveryUnknown) return recovery.deliveryUnknown;
         }
       }
-      const recovery = {
-        activeRun,
-        delivery,
-        deliveryUnknown: null,
-        isolationProven: false,
-        marked: false,
-      };
-      pendingInteractionRecoveries.set(delivery.request.turn_id, recovery);
-      try {
-        recovery.deliveryUnknown = persist(
-          () => store.markInteractionHandoffDeliveryUnknown(delivery),
-        );
-        recovery.marked = true;
-      } catch (markFailure) {
-        lifecycle = 'close_failed';
-        error.markFailure = markFailure;
-      }
-      if (activeRun && !activeRun.durableSettled) {
-        try {
-          recovery.isolationProven = await isolateInteractionRecovery(activeRun);
-        } catch (isolationFailure) {
-          lifecycle = 'close_failed';
-          error.isolationFailure = isolationFailure;
-        }
-      }
-      if (!recovery.isolationProven) lifecycle = 'close_failed';
-      if (recovery.marked && activeRun && !activeRun.durableSettled) {
-        activeRun.durableSettled = true;
-        refresh();
-        cleanupActiveRun(activeRun);
-      }
-      if (recovery.marked && recovery.isolationProven) {
-        try {
-          releaseRecoveringOwnership(activeRun.turnContext);
-        } catch (ownershipFailure) {
-          lifecycle = 'close_failed';
-          error.ownershipFailure = ownershipFailure;
-        }
-        pendingInteractionRecoveries.delete(delivery.request.turn_id);
-      }
-      reschedulePendingInteractionDeadlines();
-      if (recovery.deliveryUnknown) error.deliveryUnknown = recovery.deliveryUnknown;
+      await recoverUnknownInteractionDelivery(activeRun, sendingDelivery, error);
       throw error;
     }
     if (activeRun && committedControlStatus(activeRun) !== null) {
@@ -1341,26 +1426,7 @@ export function createExecutorService({
           || handlerAcknowledgement.blocking_interactions_remaining === true,
       });
     } catch (error) {
-      if (activeRun && !activeRun.durableSettled) {
-        let recoveryPersisted = false;
-        try {
-          transitionToRecovery(activeRun, 'interaction_ack_persistence_failed');
-          recoveryPersisted = true;
-        } catch (recoveryFailure) {
-          lifecycle = 'close_failed';
-          error.recoveryFailure = recoveryFailure;
-        }
-        try {
-          const isolationProven = await isolateInteractionRecovery(activeRun);
-          if (recoveryPersisted && isolationProven) {
-            releaseRecoveringOwnership(activeRun.turnContext);
-          }
-          if (!isolationProven) lifecycle = 'close_failed';
-        } catch (isolationFailure) {
-          lifecycle = 'close_failed';
-          error.isolationFailure = isolationFailure;
-        }
-      }
+      await recoverUnknownInteractionDelivery(activeRun, sendingDelivery, error);
       throw error;
     }
     reschedulePendingInteractionDeadlines();
@@ -1383,6 +1449,63 @@ export function createExecutorService({
       interactionDeliverySettlements.delete(delivery);
     }).catch(() => {});
     return delivery;
+  }
+
+  async function reconcileInteractionHandoff(handoffId) {
+    if (lifecycle !== 'open') {
+      throw new Error(
+        `Executor service is ${lifecycle}; it cannot reconcile an interaction handoff.`,
+      );
+    }
+    if (typeof adapter.queryInteractionHandoffAcceptance !== 'function') {
+      throw new TypeError('adapter.queryInteractionHandoffAcceptance must be a function');
+    }
+    const delivery = store.getInteractionHandoffForRecovery(handoffId);
+    store.assertInteractionHandoffRecoveryNoticeDelivered(delivery);
+    const proof = await adapter.queryInteractionHandoffAcceptance(deepFreeze(delivery));
+    if (proof?.status === 'accepted') {
+      const acknowledgement = persist(
+        () => store.acknowledgeInteractionHandoffFromQuery(delivery, proof),
+      );
+      refresh();
+      return acknowledgement;
+    }
+    return persist(() => store.recordInteractionHandoffQueryUnproven(delivery, proof));
+  }
+
+  async function resolveInteractionHandoff(handoffId, disposition) {
+    if (lifecycle !== 'open') {
+      throw new Error(
+        `Executor service is ${lifecycle}; it cannot resolve an interaction handoff.`,
+      );
+    }
+    if (interactionHandoffDispositionAuthorizer === null) {
+      throw new TypeError('No interaction handoff disposition authorizer is configured.');
+    }
+    const delivery = store.getInteractionHandoffForRecovery(handoffId);
+    store.assertInteractionHandoffRecoveryNoticeDelivered(delivery);
+    const decision = Object.freeze({
+      capability: 'interaction.handoff.resolve',
+      scope: Object.freeze({
+        conversation_id: delivery.request.conversation_id,
+        turn_id: delivery.request.turn_id,
+        handoff_id: delivery.handoff.handoff_id,
+        action: disposition?.action,
+        replacement_interaction: disposition?.replacement_interaction,
+      }),
+    });
+    const authorization = await interactionHandoffDispositionAuthorizer(
+      decision,
+      deepFreeze(delivery),
+    );
+    const result = persist(() => store.resolveInteractionHandoffDisposition(
+      delivery,
+      disposition,
+      authorization,
+    ));
+    reschedulePendingInteractionDeadlines();
+    refresh();
+    return result;
   }
 
   async function close() {
@@ -1431,6 +1554,7 @@ export function createExecutorService({
             try {
               recovery.deliveryUnknown = store.markInteractionHandoffDeliveryUnknown(
                 recovery.delivery,
+                recovery.providerError,
               );
               recovery.marked = true;
             } catch (error) {
@@ -1572,6 +1696,8 @@ export function createExecutorService({
     deliverInteractionAnswer,
     evictIdleExecutors,
     expireInteraction,
+    reconcileInteractionHandoff,
+    resolveInteractionHandoff,
     runNext,
     snapshot,
     start,

@@ -946,6 +946,31 @@ describe('Claude conversation executor', () => {
     })).toThrow(/managed by Core lineage authority/);
   });
 
+  test('reports that Claude has no read-only same-handoff acceptance query', async () => {
+    const adapter = createClaudeConversationAdapter({ query: () => {} });
+    await expect(adapter.queryInteractionHandoffAcceptance({
+      handoff: {
+        handoff_id: 'handoff-query-claude',
+        provider_attempt_id: 'provider-attempt-query-claude',
+        handoff_attempt_id: 'handoff-attempt-query-claude',
+        handoff_attempt_no: 2,
+        lease_epoch: 7,
+      },
+    })).resolves.toEqual({
+      status: 'unknown',
+      read_only: true,
+      idempotent: true,
+      handoff_id: 'handoff-query-claude',
+      provider_attempt_id: 'provider-attempt-query-claude',
+      handoff_attempt_id: 'handoff-attempt-query-claude',
+      handoff_attempt_no: 2,
+      lease_epoch: 7,
+      accepted_at: null,
+      evidence_ref: null,
+      reason_code: 'provider_acceptance_query_unavailable',
+    });
+  });
+
   test('removes static tokens when native credentials are detected', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'native-auth-env');
@@ -1267,7 +1292,7 @@ describe('Claude conversation executor', () => {
     database.close();
   });
 
-  test('keeps a sent SDK answer in delivering state when durable acknowledgement fails', async () => {
+  test('persists delivery_unknown when provider ack cannot be durably committed', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'permission-ack-failure');
     const fake = createPermissionQuery({ sessionId: 'claude-session-permission-ack-failure' });
@@ -1287,6 +1312,7 @@ describe('Claude conversation executor', () => {
     database.exec(`
       CREATE TRIGGER fail_permission_ack_audit
       BEFORE INSERT ON runtime_interaction_audit
+      WHEN NEW.outcome = 'accepted'
       BEGIN
         SELECT RAISE(ABORT, 'forced permission acknowledgement failure');
       END;
@@ -1303,8 +1329,8 @@ describe('Claude conversation executor', () => {
     expect(database.prepare(`
       SELECT state, handoff_state FROM runtime_interactions WHERE interaction_id = ?
     `).get(waiting.request.interaction_id)).toEqual({
-      state: 'answer_delivering',
-      handoff_state: 'delivering',
+      state: 'delivery_unknown',
+      handoff_state: 'delivery_unknown',
     });
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
       .get(accepted.turn_id)).toEqual({ state: 'recovering' });
@@ -1314,7 +1340,7 @@ describe('Claude conversation executor', () => {
     database.close();
   });
 
-  test('marks answer delivery unknown when the SDK query ended before handler acknowledgement', async () => {
+  test('cancels without retry when the SDK query ended before answer send', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'permission-ended-before-answer');
     const fake = createEndingPermissionQuery({
@@ -1337,9 +1363,12 @@ describe('Claude conversation executor', () => {
       permissionAnswer(waiting.request, 'ended-before-answer'),
     );
 
-    await expect(service.deliverInteractionAnswer(answer.handoff_id)).rejects.toThrow(
-      /active provider attempt fence|pending SDK permission/,
-    );
+    await expect(service.deliverInteractionAnswer(answer.handoff_id)).resolves.toMatchObject({
+      status: 'recovering',
+      interaction_state: 'cancelled',
+      handoff_state: 'cancelled',
+      turn_state: 'recovering',
+    });
     expect(database.prepare(`
       SELECT interaction.state, interaction.handoff_state,
         handoff.state AS durable_handoff_state, turn.state AS turn_state
@@ -1349,9 +1378,9 @@ describe('Claude conversation executor', () => {
       JOIN runtime_turns AS turn ON turn.turn_id = interaction.turn_id
       WHERE interaction.interaction_id = ?
     `).get(waiting.request.interaction_id)).toEqual({
-      state: 'delivery_unknown',
-      handoff_state: 'delivery_unknown',
-      durable_handoff_state: 'delivery_unknown',
+      state: 'cancelled',
+      handoff_state: 'cancelled',
+      durable_handoff_state: 'cancelled',
       turn_state: 'recovering',
     });
     const latestEvent = JSON.parse(database.prepare(`
@@ -1359,7 +1388,7 @@ describe('Claude conversation executor', () => {
       WHERE turn_id = ? ORDER BY event_sequence DESC LIMIT 1
     `).get(accepted.turn_id).event_json);
     expect(latestEvent).toMatchObject({
-      kind: 'interaction_answer_delivery_unknown',
+      kind: 'recovery_started',
       phase: 'recovering',
     });
 

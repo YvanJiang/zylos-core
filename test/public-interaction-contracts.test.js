@@ -623,6 +623,69 @@ describe('durable interaction handoff v1 record contract', () => {
       .toThrow(ContractKernelError);
   });
 
+  test('preserves unknown send evidence when an authorized disposition terminates a handoff', () => {
+    const terminated = handoff({
+      state: 'cancelled',
+      handoff_attempt_id: 'handoff-attempt-1',
+      handoff_attempt_no: 1,
+      claimed_by: 'executor-A',
+      claimed_at: '2026-07-19T05:04:02Z',
+      last_send_started_at: '2026-07-19T05:04:03Z',
+      reason_code: 'authorized_delivery_unknown_termination',
+      error: {
+        code: 'interaction_answer_delivery_unknown',
+        category: 'provider',
+        retryable: false,
+        side_effect_status: 'unknown',
+        user_message: 'The answer may have reached the provider before authorized termination.',
+        occurred_at: '2026-07-19T05:04:05Z',
+      },
+      side_effect_status: 'unknown',
+    });
+
+    expect(validateInteractionHandoff(terminated)).toEqual(terminated);
+    expect(() => validateInteractionHandoff({
+      ...terminated,
+      error: null,
+    })).toThrow(ContractKernelError);
+    expect(() => validateInteractionHandoff({
+      ...terminated,
+      side_effect_status: 'none',
+    })).toThrow(ContractKernelError);
+  });
+
+  test('preserves unproven provider side effects when preparation is cancelled before send', () => {
+    const cancelled = handoff({
+      state: 'cancelled',
+      handoff_attempt_id: 'handoff-attempt-1',
+      handoff_attempt_no: 1,
+      claimed_by: 'executor-A',
+      claimed_at: '2026-07-19T05:04:02Z',
+      reason_code: 'pre_send_non_retryable_failure',
+      error: {
+        code: 'provider_context_invalid',
+        category: 'provider',
+        retryable: false,
+        side_effect_status: 'unknown',
+        user_message: 'Provider preparation did not prove that no side effect occurred.',
+        occurred_at: '2026-07-19T05:04:03Z',
+      },
+      side_effect_status: 'unknown',
+    });
+
+    expect(validateInteractionHandoff(cancelled)).toEqual(cancelled);
+    expect(cancelled.last_send_started_at).toBeNull();
+    expect(() => validateInteractionHandoff({
+      ...cancelled,
+      error: null,
+    })).toThrow(ContractKernelError);
+    expect(() => validateInteractionHandoff({
+      ...cancelled,
+      error: { ...cancelled.error, side_effect_status: 'known' },
+      side_effect_status: 'known',
+    })).toThrow(ContractKernelError);
+  });
+
   test('only permits retry_wait before answer delivery starts', () => {
     const retryWait = handoff({
       state: 'retry_wait',
