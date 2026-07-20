@@ -12,9 +12,8 @@ import { startExecutorService } from '../cli/lib/executor-service-lifecycle.js';
 import { createInstalledExecutorUpgradeHandler } from '../runtime/migration/installed-executor-upgrade.js';
 import { createLegacyProviderQuiescence } from '../runtime/migration/legacy-provider-quiescence.js';
 import {
-  CHANNEL_AUTHORITY_PROVIDER_BINDING,
   readChannelAuthorityManifest,
-  validateChannelAuthorityManifest,
+  readDurableBootstrapAuthority,
 } from '../runtime/migration/channel-authority-manifest.js';
 
 const MANIFEST_NAME = 'base-executor-bootstrap.json';
@@ -216,18 +215,11 @@ export async function runBaseToExecutorBootstrap({
   let targetPath;
   if (managedLifecycle) {
     if (resume) {
-      manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
-      authority = validateChannelAuthorityManifest(manifest.channel_authority);
-      if (authority.sha256 !== manifest.channel_authority_sha256
-        || manifest.channel_authority_provider_binding
-          !== CHANNEL_AUTHORITY_PROVIDER_BINDING) {
-        throw new Error('Durable bootstrap channel authority facts conflict.');
-      }
-      authority = Object.freeze({
-        ...authority,
-        path: manifest.channel_authority_source_path,
-        provider_binding: CHANNEL_AUTHORITY_PROVIDER_BINDING,
+      const durableAuthority = readDurableBootstrapAuthority(manifestFile, {
+        expectedPath: manifestFile,
       });
+      manifest = durableAuthority.manifest;
+      authority = durableAuthority.authority;
     } else {
       authority = readChannelAuthorityManifest(channelAuthorityManifest, {
         expectedPath: path.join(installationRoot, 'runtime', 'channel-authority.json'),

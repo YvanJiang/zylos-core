@@ -12,6 +12,7 @@ import {
 } from '../runtime/migration/legacy-base-source.js';
 import { createLegacyProviderQuiescence } from '../runtime/migration/legacy-provider-quiescence.js';
 import { createInstalledExecutorUpgradeHandler } from '../runtime/migration/installed-executor-upgrade.js';
+import { readChannelAuthorityManifest } from '../runtime/migration/channel-authority-manifest.js';
 import { createExecutorService } from '../runtime/executor/service.js';
 import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { validateInboundEnvelope } from '../contracts/public/index.js';
@@ -268,8 +269,19 @@ describe('exact-base durable source fencing', () => {
     };
     expect(quiescence.commit(partialCommitRetry, { phase: 'committing', ...phaseJournal }))
       .toMatchObject({ removed: true });
-    expect(quiescence.commit(suspendedAgain, { phase: 'removed', ...phaseJournal }))
+    const [pid, ppid, pgid, sid] = execFileSync('ps', [
+      '-o', 'pid=,ppid=,pgid=,sess=', '-p', String(process.pid),
+    ], { encoding: 'utf8' }).trim().split(/\s+/).map(Number);
+    const reusedAfterRemoval = {
+      ...suspendedAgain,
+      members: [...suspendedAgain.members, {
+        pid, ppid, pgid, sid, state: 'R', birth_identity: 'retired provider identity',
+      }],
+    };
+    const signalsBeforeReusedPid = signals.length;
+    expect(quiescence.commit(reusedAfterRemoval, { phase: 'removed', ...phaseJournal }))
       .toMatchObject({ removed: true, already_removed: true });
+    expect(signals).toHaveLength(signalsBeforeReusedPid);
     expect(quiescence.inspect()).toMatchObject({ active: false });
     for (const pid of suspendedAgain.members.map(({ pid }) => pid)) {
       expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
@@ -369,7 +381,7 @@ describe('exact-base durable source fencing', () => {
       const providerQuiescence = createLegacyProviderQuiescence({
         provider: 'claude', execFileSyncFn: fixtureExec, tmuxArgsPrefix: ['-L', server],
       });
-      const handler = createInstalledExecutorUpgradeHandler({
+      expect(() => createInstalledExecutorUpgradeHandler({
         database, Database, zylosDir,
         currentReleasePath: fromRelease,
         currentReleaseRef: 'branch:exact-base-bootstrap',
@@ -378,6 +390,20 @@ describe('exact-base durable source fencing', () => {
           document: channelAuthority(),
           provider_binding: 'owner_only_exact_path_authenticated_event',
         },
+        legacyProviderQuiescence: providerQuiescence,
+      })).toThrow('requires verified channel prerequisite authority');
+      const authorityFile = path.join(zylosDir, 'runtime', 'channel-authority.json');
+      fs.mkdirSync(path.dirname(authorityFile), { recursive: true });
+      fs.writeFileSync(authorityFile, JSON.stringify(channelAuthority()), { mode: 0o600 });
+      const certifiedAuthority = readChannelAuthorityManifest(authorityFile, {
+        expectedPath: authorityFile,
+      });
+      const handler = createInstalledExecutorUpgradeHandler({
+        database, Database, zylosDir,
+        currentReleasePath: fromRelease,
+        currentReleaseRef: 'branch:exact-base-bootstrap',
+        provider: 'claude', allowLegacyFromRelease: true,
+        legacyChannelAuthority: certifiedAuthority,
         execFileSyncFn: fixtureExec,
         legacyProviderQuiescence: {
           ...providerQuiescence,

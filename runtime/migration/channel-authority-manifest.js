@@ -5,7 +5,8 @@ import path from 'node:path';
 import { canonicalizeJson } from '../../contracts/public/index.js';
 
 const CHANNEL_REGIONS = Object.freeze({ feishu: 'cn', lark: 'global' });
-export const CHANNEL_AUTHORITY_PROVIDER_BINDING = 'owner_only_exact_path_authenticated_event';
+const CHANNEL_AUTHORITY_PROVIDER_BINDING = 'owner_only_exact_path_authenticated_event';
+const certifiedAuthorities = new WeakMap();
 const SCOPE_KEYS = Object.freeze([
   'channel', 'region', 'tenant_id', 'bot_id', 'verified_at',
   'verification_source', 'provider_instance_id',
@@ -67,9 +68,9 @@ export function validateChannelAuthorityManifest(document) {
   });
 }
 
-export function readChannelAuthorityManifest(file, { expectedPath = null } = {}) {
+function readOwnerOnlyJson(file, expectedPath = null) {
   if (typeof file !== 'string' || !path.isAbsolute(file) || path.parse(file).root === file) {
-    throw new TypeError('Channel authority manifest must be an explicit absolute non-root file.');
+    throw new TypeError('Authority source must be an explicit absolute non-root file.');
   }
   const resolved = path.join(fs.realpathSync(path.dirname(file)), path.basename(file));
   const expected = expectedPath === null ? null : path.join(
@@ -89,16 +90,71 @@ export function readChannelAuthorityManifest(file, { expectedPath = null } = {})
       throw new Error('Channel authority manifest ownership or mode is unsafe.');
     }
     const bytes = fs.readFileSync(descriptor);
-    const validated = validateChannelAuthorityManifest(JSON.parse(bytes.toString('utf8')));
     return Object.freeze({
-      ...validated,
+      document: JSON.parse(bytes.toString('utf8')),
       path: resolved,
       raw_sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
-      provider_binding: CHANNEL_AUTHORITY_PROVIDER_BINDING,
     });
   } finally {
     fs.closeSync(descriptor);
   }
+}
+
+function prerequisiteInstallationRoot(file, expectedName) {
+  if (path.basename(file) !== expectedName || path.basename(path.dirname(file)) !== 'runtime') {
+    throw new Error('Authority source is outside the installed runtime prerequisite boundary.');
+  }
+  return fs.realpathSync(path.dirname(path.dirname(file)));
+}
+
+function certifyAuthority(value, installationRoot) {
+  const certified = Object.freeze({
+    ...value,
+    provider_binding: CHANNEL_AUTHORITY_PROVIDER_BINDING,
+  });
+  certifiedAuthorities.set(certified, installationRoot);
+  return certified;
+}
+
+export function isCertifiedChannelAuthority(value, { installationRoot } = {}) {
+  return value !== null && typeof value === 'object'
+    && certifiedAuthorities.get(value) === installationRoot;
+}
+
+export function readChannelAuthorityManifest(file, { expectedPath = null } = {}) {
+  const source = readOwnerOnlyJson(file, expectedPath);
+  const validated = validateChannelAuthorityManifest(source.document);
+  const installationRoot = prerequisiteInstallationRoot(
+    source.path, 'channel-authority.json',
+  );
+  return certifyAuthority(
+    { ...validated, ...source, document: validated.document }, installationRoot,
+  );
+}
+
+export function readDurableBootstrapAuthority(manifestFile, { expectedPath } = {}) {
+  const source = readOwnerOnlyJson(manifestFile, expectedPath);
+  const installationRoot = prerequisiteInstallationRoot(
+    source.path, 'base-executor-bootstrap.json',
+  );
+  const manifest = source.document;
+  const validated = validateChannelAuthorityManifest(manifest?.channel_authority);
+  if (validated.sha256 !== manifest.channel_authority_sha256
+    || manifest.channel_authority_provider_binding !== CHANNEL_AUTHORITY_PROVIDER_BINDING
+    || typeof manifest.channel_authority_source_path !== 'string') {
+    throw new Error('Durable bootstrap channel authority facts conflict.');
+  }
+  return Object.freeze({
+    manifest,
+    authority: certifyAuthority(
+      {
+        ...validated,
+        path: manifest.channel_authority_source_path,
+        raw_sha256: manifest.channel_authority_raw_sha256,
+      },
+      installationRoot,
+    ),
+  });
 }
 
 export function authorityScopeFor(channelAuthority, channel) {

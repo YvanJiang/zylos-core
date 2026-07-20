@@ -4,6 +4,7 @@ import path from 'node:path';
 import { describe, expect, test } from '@jest/globals';
 
 import {
+  isCertifiedChannelAuthority,
   readChannelAuthorityManifest,
   validateChannelAuthorityManifest,
 } from '../runtime/migration/channel-authority-manifest.js';
@@ -46,13 +47,22 @@ describe('legacy channel authority manifest', () => {
 
   test('reads only an explicit owner-controlled manifest file', () => {
     const root = fs.mkdtempSync('/tmp/zylos-channel-authority-');
-    const file = path.join(root, 'authority.json');
+    const installationRoot = path.join(root, 'zylos');
+    const file = path.join(installationRoot, 'runtime', 'channel-authority.json');
     try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
       fs.writeFileSync(file, JSON.stringify(document([scope()])), { mode: 0o600 });
-      expect(readChannelAuthorityManifest(file)).toMatchObject({
+      const certified = readChannelAuthorityManifest(file, { expectedPath: file });
+      expect(certified).toMatchObject({
         path: fs.realpathSync(file), document: document([scope()]),
         provider_binding: 'owner_only_exact_path_authenticated_event',
       });
+      expect(isCertifiedChannelAuthority(certified, {
+        installationRoot: fs.realpathSync(installationRoot),
+      })).toBe(true);
+      expect(isCertifiedChannelAuthority({
+        ...certified, provider_binding: 'owner_only_exact_path_authenticated_event',
+      }, { installationRoot: fs.realpathSync(installationRoot) })).toBe(false);
       expect(() => readChannelAuthorityManifest(file, {
         expectedPath: path.join(root, 'different-authority.json'),
       })).toThrow('provider prerequisite path');

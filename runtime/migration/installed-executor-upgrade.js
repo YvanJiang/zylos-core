@@ -19,7 +19,7 @@ import {
   reconcileLegacyBaseRollback,
 } from './legacy-base-source.js';
 import {
-  CHANNEL_AUTHORITY_PROVIDER_BINDING,
+  isCertifiedChannelAuthority,
   validateChannelAuthorityManifest,
 } from './channel-authority-manifest.js';
 import { findResumableRuntimeUpgrade } from './upgrade-state.js';
@@ -580,8 +580,9 @@ export function createInstalledExecutorUpgradeHandler({
     || typeof legacyProviderQuiescence.commit !== 'function')) {
     throw new TypeError('legacyProviderQuiescence is required for exact-base migration');
   }
-  if (allowLegacyFromRelease
-    && legacyChannelAuthority?.provider_binding !== CHANNEL_AUTHORITY_PROVIDER_BINDING) {
+  if (allowLegacyFromRelease && !isCertifiedChannelAuthority(legacyChannelAuthority, {
+    installationRoot,
+  })) {
     throw new Error('Exact-base migration requires verified channel prerequisite authority.');
   }
   const channelAuthority = allowLegacyFromRelease

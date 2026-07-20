@@ -326,6 +326,13 @@ export function createLegacyProviderQuiescence({
     return survivor;
   }
 
+  function signalExactIdentity(identity, signal, identityOptions) {
+    const current = currentIdentity(identity, identityOptions);
+    if (current === null) return false;
+    signalProcess(current.pid, signal);
+    return true;
+  }
+
   function commit(record, { phase = 'suspended', onPhase = () => {} } = {}) {
     if (record?.active !== true) return Object.freeze({ removed: false, session });
     validateRecord(record, session);
@@ -347,7 +354,7 @@ export function createLegacyProviderQuiescence({
     }
     if (phase !== 'removed') onPhase('committing', record);
     if (server !== null) {
-      signalProcess(record.server.pid, 'SIGCONT');
+      signalExactIdentity(record.server, 'SIGCONT', identityOptions);
       try {
         tmux(['kill-session', '-t', `=${session}`]);
       } catch (error) {
@@ -355,25 +362,26 @@ export function createLegacyProviderQuiescence({
       }
     }
     let survivors = exactSurvivors(record, identityOptions);
-    for (const member of survivors) signalProcess(member.pid, 'SIGTERM');
     for (const member of survivors) {
-      try { signalProcess(member.pid, 'SIGCONT'); } catch (error) {
+      signalExactIdentity(member, 'SIGTERM', identityOptions);
+    }
+    for (const member of survivors) {
+      try { signalExactIdentity(member, 'SIGCONT', identityOptions); } catch (error) {
         if (error?.code !== 'ESRCH') throw error;
       }
     }
     survivors = waitForExit(record, 1_000, identityOptions);
     for (const member of survivors) {
-      currentIdentity(member, identityOptions);
-      signalProcess(member.pid, 'SIGKILL');
+      signalExactIdentity(member, 'SIGKILL', identityOptions);
     }
     survivors = waitForExit(record, 1_000, identityOptions);
     let serverSurvivor = currentIdentity(record.server, identityOptions);
     if (serverSurvivor !== null) {
-      signalProcess(serverSurvivor.pid, 'SIGTERM');
+      signalExactIdentity(record.server, 'SIGTERM', identityOptions);
       serverSurvivor = waitForIdentityExit(record.server, 500, identityOptions);
     }
     if (serverSurvivor !== null) {
-      signalProcess(serverSurvivor.pid, 'SIGKILL');
+      signalExactIdentity(record.server, 'SIGKILL', identityOptions);
       serverSurvivor = waitForIdentityExit(record.server, 500, identityOptions);
     }
     if (survivors.length > 0 || serverSurvivor !== null) {
