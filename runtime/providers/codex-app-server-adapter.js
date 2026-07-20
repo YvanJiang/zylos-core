@@ -1843,6 +1843,55 @@ export function createCodexAppServerAdapter({
     return persistedThreadId;
   }
 
+  async function recoverLineage(request) {
+    const candidate = request?.candidate;
+    if (
+      typeof request?.recovery_id !== 'string'
+      || request.recovery_id.length === 0
+      || typeof request?.turn_id !== 'string'
+      || request.turn_id.length === 0
+      || typeof request?.native_recovery_attempt_id !== 'string'
+      || request.native_recovery_attempt_id.length === 0
+      || request?.native_recovery_attempt_no !== 1
+      || typeof candidate?.lineage_id !== 'string'
+      || candidate.lineage_id.length === 0
+      || candidate.provider !== 'codex'
+      || typeof candidate.provider_native_id !== 'string'
+      || candidate.provider_native_id.length === 0
+    ) {
+      throw new TypeError('Codex lineage recovery requires one complete persisted candidate fence');
+    }
+    const target = await ensureConnection();
+    if (!loadedThreads.has(candidate.provider_native_id)) {
+      await sendRequest(target, 'thread/resume', {
+        threadId: candidate.provider_native_id,
+        cwd,
+        approvalPolicy,
+        sandbox,
+      }, {
+        onResult: (response) => {
+          requireThreadResult(response, candidate.provider_native_id);
+          for (const turnId of requireThreadHistory(response)) {
+            rememberConnectionFence(
+              target,
+              target.retired_run_keys,
+              activeRunKey(candidate.provider_native_id, turnId),
+            );
+          }
+        },
+      });
+      loadedThreads.add(candidate.provider_native_id);
+    }
+    return Object.freeze({
+      status: 'recovered',
+      recovery_id: request.recovery_id,
+      lineage_id: candidate.lineage_id,
+      provider: 'codex',
+      provider_native_id: candidate.provider_native_id,
+      side_effect_status: 'none',
+    });
+  }
+
   async function* execute(context) {
     requireExecutionContext(context);
     const target = await ensureConnection();
@@ -2327,5 +2376,6 @@ export function createCodexAppServerAdapter({
     interrupt,
     prepareInteractionAnswer,
     queryInteractionHandoffAcceptance,
+    recoverLineage,
   });
 }

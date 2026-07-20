@@ -84,10 +84,18 @@ function projectRenderModel(renderModel, event) {
     text = 'Waiting for executor capacity.';
   } else if (
     event.kind === 'turn_state_changed'
+    && event.payload.reason_code === 'reply_mapping_recovery_notice'
+  ) {
+    text = 'The replied-to message lineage needs recovery. Zylos will wait until this notice is delivered, then use only a uniquely verified lineage and will not replay work with unknown side effects.';
+  } else if (
+    event.kind === 'turn_state_changed'
     && event.payload.to_state === 'starting'
     && renderModel.text === 'Waiting for executor capacity.'
   ) {
     text = 'Starting execution.';
+  } else if (event.kind === 'recovery_waiting_decision') {
+    text = event.error?.user_message ?? 'Recovery is waiting for an authorized decision.';
+    interactions = [...interactions, structuredClone(event.payload)];
   } else if (event.kind.startsWith('tool_')) {
     tools = [...tools, structuredClone(event.payload)];
   } else if (event.kind.startsWith('interaction_')) {
@@ -342,6 +350,64 @@ export function stageMainProjection(database, turn, event, {
 
   const renderModel = projectRenderModel(loadLatestRenderModel(database, lane.lane_key), event);
   const critical = isCriticalProjectionEvent(event);
+  if (
+    event.kind === 'turn_state_changed'
+    && event.payload.reason_code === 'reply_mapping_recovery_notice'
+  ) {
+    const initial = database.prepare(`
+      SELECT outbox_id, command_json
+      FROM runtime_outbox
+      WHERE lane_key = ? AND status = 'pending'
+        AND predecessor_delivery_id IS NULL
+        AND attempt_count = 0
+      ORDER BY aggregate_version ASC, created_at ASC
+      LIMIT 1
+    `).get(lane.lane_key);
+    if (initial) {
+      const command = {
+        ...JSON.parse(initial.command_json),
+        aggregate_version: event.turn_version,
+        event_sequence_through: event.event_sequence,
+        render_model: renderModel,
+      };
+      validateDeliveryCommand(command);
+      database.prepare(`
+        UPDATE runtime_projection_snapshots
+        SET status = 'superseded'
+        WHERE lane_key = ? AND status = 'staged'
+      `).run(lane.lane_key);
+      const updated = database.prepare(`
+        UPDATE runtime_outbox
+        SET aggregate_version = ?, command_json = ?, updated_at = ?
+        WHERE outbox_id = ? AND status = 'pending' AND attempt_count = 0
+      `).run(
+        event.turn_version,
+        JSON.stringify(command),
+        event.persisted_at,
+        initial.outbox_id,
+      );
+      if (updated.changes !== 1) {
+        throw new Error('The reply-mapping recovery notice lost its pending delivery fence.');
+      }
+      database.prepare(`
+        INSERT INTO runtime_projection_snapshots (
+          projection_id, lane_key, turn_id, aggregate_version,
+          event_sequence_through, render_model_json, critical, terminal,
+          status, materialized_outbox_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'materialized', ?, ?)
+      `).run(
+        generateId('projection'),
+        lane.lane_key,
+        turn.turn_id,
+        event.turn_version,
+        event.event_sequence,
+        JSON.stringify(renderModel),
+        initial.outbox_id,
+        event.persisted_at,
+      );
+      return;
+    }
+  }
   if (critical) {
     database.prepare(`
       UPDATE runtime_projection_snapshots

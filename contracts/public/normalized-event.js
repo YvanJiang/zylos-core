@@ -446,7 +446,13 @@ export function validateNormalizedEvent(
       value.provider !== null
       || value.attempt_id !== null
       || !['turn_state_changed', ...RECOVERY_EVENT_KINDS].includes(value.kind)
-      || !['received', 'queued', 'starting', 'recovering'].includes(value.phase)
+      || ![
+        'received',
+        'queued',
+        'starting',
+        'recovering',
+        ...(value.kind === 'turn_state_changed' ? ['stopped'] : []),
+      ].includes(value.phase)
     )
   ) {
     rejectContract(

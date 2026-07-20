@@ -281,6 +281,42 @@ describe('Codex app-server provider adapter', () => {
     expect(server.received.filter(({ method }) => method === 'turn/start')).toHaveLength(2);
   });
 
+  test('recovers one persisted lineage through app-server thread/resume without starting work', async () => {
+    const server = createFakeAppServer();
+    const spawnProcess = jest.fn(() => server.child);
+    const adapter = createCodexAppServerAdapter({ spawnProcess });
+    const request = {
+      recovery_id: 'mapping-recovery-codex-A',
+      turn_id: 'turn-recovery-codex-A',
+      reason: 'mapping_missing',
+      native_recovery_attempt_id: 'native-recovery-attempt-codex-A',
+      native_recovery_attempt_no: 1,
+      candidate: {
+        lineage_id: 'lineage-codex-A',
+        provider: 'codex',
+        provider_native_id: 'codex-thread-recovery-A',
+      },
+    };
+
+    await expect(adapter.recoverLineage(request)).resolves.toEqual({
+      status: 'recovered',
+      recovery_id: request.recovery_id,
+      lineage_id: request.candidate.lineage_id,
+      provider: 'codex',
+      provider_native_id: request.candidate.provider_native_id,
+      side_effect_status: 'none',
+    });
+    expect(server.received.filter(({ method }) => method === 'thread/resume'))
+      .toEqual([expect.objectContaining({
+        params: expect.objectContaining({
+          threadId: request.candidate.provider_native_id,
+        }),
+      })]);
+    expect(server.received.filter(({ method }) => method === 'turn/start')).toHaveLength(0);
+    await expect(adapter.recoverLineage(request)).resolves.toMatchObject({ status: 'recovered' });
+    expect(server.received.filter(({ method }) => method === 'thread/resume')).toHaveLength(1);
+  });
+
   test('ignores tombstoned late traffic without changing another run on the current connection', async () => {
     const reportRunBFailure = jest.fn();
     const server = createFakeAppServer({

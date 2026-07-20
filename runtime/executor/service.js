@@ -740,6 +740,52 @@ export function createExecutorService({
     }
     if (!started) start();
     if (residentHeartbeatFailure) throw persistenceFailure(residentHeartbeatFailure);
+    const replyMappingRecovery = store.claimNextReplyMappingRecoveryNotice();
+    if (replyMappingRecovery !== null) {
+      if (!replyMappingRecovery.notice_delivered) {
+        refresh();
+        return replyMappingRecovery;
+      }
+      const recoveryClaim = persist(() => store.beginReplyMappingRecovery(
+        replyMappingRecovery.turn_id,
+        { allowNativeRecovery: typeof adapter.recoverLineage === 'function' },
+      ));
+      if (recoveryClaim.status === 'waiting_decision') {
+        refresh();
+        return recoveryClaim;
+      }
+      let nativeResult = {
+        status: 'not_applicable',
+        recovery_id: recoveryClaim.recovery_id,
+        side_effect_status: 'none',
+      };
+      if (recoveryClaim.status === 'native_recovery_claimed') {
+        try {
+          nativeResult = await adapter.recoverLineage(deepFreeze({
+            recovery_id: recoveryClaim.recovery_id,
+            turn_id: recoveryClaim.turn_id,
+            reason: recoveryClaim.reason,
+            candidate: Object.freeze({ ...recoveryClaim.candidate }),
+            native_recovery_attempt_id: recoveryClaim.native_recovery_attempt_id,
+            native_recovery_attempt_no: recoveryClaim.native_recovery_attempt_no,
+          }));
+        } catch (error) {
+          nativeResult = {
+            status: 'failed',
+            recovery_id: recoveryClaim.recovery_id,
+            side_effect_status: error?.providerError?.side_effect_status ?? 'unknown',
+          };
+        }
+      } else if (recoveryClaim.status === 'native_recovery_lost') {
+        nativeResult = {
+          status: 'lost',
+          recovery_id: recoveryClaim.recovery_id,
+          side_effect_status: 'unknown',
+        };
+      }
+      persist(() => store.completeReplyMappingRecovery(recoveryClaim, nativeResult));
+      refresh();
+    }
     let reservation = store.reserveNextExecutor({
       maxResidentExecutorsPerBot,
       markCapacityWait: false,
@@ -1211,14 +1257,14 @@ export function createExecutorService({
   }
 
   async function executeInteractionDelivery(handoffId) {
-    if (typeof adapter.prepareInteractionAnswer !== 'function') {
-      throw new TypeError('adapter.prepareInteractionAnswer must be a function');
-    }
     const beginning = persist(() => store.beginInteractionHandoff(handoffId));
     if (beginning.acknowledgement !== null) {
       reschedulePendingInteractionDeadlines();
       refresh();
       return { acknowledgement: beginning.acknowledgement, execution: null };
+    }
+    if (typeof adapter.prepareInteractionAnswer !== 'function') {
+      throw new TypeError('adapter.prepareInteractionAnswer must be a function');
     }
     const { delivery } = beginning;
     const activeRun = activeRuns.get(delivery.request.turn_id);
