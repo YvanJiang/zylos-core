@@ -5,7 +5,9 @@ description: Use when the user asks to restart Claude Code, or after changing se
 
 # Restart Claude Code Skill
 
-Restart Claude Code session - sends /exit and lets activity-monitor daemon handle the restart.
+Restart the long-lived Core executor service through the authoritative Zylos
+service lifecycle. The executor owns the Claude provider prerequisite and
+re-establishes it as part of its healthy service generation.
 
 ## When to Use
 
@@ -55,15 +57,20 @@ conversation. If the user is actively waiting, send only a short user-facing
 notice to their current `reply via` path, without internal task inventory or
 cross-channel context.
 
-### 5. Enqueue /exit
+### 5. Restart through Core service control
 
 ```bash
-node ~/zylos/.claude/skills/comm-bridge/scripts/c4-control.js enqueue --content "/exit" --priority 1 --block-queue-until-idle
+zylos restart
+zylos status
 ```
+
+Treat a non-zero exit from either command as a failed restart. Do not invoke
+PM2 directly: the CLI verifies the exact executor registration, performs the
+durable shutdown handshake, and accepts only a new healthy Core service
+identity.
 
 ## How It Works
 
-1. **Enqueue /exit**: Puts `/exit` into the control queue (priority=1, block_queue_until_idle)
-2. **Block subsequent messages**: block_queue_until_idle prevents other messages from being dispatched
-3. **Deliver when idle**: Dispatcher delivers `/exit` to tmux when Claude is idle
-4. **Daemon restart**: activity-monitor detects exit and restarts Claude
+1. **Durable shutdown**: Core fences new work and closes provider ownership.
+2. **Exact supervisor control**: Zylos restarts only its owned executor registration.
+3. **Generation proof**: Success requires a different healthy executor service identity.

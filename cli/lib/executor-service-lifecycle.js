@@ -5,6 +5,13 @@ import { requestExecutorService } from '../../runtime/executor/service-host.js';
 
 export const EXECUTOR_SERVICE_NAME = 'zylos-executor';
 
+function expectedExecutorEntry() {
+  const packageRoot = process.env.ZYLOS_PACKAGE_ROOT
+    ? path.resolve(process.env.ZYLOS_PACKAGE_ROOT)
+    : path.resolve(import.meta.dirname, '..', '..');
+  return path.join(packageRoot, 'runtime', 'executor', 'launcher.js');
+}
+
 function requireZylosDir(zylosDir) {
   if (typeof zylosDir !== 'string' || !path.isAbsolute(zylosDir)) {
     throw new TypeError('zylosDir must be an absolute path');
@@ -97,6 +104,33 @@ function runPm2(execFileSyncFn, args) {
   execFileSyncFn('pm2', args, { stdio: 'pipe', timeout: 30_000 });
 }
 
+function inspectExecutorRegistration({ zylosDir, execFileSyncFn, required }) {
+  const root = requireZylosDir(zylosDir);
+  const output = execFileSyncFn('pm2', ['jlist'], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000,
+  });
+  const processes = JSON.parse(String(output));
+  if (!Array.isArray(processes)) throw new Error('PM2 process inventory must be an array.');
+  const matches = processes.filter(({ name }) => name === EXECUTOR_SERVICE_NAME);
+  if (matches.length > 1) throw new Error('Ambiguous executor supervisor registrations.');
+  if (matches.length === 0) {
+    if (required) throw new Error('Executor supervisor registration is missing.');
+    return null;
+  }
+  const registration = matches[0];
+  const environment = registration.pm2_env ?? {};
+  const actualEntry = environment.pm_exec_path ?? registration.pm_exec_path;
+  const actualCwd = environment.pm_cwd ?? registration.pm_cwd;
+  const actualRoot = environment.ZYLOS_DIR ?? registration.ZYLOS_DIR;
+  if (typeof actualEntry !== 'string'
+    || path.resolve(actualEntry) !== expectedExecutorEntry()
+    || typeof actualCwd !== 'string' || path.resolve(actualCwd) !== root
+    || typeof actualRoot !== 'string' || path.resolve(actualRoot) !== root) {
+    throw new Error('Refusing to control a foreign zylos-executor PM2 registration.');
+  }
+  return registration;
+}
+
 function pm2Failure(error) {
   return { ok: false, error: error?.message ?? 'pm2_control_failed' };
 }
@@ -109,6 +143,7 @@ export async function startExecutorService({
   retryDelaysMs = [0, 100, 250, 500, 1_000, 2_000],
 } = {}) {
   try {
+    inspectExecutorRegistration({ zylosDir, execFileSyncFn, required: false });
     runPm2(execFileSyncFn, [
       'start', ecosystemPath(zylosDir), '--only', EXECUTOR_SERVICE_NAME,
     ]);
@@ -124,6 +159,11 @@ export async function stopExecutorService({
   execFileSyncFn = execFileSync,
   requestFn = requestExecutorService,
 } = {}) {
+  try {
+    inspectExecutorRegistration({ zylosDir, execFileSyncFn, required: true });
+  } catch (error) {
+    return pm2Failure(error);
+  }
   let response;
   try {
     response = await requestFn(executorServiceSocketPath(zylosDir), { action: 'shutdown' });
@@ -155,6 +195,11 @@ export async function restartExecutorService({
   requestFn = requestExecutorService,
   retryDelaysMs = [0, 100, 250, 500, 1_000, 2_000],
 } = {}) {
+  try {
+    inspectExecutorRegistration({ zylosDir, execFileSyncFn, required: true });
+  } catch (error) {
+    return pm2Failure(error);
+  }
   const previous = await readHealth({ zylosDir, requestFn });
   if (typeof previous.serviceInstanceId !== 'string') return previous;
   if (previous.snapshot?.service?.maintenance === true
@@ -267,8 +312,12 @@ export async function getExecutorServiceHealth({
   return readHealth({ zylosDir, requestFn });
 }
 
-export function removeExecutorServiceRegistration({ execFileSyncFn = execFileSync } = {}) {
+export function removeExecutorServiceRegistration({
+  zylosDir,
+  execFileSyncFn = execFileSync,
+} = {}) {
   try {
+    inspectExecutorRegistration({ zylosDir, execFileSyncFn, required: true });
     runPm2(execFileSyncFn, ['delete', EXECUTOR_SERVICE_NAME]);
     runPm2(execFileSyncFn, ['save']);
     return { ok: true };

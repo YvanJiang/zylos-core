@@ -153,6 +153,72 @@ describe('executor service lifecycle host', () => {
     fs.rmSync(state.socketPath, { force: true });
   });
 
+  test('does not unlink a replacement that appears during stale-socket probing', async () => {
+    const state = fixture();
+    fs.mkdirSync(path.dirname(state.socketPath), { recursive: true });
+    const stale = net.createServer();
+    await new Promise((resolve, reject) => {
+      stale.once('error', reject);
+      stale.listen(state.socketPath, resolve);
+    });
+    const replacement = net.createServer((socket) => {
+      socket.once('data', () => socket.end('{"ok":true,"owner":"replacement"}\n'));
+    });
+    const host = createExecutorServiceHost({
+      database: state.database,
+      adapter: inertAdapter(),
+      provider: 'claude',
+      serviceInstanceId: 'service-fixture-probe-race',
+      socketPath: state.socketPath,
+      workspaceRoot: state.directory,
+      probeControl: async () => {
+        await new Promise((resolve, reject) => stale.close((error) => (error ? reject(error) : resolve())));
+        await new Promise((resolve, reject) => {
+          replacement.once('error', reject);
+          replacement.listen(state.socketPath, resolve);
+        });
+        throw Object.assign(new Error('stale observation'), { code: 'ECONNREFUSED' });
+      },
+    });
+    hosts.push(host);
+    try {
+      await expect(host.start()).rejects.toThrow('changed during stale-path probing');
+      await expect(requestExecutorService(state.socketPath, { action: 'health' }))
+        .resolves.toEqual({ ok: true, owner: 'replacement' });
+    } finally {
+      await new Promise((resolve, reject) => replacement.close((error) => (
+        error ? reject(error) : resolve()
+      )));
+      fs.rmSync(state.socketPath, { force: true });
+    }
+  });
+
+  test('marks reset and malformed mutating responses uncertain after dispatch', async () => {
+    for (const response of [null, 'not-json\n']) {
+      const state = fixture();
+      fs.mkdirSync(path.dirname(state.socketPath), { recursive: true });
+      const server = net.createServer((socket) => {
+        socket.once('data', () => {
+          if (response === null) socket.destroy();
+          else socket.end(response);
+        });
+      });
+      await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(state.socketPath, resolve);
+      });
+      try {
+        await expect(requestExecutorService(state.socketPath, { action: 'upgrade', target: {} }))
+          .rejects.toMatchObject({ outcome: 'unknown' });
+      } finally {
+        await new Promise((resolve, reject) => server.close((error) => (
+          error ? reject(error) : resolve()
+        )));
+        fs.rmSync(state.socketPath, { force: true });
+      }
+    }
+  });
+
   test('does not unlink a replacement socket that rebinds the control path', async () => {
     const state = fixture();
     const host = createExecutorServiceHost({
@@ -471,6 +537,21 @@ describe('executor daemon resource ownership', () => {
 });
 
 describe('executor prerequisite ownership', () => {
+  test.each([
+    [{ name: 'c4-dispatcher', was_running: true }, 'Active legacy runtime services'],
+    [{ name: 'scheduler', was_running: false }, 'Stopped legacy runtime registrations'],
+  ])('fails closed before spawning when legacy registration remains: %j', async (registration, message) => {
+    const state = fixture();
+    const spawned = [];
+    const owner = createExecutorPrerequisiteOwner({
+      zylosDir: state.directory,
+      inspectLegacy: () => [registration],
+      spawnFn: (...args) => { spawned.push(args); throw new Error('must not spawn'); },
+    });
+    await expect(owner.start()).rejects.toThrow(message);
+    expect(spawned).toEqual([]);
+  });
+
   test('owns scheduler and web-console children without starting retired runtime daemons', async () => {
     const state = fixture();
     const scheduler = path.join(state.directory, '.claude', 'skills', 'scheduler', 'scripts', 'daemon.js');

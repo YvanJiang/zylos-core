@@ -2,7 +2,7 @@
 
 Receives messages from external channels and queues them for delivery to Claude.
 
-Messages are written to DB with `status='pending'`. The c4-dispatcher daemon handles serial delivery to Claude via tmux.
+Messages are durably accepted into Core. The executor service owns serialized provider execution.
 
 ## Usage
 

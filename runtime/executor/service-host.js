@@ -42,10 +42,10 @@ function removeOwnedSocket(socketPath, identity = null) {
   return true;
 }
 
-async function prepareSocketPath(socketPath) {
+async function prepareSocketPath(socketPath, probeControl) {
   let stat;
   try {
-    stat = fs.lstatSync(socketPath);
+    stat = fs.lstatSync(socketPath, { bigint: true });
   } catch (error) {
     if (error?.code === 'ENOENT') return;
     throw error;
@@ -53,14 +53,22 @@ async function prepareSocketPath(socketPath) {
   if (!stat.isSocket()) {
     throw new Error(`Refusing to replace non-socket control path: ${socketPath}`);
   }
+  const observedIdentity = Object.freeze({
+    dev: stat.dev,
+    ino: stat.ino,
+    ctimeNs: stat.ctimeNs,
+    birthtimeNs: stat.birthtimeNs,
+  });
   try {
-    await requestExecutorService(socketPath, { action: 'health' }, { timeoutMs: 500 });
+    await probeControl(socketPath, { action: 'health' }, { timeoutMs: 500 });
     throw new Error(`Executor service control socket is already active: ${socketPath}`);
   } catch (error) {
     if (error?.message?.includes('already active')) throw error;
     if (!['ECONNREFUSED', 'ENOENT', 'ECONNRESET'].includes(error?.code)) throw error;
   }
-  removeOwnedSocket(socketPath);
+  if (!removeOwnedSocket(socketPath, observedIdentity)) {
+    throw new Error(`Executor service control socket changed during stale-path probing: ${socketPath}`);
+  }
 }
 
 function listen(server, socketPath) {
@@ -101,6 +109,13 @@ export function requestExecutorService(socketPath, request, { timeoutMs = 5_000 
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(socketPath);
     let data = '';
+    let dispatched = false;
+    const classifyFailure = (error) => {
+      if (dispatched && request.action !== 'health') {
+        error.outcome = 'unknown';
+      }
+      return error;
+    };
     const timer = setTimeout(() => {
       const error = new Error('Executor service control request timed out; the durable operation outcome is unknown.');
       error.code = 'ETIMEDOUT';
@@ -109,7 +124,10 @@ export function requestExecutorService(socketPath, request, { timeoutMs = 5_000 
     }, timeoutMs);
     timer.unref?.();
     socket.setEncoding('utf8');
-    socket.on('connect', () => socket.write(`${JSON.stringify(request)}\n`));
+    socket.on('connect', () => {
+      dispatched = true;
+      socket.write(`${JSON.stringify(request)}\n`);
+    });
     socket.on('data', (chunk) => {
       data += chunk;
       if (data.length > MAX_REQUEST_BYTES) {
@@ -118,7 +136,7 @@ export function requestExecutorService(socketPath, request, { timeoutMs = 5_000 
     });
     socket.on('error', (error) => {
       clearTimeout(timer);
-      reject(error);
+      reject(classifyFailure(error));
     });
     socket.on('end', () => {
       clearTimeout(timer);
@@ -127,7 +145,7 @@ export function requestExecutorService(socketPath, request, { timeoutMs = 5_000 
         if (line.length === 0) throw new Error('Executor service returned an empty response.');
         resolve(JSON.parse(line));
       } catch (error) {
-        reject(error);
+        reject(classifyFailure(error));
       }
     });
   });
@@ -145,6 +163,7 @@ export function createExecutorServiceHost({
   onUpgrade = null,
   onClose = null,
   healthCheck = null,
+  probeControl = requestExecutorService,
   createService = createExecutorService,
   ...serviceOptions
 }) {
@@ -159,6 +178,7 @@ export function createExecutorServiceHost({
   if (healthCheck !== null && typeof healthCheck !== 'function') {
     throw new TypeError('healthCheck must be a function or null');
   }
+  if (typeof probeControl !== 'function') throw new TypeError('probeControl must be a function');
   if (onClose !== null && typeof onClose !== 'function') {
     throw new TypeError('onClose must be a function or null');
   }
@@ -273,7 +293,7 @@ export function createExecutorServiceHost({
   async function start() {
     if (lifecycle !== 'created') throw new Error(`Executor service host is ${lifecycle}.`);
     fs.mkdirSync(path.dirname(socketPath), { recursive: true });
-    await prepareSocketPath(socketPath);
+    await prepareSocketPath(socketPath, probeControl);
     service.start();
     try {
       await listen(server, socketPath);

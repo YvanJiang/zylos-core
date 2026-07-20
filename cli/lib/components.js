@@ -209,7 +209,7 @@ export function outputTask(action, data) {
   console.log('[/ZYLOS_TASK]\n');
 
   // Queue task via C4 for Scene B (terminal execution)
-  // C4 dispatcher will deliver to Claude via tmux
+  // Core executor delivery makes the component available to the provider.
   const c4ReceivePath = path.join(import.meta.dirname, '..', '..', 'skills', 'comm-bridge', 'scripts', 'c4-receive.js');
 
   try {

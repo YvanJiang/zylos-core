@@ -18,7 +18,7 @@ import { prompt, promptYesNo, promptChoice, promptSecret } from '../lib/prompts.
 import { bold, dim, green, red, yellow, cyan, bgGreen, success, error, warn, heading } from '../lib/colors.js';
 import { commandExists } from '../lib/shell-utils.js';
 import { reconcileExecutorService } from '../lib/executor-service-lifecycle.js';
-import { assertLegacyServicesInactive } from '../../runtime/migration/installed-executor-upgrade.js';
+import { reconcileLegacyServicesForExecutorStart } from '../../runtime/migration/installed-executor-upgrade.js';
 import {
   cleanupRetiredRuntimeSkillArtifacts,
   isRetiredRuntimeSkill,
@@ -969,7 +969,7 @@ async function startCoreServices() {
     throw new Error(`Executor service configuration is missing: ${ecosystemPath}`);
   }
 
-  assertLegacyServicesInactive({ zylosDir: ZYLOS_DIR });
+  reconcileLegacyServicesForExecutorStart({ zylosDir: ZYLOS_DIR });
 
   const result = requireHealthyExecutorStart(
     await reconcileExecutorService({

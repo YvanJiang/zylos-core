@@ -74,7 +74,11 @@ export function createExecutorPrerequisiteOwner({
     if (started) return health();
     const legacy = inspectLegacy({ zylosDir });
     if (legacy.length > 0) {
-      return Object.freeze({ ok: true, deferred: 'legacy_services_registered', services: [] });
+      const active = legacy.filter(({ was_running: wasRunning }) => wasRunning);
+      const names = (active.length > 0 ? active : legacy).map(({ name }) => name).join(', ');
+      throw new Error(active.length > 0
+        ? `Active legacy runtime services block executor startup: ${names}`
+        : `Stopped legacy runtime registrations require one-time reconciliation: ${names}`);
     }
     for (const descriptor of descriptors()) {
       const child = spawnFn(descriptor.command, descriptor.args, {

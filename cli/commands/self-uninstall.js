@@ -72,7 +72,7 @@ export async function selfUninstall(args) {
     return { ok: false, phase: 'executor_shutdown', error: stopped.error };
   }
   console.log(success(`Executor stopped: ${stopped.serviceInstanceId}`));
-  const registration = removeExecutorServiceRegistration();
+  const registration = removeExecutorServiceRegistration({ zylosDir: ZYLOS_DIR });
   if (!registration.ok) {
     console.error(error(`Executor supervisor cleanup failed: ${registration.error}`));
     console.error(dim('The package and managed data were preserved.'));

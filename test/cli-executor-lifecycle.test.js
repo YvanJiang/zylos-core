@@ -38,6 +38,24 @@ function shutdown(instanceId) {
   return { ok: true, result: { status: 'completed', service_instance_id: instanceId } };
 }
 
+function pm2Fixture(commands, { registered = true, foreign = false } = {}) {
+  return (file, args) => {
+    commands.push([file, args]);
+    if (file === 'pm2' && args[0] === 'jlist') {
+      return JSON.stringify(registered ? [{
+        name: EXECUTOR_SERVICE_NAME,
+        pm2_env: {
+          status: 'online',
+          pm_exec_path: foreign ? '/opt/user/executor.js' : path.resolve('runtime/executor/launcher.js'),
+          pm_cwd: '/tmp/zylos-cli-fixture',
+          ZYLOS_DIR: '/tmp/zylos-cli-fixture',
+        },
+      }] : []);
+    }
+    return '';
+  };
+}
+
 describe('executor lifecycle CLI boundary', () => {
   test('classifies a control timeout as an unknown durable outcome without a fake failed step', () => {
     const timeout = Object.assign(new Error('timed out'), {
@@ -78,12 +96,13 @@ describe('executor lifecycle CLI boundary', () => {
     const commands = [];
     const result = await startExecutorService({
       zylosDir: '/tmp/zylos-cli-fixture',
-      execFileSyncFn: (file, args) => commands.push([file, args]),
+      execFileSyncFn: pm2Fixture(commands, { registered: false }),
       requestFn: async () => health('executor-new'),
       retryDelaysMs: [0],
     });
 
     expect(commands).toEqual([
+      ['pm2', ['jlist']],
       ['pm2', ['start', '/tmp/zylos-cli-fixture/pm2/ecosystem.config.cjs', '--only', EXECUTOR_SERVICE_NAME]],
       ['pm2', ['save']],
     ]);
@@ -94,12 +113,12 @@ describe('executor lifecycle CLI boundary', () => {
     const commands = [];
     const result = await stopExecutorService({
       zylosDir: '/tmp/zylos-cli-fixture',
-      execFileSyncFn: (file, args) => commands.push([file, args]),
+      execFileSyncFn: pm2Fixture(commands),
       requestFn: async () => ({ ok: false, error: 'shutdown_rejected' }),
     });
 
     expect(result).toEqual({ ok: false, error: 'shutdown_rejected' });
-    expect(commands).toEqual([]);
+    expect(commands).toEqual([['pm2', ['jlist']]]);
   });
 
   test('restart succeeds only after Core reports a new healthy identity', async () => {
@@ -110,12 +129,13 @@ describe('executor lifecycle CLI boundary', () => {
     ];
     const result = await restartExecutorService({
       zylosDir: '/tmp/zylos-cli-fixture',
-      execFileSyncFn: (file, args) => commands.push([file, args]),
+      execFileSyncFn: pm2Fixture(commands),
       requestFn: async () => replies.shift(),
       retryDelaysMs: [0, 0],
     });
 
     expect(commands).toEqual([
+      ['pm2', ['jlist']],
       ['pm2', ['restart', '/tmp/zylos-cli-fixture/pm2/ecosystem.config.cjs', '--only', EXECUTOR_SERVICE_NAME]],
       ['pm2', ['save']],
     ]);
@@ -131,7 +151,7 @@ describe('executor lifecycle CLI boundary', () => {
     const result = await restartExecutorService({
       zylosDir: '/tmp/zylos-cli-fixture',
       expectedProvider: 'codex',
-      execFileSyncFn: () => {},
+      execFileSyncFn: pm2Fixture([]),
       requestFn: async () => replies.shift(),
       retryDelaysMs: [0],
     });
@@ -150,13 +170,13 @@ describe('executor lifecycle CLI boundary', () => {
     busy.result.snapshot.service.maintenance = true;
     const result = await restartExecutorService({
       zylosDir: '/tmp/zylos-cli-fixture',
-      execFileSyncFn: (file, args) => commands.push([file, args]),
+      execFileSyncFn: pm2Fixture(commands),
       requestFn: async () => busy,
       retryDelaysMs: [0],
     });
 
     expect(result).toEqual({ ok: false, error: 'executor_lifecycle_operation_in_progress' });
-    expect(commands).toEqual([]);
+    expect(commands).toEqual([['pm2', ['jlist']]]);
   });
 
   test('provider reconfiguration rolls back the configuration and old provider on failed health', async () => {
@@ -172,7 +192,17 @@ describe('executor lifecycle CLI boundary', () => {
       expectedProvider: 'codex',
       beforeSupervisorRestart: async () => events.push('configure-codex'),
       restoreConfiguration: async () => events.push('restore-claude'),
-      execFileSyncFn: (file, args) => events.push(`${file}:${args[0]}`),
+      execFileSyncFn: (file, args) => {
+        events.push(`${file}:${args[0]}`);
+        if (file === 'pm2' && args[0] === 'jlist') return JSON.stringify([{
+          name: EXECUTOR_SERVICE_NAME,
+          pm2_env: {
+            pm_exec_path: path.resolve('runtime/executor/launcher.js'),
+            pm_cwd: '/tmp/zylos-cli-fixture', ZYLOS_DIR: '/tmp/zylos-cli-fixture',
+          },
+        }]);
+        return '';
+      },
       requestFn: async (_socket, request) => {
         events.push(`core:${request.action}`);
         return replies.shift();
@@ -190,7 +220,7 @@ describe('executor lifecycle CLI boundary', () => {
       },
     });
     expect(events).toEqual([
-      'core:health', 'core:shutdown', 'configure-codex',
+      'pm2:jlist', 'core:health', 'core:shutdown', 'configure-codex',
       'pm2:restart', 'pm2:save', 'core:health', 'restore-claude',
       'pm2:restart', 'pm2:save', 'core:health',
     ]);
@@ -211,7 +241,17 @@ describe('executor lifecycle CLI boundary', () => {
         throw new Error('config write failed');
       },
       restoreConfiguration: async () => events.push('restore-claude'),
-      execFileSyncFn: (file, args) => events.push(`${file}:${args[0]}`),
+      execFileSyncFn: (file, args) => {
+        events.push(`${file}:${args[0]}`);
+        if (file === 'pm2' && args[0] === 'jlist') return JSON.stringify([{
+          name: EXECUTOR_SERVICE_NAME,
+          pm2_env: {
+            pm_exec_path: path.resolve('runtime/executor/launcher.js'),
+            pm_cwd: '/tmp/zylos-cli-fixture', ZYLOS_DIR: '/tmp/zylos-cli-fixture',
+          },
+        }]);
+        return '';
+      },
       requestFn: async (_socket, request) => {
         events.push(`core:${request.action}`);
         return replies.shift();
@@ -227,7 +267,7 @@ describe('executor lifecycle CLI boundary', () => {
       },
     });
     expect(events).toEqual([
-      'core:health', 'core:shutdown', 'configure-codex', 'restore-claude',
+      'pm2:jlist', 'core:health', 'core:shutdown', 'configure-codex', 'restore-claude',
       'pm2:restart', 'pm2:save', 'core:health',
     ]);
   });
@@ -236,7 +276,7 @@ describe('executor lifecycle CLI boundary', () => {
     const healthyCommands = [];
     await expect(selfHealExecutorService({
       zylosDir: '/tmp/zylos-cli-fixture',
-      execFileSyncFn: (...args) => healthyCommands.push(args),
+      execFileSyncFn: pm2Fixture(healthyCommands),
       requestFn: async () => health('executor-current'),
       retryDelaysMs: [0],
     })).resolves.toMatchObject({ ok: true, repaired: false });
@@ -246,11 +286,11 @@ describe('executor lifecycle CLI boundary', () => {
     const replies = [Promise.reject(Object.assign(new Error('offline'), { code: 'ENOENT' })), health('executor-repaired')];
     await expect(selfHealExecutorService({
       zylosDir: '/tmp/zylos-cli-fixture',
-      execFileSyncFn: (file, args) => repairedCommands.push([file, args]),
+      execFileSyncFn: pm2Fixture(repairedCommands, { registered: false }),
       requestFn: () => replies.shift(),
       retryDelaysMs: [0],
     })).resolves.toMatchObject({ ok: true, repaired: true, serviceInstanceId: 'executor-repaired' });
-    expect(repairedCommands[0]).toEqual([
+    expect(repairedCommands[1]).toEqual([
       'pm2', ['start', '/tmp/zylos-cli-fixture/pm2/ecosystem.config.cjs', '--only', EXECUTOR_SERVICE_NAME],
     ]);
 
@@ -263,7 +303,7 @@ describe('executor lifecycle CLI boundary', () => {
     ];
     await expect(selfHealExecutorService({
       zylosDir: '/tmp/zylos-cli-fixture',
-      execFileSyncFn: (file, args) => degradedCommands.push([file, args]),
+      execFileSyncFn: pm2Fixture(degradedCommands),
       requestFn: async () => degradedReplies.shift(),
       retryDelaysMs: [0],
     })).resolves.toMatchObject({
@@ -272,7 +312,7 @@ describe('executor lifecycle CLI boundary', () => {
       previousServiceInstanceId: 'executor-degraded',
       serviceInstanceId: 'executor-healed',
     });
-    expect(degradedCommands[0]).toEqual([
+    expect(degradedCommands[1]).toEqual([
       'pm2', ['restart', '/tmp/zylos-cli-fixture/pm2/ecosystem.config.cjs', '--only', EXECUTOR_SERVICE_NAME],
     ]);
 
@@ -286,13 +326,13 @@ describe('executor lifecycle CLI boundary', () => {
     await expect(selfHealExecutorService({
       zylosDir: '/tmp/zylos-cli-fixture',
       expectedProvider: 'codex',
-      execFileSyncFn: (file, args) => mismatchCommands.push([file, args]),
+      execFileSyncFn: pm2Fixture(mismatchCommands),
       requestFn: async () => mismatchReplies.shift(),
       retryDelaysMs: [0],
     })).resolves.toMatchObject({
       ok: true, repaired: true, provider: 'codex', serviceInstanceId: 'executor-codex',
     });
-    expect(mismatchCommands[0]).toEqual([
+    expect(mismatchCommands[1]).toEqual([
       'pm2', ['restart', '/tmp/zylos-cli-fixture/pm2/ecosystem.config.cjs', '--only', EXECUTOR_SERVICE_NAME],
     ]);
   });
@@ -305,12 +345,36 @@ describe('executor lifecycle CLI boundary', () => {
   test('uninstall removes only the exact executor supervisor registration', () => {
     const commands = [];
     expect(removeExecutorServiceRegistration({
-      execFileSyncFn: (file, args) => commands.push([file, args]),
+      zylosDir: '/tmp/zylos-cli-fixture',
+      execFileSyncFn: pm2Fixture(commands),
     })).toEqual({ ok: true });
     expect(commands).toEqual([
+      ['pm2', ['jlist']],
       ['pm2', ['delete', EXECUTOR_SERVICE_NAME]],
       ['pm2', ['save']],
     ]);
+  });
+
+  test('all supervisor mutations fail closed on a foreign generic-name collision', async () => {
+    for (const operation of [
+      (options) => startExecutorService(options),
+      (options) => stopExecutorService(options),
+      (options) => restartExecutorService(options),
+      (options) => Promise.resolve(removeExecutorServiceRegistration(options)),
+    ]) {
+      const commands = [];
+      const result = await operation({
+        zylosDir: '/tmp/zylos-cli-fixture',
+        execFileSyncFn: pm2Fixture(commands, { foreign: true }),
+        requestFn: async () => { throw new Error('Core must not be contacted'); },
+        retryDelaysMs: [0],
+      });
+      expect(result).toMatchObject({
+        ok: false,
+        error: 'Refusing to control a foreign zylos-executor PM2 registration.',
+      });
+      expect(commands).toEqual([['pm2', ['jlist']]]);
+    }
   });
 
   test('init reconciliation replaces a healthy old identity with the deployed executor config', async () => {
@@ -323,7 +387,7 @@ describe('executor lifecycle CLI boundary', () => {
     ];
     await expect(reconcileExecutorService({
       zylosDir: '/tmp/zylos-cli-fixture',
-      execFileSyncFn: (file, args) => commands.push([file, args]),
+      execFileSyncFn: pm2Fixture(commands),
       requestFn: async () => replies.shift(),
       retryDelaysMs: [0],
     })).resolves.toMatchObject({
@@ -331,7 +395,7 @@ describe('executor lifecycle CLI boundary', () => {
       previousServiceInstanceId: 'executor-before-init',
       serviceInstanceId: 'executor-after-init',
     });
-    expect(commands[0]).toEqual([
+    expect(commands[1]).toEqual([
       'pm2', ['restart', '/tmp/zylos-cli-fixture/pm2/ecosystem.config.cjs', '--only', EXECUTOR_SERVICE_NAME],
     ]);
   });

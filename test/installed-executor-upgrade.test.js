@@ -8,6 +8,7 @@ import { afterEach, describe, expect, test } from '@jest/globals';
 import { driveInstalledRuntimeUpgrade } from '../runtime/migration/executor-upgrade-driver.js';
 import {
   createInstalledExecutorUpgradeHandler,
+  reconcileLegacyServicesForExecutorStart,
   removeLegacyServiceRegistrations,
 } from '../runtime/migration/installed-executor-upgrade.js';
 import { legacyLifecycleArtifactPaths } from '../runtime/migration/legacy-lifecycle-artifacts.js';
@@ -224,6 +225,37 @@ describe('installed executor production upgrade owner', () => {
     expect(commands).toEqual([['pm2', ['jlist']]]);
   });
 
+  test('init removes exact stopped legacy registrations but never takes over active ones', () => {
+    const zylosDir = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-init-legacy-'));
+    directories.push(zylosDir);
+    const scriptPath = path.join(
+      zylosDir, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-dispatcher.js',
+    );
+    for (const status of ['stopped', 'online']) {
+      const commands = [];
+      let registered = true;
+      const execFileSyncFn = (file, args) => {
+        commands.push([file, args]);
+        if (args[0] === 'jlist') {
+          return JSON.stringify(registered ? [{
+            name: 'c4-dispatcher', pm2_env: { status, pm_exec_path: scriptPath },
+          }] : []);
+        }
+        if (args[0] === 'delete') registered = false;
+        return '';
+      };
+      if (status === 'stopped') {
+        expect(reconcileLegacyServicesForExecutorStart({ zylosDir, execFileSyncFn }))
+          .toEqual({ removed_services: ['c4-dispatcher'] });
+        expect(commands).toContainEqual(['pm2', ['delete', 'c4-dispatcher']]);
+      } else {
+        expect(() => reconcileLegacyServicesForExecutorStart({ zylosDir, execFileSyncFn }))
+          .toThrow('still active');
+        expect(commands).toEqual([['pm2', ['jlist']]]);
+      }
+    }
+  });
+
   test('commits a prepared release through Global26 and removes obsolete artifacts only afterward', async () => {
     const directory = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-installed-upgrade-'));
     directories.push(directory);
@@ -271,6 +303,8 @@ describe('installed executor production upgrade owner', () => {
     const commands = [];
     const commandStates = [];
     const commandDirectories = [];
+    const commandOptions = [];
+    let failStrictPostinstallOnce = true;
     const handler = createInstalledExecutorUpgradeHandler({
       database,
       Database,
@@ -309,10 +343,15 @@ describe('installed executor production upgrade owner', () => {
       execFileSyncFn: (file, args, options = {}) => {
         commands.push([file, args]);
         commandDirectories.push(options.cwd ?? null);
+        commandOptions.push(options);
         if (file === process.execPath && args[0]?.endsWith('/scripts/postinstall.js')) {
           commandStates.push(database.prepare(
             'SELECT state FROM runtime_upgrade_runs ORDER BY created_at DESC LIMIT 1',
           ).get()?.state ?? null);
+          if (failStrictPostinstallOnce) {
+            failStrictPostinstallOnce = false;
+            throw new Error('strict postinstall fixture failed');
+          }
         }
         if (file === 'pm2') return '[]';
         return '';
@@ -323,20 +362,29 @@ describe('installed executor production upgrade owner', () => {
       })(),
     });
 
-    const result = await handler({
+    const firstResult = await handler({
       action: 'upgrade',
       target: { release: 'release-B', downloaded_source: downloadedSource },
     });
+    expect(firstResult).toMatchObject({
+      success: false,
+      committed: true,
+      state: 'committed',
+      error: 'strict postinstall fixture failed',
+    });
+    expect(fs.readdirSync(path.join(zylosDir, 'runtime', 'upgrade-plans'))).toHaveLength(1);
+
+    const result = await handler.resumeBlocking();
 
     expect(result).toMatchObject({ success: true, state: 'committed', to: 'release-B' });
     expect(commands.filter(([file, args]) => file === 'npm' && args[0] === 'ci'))
       .toHaveLength(7);
-    expect(commands).toContainEqual(['npm', ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund']]);
+    expect(commands).toContainEqual(['npm', ['ci', '--omit=dev', '--no-audit', '--no-fund']]);
     expect(commands).toContainEqual([
       process.execPath,
       [expect.stringMatching(/scripts\/postinstall\.js$/)],
     ]);
-    expect(commandStates).toEqual(['committed']);
+    expect(commandStates).toEqual(['committed', 'committed']);
     const precommitDependencyDirectories = commands
       .map((command, index) => ({ command, cwd: commandDirectories[index] }))
       .filter(({ command: [file, args], cwd }) => (
@@ -346,7 +394,18 @@ describe('installed executor production upgrade owner', () => {
     expect(precommitDependencyDirectories).toHaveLength(4);
     expect(precommitDependencyDirectories.some((cwd) => cwd.endsWith('/skills/comm-bridge'))).toBe(true);
     expect(commands.filter(([file, args]) => file === 'npm' && args[0] === 'ci')
-      .every(([, args]) => args.includes('--ignore-scripts'))).toBe(true);
+      .every(([, args]) => !args.includes('--ignore-scripts'))).toBe(true);
+    expect(commands.filter(([file, args]) => file === process.execPath && args[0] === '-e'))
+      .toHaveLength(6);
+    const prepareRootIndex = commandDirectories.findIndex((cwd) => (
+      cwd?.startsWith(path.join(zylosDir, 'runtime', 'releases'))
+      && !cwd.includes('/skills/')
+    ));
+    expect(commandOptions[prepareRootIndex].env.ZYLOS_PACKAGE_PREPARE).toBe('1');
+    const strictPostinstallIndex = commands.findIndex(([file, args]) => (
+      file === process.execPath && args[0]?.endsWith('/scripts/postinstall.js')
+    ));
+    expect(commandOptions[strictPostinstallIndex].env.ZYLOS_POSTINSTALL_STRICT).toBe('1');
     expect(obsoleteArtifacts.every((artifact) => !fs.existsSync(artifact))).toBe(true);
     expect(JSON.parse(fs.readFileSync(
       path.join(zylosDir, 'runtime', 'active-release.json'), 'utf8',

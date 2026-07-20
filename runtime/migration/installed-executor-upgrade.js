@@ -139,7 +139,13 @@ function readUpgradePlan(planFile, expectedUpgradeId, {
   if (path.dirname(toReleasePath) !== resolvedReleaseRoot) {
     throw new Error(`Runtime upgrade plan ${expectedUpgradeId} target escaped the release store.`);
   }
-  const fromPackageVersion = readPackageRelease(fromReleasePath);
+  const fromReleaseKind = plan.from_release_kind ?? 'executor';
+  if (!['executor', 'legacy_base'].includes(fromReleaseKind)) {
+    throw new Error(`Runtime upgrade plan ${expectedUpgradeId} has an invalid source kind.`);
+  }
+  const fromPackageVersion = readPackageRelease(fromReleasePath, {
+    legacySource: fromReleaseKind === 'legacy_base',
+  });
   const toPackageVersion = readPackageRelease(toReleasePath);
   if (fromPackageVersion !== plan.from_package_version
     || toPackageVersion !== plan.to_package_version) {
@@ -167,12 +173,14 @@ function upgradePlanPath(planDirectory, upgradeId) {
   return path.join(planDirectory, `${upgradeId}.json`);
 }
 
-function readPackageRelease(releasePath) {
+function readPackageRelease(releasePath, { legacySource = false } = {}) {
   const packageDocument = JSON.parse(fs.readFileSync(path.join(releasePath, 'package.json'), 'utf8'));
   if (packageDocument.name !== 'zylos' || typeof packageDocument.version !== 'string') {
     throw new Error('Downloaded release is not a zylos-core package.');
   }
-  for (const entry of [
+  const requiredEntries = legacySource ? [
+    path.join(releasePath, 'cli', 'zylos.js'),
+  ] : [
     path.join(releasePath, 'cli', 'launcher.js'),
     path.join(releasePath, 'cli', 'zylos.js'),
     path.join(releasePath, 'runtime', 'executor', 'daemon.js'),
@@ -180,7 +188,8 @@ function readPackageRelease(releasePath) {
     path.join(releasePath, 'runtime', 'executor', 'launcher.js'),
     path.join(releasePath, 'scripts', 'postinstall.js'),
     path.join(releasePath, 'templates', 'pm2', 'ecosystem.config.cjs'),
-  ]) {
+  ];
+  for (const entry of requiredEntries) {
     if (!fs.statSync(entry).isFile()) throw new Error(`Downloaded release is missing ${entry}.`);
   }
   return packageDocument.version;
@@ -195,6 +204,14 @@ export function assertLegacyServicesInactive({ zylosDir, execFileSyncFn = execFi
   return { stopped: true, stopped_at: new Date().toISOString() };
 }
 
+export function reconcileLegacyServicesForExecutorStart({
+  zylosDir,
+  execFileSyncFn = execFileSync,
+}) {
+  assertLegacyServicesInactive({ zylosDir, execFileSyncFn });
+  return removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn });
+}
+
 export function removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn = execFileSync }) {
   const registered = inspectLegacyServiceRegistrations({ zylosDir, execFileSyncFn })
     .map(({ name }) => name);
@@ -205,6 +222,45 @@ export function removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn = ex
     execFileSyncFn('pm2', ['save'], { stdio: 'pipe', timeout: 30_000 });
   }
   return Object.freeze({ removed_services: Object.freeze(registered) });
+}
+
+function installReleaseDependencies({ releasePath, execFileSyncFn, prepareOnly, installRoot = true }) {
+  const dependencyArgs = ['ci', '--omit=dev', '--no-audit', '--no-fund'];
+  const isolatedHome = path.join(releasePath, '.zylos-package-prepare-home');
+  if (installRoot) {
+    execFileSyncFn('npm', dependencyArgs, {
+      cwd: releasePath,
+      env: {
+        ...process.env,
+        HOME: isolatedHome,
+        ZYLOS_PACKAGE_PREPARE: prepareOnly ? '1' : '',
+      },
+      stdio: 'pipe',
+      timeout: 15 * 60_000,
+    });
+  }
+  for (const skill of ['comm-bridge', 'scheduler', 'web-console']) {
+    const skillDirectory = path.join(releasePath, 'skills', skill);
+    execFileSyncFn('npm', dependencyArgs, {
+      cwd: skillDirectory,
+      env: { ...process.env, HOME: isolatedHome },
+      stdio: 'pipe',
+      timeout: 15 * 60_000,
+    });
+    execFileSyncFn(process.execPath, ['-e', [
+      "const Database=require('better-sqlite3');",
+      "const db=new Database(':memory:');",
+      "db.exec('CREATE TABLE dependency_probe(value INTEGER); INSERT INTO dependency_probe VALUES (1)');",
+      "if(db.prepare('SELECT value FROM dependency_probe').pluck().get()!==1)process.exit(2);",
+      'db.close();',
+    ].join('')], {
+      cwd: skillDirectory,
+      env: { ...process.env, HOME: isolatedHome },
+      stdio: 'pipe',
+      timeout: 30_000,
+    });
+  }
+  fs.rmSync(isolatedHome, { recursive: true, force: true });
 }
 
 function prepareRelease({ source, releaseRef, branch, releaseRoot, execFileSyncFn }) {
@@ -220,19 +276,7 @@ function prepareRelease({ source, releaseRef, branch, releaseRoot, execFileSyncF
   const releasePath = path.join(releaseRoot, `${safeRef}-${crypto.randomUUID()}`);
   fs.mkdirSync(releaseRoot, { recursive: true });
   fs.cpSync(sourcePath, releasePath, { recursive: true, errorOnExist: true, force: false });
-  const dependencyArgs = ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund'];
-  execFileSyncFn('npm', dependencyArgs, {
-    cwd: releasePath,
-    stdio: 'pipe',
-    timeout: 15 * 60_000,
-  });
-  for (const skill of ['comm-bridge', 'scheduler', 'web-console']) {
-    execFileSyncFn('npm', dependencyArgs, {
-      cwd: path.join(releasePath, 'skills', skill),
-      stdio: 'pipe',
-      timeout: 15 * 60_000,
-    });
-  }
+  installReleaseDependencies({ releasePath, execFileSyncFn, prepareOnly: true });
   return Object.freeze({ packageVersion, releasePath, releaseRef });
 }
 
@@ -270,19 +314,18 @@ function decorateReleaseAdapter(adapter, activeReleaseFile, execFileSyncFn, {
           HOME: path.dirname(zylosDir),
           ZYLOS_DIR: zylosDir,
           ZYLOS_SKIP_POSTINSTALL: '',
+          ZYLOS_POSTINSTALL_STRICT: '1',
           CI: '',
         },
         stdio: 'pipe',
         timeout: 15 * 60_000,
       });
-      const dependencyArgs = ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund'];
-      for (const skill of ['comm-bridge', 'scheduler', 'web-console']) {
-        execFileSyncFn('npm', dependencyArgs, {
-          cwd: path.join(zylosDir, '.claude', 'skills', skill),
-          stdio: 'pipe',
-          timeout: 15 * 60_000,
-        });
-      }
+      installReleaseDependencies({
+        releasePath: path.join(zylosDir, '.claude'),
+        execFileSyncFn,
+        prepareOnly: false,
+        installRoot: false,
+      });
       const result = await adapter.cleanup(request);
       const registrations = removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn });
       return Object.freeze({
@@ -410,6 +453,7 @@ export function createInstalledExecutorUpgradeHandler({
   currentReleasePath,
   currentReleaseRef,
   provider,
+  allowLegacyFromRelease = false,
   execFileSyncFn = execFileSync,
   startTargetHealth = startTargetHealthProcess,
   targetHealthProofTimeoutMs = 30_000,
@@ -703,9 +747,12 @@ export function createInstalledExecutorUpgradeHandler({
       legacy_queue_file: legacyQueueFile,
       from_release_path: packageRoot,
       to_release_path: prepared.releasePath,
-      from_package_version: readPackageRelease(packageRoot),
+      from_package_version: readPackageRelease(packageRoot, {
+        legacySource: allowLegacyFromRelease,
+      }),
       to_package_version: prepared.packageVersion,
       provider,
+      from_release_kind: allowLegacyFromRelease ? 'legacy_base' : 'executor',
     });
     atomicJson(upgradePlanPath(planDirectory, upgradeId), plan);
     return executePlan(plan);

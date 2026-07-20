@@ -8,7 +8,8 @@ import { execFileSync } from 'child_process';
 import { readFileSync, existsSync, statSync } from 'fs';
 import net from 'net';
 import path from 'path';
-import { logDeliveryFailure, saveTmuxCapture } from './c4-diagnostic.js';
+import { logDeliveryFailure } from './c4-diagnostic.js';
+import { saveTmuxCapture } from '../../../runtime/migration/legacy-c4-diagnostic.js';
 import {
   getNextPending,
   claimConversation,
@@ -44,15 +45,17 @@ import {
   REQUIRE_IDLE_POST_SEND_HOLD_MS,
   REQUIRE_IDLE_EXECUTION_MAX_WAIT_MS,
   REQUIRE_IDLE_EXECUTION_POLL_MS,
-  ACTIVE_RUNTIME,
-  TMUX_SESSION,
   ACTIVITY_MONITOR_DIR,
   AGENT_STATUS_FILE,
   PROC_STATE_FILE,
   API_ACTIVITY_FILE,
   STALE_STATUS_THRESHOLD,
-  TMUX_MISSING_WARN_THRESHOLD
 } from './c4-config.js';
+import {
+  ACTIVE_RUNTIME,
+  TMUX_MISSING_WARN_THRESHOLD,
+  TMUX_SESSION,
+} from '../../../runtime/migration/legacy-c4-runtime-config.js';
 import {
   findPromptY as sharedFindPromptY,
   isUsageOverlayCapture as sharedIsUsageOverlayCapture

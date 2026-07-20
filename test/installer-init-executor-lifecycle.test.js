@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 import { describe, expect, test } from '@jest/globals';
 
@@ -42,6 +43,16 @@ describe('installer and init executor lifecycle', () => {
     expect(JSON.stringify(template)).not.toContain('activity-monitor');
   });
 
+  test('the bundled restart skill uses authoritative executor lifecycle control', () => {
+    const restartSkill = fs.readFileSync(
+      new URL('../skills/restart-claude/SKILL.md', import.meta.url),
+      'utf8',
+    );
+    expect(restartSkill).toContain('zylos restart');
+    expect(restartSkill).toContain('zylos status');
+    expect(restartSkill).not.toMatch(/tmux|activity-monitor|c4-control/i);
+  });
+
   test('fresh skill deployment removes the retired dispatcher script from an isolated installation', () => {
     const root = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-init-retired-script-'));
     const skillsDir = path.join(root, '.claude', 'skills');
@@ -58,6 +69,23 @@ describe('installer and init executor lifecycle', () => {
 
   test('init checks legacy ownership using the selected isolated ZYLOS_DIR', () => {
     const initSource = fs.readFileSync(new URL('../cli/commands/init.js', import.meta.url), 'utf8');
-    expect(initSource).toContain('assertLegacyServicesInactive({ zylosDir: ZYLOS_DIR })');
+    expect(initSource).toContain('reconcileLegacyServicesForExecutorStart({ zylosDir: ZYLOS_DIR })');
+  });
+
+  test('the shipped package excludes retired executable runtime implementations', () => {
+    const packed = JSON.parse(execFileSync('npm', [
+      'pack', '--dry-run', '--json', '--ignore-scripts',
+    ], { cwd: path.resolve('.'), encoding: 'utf8', timeout: 30_000 }));
+    const files = packed[0].files.map(({ path: file }) => file);
+    for (const retired of [
+      'skills/activity-monitor/',
+      'skills/comm-bridge/scripts/c4-dispatcher.js',
+      'skills/comm-bridge/scripts/tmux-input-state.js',
+      'cli/lib/runtime/claude.js',
+      'cli/lib/runtime/codex.js',
+      'cli/lib/runtime/tmux-helpers.js',
+    ]) {
+      expect(files.some((file) => file === retired || file.startsWith(retired))).toBe(false);
+    }
   });
 });

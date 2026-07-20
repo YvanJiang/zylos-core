@@ -285,10 +285,25 @@ FISH_EOF
 
 # ── Install Zylos ─────────────────────────────────────────────
 install_zylos() {
+  local bootstrap_backup=""
+  local bootstrap_tarball=""
+  local use_sudo=false
   if command -v zylos &>/dev/null; then
     local current_version
     current_version="$(zylos --version 2>/dev/null || echo 'unknown')"
     warn "zylos is already installed (${current_version}). Upgrading..."
+    local installed_bin installed_root
+    installed_bin="$(command -v zylos)"
+    installed_root="$(node -e 'const fs=require("fs"),path=require("path");process.stdout.write(path.dirname(path.dirname(fs.realpathSync(process.argv[1]))))' "$installed_bin")"
+    local bootstrap_root
+    bootstrap_root="${ZYLOS_DIR:-$HOME/zylos}/runtime"
+    mkdir -p "$bootstrap_root"
+    bootstrap_backup="$(mktemp -d "$bootstrap_root/base-to-executor.XXXXXX")"
+    mkdir -p "$bootstrap_backup/base-release"
+    cp -R "$installed_root/." "$bootstrap_backup/base-release/"
+    bootstrap_tarball="$(cd "$bootstrap_backup/base-release" && npm pack --pack-destination "$bootstrap_backup" --silent)"
+    bootstrap_tarball="$bootstrap_backup/$bootstrap_tarball"
+    git clone --depth 1 --branch "$BRANCH" "$ZYLOS_REPO" "$bootstrap_backup/target-release"
   fi
 
   local install_url="${ZYLOS_REPO}#${BRANCH}"
@@ -298,15 +313,62 @@ install_zylos() {
   # use sudo for npm install -g
   local npm_prefix
   npm_prefix="$(npm config get prefix 2>/dev/null || echo "")"
-  if [ -n "$npm_prefix" ] && [ -w "$npm_prefix" ]; then
-    npm install -g --install-links "$install_url"
-  else
+  if ! { [ -n "$npm_prefix" ] && [ -w "$npm_prefix" ]; }; then
     warn "npm global directory (${npm_prefix:-unknown}) requires elevated permissions, using sudo..."
-    if [ "$(id -u)" -eq 0 ]; then
-      npm install -g --install-links "$install_url"
-    else
-      sudo npm install -g --install-links "$install_url"
+    if [ "$(id -u)" -ne 0 ]; then use_sudo=true; fi
+  fi
+
+  local install_status=0
+  if [ "$use_sudo" = true ]; then
+    sudo env ZYLOS_PACKAGE_PREPARE=1 npm install -g --install-links "$install_url" || install_status=$?
+  else
+    ZYLOS_PACKAGE_PREPARE=1 npm install -g --install-links "$install_url" || install_status=$?
+  fi
+  if [ "$install_status" -ne 0 ]; then
+    if [ -n "$bootstrap_tarball" ]; then
+      warn "New package installation failed; restoring the previous package."
+      local restore_status=0
+      if [ "$use_sudo" = true ]; then
+        sudo env ZYLOS_PACKAGE_PREPARE=1 npm install -g --install-links "$bootstrap_tarball" || restore_status=$?
+      else
+        ZYLOS_PACKAGE_PREPARE=1 npm install -g --install-links "$bootstrap_tarball" || restore_status=$?
+      fi
+      if [ "$restore_status" -ne 0 ]; then
+        warn "Previous package restoration also failed (exit ${restore_status}); rollback backup remains at ${bootstrap_backup}."
+        return "$restore_status"
+      fi
     fi
+    return "$install_status"
+  fi
+
+  if [ -n "$bootstrap_backup" ]; then
+    local new_bin new_root bootstrap_status
+    new_bin="$(command -v zylos)"
+    new_root="$(node -e 'const fs=require("fs"),path=require("path");process.stdout.write(path.dirname(path.dirname(fs.realpathSync(process.argv[1]))))' "$new_bin")"
+    bootstrap_status=0
+    node "$new_root/scripts/bootstrap-executor-lifecycle.js" \
+      --zylos-dir "${ZYLOS_DIR:-$HOME/zylos}" \
+      --from-release "$bootstrap_backup/base-release" \
+      --target-release "$bootstrap_backup/target-release" || bootstrap_status=$?
+    if [ "$bootstrap_status" -ne 0 ]; then
+      if [ "$bootstrap_status" -eq 2 ]; then
+        warn "Executor migration committed, but post-commit completion failed; the new package remains installed and the durable upgrade will resume on the next executor start."
+        return "$bootstrap_status"
+      fi
+      warn "Executor migration rolled back; restoring the previous package."
+      local restore_status=0
+      if [ "$use_sudo" = true ]; then
+        sudo env ZYLOS_PACKAGE_PREPARE=1 npm install -g --install-links "$bootstrap_tarball" || restore_status=$?
+      else
+        ZYLOS_PACKAGE_PREPARE=1 npm install -g --install-links "$bootstrap_tarball" || restore_status=$?
+      fi
+      if [ "$restore_status" -ne 0 ]; then
+        warn "Previous package restoration failed (exit ${restore_status}); rollback backup remains at ${bootstrap_backup}."
+        return "$restore_status"
+      fi
+      return "$bootstrap_status"
+    fi
+    find "$bootstrap_backup" -depth -delete
   fi
 
   ok "zylos: $(zylos --version 2>/dev/null || echo 'installed')"

@@ -32,7 +32,9 @@ function main() {
   const zylosDir = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
   const packageRoot = path.resolve(import.meta.dirname, '..');
   const entry = resolveCliEntry({ zylosDir, packageRoot });
-  runForwardedNode(entry, process.argv.slice(2), { env: process.env });
+  runForwardedNode(entry, process.argv.slice(2), {
+    env: { ...process.env, ZYLOS_PACKAGE_ROOT: packageRoot },
+  });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
