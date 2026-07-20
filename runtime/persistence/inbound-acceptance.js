@@ -26,6 +26,7 @@ import {
   DEFAULT_PERMISSION_MAX_TIMED_DURATION_MS,
   parsePermissionCommand,
 } from '../permissions/permission-service.js';
+import { findBlockingRuntimeUpgrade } from '../migration/upgrade-state.js';
 
 export const INBOUND_ENVELOPE_KNOWN_FIELDS = Object.freeze([
   'contract',
@@ -196,9 +197,87 @@ export function buildInitialDeliveryCommand({
   };
 }
 
+function resolveOrCreateDefaultLineage(database, envelope, conversationId, committedAt, generateId) {
+  let lineage = database.prepare(`
+    SELECT lineage_id
+    FROM runtime_lineages
+    WHERE conversation_id = ? AND is_default = 1
+  `).get(conversationId);
+  if (!lineage) {
+    lineage = { lineage_id: generateId('lineage') };
+    database.prepare(`
+      INSERT INTO runtime_lineages (
+        lineage_id, conversation_id, lineage_kind, is_default, created_at
+      ) VALUES (?, ?, ?, 1, ?)
+    `).run(
+      lineage.lineage_id,
+      conversationId,
+      envelope.source.kind === 'scheduler' && envelope.chat_type === 'synthetic'
+        ? 'scheduler'
+        : 'normal',
+      committedAt,
+    );
+  }
+  return lineage;
+}
+
 function resolveNormalLineage(database, envelope, conversationId, committedAt, generateId) {
   const replyToMessageId = envelope.reply.reply_to_message_id;
   if (replyToMessageId !== null) {
+    const legacyUnmapped = database.prepare(`
+      SELECT message.upgrade_id, message.legacy_kind, message.legacy_record_id,
+        message.recent_c4_context_json, message.memory_handoff
+      FROM runtime_legacy_unmapped_messages AS message
+      JOIN runtime_upgrade_runs AS upgrade ON upgrade.upgrade_id = message.upgrade_id
+      WHERE message.region = ? AND message.tenant_id = ? AND message.channel = ?
+        AND message.bot_id = ? AND message.chat_type = ? AND message.chat_id = ?
+        AND message.native_thread_or_topic_id IS ?
+        AND message.platform_message_id = ?
+        AND upgrade.state != 'rolled_back'
+      ORDER BY upgrade.created_at DESC, message.upgrade_id DESC
+      LIMIT 1
+    `).get(
+      envelope.region,
+      envelope.tenant_id,
+      envelope.channel,
+      envelope.bot_id,
+      envelope.chat_type,
+      envelope.chat_id,
+      envelope.native_thread_or_topic_id,
+      replyToMessageId,
+    );
+    if (legacyUnmapped) {
+      const lineage = resolveOrCreateDefaultLineage(
+        database, envelope, conversationId, committedAt, generateId,
+      );
+      const durableContext = JSON.parse(legacyUnmapped.recent_c4_context_json);
+      const recentContext = Array.isArray(durableContext)
+        ? durableContext.filter((text) => typeof text === 'string')
+        : [];
+      return {
+        ...lineage,
+        recovery: null,
+        pending_turn: null,
+        legacy_unmapped: true,
+        provider_input: {
+          kind: 'text',
+          text: [
+            '[Zylos legacy lineage handoff]',
+            'The old global provider lineage cannot be assigned to this chat.',
+            'Continue in this chat-specific lineage; do not claim or resume the old provider session.',
+            ...(legacyUnmapped.memory_handoff.length > 0
+              ? [legacyUnmapped.memory_handoff]
+              : ['Existing Zylos memory and runtime instructions remain authoritative.']),
+            ...(recentContext.length > 0
+              ? ['Recent durable C4 context:', ...recentContext.map((text) => `- ${text}`)]
+              : []),
+            'Current user request:',
+            envelope.content.text,
+          ].join('\n').slice(0, 16_000),
+          attachments: structuredClone(envelope.content.attachments),
+        },
+      };
+    }
     const boundRecoveries = database.prepare(`
       SELECT DISTINCT recovery.bound_lineage_id AS lineage_id,
         lineage.provider_native_state
@@ -380,26 +459,9 @@ function resolveNormalLineage(database, envelope, conversationId, committedAt, g
     };
   }
 
-  let lineage = database.prepare(`
-    SELECT lineage_id
-    FROM runtime_lineages
-    WHERE conversation_id = ? AND is_default = 1
-  `).get(conversationId);
-  if (!lineage) {
-    lineage = { lineage_id: generateId('lineage') };
-    database.prepare(`
-      INSERT INTO runtime_lineages (
-        lineage_id, conversation_id, lineage_kind, is_default, created_at
-      ) VALUES (?, ?, ?, 1, ?)
-    `).run(
-      lineage.lineage_id,
-      conversationId,
-      envelope.source.kind === 'scheduler' && envelope.chat_type === 'synthetic'
-        ? 'scheduler'
-        : 'normal',
-      committedAt,
-    );
-  }
+  const lineage = resolveOrCreateDefaultLineage(
+    database, envelope, conversationId, committedAt, generateId,
+  );
   return { ...lineage, recovery: null, pending_turn: null };
 }
 
@@ -522,8 +584,9 @@ export function acceptNormalInbound(
         committedAt,
       );
     }
+    const blockingUpgrade = findBlockingRuntimeUpgrade(database, envelope.bot_id);
 
-    if (permissionCommand !== null) {
+    if (blockingUpgrade === null && permissionCommand !== null) {
       const permissionResult = acceptPermissionCommandInTransaction(database, {
         envelope: validated.forwarded,
         command: permissionCommand,
@@ -615,7 +678,9 @@ export function acceptNormalInbound(
       WHERE conversation_id = ? AND status = 'queued' AND priority = 0
     `).get(conversation.conversation_id).count;
     const pendingRecovery = lineage.recovery !== null;
-    const queueFull = !pendingRecovery && queuedTurnCount >= maxQueuedTurns;
+    const queueFull = blockingUpgrade === null
+      && !pendingRecovery
+      && queuedTurnCount >= maxQueuedTurns;
     const queueFullError = queueFull
       ? createContractError({
         code: 'queue_full',
@@ -657,8 +722,8 @@ export function acceptNormalInbound(
     database.prepare(`
       INSERT INTO runtime_turns (
         turn_id, conversation_id, lineage_id, inbound_event_id, state,
-        turn_version, queue_sequence, created_at, committed_at
-      ) VALUES (?, ?, ?, ?, ?, 2, ?, ?, ?)
+        turn_version, queue_sequence, provider_input_json, created_at, committed_at
+      ) VALUES (?, ?, ?, ?, ?, 2, ?, ?, ?, ?)
     `).run(
       turnId,
       conversation.conversation_id,
@@ -666,6 +731,7 @@ export function acceptNormalInbound(
       envelope.inbound_event_id,
       queueFull ? 'failed' : 'queued',
       queueSequence,
+      lineage.provider_input === undefined ? null : JSON.stringify(lineage.provider_input),
       committedAt,
       committedAt,
     );
@@ -678,7 +744,9 @@ export function acceptNormalInbound(
         conversation.conversation_id,
         queueSequence,
         turnId,
-        pendingRecovery ? 'lineage_resolution_pending' : null,
+        pendingRecovery
+          ? 'lineage_resolution_pending'
+          : (blockingUpgrade === null ? null : 'maintenance'),
         committedAt,
       );
       bindPermissionToAcceptedTurnInTransaction(database, {
@@ -751,7 +819,11 @@ export function acceptNormalInbound(
       phase: queueFull ? 'failed' : 'received',
       text: queueFull
         ? queueFullError.user_message
-        : (envelope.source.kind === 'scheduler'
+        : (blockingUpgrade !== null
+          ? 'Zylos is in maintenance; your message is durably queued.'
+          : lineage.legacy_unmapped === true
+          ? 'That message came from the legacy global provider lineage. Continuing safely in this chat.'
+          : envelope.source.kind === 'scheduler'
           ? (envelope.schedule.notification_text ?? 'Scheduled occurrence queued.')
           : 'Message received.'),
       error: queueFullError,

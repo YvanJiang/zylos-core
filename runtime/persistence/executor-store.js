@@ -38,6 +38,42 @@ import {
   createWorkspaceLeaseCoordinator,
   normalizeWorkspaceRoot,
 } from '../workspace/lease-coordinator.js';
+import { BLOCKING_UPGRADE_STATES_SQL } from '../migration/upgrade-state.js';
+
+const RELEASE_FENCE_PREDICATE_SQL = `
+  (
+    NOT EXISTS (
+      SELECT 1 FROM runtime_executor_service_instances AS revoked_service
+      WHERE revoked_service.service_instance_id = ?
+        AND revoked_service.revoked_at IS NOT NULL
+    )
+    AND (
+      NOT EXISTS (
+      SELECT 1 FROM runtime_active_release_fences AS fence
+      WHERE fence.scope_kind = 'installation'
+        OR (fence.scope_kind = 'bot' AND fence.bot_id = conversation.bot_id)
+      )
+      OR EXISTS (
+      SELECT 1
+      FROM runtime_active_release_fences AS fence
+      JOIN runtime_executor_service_instances AS service
+        ON service.service_instance_id = ?
+       AND service.upgrade_id = fence.upgrade_id
+       AND service.release_ref = fence.release_ref
+       AND service.revoked_at IS NULL
+      WHERE fence.scope_key = (
+        SELECT applicable.scope_key
+        FROM runtime_active_release_fences AS applicable
+        WHERE applicable.scope_kind = 'installation'
+          OR (applicable.scope_kind = 'bot' AND applicable.bot_id = conversation.bot_id)
+        ORDER BY CASE applicable.scope_kind WHEN 'bot' THEN 0 ELSE 1 END,
+          applicable.generation DESC
+        LIMIT 1
+      )
+      )
+    )
+  )
+`;
 
 const CANONICAL_TRANSITIONS = Object.freeze({
   queued: Object.freeze(['starting']),
@@ -797,6 +833,15 @@ export function createExecutorStore({
       JOIN runtime_conversations AS conversation
         ON conversation.conversation_id = turn.conversation_id
       WHERE queue.status = 'queued'
+        AND NOT EXISTS (
+          SELECT 1 FROM runtime_upgrade_runs AS upgrade
+          WHERE upgrade.state IN (${BLOCKING_UPGRADE_STATES_SQL})
+            AND (
+              upgrade.scope_kind = 'installation'
+              OR (upgrade.scope_kind = 'bot' AND upgrade.bot_id = conversation.bot_id)
+            )
+        )
+        AND ${RELEASE_FENCE_PREDICATE_SQL}
         AND turn.lineage_id IS NOT NULL
         AND (
           turn.state = 'queued'
@@ -850,7 +895,7 @@ export function createExecutorStore({
             AND workspace.state IN ('active', 'uncertain')
         )
       ORDER BY turn.created_at ASC, turn.conversation_id ASC, queue.queue_sequence ASC
-    `).all(claimableAt);
+    `).all(serviceInstanceId, serviceInstanceId, claimableAt);
   }
 
   function claimNextReplyMappingRecoveryNotice() {
@@ -871,6 +916,8 @@ export function createExecutorStore({
         FROM runtime_reply_mapping_recoveries AS recovery
         JOIN runtime_turns AS turn ON turn.turn_id = recovery.turn_id
         JOIN runtime_turn_queue AS queue ON queue.turn_id = recovery.turn_id
+        JOIN runtime_conversations AS conversation
+          ON conversation.conversation_id = turn.conversation_id
         WHERE recovery.state IN (
             'notice_pending',
             'native_recovery_claimed',
@@ -892,10 +939,19 @@ export function createExecutorStore({
             OR recovery.native_recovery_claim_expires_at IS NULL
             OR recovery.native_recovery_claim_expires_at <= ?
           )
+          AND NOT EXISTS (
+            SELECT 1 FROM runtime_upgrade_runs AS upgrade
+            WHERE upgrade.state IN (${BLOCKING_UPGRADE_STATES_SQL})
+              AND (
+                upgrade.scope_kind = 'installation'
+                OR (upgrade.scope_kind = 'bot' AND upgrade.bot_id = conversation.bot_id)
+              )
+          )
+          AND ${RELEASE_FENCE_PREDICATE_SQL}
         ORDER BY turn.created_at ASC, turn.conversation_id ASC,
           queue.queue_sequence ASC
         LIMIT 1
-      `).get(claimAt);
+      `).get(claimAt, serviceInstanceId, serviceInstanceId);
       if (existing) {
         return {
           status: 'lineage_resolution_pending',
@@ -911,6 +967,8 @@ export function createExecutorStore({
         FROM runtime_reply_mapping_recoveries AS recovery
         JOIN runtime_turns AS turn ON turn.turn_id = recovery.turn_id
         JOIN runtime_turn_queue AS queue ON queue.turn_id = recovery.turn_id
+        JOIN runtime_conversations AS conversation
+          ON conversation.conversation_id = turn.conversation_id
         WHERE recovery.state = 'queued'
           AND turn.state = 'queued' AND turn.lineage_id IS NULL
           AND turn.attempt_id IS NULL AND turn.attempt_no IS NULL
@@ -935,10 +993,19 @@ export function createExecutorStore({
             WHERE lease.conversation_id = queue.conversation_id
               AND lease.lease_owner IS NOT NULL
           )
+          AND NOT EXISTS (
+            SELECT 1 FROM runtime_upgrade_runs AS upgrade
+            WHERE upgrade.state IN (${BLOCKING_UPGRADE_STATES_SQL})
+              AND (
+                upgrade.scope_kind = 'installation'
+                OR (upgrade.scope_kind = 'bot' AND upgrade.bot_id = conversation.bot_id)
+              )
+          )
+          AND ${RELEASE_FENCE_PREDICATE_SQL}
         ORDER BY turn.created_at ASC, turn.conversation_id ASC,
           queue.priority DESC, queue.queue_sequence ASC
         LIMIT 1
-      `).get();
+      `).get(serviceInstanceId, serviceInstanceId);
       if (!candidate) return null;
 
       const claimedAt = now();
@@ -2107,7 +2174,18 @@ export function createExecutorStore({
         SELECT turn.turn_id
         FROM runtime_turn_queue AS queue
         JOIN runtime_turns AS turn ON turn.turn_id = queue.turn_id
+        JOIN runtime_conversations AS conversation
+          ON conversation.conversation_id = turn.conversation_id
         WHERE queue.status = 'queued'
+          AND NOT EXISTS (
+            SELECT 1 FROM runtime_upgrade_runs AS upgrade
+            WHERE upgrade.state IN (${BLOCKING_UPGRADE_STATES_SQL})
+              AND (
+                upgrade.scope_kind = 'installation'
+                OR (upgrade.scope_kind = 'bot' AND upgrade.bot_id = conversation.bot_id)
+              )
+          )
+          AND ${RELEASE_FENCE_PREDICATE_SQL}
           AND turn.lineage_id IS NOT NULL
           AND (
             turn.state = 'queued'
@@ -2157,7 +2235,9 @@ export function createExecutorStore({
           )
         ORDER BY turn.created_at ASC, turn.conversation_id ASC, queue.queue_sequence ASC
         LIMIT 1
-      `).get(claimableAt, conversationId, conversationId);
+      `).get(
+        serviceInstanceId, serviceInstanceId, claimableAt, conversationId, conversationId,
+      );
       if (!turn) return null;
 
       const claimedAt = now();
@@ -4162,6 +4242,100 @@ export function createExecutorStore({
       };
     });
     return clear.immediate();
+  }
+
+  function cancelUpgradeImportedTurns(upgradeId) {
+    if (typeof upgradeId !== 'string' || upgradeId.length === 0) {
+      throw new TypeError('upgradeId must be a non-empty string');
+    }
+    const cancel = database.transaction(() => {
+      const run = database.prepare(`
+        SELECT state FROM runtime_upgrade_runs WHERE upgrade_id = ?
+      `).get(upgradeId);
+      if (!run || run.state !== 'rollback_required') {
+        conflict('illegal_transition', 'Upgrade-import cancellation requires rollback_required.');
+      }
+      const rows = database.prepare(`
+        SELECT migrated_turn_id AS turn_id
+        FROM runtime_legacy_migration_records
+        WHERE upgrade_id = ? AND migrated_turn_id IS NOT NULL AND imported_by_upgrade = 1
+        ORDER BY created_at, legacy_kind, legacy_record_id
+      `).all(upgradeId);
+      for (const { turn_id: turnId } of rows) {
+        const turn = loadTurn(database, turnId);
+        const currentQueue = database.prepare(`
+          SELECT status, wait_reason FROM runtime_turn_queue WHERE turn_id = ?
+        `).get(turnId);
+        if (turn.state === 'queued' && currentQueue?.status === 'cancelled'
+          && currentQueue.wait_reason === 'upgrade_rollback_parked') continue;
+        if (turn.state !== 'queued' || turn.attempt_id !== null) {
+          conflict('version_conflict', 'Only unexecuted upgrade imports can be parked for retry.');
+        }
+        const queueUpdate = database.prepare(`
+          UPDATE runtime_turn_queue
+          SET status = 'cancelled', wait_reason = 'upgrade_rollback_parked'
+          WHERE turn_id = ? AND status = 'queued'
+        `).run(turnId);
+        if (queueUpdate.changes !== 1) {
+          conflict('version_conflict', 'Upgrade import parking lost its durable CAS.');
+        }
+      }
+      return Object.freeze(rows.map(({ turn_id: turnId }) => turnId));
+    });
+    return cancel.immediate();
+  }
+
+  function requeueRolledBackUpgradeImportedTurn({
+    previous_upgrade_id: previousUpgradeId,
+    current_upgrade_id: currentUpgradeId,
+    turn_id: turnId,
+  }) {
+    for (const [name, value] of Object.entries({ previousUpgradeId, currentUpgradeId, turnId })) {
+      if (typeof value !== 'string' || value.length === 0) {
+        throw new TypeError(`${name} must be a non-empty string`);
+      }
+    }
+    const requeue = database.transaction(() => {
+      const ownership = database.prepare(`
+        SELECT previous.state AS previous_state, current.state AS current_state,
+          legacy.imported_by_upgrade
+        FROM runtime_legacy_migration_records AS legacy
+        JOIN runtime_upgrade_runs AS previous ON previous.upgrade_id = legacy.upgrade_id
+        JOIN runtime_upgrade_runs AS current ON current.upgrade_id = ?
+        WHERE legacy.upgrade_id = ? AND legacy.migrated_turn_id = ?
+      `).get(currentUpgradeId, previousUpgradeId, turnId);
+      if (!ownership || ownership.previous_state !== 'rolled_back'
+        || ownership.current_state !== 'migrating' || ownership.imported_by_upgrade !== 1) {
+        conflict('illegal_transition', 'Legacy turn adoption requires exact rolled-back ownership.');
+      }
+      const turn = loadTurn(database, turnId);
+      const queue = database.prepare(`
+        SELECT status FROM runtime_turn_queue WHERE turn_id = ?
+      `).get(turnId);
+      const attempts = database.prepare(`
+        SELECT COUNT(*) AS count FROM runtime_provider_attempts WHERE turn_id = ?
+      `).get(turnId).count;
+      if (turn.state !== 'queued' || queue?.status !== 'cancelled'
+        || turn.attempt_id !== null || turn.attempt_no !== null || turn.lease_epoch !== null
+        || attempts !== 0) {
+        conflict(
+          'version_conflict',
+          'Rolled-back legacy turn was executed or changed and cannot be adopted.',
+        );
+      }
+      const adoptedAt = now();
+      const queueUpdate = database.prepare(`
+        UPDATE runtime_turn_queue
+        SET status = 'queued', wait_reason = 'maintenance'
+        WHERE turn_id = ? AND status = 'cancelled'
+          AND wait_reason = 'upgrade_rollback_parked'
+      `).run(turnId);
+      if (queueUpdate.changes !== 1) {
+        conflict('version_conflict', 'Legacy turn adoption lost its durable CAS.');
+      }
+      return Object.freeze({ turn_id: turnId, adopted: true, adopted_at: adoptedAt });
+    });
+    return requeue.immediate();
   }
 
   function synchronizeSteerReconciliationWithStopInTransaction(stopResult) {
@@ -9144,6 +9318,8 @@ export function createExecutorStore({
     claimOrphanedWorkspaceRecoveries,
     claimInteractionHandoff,
     clearUnstartedQueue,
+    cancelUpgradeImportedTurns,
+    requeueRolledBackUpgradeImportedTurn,
     completeSteer,
     commitInteractionAnswer,
     completeReplyMappingRecovery,

@@ -520,6 +520,282 @@ const RUNTIME_SCHEMA = `
     updated_at TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS runtime_executor_service_instances (
+    service_instance_id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL CHECK (provider IN ('claude', 'codex')),
+    provider_transport TEXT NOT NULL CHECK (
+      provider_transport IN ('claude_agent_sdk', 'official_app_server', 'injected_test_seam')
+    ),
+    release_ref TEXT,
+    upgrade_id TEXT REFERENCES runtime_upgrade_runs(upgrade_id),
+    started_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT,
+    CHECK (
+      (upgrade_id IS NULL AND release_ref IS NULL)
+      OR (upgrade_id IS NOT NULL AND release_ref IS NOT NULL)
+    )
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_upgrade_runs (
+    upgrade_id TEXT PRIMARY KEY,
+    scope_kind TEXT NOT NULL CHECK (scope_kind IN ('installation', 'bot')),
+    bot_id TEXT,
+    from_release TEXT NOT NULL,
+    to_release TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+      state IN (
+        'preflight', 'snapshotted', 'maintenance', 'drained', 'migrating',
+        'health_check', 'ready_to_commit', 'rollback_required',
+        'committed', 'rolled_back'
+      )
+    ),
+    state_version INTEGER NOT NULL CHECK (state_version > 0),
+    preflight_json TEXT NOT NULL,
+    snapshot_json TEXT,
+    migration_json TEXT,
+    health_json TEXT,
+    failure_json TEXT,
+    maintenance_started_at TEXT,
+    committed_at TEXT,
+    rolled_back_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+      (scope_kind = 'installation' AND bot_id IS NULL)
+      OR (scope_kind = 'bot' AND bot_id IS NOT NULL AND length(bot_id) > 0)
+    )
+  );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS runtime_upgrade_one_active_run
+    ON runtime_upgrade_runs((1))
+    WHERE state NOT IN ('committed', 'rolled_back');
+
+  CREATE TABLE IF NOT EXISTS runtime_upgrade_events (
+    upgrade_id TEXT NOT NULL REFERENCES runtime_upgrade_runs(upgrade_id),
+    step_key TEXT NOT NULL,
+    from_state TEXT,
+    to_state TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    committed_at TEXT NOT NULL,
+    PRIMARY KEY (upgrade_id, step_key)
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_upgrade_effects (
+    upgrade_id TEXT NOT NULL REFERENCES runtime_upgrade_runs(upgrade_id),
+    step_key TEXT NOT NULL,
+    step_id TEXT NOT NULL UNIQUE,
+    input_hash TEXT NOT NULL,
+    input_json TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL CHECK (state IN ('claimed', 'completed')),
+    claim_owner TEXT NOT NULL,
+    claim_attempt INTEGER NOT NULL CHECK (claim_attempt > 0),
+    claim_expires_at TEXT,
+    result_json TEXT,
+    committed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (upgrade_id, step_key),
+    CHECK (step_id = upgrade_id || ':' || step_key),
+    CHECK (
+      (state = 'claimed' AND claim_expires_at IS NOT NULL AND result_json IS NULL)
+      OR (state = 'completed' AND claim_expires_at IS NULL AND result_json IS NOT NULL)
+    )
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_active_release_fences (
+    scope_key TEXT PRIMARY KEY,
+    scope_kind TEXT NOT NULL CHECK (scope_kind IN ('installation', 'bot')),
+    bot_id TEXT,
+    upgrade_id TEXT NOT NULL UNIQUE REFERENCES runtime_upgrade_runs(upgrade_id),
+    release_ref TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    activated_at TEXT NOT NULL,
+    CHECK (
+      (scope_kind = 'installation' AND bot_id IS NULL AND scope_key = 'installation')
+      OR (scope_kind = 'bot' AND bot_id IS NOT NULL AND scope_key = 'bot:' || bot_id)
+    )
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_upgrade_release_fence_history (
+    upgrade_id TEXT PRIMARY KEY REFERENCES runtime_upgrade_runs(upgrade_id),
+    scope_key TEXT NOT NULL,
+    previous_fence_json TEXT,
+    target_generation INTEGER NOT NULL CHECK (target_generation > 0),
+    activated_at TEXT NOT NULL,
+    restored_at TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_upgrade_force_notices (
+    upgrade_id TEXT NOT NULL REFERENCES runtime_upgrade_runs(upgrade_id),
+    turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),
+    outbox_id TEXT NOT NULL UNIQUE REFERENCES runtime_outbox(outbox_id),
+    delivery_id TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (upgrade_id, turn_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_legacy_migration_records (
+    upgrade_id TEXT NOT NULL REFERENCES runtime_upgrade_runs(upgrade_id),
+    legacy_kind TEXT NOT NULL CHECK (
+      legacy_kind IN ('c4', 'global_provider_lineage', 'scheduler', 'runtime_control')
+    ),
+    legacy_record_id TEXT NOT NULL,
+    legacy_state TEXT NOT NULL,
+    disposition TEXT NOT NULL CHECK (
+      disposition IN (
+        'migrated_pending', 'quarantined_ambiguous',
+        'quarantined_invalid_identity', 'quarantined_side_effect_unknown', 'retained_delivered',
+        'retained_failed', 'archived_unmapped', 'retained_history',
+        'invalidated_audit_only', 'migrated_scheduler', 'skipped_missed',
+        'restored_pending', 'restored_scheduler'
+      )
+    ),
+    payload_hash TEXT NOT NULL,
+    audit_json TEXT NOT NULL,
+    migrated_turn_id TEXT REFERENCES runtime_turns(turn_id),
+    imported_by_upgrade INTEGER NOT NULL DEFAULT 0 CHECK (imported_by_upgrade IN (0, 1)),
+    executable INTEGER NOT NULL DEFAULT 0 CHECK (executable = 0),
+    read_only INTEGER NOT NULL DEFAULT 1 CHECK (read_only = 1),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (upgrade_id, legacy_kind, legacy_record_id),
+    CHECK (
+      legacy_kind != 'runtime_control'
+      OR (disposition = 'invalidated_audit_only' AND migrated_turn_id IS NULL)
+    ),
+    CHECK (
+      disposition IN ('migrated_pending', 'migrated_scheduler') OR migrated_turn_id IS NULL
+    ),
+    CHECK (
+      imported_by_upgrade = 0 OR migrated_turn_id IS NOT NULL
+    )
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_legacy_migration_payloads (
+    upgrade_id TEXT NOT NULL,
+    legacy_kind TEXT NOT NULL,
+    legacy_record_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (upgrade_id, legacy_kind, legacy_record_id),
+    FOREIGN KEY (upgrade_id, legacy_kind, legacy_record_id)
+      REFERENCES runtime_legacy_migration_records(upgrade_id, legacy_kind, legacy_record_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_legacy_migration_audit_payloads (
+    upgrade_id TEXT NOT NULL,
+    legacy_kind TEXT NOT NULL,
+    legacy_record_id TEXT NOT NULL,
+    audit_payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (upgrade_id, legacy_kind, legacy_record_id),
+    FOREIGN KEY (upgrade_id, legacy_kind, legacy_record_id)
+      REFERENCES runtime_legacy_migration_records(upgrade_id, legacy_kind, legacy_record_id),
+    CHECK (legacy_kind = 'runtime_control')
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_legacy_migration_durable_facts (
+    upgrade_id TEXT NOT NULL,
+    legacy_kind TEXT NOT NULL CHECK (legacy_kind IN ('c4', 'scheduler')),
+    legacy_record_id TEXT NOT NULL,
+    fact_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (upgrade_id, legacy_kind, legacy_record_id),
+    FOREIGN KEY (upgrade_id, legacy_kind, legacy_record_id)
+      REFERENCES runtime_legacy_migration_records(upgrade_id, legacy_kind, legacy_record_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_legacy_unmapped_messages (
+    region TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    bot_id TEXT NOT NULL,
+    chat_type TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    native_thread_or_topic_id TEXT,
+    platform_message_id TEXT NOT NULL,
+    upgrade_id TEXT NOT NULL,
+    legacy_kind TEXT NOT NULL CHECK (legacy_kind = 'global_provider_lineage'),
+    legacy_record_id TEXT NOT NULL,
+    recent_c4_context_json TEXT NOT NULL,
+    memory_handoff TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (
+      region, tenant_id, channel, bot_id, platform_message_id, upgrade_id
+    ),
+    FOREIGN KEY (upgrade_id, legacy_kind, legacy_record_id)
+      REFERENCES runtime_legacy_migration_records(upgrade_id, legacy_kind, legacy_record_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_legacy_migration_notices (
+    upgrade_id TEXT NOT NULL,
+    legacy_kind TEXT NOT NULL,
+    legacy_record_id TEXT NOT NULL,
+    outbox_id TEXT NOT NULL UNIQUE REFERENCES runtime_outbox(outbox_id),
+    delivery_id TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'delivered')),
+    proof_hash TEXT,
+    proof_json TEXT,
+    created_at TEXT NOT NULL,
+    delivered_at TEXT,
+    PRIMARY KEY (upgrade_id, legacy_kind, legacy_record_id),
+    FOREIGN KEY (upgrade_id, legacy_kind, legacy_record_id)
+      REFERENCES runtime_legacy_migration_records(upgrade_id, legacy_kind, legacy_record_id),
+    CHECK (
+      (state = 'pending' AND proof_hash IS NULL AND proof_json IS NULL AND delivered_at IS NULL)
+      OR (state = 'delivered' AND proof_hash IS NOT NULL AND proof_json IS NOT NULL
+        AND delivered_at IS NOT NULL)
+    )
+  );
+
+  CREATE TRIGGER IF NOT EXISTS runtime_legacy_migration_audit_update_immutable
+  BEFORE UPDATE ON runtime_legacy_migration_records
+  BEGIN
+    SELECT RAISE(ABORT, 'legacy migration audit is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS runtime_legacy_migration_audit_delete_immutable
+  BEFORE DELETE ON runtime_legacy_migration_records
+  BEGIN
+    SELECT RAISE(ABORT, 'legacy migration audit is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS runtime_legacy_migration_payload_update_immutable
+  BEFORE UPDATE ON runtime_legacy_migration_payloads
+  BEGIN
+    SELECT RAISE(ABORT, 'legacy migration payload is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS runtime_legacy_migration_audit_payload_update_immutable
+  BEFORE UPDATE ON runtime_legacy_migration_audit_payloads
+  BEGIN
+    SELECT RAISE(ABORT, 'legacy migration audit payload is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS runtime_legacy_migration_durable_fact_update_immutable
+  BEFORE UPDATE ON runtime_legacy_migration_durable_facts
+  BEGIN
+    SELECT RAISE(ABORT, 'legacy migration durable fact is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS runtime_legacy_migration_durable_fact_delete_immutable
+  BEFORE DELETE ON runtime_legacy_migration_durable_facts
+  BEGIN
+    SELECT RAISE(ABORT, 'legacy migration durable fact is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS runtime_legacy_unmapped_message_update_immutable
+  BEFORE UPDATE ON runtime_legacy_unmapped_messages
+  BEGIN
+    SELECT RAISE(ABORT, 'legacy unmapped message identity is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS runtime_legacy_unmapped_message_delete_immutable
+  BEFORE DELETE ON runtime_legacy_unmapped_messages
+  BEGIN
+    SELECT RAISE(ABORT, 'legacy unmapped message identity is immutable');
+  END;
+
   CREATE TABLE IF NOT EXISTS runtime_operations_policies (
     policy_id TEXT NOT NULL,
     policy_version INTEGER NOT NULL CHECK (policy_version > 0),
@@ -1368,11 +1644,27 @@ export function initializeRuntimePersistence(database) {
   );
   addColumnIfMissing(database, 'runtime_turn_queue', 'wait_reason', 'TEXT');
   addColumnIfMissing(database, 'runtime_turn_queue', 'wait_detail_json', 'TEXT');
+  addColumnIfMissing(database, 'runtime_executor_service_instances', 'revoked_at', 'TEXT');
+  addColumnIfMissing(
+    database,
+    'runtime_legacy_unmapped_messages',
+    'recent_c4_context_json',
+    "TEXT NOT NULL DEFAULT '[]'",
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_legacy_unmapped_messages',
+    'memory_handoff',
+    "TEXT NOT NULL DEFAULT ''",
+  );
   addColumnIfMissing(
     database,
     'runtime_reply_mapping_recoveries',
     'recovery_version',
     'INTEGER NOT NULL DEFAULT 1 CHECK (recovery_version > 0)',
+  );
+  addColumnIfMissing(
+    database, 'runtime_upgrade_effects', 'input_json', "TEXT NOT NULL DEFAULT '{}'",
   );
   addColumnIfMissing(
     database,
@@ -1702,6 +1994,36 @@ export function initializeRuntimePersistence(database) {
         NULL, 'security_audit_180d', NEW.committed_at,
         strftime('%Y-%m-%dT%H:%M:%fZ', NEW.committed_at, '+180 days'),
         'delete', NEW.committed_at
+      );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_legacy_migration_payload_retention
+    AFTER INSERT ON runtime_legacy_migration_payloads
+    BEGIN
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      ) VALUES (
+        'legacy_migration_payload',
+        json_array(NEW.upgrade_id, NEW.legacy_kind, NEW.legacy_record_id),
+        NULL, 'terminal_detail_30d', NEW.created_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at, '+30 days'),
+        'delete', NEW.created_at
+      );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_legacy_migration_audit_payload_retention
+    AFTER INSERT ON runtime_legacy_migration_audit_payloads
+    BEGIN
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      ) VALUES (
+        'legacy_migration_audit_payload',
+        json_array(NEW.upgrade_id, NEW.legacy_kind, NEW.legacy_record_id),
+        NULL, 'security_audit_180d', NEW.created_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at, '+180 days'),
+        'delete', NEW.created_at
       );
     END;
 

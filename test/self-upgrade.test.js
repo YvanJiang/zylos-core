@@ -8,6 +8,8 @@ import os from 'node:os';
 let tmpRoot;
 let skillsDir;
 let syncCoreSkills;
+let runSelfUpgrade;
+let runSelfUpgradeFinalize;
 let generateManifest;
 let saveManifest;
 
@@ -15,7 +17,9 @@ beforeAll(async () => {
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-selfup-test-'));
   process.env.ZYLOS_DIR = tmpRoot;
   skillsDir = path.join(tmpRoot, '.claude', 'skills');
-  ({ syncCoreSkills } = await import('../cli/lib/self-upgrade.js'));
+  ({ syncCoreSkills, runSelfUpgrade, runSelfUpgradeFinalize } = await import(
+    '../cli/lib/self-upgrade.js'
+  ));
   ({ generateManifest, saveManifest } = await import('../cli/lib/manifest.js'));
 });
 
@@ -25,6 +29,58 @@ afterAll(() => {
 
 beforeEach(() => {
   fs.rmSync(skillsDir, { recursive: true, force: true });
+  fs.rmSync(path.join(tmpRoot, 'runtime'), { recursive: true, force: true });
+});
+
+describe('durable runtime upgrade ownership guard', () => {
+  test('fails unconditionally before every legacy backup, stop, install, finalizer, or rollback mutation', () => {
+    const mutations = [];
+    const result = runSelfUpgrade({
+      tempDir: path.join(tmpRoot, 'download'), newVersion: '9.9.9',
+    }, {
+      zylosDir: tmpRoot,
+      getCurrentVersion: () => {
+        mutations.push('version');
+        return { success: true, version: '0.6.0' };
+      },
+      preInstallSteps: [() => {
+        mutations.push('pre-install');
+        return { step: 1, status: 'done' };
+      }],
+      runInstalledFinalizer: () => mutations.push('finalizer'),
+      rollbackSelf: () => mutations.push('rollback'),
+    });
+    expect(result).toMatchObject({
+      success: false, failedStep: 0, durableRuntimeOwner: true,
+      error: 'Legacy self-upgrade is disabled because the durable runtime owns upgrades.',
+      steps: [], rollback: { performed: false, steps: [] },
+    });
+    expect(mutations).toEqual([]);
+    const finalizerMutations = [];
+    expect(runSelfUpgradeFinalize({ from: '0.6.0', to: '9.9.9' }, {
+      zylosDir: tmpRoot,
+      steps: [() => finalizerMutations.push('finalizer-step')],
+    })).toMatchObject({ success: false, failedStep: 0, durableRuntimeOwner: true });
+    expect(finalizerMutations).toEqual([]);
+  });
+
+  test('remains fail-closed when an installation lock also exists', () => {
+    fs.mkdirSync(path.join(tmpRoot, 'runtime', 'upgrade-owner.lock'), { recursive: true });
+    const mutations = [];
+    expect(runSelfUpgrade({ newVersion: '9.9.9' }, {
+      zylosDir: tmpRoot,
+      preInstallSteps: [() => mutations.push('pre-install')],
+    })).toMatchObject({
+      success: false, failedStep: 0, durableRuntimeOwner: true,
+      error: 'Legacy self-upgrade is disabled because the durable runtime owns upgrades.',
+    });
+    expect(mutations).toEqual([]);
+    expect(runSelfUpgradeFinalize({ from: '0.6.0', to: '9.9.9' }, {
+      zylosDir: tmpRoot,
+      steps: [() => mutations.push('finalizer-step')],
+    })).toMatchObject({ success: false, failedStep: 0, durableRuntimeOwner: true });
+    expect(mutations).toEqual([]);
+  });
 });
 
 function writeFile(dir, relPath, content) {
