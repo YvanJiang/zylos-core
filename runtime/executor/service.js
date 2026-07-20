@@ -186,6 +186,7 @@ export function createExecutorService({
   const permissionControllers = new Map();
   const activeRunSettlements = new Set();
   const interactionDeliverySettlements = new Set();
+  const replyMappingRecoverySettlements = new Set();
   const endedResidentFences = new Map();
   const pendingInteractionRecoveries = new Map();
   const pendingRecoveryIsolations = new Map();
@@ -843,39 +844,61 @@ export function createExecutorService({
         recovery_id: recoveryClaim.recovery_id,
         side_effect_status: 'none',
       };
+      let finishRecoverySettlement = null;
       if (recoveryClaim.status === 'native_recovery_claimed') {
-        try {
-          nativeResult = await adapter.recoverLineage(deepFreeze({
-            recovery_id: recoveryClaim.recovery_id,
-            turn_id: recoveryClaim.turn_id,
-            reason: recoveryClaim.reason,
-            candidate: Object.freeze({ ...recoveryClaim.candidate }),
-            native_recovery_attempt_id: recoveryClaim.native_recovery_attempt_id,
-            native_recovery_attempt_no: recoveryClaim.native_recovery_attempt_no,
-          }));
-        } catch (error) {
+        const recoverySettlement = new Promise((resolve) => {
+          finishRecoverySettlement = resolve;
+        });
+        replyMappingRecoverySettlements.add(recoverySettlement);
+        recoverySettlement.finally(() => {
+          replyMappingRecoverySettlements.delete(recoverySettlement);
+        }).catch(() => {});
+      }
+      let recoveryCompletion;
+      try {
+        if (recoveryClaim.status === 'native_recovery_claimed') {
+          try {
+            nativeResult = await adapter.recoverLineage(deepFreeze({
+              recovery_id: recoveryClaim.recovery_id,
+              turn_id: recoveryClaim.turn_id,
+              reason: recoveryClaim.reason,
+              candidate: Object.freeze({ ...recoveryClaim.candidate }),
+              native_recovery_attempt_id: recoveryClaim.native_recovery_attempt_id,
+              native_recovery_attempt_no: recoveryClaim.native_recovery_attempt_no,
+            }));
+          } catch (error) {
+            nativeResult = {
+              status: 'failed',
+              recovery_id: recoveryClaim.recovery_id,
+              native_recovery_attempt_id: recoveryClaim.native_recovery_attempt_id,
+              native_recovery_attempt_no: recoveryClaim.native_recovery_attempt_no,
+              side_effect_status: error?.providerError?.side_effect_status ?? 'unknown',
+            };
+          }
+        } else if (recoveryClaim.status === 'native_recovery_lost') {
           nativeResult = {
-            status: 'failed',
+            status: 'lost',
             recovery_id: recoveryClaim.recovery_id,
             native_recovery_attempt_id: recoveryClaim.native_recovery_attempt_id,
             native_recovery_attempt_no: recoveryClaim.native_recovery_attempt_no,
-            side_effect_status: error?.providerError?.side_effect_status ?? 'unknown',
+            side_effect_status: 'unknown',
           };
         }
-      } else if (recoveryClaim.status === 'native_recovery_lost') {
-        nativeResult = {
-          status: 'lost',
-          recovery_id: recoveryClaim.recovery_id,
-          native_recovery_attempt_id: recoveryClaim.native_recovery_attempt_id,
-          native_recovery_attempt_no: recoveryClaim.native_recovery_attempt_no,
-          side_effect_status: 'unknown',
+        recoveryCompletion = persist(
+          () => store.completeReplyMappingRecovery(recoveryClaim, nativeResult),
+        );
+        refresh();
+      } finally {
+        finishRecoverySettlement?.();
+      }
+      if (recoveryCompletion.status === 'stopped') return recoveryCompletion;
+      if (lifecycle !== 'open') {
+        return {
+          status: 'service_closing',
+          turn_id: recoveryCompletion.turn_id,
+          recovery_status: recoveryCompletion.status,
         };
       }
-      const recoveryCompletion = persist(
-        () => store.completeReplyMappingRecovery(recoveryClaim, nativeResult),
-      );
-      refresh();
-      if (recoveryCompletion.status === 'stopped') return recoveryCompletion;
     }
     let reservation = store.reserveNextExecutor({
       maxResidentExecutorsPerBot,
@@ -1738,6 +1761,7 @@ export function createExecutorService({
         );
         await Promise.allSettled([...interactionDeliverySettlements]);
         const providerCloseResult = await providerClosing;
+        await Promise.allSettled([...replyMappingRecoverySettlements]);
         const { closedConversationIds } = providerCloseResult;
         if (providerCloseResult.error) shutdownFailures.push(providerCloseResult.error);
         const closedConversationIdSet = new Set(closedConversationIds);

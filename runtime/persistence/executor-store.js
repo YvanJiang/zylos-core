@@ -791,6 +791,7 @@ export function createExecutorStore({
 
   function claimNextReplyMappingRecoveryNotice() {
     const claim = database.transaction(() => {
+      const claimAt = now();
       const existing = database.prepare(`
         SELECT recovery.turn_id, recovery.notice_event_sequence,
           queue.wait_reason,
@@ -822,10 +823,15 @@ export function createExecutorStore({
           AND turn.attempt_id IS NULL AND turn.attempt_no IS NULL
           AND turn.lease_epoch IS NULL
           AND queue.status = 'claimed'
+          AND (
+            recovery.state = 'notice_pending'
+            OR recovery.native_recovery_claim_expires_at IS NULL
+            OR recovery.native_recovery_claim_expires_at <= ?
+          )
         ORDER BY turn.created_at ASC, turn.conversation_id ASC,
           queue.queue_sequence ASC
         LIMIT 1
-      `).get();
+      `).get(claimAt);
       if (existing) {
         return {
           status: 'lineage_resolution_pending',
@@ -1291,6 +1297,12 @@ export function createExecutorStore({
         conflict('stale_attempt', 'The reply-mapping recovery owner no longer matches this fence.');
       }
       if (
+        recovery.native_recovery_claim_expires_at === null
+        || recovery.native_recovery_claim_expires_at <= completedAt
+      ) {
+        conflict('stale_attempt', 'The reply-mapping recovery claim lease expired.');
+      }
+      if (
         claim?.recovery_id !== recovery.recovery_id
         || claim?.turn_id !== recovery.turn_id
       ) {
@@ -1425,8 +1437,8 @@ export function createExecutorStore({
       const currentLaneMapping = JSON.parse(lane.mapping_json);
       const binding = resolveProvisionalMappingBinding(currentLaneMapping, {
         authority: 'core',
-        mapping_id: recovery.mapping_id,
-        expected_mapping_version: 1,
+        mapping_id: currentLaneMapping.mapping_id,
+        expected_mapping_version: currentLaneMapping.mapping_version,
         lineage_id: lineageId,
       }, { occurredAt: completedAt });
       if (binding.status !== 'bound') {
@@ -1549,6 +1561,8 @@ export function createExecutorStore({
         SET state = 'bound', bound_lineage_id = ?,
           native_recovery_status = ?, native_recovery_result_json = ?, updated_at = ?
         WHERE recovery_id = ? AND state = ? AND bound_lineage_id IS NULL
+          AND native_recovery_owner_service_instance_id = ?
+          AND native_recovery_claim_expires_at > ?
       `).run(
         lineageId,
         nativeRecovered
@@ -1560,6 +1574,8 @@ export function createExecutorStore({
         completedAt,
         recovery.recovery_id,
         recovery.state,
+        serviceInstanceId,
+        completedAt,
       );
       const queueUpdate = database.prepare(`
         UPDATE runtime_turn_queue

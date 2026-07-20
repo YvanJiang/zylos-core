@@ -200,7 +200,8 @@ function resolveNormalLineage(database, envelope, conversationId, committedAt, g
   const replyToMessageId = envelope.reply.reply_to_message_id;
   if (replyToMessageId !== null) {
     const boundRecoveries = database.prepare(`
-      SELECT DISTINCT recovery.bound_lineage_id AS lineage_id
+      SELECT DISTINCT recovery.bound_lineage_id AS lineage_id,
+        lineage.provider_native_state
       FROM runtime_reply_mapping_recoveries AS recovery
       JOIN runtime_turns AS turn ON turn.turn_id = recovery.turn_id
       JOIN runtime_lineages AS lineage
@@ -211,7 +212,11 @@ function resolveNormalLineage(database, envelope, conversationId, committedAt, g
         AND recovery.state = 'bound'
       LIMIT 2
     `).all(conversationId, replyToMessageId);
-    if (boundRecoveries.length === 1) {
+    const invalidRecoveredLineageId = boundRecoveries.length === 1
+      && boundRecoveries[0].provider_native_state === 'invalid'
+      ? boundRecoveries[0].lineage_id
+      : null;
+    if (boundRecoveries.length === 1 && invalidRecoveredLineageId === null) {
       return {
         lineage_id: boundRecoveries[0].lineage_id,
         recovery: null,
@@ -280,7 +285,9 @@ function resolveNormalLineage(database, envelope, conversationId, committedAt, g
     );
     let reason = null;
     if (!mapped) {
-      reason = 'mapping_missing';
+      reason = invalidRecoveredLineageId === null
+        ? 'mapping_missing'
+        : 'provider_lineage_invalid';
     } else {
       const publicMapping = {
         mapping_id: mapped.mapping_id,
@@ -331,10 +338,13 @@ function resolveNormalLineage(database, envelope, conversationId, committedAt, g
       LIMIT 2
     `).all(conversationId);
     const exactInvalidCandidate = reason === 'provider_lineage_invalid'
-      && mapped?.lineage_id !== null
-      && mapped?.lineage_id !== undefined
-      && mapped.lineage_conversation_id === conversationId
-      ? mapped.lineage_id
+      ? (invalidRecoveredLineageId ?? (
+        mapped?.lineage_id !== null
+        && mapped?.lineage_id !== undefined
+        && mapped.lineage_conversation_id === conversationId
+          ? mapped.lineage_id
+          : null
+      ))
       : null;
     const candidateLineageId = exactInvalidCandidate
       ?? (conversationLineages.length === 1 ? conversationLineages[0].lineage_id : null);

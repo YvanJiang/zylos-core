@@ -1193,19 +1193,27 @@ export function initializeRuntimePersistence(database) {
       SELECT RAISE(ABORT, 'bound recovery turn lineage is immutable');
     END;
 
-    CREATE TRIGGER IF NOT EXISTS runtime_bound_delivery_lane_mapping_immutable
+    DROP TRIGGER IF EXISTS runtime_bound_delivery_lane_mapping_immutable;
+    CREATE TRIGGER runtime_bound_delivery_lane_mapping_immutable
     BEFORE UPDATE OF mapping_json ON runtime_delivery_lanes
     WHEN json_extract(OLD.mapping_json, '$.binding_state') = 'bound' AND (
-      json_extract(NEW.mapping_json, '$.lineage_id')
+      json_extract(NEW.mapping_json, '$.conversation_id')
+        IS NOT json_extract(OLD.mapping_json, '$.conversation_id')
+      OR json_extract(NEW.mapping_json, '$.turn_id')
+        IS NOT json_extract(OLD.mapping_json, '$.turn_id')
+      OR json_extract(NEW.mapping_json, '$.lineage_id')
         IS NOT json_extract(OLD.mapping_json, '$.lineage_id')
       OR json_extract(NEW.mapping_json, '$.binding_state')
         IS NOT json_extract(OLD.mapping_json, '$.binding_state')
+      OR json_extract(NEW.mapping_json, '$.reason')
+        IS NOT json_extract(OLD.mapping_json, '$.reason')
     )
     BEGIN
       SELECT RAISE(ABORT, 'bound delivery lane mapping is immutable');
     END;
 
-    CREATE TRIGGER IF NOT EXISTS runtime_bound_outbox_mapping_immutable
+    DROP TRIGGER IF EXISTS runtime_bound_outbox_mapping_immutable;
+    CREATE TRIGGER runtime_bound_outbox_mapping_immutable
     BEFORE UPDATE OF command_json ON runtime_outbox
     WHEN json_extract(OLD.command_json, '$.mapping.binding_state') = 'bound' AND (
       json_extract(NEW.command_json, '$.mapping.mapping_id')
@@ -1216,6 +1224,12 @@ export function initializeRuntimePersistence(database) {
         IS NOT json_extract(OLD.command_json, '$.mapping.binding_state')
       OR json_extract(NEW.command_json, '$.mapping.mapping_version')
         IS NOT json_extract(OLD.command_json, '$.mapping.mapping_version')
+      OR json_extract(NEW.command_json, '$.mapping.conversation_id')
+        IS NOT json_extract(OLD.command_json, '$.mapping.conversation_id')
+      OR json_extract(NEW.command_json, '$.mapping.turn_id')
+        IS NOT json_extract(OLD.command_json, '$.mapping.turn_id')
+      OR json_extract(NEW.command_json, '$.mapping.reason')
+        IS NOT json_extract(OLD.command_json, '$.mapping.reason')
     )
     BEGIN
       SELECT RAISE(ABORT, 'bound outbox mapping is immutable');
