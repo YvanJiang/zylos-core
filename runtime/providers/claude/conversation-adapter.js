@@ -784,6 +784,11 @@ export function createClaudeConversationAdapter({
     executor.residentEnded = controls.residentEnded ?? null;
     try {
       executor.start();
+      context.reportRuntimeEvidence?.({
+        runtime_instance_id: messageUuid,
+        handle_kind: 'claude_sdk_query',
+        controllable: true,
+      });
       executor.input.push({
         message: createSdkUserMessage(context.input, messageUuid),
         turn: executor.activeTurn,

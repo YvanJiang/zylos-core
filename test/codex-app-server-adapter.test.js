@@ -106,6 +106,7 @@ function executionContext(overrides = {}) {
     lineage: { provider_native_id: null },
     bindProviderNativeId: jest.fn(async () => {}),
     reportProviderState: jest.fn(),
+    reportRuntimeEvidence: jest.fn(),
     interaction: {
       authorized_subjects: [{ type: 'actor', actor_id: 'user-1' }],
       allowed_sources: ['main_card_reply', 'card_action'],
@@ -196,7 +197,11 @@ describe('Codex app-server provider adapter', () => {
     context.bindProviderNativeId = jest.fn(async (threadId) => {
       server.received.push({ method: 'core/thread-bound', params: { threadId } });
     });
-    const adapter = createCodexAppServerAdapter({ spawnProcess, cwd: '/workspace' });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess,
+      cwd: '/workspace',
+      now: () => '2026-07-19T05:00:00Z',
+    });
 
     await expect(collect(adapter.execute(context))).resolves.toEqual([]);
 
@@ -234,6 +239,11 @@ describe('Codex app-server provider adapter', () => {
     expect(context.reportProviderState).toHaveBeenCalledWith({
       state: 'started',
       provider_native_id: 'codex-thread-1',
+    });
+    expect(context.reportRuntimeEvidence).toHaveBeenCalledWith({
+      runtime_instance_id: 'codex-app-server-1',
+      handle_kind: 'codex_app_server_connection',
+      controllable: true,
     });
     const turnStartIndex = server.received.findIndex(({ method }) => method === 'turn/start');
     expect(turnStartIndex).toBeGreaterThan(2);

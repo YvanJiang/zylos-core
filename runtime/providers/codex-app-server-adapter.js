@@ -131,6 +131,9 @@ function requireExecutionContext(context) {
   if (typeof context.reportProviderState !== 'function') {
     throw new TypeError('reportProviderState must be a function');
   }
+  if (typeof context.reportRuntimeEvidence !== 'function') {
+    throw new TypeError('reportRuntimeEvidence must be a function');
+  }
   if (
     context.reportProviderFailure !== undefined
     && typeof context.reportProviderFailure !== 'function'
@@ -526,6 +529,7 @@ export function createCodexAppServerAdapter({
   isProcessGroupAlive = supervisedProcessGroupIsAlive,
   setTimeoutFn = setTimeout,
   clearTimeoutFn = clearTimeout,
+  now = () => new Date().toISOString(),
 } = {}) {
   if (typeof codexExecutable !== 'string' || codexExecutable.length === 0) {
     throw new TypeError('codexExecutable must be a non-empty string');
@@ -561,6 +565,7 @@ export function createCodexAppServerAdapter({
   if (typeof setTimeoutFn !== 'function' || typeof clearTimeoutFn !== 'function') {
     throw new TypeError('timeout functions must be callable');
   }
+  if (typeof now !== 'function') throw new TypeError('now must be a function');
 
   const childEnvironment = selectEnvironment(env, envAllowlist);
   const loadedThreads = new Set();
@@ -1759,6 +1764,7 @@ export function createCodexAppServerAdapter({
       termination_requested: false,
       termination_timer: null,
       next_request_no: 1,
+      started_at: now(),
       pending: new Map(),
       process_group_id: detachedProcessGroup
         && Number.isSafeInteger(child.pid)
@@ -1912,6 +1918,20 @@ export function createCodexAppServerAdapter({
   async function* execute(context, controls = null) {
     requireExecutionContext(context);
     const target = await ensureConnection();
+    const processEvidence = Number.isSafeInteger(target.child.pid) && target.child.pid > 0
+      ? {
+        pid: target.child.pid,
+        pgid: target.process_group_id,
+        started_at: target.started_at,
+        diagnostic_only: true,
+      }
+      : null;
+    context.reportRuntimeEvidence({
+      runtime_instance_id: target.connection_id,
+      handle_kind: 'codex_app_server_connection',
+      controllable: target.failed !== true,
+      ...(processEvidence === null ? {} : { process: processEvidence }),
+    });
     const threadId = await loadThread(target, context);
     let resolveTerminal;
     let rejectTerminal;

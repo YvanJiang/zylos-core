@@ -2073,11 +2073,12 @@ describe('runtime interaction happy path', () => {
     expect(database.prepare(`
       SELECT state FROM runtime_turns WHERE turn_id = ?
     `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
-    expect(readEvents(database, accepted.turn_id).slice(-3).map(({ kind, phase }) => ({ kind, phase })))
+    expect(readEvents(database, accepted.turn_id).slice(-4).map(({ kind, phase }) => ({ kind, phase })))
       .toEqual([
         { kind: 'interaction_cancelled', phase: 'waiting_user' },
         { kind: 'turn_state_changed', phase: 'recovering' },
         { kind: 'recovery_started', phase: 'recovering' },
+        { kind: 'recovery_waiting_decision', phase: 'recovering' },
       ]);
     const recoveryProjection = database.prepare(`
       SELECT status, render_model_json

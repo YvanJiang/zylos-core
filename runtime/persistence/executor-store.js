@@ -740,6 +740,7 @@ export function createExecutorStore({
   }
 
   function listClaimableQueuedTurns() {
+    const claimableAt = now();
     return database.prepare(`
       SELECT
         turn.turn_id,
@@ -757,12 +758,25 @@ export function createExecutorStore({
           turn.state = 'queued'
           OR (
             turn.state = 'recovering'
-            AND EXISTS (
-              SELECT 1
-              FROM runtime_reply_mapping_recoveries AS recovery
-              WHERE recovery.turn_id = turn.turn_id
-                AND recovery.state = 'bound'
-                AND recovery.bound_lineage_id = turn.lineage_id
+            AND (
+              EXISTS (
+                SELECT 1
+                FROM runtime_reply_mapping_recoveries AS recovery
+                WHERE recovery.turn_id = turn.turn_id
+                  AND recovery.state = 'bound'
+                  AND recovery.bound_lineage_id = turn.lineage_id
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM runtime_provider_attempts AS provider_attempt
+                WHERE provider_attempt.turn_id = turn.turn_id
+                  AND provider_attempt.attempt_id = turn.attempt_id
+                  AND provider_attempt.attempt_no = turn.attempt_no
+                  AND provider_attempt.lease_epoch = turn.lease_epoch
+                  AND provider_attempt.state = 'retry_wait'
+                  AND provider_attempt.side_effect_status = 'none'
+                  AND provider_attempt.next_retry_at <= ?
+              )
             )
           )
         )
@@ -786,7 +800,7 @@ export function createExecutorStore({
             AND lease.lease_owner IS NOT NULL
         )
       ORDER BY turn.created_at ASC, turn.conversation_id ASC, queue.queue_sequence ASC
-    `).all();
+    `).all(claimableAt);
   }
 
   function claimNextReplyMappingRecoveryNotice() {
@@ -1681,6 +1695,72 @@ export function createExecutorStore({
     return residentHeartbeat + recoveryHeartbeat;
   }
 
+  function renewOwnedTurnLeases(turnContexts) {
+    if (!Array.isArray(turnContexts)) {
+      throw new TypeError('turnContexts must be an array');
+    }
+    const renew = database.transaction(() => {
+      const renewedAt = now();
+      const leaseExpiresAt = new Date(
+        Date.parse(renewedAt) + leaseDurationMs,
+      ).toISOString();
+      let renewed = 0;
+      const statement = database.prepare(`
+        UPDATE runtime_executor_leases
+        SET lease_expires_at = ?, updated_at = ?
+        WHERE conversation_id = ? AND lease_owner = ? AND turn_id = ?
+          AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+          AND EXISTS (
+            SELECT 1 FROM runtime_turns
+            WHERE runtime_turns.turn_id = runtime_executor_leases.turn_id
+              AND runtime_turns.state IN (
+                'starting', 'running', 'waiting_user', 'redirecting', 'recovering'
+              )
+          )
+      `);
+      for (const context of turnContexts) {
+        const fence = context?.attempt;
+        if (
+          typeof context?.conversation_id !== 'string'
+          || typeof context?.turn_id !== 'string'
+          || typeof fence?.attempt_id !== 'string'
+          || !Number.isSafeInteger(fence?.attempt_no)
+          || !Number.isSafeInteger(fence?.lease_epoch)
+        ) {
+          throw new TypeError('each turn context must carry its exact durable attempt fence');
+        }
+        renewed += statement.run(
+          leaseExpiresAt,
+          renewedAt,
+          context.conversation_id,
+          serviceInstanceId,
+          context.turn_id,
+          fence.attempt_id,
+          fence.attempt_no,
+          fence.lease_epoch,
+        ).changes;
+        database.prepare(`
+          UPDATE runtime_provider_attempts
+          SET last_lease_renewed_at = ?, updated_at = ?
+          WHERE attempt_id = ? AND turn_id = ? AND attempt_no = ? AND lease_epoch = ?
+            AND service_instance_id = ? AND executor_instance_id = ?
+            AND state IN ('starting', 'running', 'recovering')
+        `).run(
+          renewedAt,
+          renewedAt,
+          fence.attempt_id,
+          context.turn_id,
+          fence.attempt_no,
+          fence.lease_epoch,
+          serviceInstanceId,
+          context.executor_instance_id,
+        );
+      }
+      return renewed;
+    });
+    return renew.immediate();
+  }
+
   function reconcileExpiredResidents() {
     if (provider !== 'claude') return 0;
     const reconciledAt = now();
@@ -1837,6 +1917,7 @@ export function createExecutorStore({
 
   function claimNextQueuedTurn({ conversationId = null, requireResident = false } = {}) {
     const claim = database.transaction(() => {
+      const claimableAt = now();
       const turn = database.prepare(`
         SELECT turn.turn_id
         FROM runtime_turn_queue AS queue
@@ -1847,12 +1928,25 @@ export function createExecutorStore({
             turn.state = 'queued'
             OR (
               turn.state = 'recovering'
-              AND EXISTS (
-                SELECT 1
-                FROM runtime_reply_mapping_recoveries AS recovery
-                WHERE recovery.turn_id = turn.turn_id
-                  AND recovery.state = 'bound'
-                  AND recovery.bound_lineage_id = turn.lineage_id
+              AND (
+                EXISTS (
+                  SELECT 1
+                  FROM runtime_reply_mapping_recoveries AS recovery
+                  WHERE recovery.turn_id = turn.turn_id
+                    AND recovery.state = 'bound'
+                    AND recovery.bound_lineage_id = turn.lineage_id
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM runtime_provider_attempts AS provider_attempt
+                  WHERE provider_attempt.turn_id = turn.turn_id
+                    AND provider_attempt.attempt_id = turn.attempt_id
+                    AND provider_attempt.attempt_no = turn.attempt_no
+                    AND provider_attempt.lease_epoch = turn.lease_epoch
+                    AND provider_attempt.state = 'retry_wait'
+                    AND provider_attempt.side_effect_status = 'none'
+                    AND provider_attempt.next_retry_at <= ?
+                )
               )
             )
           )
@@ -1878,11 +1972,26 @@ export function createExecutorStore({
           )
         ORDER BY turn.created_at ASC, turn.conversation_id ASC, queue.queue_sequence ASC
         LIMIT 1
-      `).get(conversationId, conversationId);
+      `).get(claimableAt, conversationId, conversationId);
       if (!turn) return null;
 
       const claimedAt = now();
       const current = loadTurn(database, turn.turn_id);
+      const retryAttempt = (current.state === 'recovering'
+        ? database.prepare(`
+          SELECT retry_backoff_ms, next_retry_at, error_json
+          FROM runtime_provider_attempts
+          WHERE turn_id = ? AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+            AND state = 'retry_wait' AND side_effect_status = 'none'
+            AND next_retry_at <= ?
+        `).get(
+          current.turn_id,
+          current.attempt_id,
+          current.attempt_no,
+          current.lease_epoch,
+          claimedAt,
+        )
+        : null) ?? null;
       const resident = provider === 'claude'
         ? isResidentConversation(current.conversation_id)
         : null;
@@ -1910,9 +2019,10 @@ export function createExecutorStore({
       `).get(current.conversation_id);
       const fence = {
         attempt_id: generateId('attempt'),
-        attempt_no: 1,
+        attempt_no: retryAttempt === null ? 1 : current.attempt_no + 1,
         lease_epoch: (existingLease?.lease_epoch ?? 0) + 1,
       };
+      const executorInstanceId = generateId('executor');
       const leaseExpiresAt = new Date(
         Date.parse(claimedAt) + leaseDurationMs,
       ).toISOString();
@@ -1946,13 +2056,24 @@ export function createExecutorStore({
       const turnUpdate = database.prepare(`
         UPDATE runtime_turns
         SET attempt_id = ?, attempt_no = ?, lease_epoch = ?
-        WHERE turn_id = ? AND state = ? AND attempt_id IS NULL
+        WHERE turn_id = ? AND state = ?
+          AND (
+            (? = 0 AND attempt_id IS NULL AND attempt_no IS NULL)
+            OR (
+              ? = 1 AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+            )
+          )
       `).run(
         fence.attempt_id,
         fence.attempt_no,
         fence.lease_epoch,
         current.turn_id,
         current.state,
+        retryAttempt === null ? 0 : 1,
+        retryAttempt === null ? 0 : 1,
+        current.attempt_id,
+        current.attempt_no,
+        current.lease_epoch,
       );
       const queueUpdate = database.prepare(`
         UPDATE runtime_turn_queue
@@ -1961,6 +2082,57 @@ export function createExecutorStore({
       `).run(current.turn_id);
       if (turnUpdate.changes !== 1 || queueUpdate.changes !== 1) {
         conflict('stale_attempt', 'The durable queue entry was claimed concurrently.');
+      }
+      database.prepare(`
+        INSERT INTO runtime_provider_attempts (
+          attempt_id, turn_id, conversation_id, attempt_no, lease_epoch,
+          provider, service_instance_id, executor_instance_id, state,
+          last_lease_renewed_at, started_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?)
+      `).run(
+        fence.attempt_id,
+        current.turn_id,
+        current.conversation_id,
+        fence.attempt_no,
+        fence.lease_epoch,
+        provider,
+        serviceInstanceId,
+        executorInstanceId,
+        claimedAt,
+        claimedAt,
+        claimedAt,
+      );
+      if (retryAttempt !== null) {
+        const retryEvent = buildEvent({
+          turn: loadTurn(database, current.turn_id),
+          lastEvent: loadLastEvent(database, current.turn_id),
+          fence,
+          provider,
+          descriptor: {
+            kind: 'retry_attempt_started',
+            phase: 'recovering',
+            payload: {
+              retry_no: current.attempt_no,
+              attempt_no: fence.attempt_no,
+              backoff_ms: retryAttempt.retry_backoff_ms,
+              reason_code: 'provider_transient',
+            },
+            provider_native_id: current.provider_native_id,
+            error: retryAttempt.error_json === null
+              ? null
+              : JSON.parse(retryAttempt.error_json),
+          },
+          occurredAt: claimedAt,
+          generateId,
+        });
+        commitTurnEvent(database, {
+          turn: loadTurn(database, current.turn_id),
+          event: retryEvent,
+          fence,
+          nextState: 'recovering',
+          staleMessage: 'The retry attempt start lost its provider attempt fence.',
+          generateId,
+        });
       }
       transitionInTransaction(database, {
         turnId: current.turn_id,
@@ -2006,10 +2178,198 @@ export function createExecutorStore({
         resident: resident === null ? null : Object.freeze({
           owner_epoch: resident.owner_epoch,
         }),
+        executor_instance_id: executorInstanceId,
         attempt: fence,
       };
     });
     return claim.immediate();
+  }
+
+  function scheduleProviderRetry(turnContext, error, backoffMs) {
+    if (
+      error?.retryable !== true
+      || error.side_effect_status !== 'none'
+      || !Number.isSafeInteger(backoffMs)
+      || backoffMs < 0
+      || turnContext.attempt.attempt_no > 3
+    ) {
+      conflict('provider_context_invalid', 'Provider retry requires proven no-side-effect eligibility.');
+    }
+    const schedule = database.transaction(() => {
+      const occurredAt = now();
+      let turn = loadTurn(database, turnContext.turn_id);
+      assertTurnContextFence(turn, turnContext);
+      assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
+      if (!['starting', 'running'].includes(turn.state)) {
+        conflict('illegal_transition', `Provider retry is invalid while turn is ${turn.state}.`);
+      }
+      transitionInTransaction(database, {
+        turnId: turn.turn_id,
+        fromState: turn.state,
+        toState: 'recovering',
+        fence: turnContext.attempt,
+        provider,
+        serviceInstanceId,
+        occurredAt,
+        generateId,
+        reasonCode: 'provider_retry_scheduled',
+      });
+      turn = loadTurn(database, turn.turn_id);
+      const retryNo = turnContext.attempt.attempt_no;
+      const event = buildEvent({
+        turn,
+        lastEvent: loadLastEvent(database, turn.turn_id),
+        fence: turnContext.attempt,
+        provider,
+        descriptor: {
+          kind: 'retry_scheduled',
+          phase: 'recovering',
+          payload: {
+            retry_no: retryNo,
+            attempt_no: retryNo + 1,
+            backoff_ms: backoffMs,
+            reason_code: 'provider_transient',
+          },
+          provider_native_id: turn.provider_native_id,
+          error,
+        },
+        occurredAt,
+        generateId,
+      });
+      commitTurnEvent(database, {
+        turn,
+        event,
+        fence: turnContext.attempt,
+        nextState: 'recovering',
+        staleMessage: 'The retry schedule lost its provider attempt fence.',
+        generateId,
+      });
+      const nextRetryAt = new Date(Date.parse(occurredAt) + backoffMs).toISOString();
+      const attemptUpdate = database.prepare(`
+        UPDATE runtime_provider_attempts
+        SET state = 'retry_wait', side_effect_status = 'none', error_json = ?,
+          retry_backoff_ms = ?, next_retry_at = ?, updated_at = ?
+        WHERE turn_id = ? AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+          AND service_instance_id = ? AND state IN ('starting', 'running')
+      `).run(
+        JSON.stringify(error),
+        backoffMs,
+        nextRetryAt,
+        occurredAt,
+        turn.turn_id,
+        turnContext.attempt.attempt_id,
+        turnContext.attempt.attempt_no,
+        turnContext.attempt.lease_epoch,
+        serviceInstanceId,
+      );
+      const queueUpdate = database.prepare(`
+        UPDATE runtime_turn_queue
+        SET status = 'queued', wait_reason = 'provider_retry'
+        WHERE turn_id = ? AND status = 'claimed'
+      `).run(turn.turn_id);
+      const leaseUpdate = database.prepare(`
+        UPDATE runtime_executor_leases
+        SET lease_owner = NULL, turn_id = NULL, attempt_id = NULL,
+          attempt_no = NULL, lease_expires_at = NULL, updated_at = ?
+        WHERE conversation_id = ? AND lease_owner = ? AND turn_id = ?
+          AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+      `).run(
+        occurredAt,
+        turn.conversation_id,
+        serviceInstanceId,
+        turn.turn_id,
+        turnContext.attempt.attempt_id,
+        turnContext.attempt.attempt_no,
+        turnContext.attempt.lease_epoch,
+      );
+      if (attemptUpdate.changes !== 1 || queueUpdate.changes !== 1 || leaseUpdate.changes !== 1) {
+        conflict('stale_attempt', 'The provider retry schedule changed concurrently.');
+      }
+      return Object.freeze({
+        retry_no: retryNo,
+        next_attempt_no: retryNo + 1,
+        backoff_ms: backoffMs,
+        next_retry_at: nextRetryAt,
+      });
+    });
+    return schedule.immediate();
+  }
+
+  function exhaustProviderRetries(turnContext, error) {
+    if (
+      error?.retryable !== true
+      || error.side_effect_status !== 'none'
+      || turnContext.attempt.attempt_no !== 4
+    ) {
+      conflict('provider_context_invalid', 'Retry exhaustion requires the fourth safe attempt.');
+    }
+    const exhaust = database.transaction(() => {
+      const occurredAt = now();
+      const turn = loadTurn(database, turnContext.turn_id);
+      assertTurnContextFence(turn, turnContext);
+      assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
+      if (!['starting', 'running'].includes(turn.state)) {
+        conflict('illegal_transition', `Retry exhaustion is invalid while turn is ${turn.state}.`);
+      }
+      const event = buildEvent({
+        turn,
+        lastEvent: loadLastEvent(database, turn.turn_id),
+        fence: turnContext.attempt,
+        provider,
+        descriptor: {
+          kind: 'retry_exhausted',
+          phase: turn.state,
+          payload: {
+            retry_no: 3,
+            attempt_no: 4,
+            backoff_ms: 0,
+            reason_code: 'provider_transient',
+          },
+          provider_native_id: turn.provider_native_id,
+          error,
+        },
+        occurredAt,
+        generateId,
+      });
+      commitTurnEvent(database, {
+        turn,
+        event,
+        fence: turnContext.attempt,
+        nextState: turn.state,
+        staleMessage: 'Retry exhaustion lost its provider attempt fence.',
+        generateId,
+      });
+      transitionInTransaction(database, {
+        turnId: turn.turn_id,
+        fromState: turn.state,
+        toState: 'failed',
+        fence: turnContext.attempt,
+        provider,
+        serviceInstanceId,
+        occurredAt,
+        generateId,
+        reasonCode: 'provider_retry_exhausted',
+        error,
+      });
+      const attemptUpdate = database.prepare(`
+        UPDATE runtime_provider_attempts
+        SET state = 'failed', side_effect_status = 'none', error_json = ?, updated_at = ?
+        WHERE turn_id = ? AND attempt_id = ? AND attempt_no = 4 AND lease_epoch = ?
+          AND service_instance_id = ? AND state IN ('starting', 'running')
+      `).run(
+        JSON.stringify(error),
+        occurredAt,
+        turn.turn_id,
+        turnContext.attempt.attempt_id,
+        turnContext.attempt.lease_epoch,
+        serviceInstanceId,
+      );
+      if (attemptUpdate.changes !== 1) {
+        conflict('stale_attempt', 'Retry exhaustion lost its durable attempt record.');
+      }
+      return event;
+    });
+    return exhaust.immediate();
   }
 
   function persistDeliveryUnknownInTransaction({
@@ -2344,9 +2704,25 @@ export function createExecutorStore({
           UPDATE runtime_lineages
           SET provider_native_state = 'invalid'
           WHERE lineage_id = ? AND conversation_id = ?
-            AND provider = ? AND provider_native_id IS NOT NULL
+          AND provider = ? AND provider_native_id IS NOT NULL
         `).run(turn.lineage_id, turn.conversation_id, provider);
       }
+      database.prepare(`
+        UPDATE runtime_provider_attempts
+        SET state = ?, side_effect_status = ?, error_json = ?, updated_at = ?
+        WHERE attempt_id = ? AND turn_id = ? AND attempt_no = ? AND lease_epoch = ?
+          AND service_instance_id = ?
+      `).run(
+        toState,
+        error?.side_effect_status ?? 'none',
+        error === null ? null : JSON.stringify(error),
+        occurredAt,
+        turnContext.attempt.attempt_id,
+        turnContext.turn_id,
+        turnContext.attempt.attempt_no,
+        turnContext.attempt.lease_epoch,
+        serviceInstanceId,
+      );
       return event;
     });
     return transition.immediate();
@@ -4138,6 +4514,63 @@ export function createExecutorStore({
     return Object.freeze(diagnostic);
   }
 
+  function recordProviderRuntimeEvidence(turnContext, evidence) {
+    if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) {
+      throw new TypeError('runtime evidence must be an object');
+    }
+    if (
+      typeof evidence.runtime_instance_id !== 'string'
+      || evidence.runtime_instance_id.length === 0
+      || typeof evidence.handle_kind !== 'string'
+      || evidence.handle_kind.length === 0
+      || typeof evidence.controllable !== 'boolean'
+    ) {
+      throw new TypeError('runtime evidence requires identity, handle kind, and controllability');
+    }
+    if (Object.hasOwn(evidence, 'process')) {
+      const process = evidence.process;
+      if (
+        !process
+        || typeof process !== 'object'
+        || Array.isArray(process)
+        || !Number.isSafeInteger(process.pid)
+        || process.pid <= 0
+        || !(process.pgid === null || Number.isSafeInteger(process.pgid) && process.pgid > 0)
+        || typeof process.started_at !== 'string'
+        || !Number.isFinite(Date.parse(process.started_at))
+        || process.diagnostic_only !== true
+      ) {
+        throw new TypeError('process runtime evidence must be complete and diagnostic-only');
+      }
+    }
+    const recordedAt = now();
+    const turn = loadTurn(database, turnContext.turn_id);
+    assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
+    const updated = database.prepare(`
+      UPDATE runtime_provider_attempts
+      SET runtime_instance_id = ?, runtime_evidence_json = ?,
+        last_provider_event_at = ?, updated_at = ?
+      WHERE attempt_id = ? AND turn_id = ? AND attempt_no = ? AND lease_epoch = ?
+        AND service_instance_id = ? AND executor_instance_id = ?
+        AND state IN ('starting', 'running')
+    `).run(
+      evidence.runtime_instance_id,
+      JSON.stringify(evidence),
+      recordedAt,
+      recordedAt,
+      turnContext.attempt.attempt_id,
+      turnContext.turn_id,
+      turnContext.attempt.attempt_no,
+      turnContext.attempt.lease_epoch,
+      serviceInstanceId,
+      turnContext.executor_instance_id,
+    );
+    if (updated.changes !== 1) {
+      conflict('stale_attempt', 'Runtime evidence lost its provider attempt identity fence.');
+    }
+    return Object.freeze({ status: 'recorded', recorded_at: recordedAt });
+  }
+
   function isConversationEvictable(conversationId) {
     if (typeof conversationId !== 'string' || conversationId.length === 0) {
       throw new TypeError('conversationId must be a non-empty string');
@@ -4406,6 +4839,33 @@ export function createExecutorStore({
         assertResidentOwner(turn.conversation_id);
       } else if (request.parent_type !== 'recovery_control') {
         conflict('illegal_transition', 'This executor store cannot answer security control interactions.');
+      } else {
+        const executionRecovery = database.prepare(`
+          SELECT state, notice_event_sequence
+          FROM runtime_execution_recoveries
+          WHERE recovery_id = ? AND turn_id = ? AND interaction_id = ?
+        `).get(request.control_id, request.turn_id, request.interaction_id);
+        if (executionRecovery) {
+          if (executionRecovery.state !== 'waiting_decision') {
+            conflict('interaction_already_answered', 'Execution recovery is no longer awaiting a decision.');
+          }
+          const deliveredNotice = database.prepare(`
+            SELECT 1
+            FROM runtime_projection_snapshots AS projection
+            JOIN runtime_outbox AS outbox
+              ON outbox.outbox_id = projection.materialized_outbox_id
+            WHERE projection.turn_id = ?
+              AND projection.event_sequence_through >= ?
+              AND outbox.status = 'delivered'
+            LIMIT 1
+          `).get(request.turn_id, executionRecovery.notice_event_sequence);
+          if (!deliveredNotice) {
+            conflict(
+              'side_effect_unknown',
+              'The execution recovery decision must wait for its delivered user notice.',
+            );
+          }
+        }
       }
 
       validateInteractionTransition({
@@ -6105,6 +6565,15 @@ export function createExecutorStore({
         delivery.request.control_id,
         delivery.request.turn_id,
       );
+      const executionRecovery = database.prepare(`
+        SELECT recovery_id, turn_id, attempt_id, attempt_no, lease_epoch, state
+        FROM runtime_execution_recoveries
+        WHERE recovery_id = ? AND turn_id = ? AND interaction_id = ?
+      `).get(
+        delivery.request.control_id,
+        delivery.request.turn_id,
+        delivery.request.interaction_id,
+      );
       let recoveryResolution = null;
       if (replyMappingRecovery) {
         if (
@@ -6184,6 +6653,73 @@ export function createExecutorStore({
             side_effect_status: 'unknown',
           });
         }
+      } else if (executionRecovery) {
+        if (
+          delivery.request.kind !== 'recovery_decision'
+          || executionRecovery.state !== 'waiting_decision'
+        ) {
+          conflict('stale_attempt', 'The execution recovery decision lost its recovery fence.');
+        }
+        const decision = delivery.answer.value?.decision;
+        if (!['approve', 'deny'].includes(decision)) {
+          conflict('provider_context_invalid', 'An execution recovery decision must approve or deny.');
+        }
+        const decidedAt = now();
+        const recoveryState = decision === 'approve' ? 'authorized' : 'stopped';
+        const recoveryUpdate = database.prepare(`
+          UPDATE runtime_execution_recoveries
+          SET state = ?, updated_at = ?
+          WHERE recovery_id = ? AND turn_id = ? AND state = 'waiting_decision'
+            AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+        `).run(
+          recoveryState,
+          decidedAt,
+          executionRecovery.recovery_id,
+          executionRecovery.turn_id,
+          executionRecovery.attempt_id,
+          executionRecovery.attempt_no,
+          executionRecovery.lease_epoch,
+        );
+        if (recoveryUpdate.changes !== 1) {
+          conflict('version_conflict', 'The execution recovery decision changed concurrently.');
+        }
+        if (decision === 'deny') {
+          transitionInTransaction(database, {
+            turnId: executionRecovery.turn_id,
+            fromState: 'recovering',
+            toState: 'stopped',
+            fence: {
+              attempt_id: executionRecovery.attempt_id,
+              attempt_no: executionRecovery.attempt_no,
+              lease_epoch: executionRecovery.lease_epoch,
+            },
+            provider,
+            serviceInstanceId,
+            occurredAt: decidedAt,
+            generateId,
+            reasonCode: 'execution_recovery_stopped_by_user',
+            requireActiveLease: false,
+            retainLease: true,
+          });
+          database.prepare(`
+            UPDATE runtime_provider_attempts
+            SET state = 'stopped', side_effect_status = 'unknown', updated_at = ?
+            WHERE turn_id = ? AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+          `).run(
+            decidedAt,
+            executionRecovery.turn_id,
+            executionRecovery.attempt_id,
+            executionRecovery.attempt_no,
+            executionRecovery.lease_epoch,
+          );
+        }
+        recoveryResolution = {
+          status: recoveryState,
+          recovery_id: executionRecovery.recovery_id,
+          turn_id: executionRecovery.turn_id,
+          automatic_replay: false,
+          lease_released: false,
+        };
       }
       return { acknowledgement, sendingDelivery, recovery_resolution: recoveryResolution };
     });
@@ -6853,6 +7389,358 @@ export function createExecutorStore({
     return resolve.immediate();
   }
 
+  function persistExecutionRecoveryDecisionInTransaction(
+    turnContext,
+    error,
+    occurredAt,
+    recoveryKind,
+    { requireActiveLease = true } = {},
+  ) {
+    const existing = database.prepare(`
+      SELECT recovery_id, interaction_id, state, notice_event_sequence
+      FROM runtime_execution_recoveries WHERE turn_id = ?
+    `).get(turnContext.turn_id);
+    if (existing) return existing;
+    const recoveringTurn = loadTurn(database, turnContext.turn_id);
+    if (requireActiveLease) assertTurnContextFence(recoveringTurn, turnContext);
+    else if (!sameFence(recoveringTurn, turnContext.attempt)) {
+      conflict('stale_attempt', 'Execution recovery lost its durable attempt fence.');
+    }
+    if (recoveringTurn.state !== 'recovering') {
+      conflict('illegal_transition', 'Execution recovery decisions require a recovering turn.');
+    }
+    const recoveryId = generateId('recovery');
+    const recoveryEvent = buildEvent({
+      turn: recoveringTurn,
+      lastEvent: loadLastEvent(database, recoveringTurn.turn_id),
+      fence: turnContext.attempt,
+      provider,
+      descriptor: {
+        kind: 'recovery_started',
+        phase: 'recovering',
+        provider_native_id: recoveringTurn.provider_native_id,
+        payload: {
+          recovery_id: recoveryId,
+          recovery_of_turn_id: recoveringTurn.turn_id,
+          recovery_of_lineage_id: recoveringTurn.lineage_id,
+          side_effect_status: 'unknown',
+        },
+        error,
+      },
+      occurredAt,
+      generateId,
+    });
+    commitTurnEvent(database, {
+      turn: recoveringTurn,
+      event: recoveryEvent,
+      fence: turnContext.attempt,
+      nextState: 'recovering',
+      staleMessage: 'The provider failure lost its recovery fence.',
+      generateId,
+    });
+    const currentTurn = loadTurn(database, recoveringTurn.turn_id);
+    const envelope = JSON.parse(currentTurn.envelope_json);
+    if (envelope.actor?.authenticated !== true) {
+      conflict('authorization_denied', 'Execution recovery decisions require an authenticated actor.');
+    }
+    const interaction = {
+      contract: 'zylos.interaction-request',
+      contract_version: '1.0',
+      trace_id: envelope.trace_id,
+      interaction_id: generateId('interaction'),
+      conversation_id: currentTurn.conversation_id,
+      turn_id: currentTurn.turn_id,
+      lineage_id: currentTurn.lineage_id,
+      control_id: recoveryId,
+      parent_type: 'recovery_control',
+      tool_use_id: null,
+      ordinal: 1,
+      kind: 'recovery_decision',
+      prompt: 'Provider work may still be running or may have unknown side effects. Choose how to recover.',
+      choices: [
+        { choice_id: 'approve', label: 'Authorize recovery' },
+        { choice_id: 'deny', label: 'Stop this turn' },
+      ],
+      authorized_subjects: [{ type: 'actor', actor_id: envelope.actor.actor_id }],
+      allowed_sources: [
+        'main_card_reply',
+        ...(['feishu', 'lark'].includes(envelope.channel) ? ['card_action'] : []),
+      ],
+      runtime_fence: null,
+      state: 'pending',
+      version: 1,
+      handoff_state: 'not_started',
+      created_at: occurredAt,
+      expires_at: new Date(Date.parse(occurredAt) + interactionTimeoutMs).toISOString(),
+      card_delivery_id: null,
+    };
+    validateInteractionRequest(interaction, { occurredAt });
+    database.prepare(`
+      INSERT INTO runtime_interactions (
+        interaction_id, conversation_id, turn_id, lineage_id, parent_type, parent_id,
+        ordinal, state, version, handoff_state, handoff_version, request_json,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'recovery_control', ?, 1, 'pending', 1,
+        'not_started', NULL, ?, ?, ?)
+    `).run(
+      interaction.interaction_id,
+      interaction.conversation_id,
+      interaction.turn_id,
+      interaction.lineage_id,
+      interaction.control_id,
+      JSON.stringify(interaction),
+      occurredAt,
+      occurredAt,
+    );
+    const waitingEvent = buildEvent({
+      turn: currentTurn,
+      lastEvent: loadLastEvent(database, currentTurn.turn_id),
+      fence: turnContext.attempt,
+      provider,
+      descriptor: {
+        kind: 'recovery_waiting_decision',
+        phase: 'recovering',
+        provider_native_id: currentTurn.provider_native_id,
+        payload: {
+          recovery_id: recoveryId,
+          recovery_of_turn_id: currentTurn.turn_id,
+          recovery_of_lineage_id: currentTurn.lineage_id,
+          side_effect_status: 'unknown',
+          interaction_id: interaction.interaction_id,
+          ordinal: interaction.ordinal,
+          interaction_version: interaction.version,
+          handoff_version: null,
+          kind: interaction.kind,
+          prompt: interaction.prompt,
+          choices: structuredClone(interaction.choices),
+          allowed_sources: [...interaction.allowed_sources],
+        },
+        error,
+      },
+      occurredAt,
+      generateId,
+    });
+    commitTurnEvent(database, {
+      turn: currentTurn,
+      event: waitingEvent,
+      fence: turnContext.attempt,
+      nextState: 'recovering',
+      staleMessage: 'The provider failure lost its recovery-decision fence.',
+      generateId,
+    });
+    const attempt = database.prepare(`
+      SELECT service_instance_id, executor_instance_id, runtime_instance_id
+      FROM runtime_provider_attempts
+      WHERE turn_id = ? AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+    `).get(
+      currentTurn.turn_id,
+      turnContext.attempt.attempt_id,
+      turnContext.attempt.attempt_no,
+      turnContext.attempt.lease_epoch,
+    );
+    database.prepare(`
+      INSERT INTO runtime_execution_recoveries (
+        recovery_id, turn_id, attempt_id, attempt_no, lease_epoch, provider,
+        prior_service_instance_id, prior_executor_instance_id, prior_runtime_instance_id,
+        recovery_kind, state, side_effect_status, notice_event_sequence,
+        interaction_id, error_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting_decision', 'unknown', ?, ?, ?, ?, ?)
+    `).run(
+      recoveryId,
+      currentTurn.turn_id,
+      turnContext.attempt.attempt_id,
+      turnContext.attempt.attempt_no,
+      turnContext.attempt.lease_epoch,
+      provider,
+      attempt?.service_instance_id ?? null,
+      attempt?.executor_instance_id ?? null,
+      attempt?.runtime_instance_id ?? null,
+      recoveryKind,
+      waitingEvent.event_sequence,
+      interaction.interaction_id,
+      JSON.stringify(error),
+      occurredAt,
+      occurredAt,
+    );
+    database.prepare(`
+      UPDATE runtime_provider_attempts
+      SET state = 'recovering', side_effect_status = 'unknown', error_json = ?, updated_at = ?
+      WHERE turn_id = ? AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+        AND state IN ('starting', 'running')
+    `).run(
+      JSON.stringify(error),
+      occurredAt,
+      currentTurn.turn_id,
+      turnContext.attempt.attempt_id,
+      turnContext.attempt.attempt_no,
+      turnContext.attempt.lease_epoch,
+    );
+    database.prepare(`
+      UPDATE runtime_turn_queue
+      SET wait_reason = 'execution_recovery_decision'
+      WHERE turn_id = ? AND status = 'claimed'
+    `).run(currentTurn.turn_id);
+    return {
+      recovery_id: recoveryId,
+      interaction_id: interaction.interaction_id,
+      state: 'waiting_decision',
+      notice_event_sequence: waitingEvent.event_sequence,
+    };
+  }
+
+  function reconcileNonterminalTurns(
+    controlledTurnContexts = [],
+    recoveryKind = 'sweep_reconciliation',
+  ) {
+    if (!Array.isArray(controlledTurnContexts)) {
+      throw new TypeError('controlledTurnContexts must be an array');
+    }
+    if (!['startup_reconciliation', 'sweep_reconciliation'].includes(recoveryKind)) {
+      throw new TypeError('recoveryKind must identify startup or sweep reconciliation');
+    }
+    const controlled = new Map(controlledTurnContexts.map((context) => [context.turn_id, context]));
+    const reconcile = database.transaction(() => {
+      const reconciledAt = now();
+      const candidates = database.prepare(`
+        SELECT turn.turn_id, turn.conversation_id, turn.state, turn.attempt_id,
+          turn.attempt_no, turn.lease_epoch,
+          attempt.service_instance_id, attempt.executor_instance_id,
+          attempt.runtime_instance_id, attempt.runtime_evidence_json,
+          lease.lease_owner, lease.turn_id AS lease_turn_id,
+          lease.attempt_id AS lease_attempt_id, lease.attempt_no AS lease_attempt_no,
+          lease.lease_epoch AS lease_epoch_current, lease.lease_expires_at,
+          EXISTS (
+            SELECT 1 FROM runtime_interactions AS interaction
+            WHERE interaction.turn_id = turn.turn_id
+              AND interaction.state IN (${BLOCKING_INTERACTION_STATES_SQL})
+          ) AS has_blocking_interaction
+        FROM runtime_turns AS turn
+        JOIN runtime_lineages AS lineage ON lineage.lineage_id = turn.lineage_id
+        LEFT JOIN runtime_provider_attempts AS attempt
+          ON attempt.turn_id = turn.turn_id
+         AND attempt.attempt_id = turn.attempt_id
+         AND attempt.attempt_no = turn.attempt_no
+         AND attempt.lease_epoch = turn.lease_epoch
+        LEFT JOIN runtime_executor_leases AS lease
+          ON lease.conversation_id = turn.conversation_id
+        WHERE attempt.provider = ?
+          AND turn.state IN ('starting', 'running', 'waiting_user', 'redirecting', 'recovering')
+          AND turn.attempt_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM runtime_execution_recoveries AS recovery
+            WHERE recovery.turn_id = turn.turn_id
+          )
+        ORDER BY turn.created_at, turn.turn_id
+      `).all(provider);
+      const results = [];
+      for (const candidate of candidates) {
+        if (['redirecting', 'recovering'].includes(candidate.state)) {
+          results.push({
+            turn_id: candidate.turn_id,
+            status: 'specialized_recovery_retained',
+          });
+          continue;
+        }
+        const context = controlled.get(candidate.turn_id);
+        let evidence = null;
+        try {
+          evidence = candidate.runtime_evidence_json === null
+            ? null
+            : JSON.parse(candidate.runtime_evidence_json);
+        } catch {
+          evidence = null;
+        }
+        const exactLocalFence = context
+          && context.attempt.attempt_id === candidate.attempt_id
+          && context.attempt.attempt_no === candidate.attempt_no
+          && context.attempt.lease_epoch === candidate.lease_epoch;
+        const durableAttemptIdentity = candidate.service_instance_id === candidate.lease_owner
+          && (
+            candidate.lease_owner !== serviceInstanceId
+            || (
+              exactLocalFence
+              && context.executor_instance_id === candidate.executor_instance_id
+            )
+          );
+        const durableLease = durableAttemptIdentity
+          && candidate.lease_turn_id === candidate.turn_id
+          && candidate.lease_attempt_id === candidate.attempt_id
+          && candidate.lease_attempt_no === candidate.attempt_no
+          && candidate.lease_epoch_current === candidate.lease_epoch
+          && candidate.lease_expires_at !== null
+          && candidate.lease_expires_at > reconciledAt;
+        const durableRuntimeEvidence = evidence !== null
+          && evidence.runtime_instance_id === candidate.runtime_instance_id
+          && typeof evidence.runtime_instance_id === 'string'
+          && evidence.runtime_instance_id.length > 0
+          && typeof evidence.handle_kind === 'string'
+          && evidence.handle_kind.length > 0
+          && evidence.controllable === true;
+        if (durableLease && durableRuntimeEvidence) {
+          results.push({ turn_id: candidate.turn_id, status: 'healthy' });
+          continue;
+        }
+        if (candidate.state === 'waiting_user' && candidate.has_blocking_interaction === 1) {
+          results.push({
+            turn_id: candidate.turn_id,
+            status: 'specialized_recovery_retained',
+          });
+          continue;
+        }
+        const turnContext = {
+          turn_id: candidate.turn_id,
+          conversation_id: candidate.conversation_id,
+          executor_instance_id: candidate.executor_instance_id,
+          attempt: {
+            attempt_id: candidate.attempt_id,
+            attempt_no: candidate.attempt_no,
+            lease_epoch: candidate.lease_epoch,
+          },
+        };
+        transitionInTransaction(database, {
+          turnId: candidate.turn_id,
+          fromState: candidate.state,
+          toState: 'recovering',
+          fence: turnContext.attempt,
+          provider,
+          serviceInstanceId,
+          occurredAt: reconciledAt,
+          generateId,
+          reasonCode: 'executor_reconciliation_uncertain',
+          requireActiveLease: false,
+        });
+        const error = createContractError({
+          code: 'side_effect_unknown',
+          category: 'provider',
+          retryable: false,
+          sideEffectStatus: 'unknown',
+          userMessage: 'Executor ownership or provider runtime isolation could not be proven.',
+          occurredAt: reconciledAt,
+        });
+        const recovery = persistExecutionRecoveryDecisionInTransaction(
+          turnContext,
+          error,
+          reconciledAt,
+          recoveryKind,
+          { requireActiveLease: false },
+        );
+        results.push({
+          turn_id: candidate.turn_id,
+          status: 'waiting_decision',
+          recovery_id: recovery.recovery_id,
+          interaction_id: recovery.interaction_id,
+        });
+      }
+      return Object.freeze({
+        inspected: candidates.length,
+        healthy: results.filter(({ status }) => status === 'healthy').length,
+        waiting_decision: results.filter(({ status }) => status === 'waiting_decision').length,
+        results: Object.freeze(results.map((result) => Object.freeze(result))),
+      });
+    });
+    return reconcile.immediate();
+  }
+
   function markProviderFailure(turnContext, error) {
     const markFailure = database.transaction(() => {
       const occurredAt = now();
@@ -6871,41 +7759,19 @@ export function createExecutorStore({
           generateId,
           reasonCode: 'provider_connection_lost',
         });
-        const recoveringTurn = loadTurn(database, turn.turn_id);
-        const recoveryEvent = buildEvent({
-          turn: recoveringTurn,
-          lastEvent: loadLastEvent(database, turn.turn_id),
-          fence: turnContext.attempt,
-          provider,
-          descriptor: {
-            kind: 'recovery_started',
-            phase: 'recovering',
-            provider_native_id: recoveringTurn.provider_native_id,
-            payload: {
-              recovery_id: generateId('recovery'),
-              recovery_of_turn_id: recoveringTurn.turn_id,
-              recovery_of_lineage_id: recoveringTurn.lineage_id,
-              side_effect_status: 'unknown',
-            },
-            error,
-          },
+        const recovery = persistExecutionRecoveryDecisionInTransaction(
+          turnContext,
+          error,
           occurredAt,
-          generateId,
-        });
-        commitTurnEvent(database, {
-          turn: recoveringTurn,
-          event: recoveryEvent,
-          fence: turnContext.attempt,
-          nextState: 'recovering',
-          staleMessage: 'The provider failure lost its recovery fence.',
-          generateId,
-        });
+          'provider_failure',
+        );
         return {
           status: 'recovering',
           turn_id: turn.turn_id,
           turn_state: 'recovering',
           previous_turn_state: fromState,
           cancelled_interaction_ids: [],
+          ...recovery,
         };
       }
       if (turn.state !== 'waiting_user') {
@@ -7086,41 +7952,19 @@ export function createExecutorStore({
         generateId,
         reasonCode: 'provider_connection_lost',
       });
-      const recoveringTurn = loadTurn(database, turn.turn_id);
-      const recoveryEvent = buildEvent({
-        turn: recoveringTurn,
-        lastEvent: loadLastEvent(database, turn.turn_id),
-        fence: turnContext.attempt,
-        provider,
-        descriptor: {
-          kind: 'recovery_started',
-          phase: 'recovering',
-          provider_native_id: recoveringTurn.provider_native_id,
-          payload: {
-            recovery_id: generateId('recovery'),
-            recovery_of_turn_id: recoveringTurn.turn_id,
-            recovery_of_lineage_id: recoveringTurn.lineage_id,
-            side_effect_status: 'unknown',
-          },
-          error,
-        },
+      const recovery = persistExecutionRecoveryDecisionInTransaction(
+        turnContext,
+        error,
         occurredAt,
-        generateId,
-      });
-      commitTurnEvent(database, {
-        turn: recoveringTurn,
-        event: recoveryEvent,
-        fence: turnContext.attempt,
-        nextState: 'recovering',
-        staleMessage: 'The provider failure lost its recovery fence.',
-        generateId,
-      });
+        'provider_failure',
+      );
       return {
         status: 'recovering',
         turn_id: turn.turn_id,
         turn_state: 'recovering',
         cancelled_interaction_ids: cancelledInteractionIds,
         cancelled_handoff_ids: cancelledHandoffIds,
+        ...recovery,
       };
     });
     return markFailure.immediate();
@@ -7178,6 +8022,7 @@ export function createExecutorStore({
     markProviderFailure,
     markProviderStopUnknown,
     heartbeatOwnedResidents,
+    renewOwnedTurnLeases,
     isConversationEvictable,
     markInteractionHandoffDeliveryUnknown,
     markInteractionHandoffPreSendFailure,
@@ -7186,9 +8031,11 @@ export function createExecutorStore({
     releaseRecoveringExecutorOwnership,
     reconcileExpiredResidents,
     recordProviderEventDiagnostic,
+    recordProviderRuntimeEvidence,
     recordSteerReconciliationOutcome,
     recordStopProviderOutcome,
     expireInteraction,
+    exhaustProviderRetries,
     failSteer,
     getInteractionHandoffForRecovery,
     listPendingInteractionDeadlines,
@@ -7196,10 +8043,12 @@ export function createExecutorStore({
     reconcileExpiredStartedInteractionHandoffs,
     resolveInteractionHandoffDisposition,
     rebuildExecutorCache,
+    reconcileNonterminalTurns,
     releaseTimedOutExecutorLease,
     requestInteraction,
     resumeTurnAfterPermission,
     reserveNextExecutor,
+    scheduleProviderRetry,
     stopConversation,
     transitionTurn,
   });
