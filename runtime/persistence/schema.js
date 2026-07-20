@@ -45,6 +45,7 @@ const RUNTIME_SCHEMA = `
     chat_id TEXT NOT NULL,
     native_thread_or_topic_id TEXT,
     last_queue_sequence INTEGER NOT NULL DEFAULT 0 CHECK (last_queue_sequence >= 0),
+    queue_version INTEGER NOT NULL DEFAULT 1 CHECK (queue_version > 0),
     created_at TEXT NOT NULL
   );
 
@@ -455,6 +456,7 @@ const RUNTIME_SCHEMA = `
 
   CREATE TABLE IF NOT EXISTS runtime_execution_recoveries (
     recovery_id TEXT PRIMARY KEY,
+    recovery_version INTEGER NOT NULL DEFAULT 1 CHECK (recovery_version > 0),
     turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
     attempt_id TEXT NOT NULL,
     attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
@@ -516,6 +518,73 @@ const RUNTIME_SCHEMA = `
     last_reconciliation_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_operations_policies (
+    policy_id TEXT NOT NULL,
+    policy_version INTEGER NOT NULL CHECK (policy_version > 0),
+    artifact_hash TEXT NOT NULL,
+    policy_json TEXT NOT NULL,
+    registered_at TEXT NOT NULL,
+    PRIMARY KEY (policy_id, policy_version)
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_operations_controls (
+    caller_namespace TEXT NOT NULL,
+    control_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target_json TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    normalized_request_json TEXT NOT NULL,
+    control_result_version INTEGER NOT NULL CHECK (control_result_version > 0),
+    latest_result_json TEXT NOT NULL,
+    audit_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (caller_namespace, control_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_operations_audit (
+    audit_id TEXT PRIMARY KEY,
+    caller_namespace TEXT NOT NULL,
+    control_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    capability TEXT,
+    grant_id TEXT,
+    policy_id TEXT NOT NULL,
+    policy_version INTEGER NOT NULL CHECK (policy_version > 0),
+    target_json TEXT NOT NULL,
+    expected_version_json TEXT,
+    previous_target_version INTEGER,
+    target_version INTEGER,
+    reason TEXT NOT NULL,
+    error_json TEXT,
+    committed_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_operations_idempotency_conflicts (
+    caller_namespace TEXT NOT NULL,
+    control_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    audit_id TEXT NOT NULL UNIQUE,
+    committed_at TEXT NOT NULL,
+    PRIMARY KEY (caller_namespace, control_id, request_hash)
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_operations_reconciliation_intents (
+    intent_id TEXT PRIMARY KEY,
+    service_instance_id TEXT NOT NULL,
+    caller_namespace TEXT NOT NULL,
+    expected_service_version INTEGER NOT NULL CHECK (expected_service_version > 0),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed')),
+    control_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (service_instance_id, caller_namespace, control_id)
   );
 
   CREATE TABLE IF NOT EXISTS runtime_normalized_events (
@@ -660,6 +729,7 @@ const RUNTIME_SCHEMA = `
 
   CREATE TABLE IF NOT EXISTS runtime_reply_mapping_recoveries (
     recovery_id TEXT PRIMARY KEY,
+    recovery_version INTEGER NOT NULL DEFAULT 1 CHECK (recovery_version > 0),
     turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
     mapping_id TEXT NOT NULL UNIQUE,
     source_platform_message_id TEXT NOT NULL,
@@ -700,6 +770,7 @@ const RUNTIME_SCHEMA = `
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
+
 `;
 
 const OUTBOX_V2_SCHEMA = `CREATE TABLE runtime_outbox ${OUTBOX_TABLE_SCHEMA};`;
@@ -737,6 +808,52 @@ function addColumnIfMissing(database, tableName, columnName, definition) {
   const columns = database.prepare(`PRAGMA table_info(${tableName})`).all();
   if (columns.some(({ name }) => name === columnName)) return;
   database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+}
+
+function migrateOperationsReconciliationIntents(database) {
+  const columns = database.prepare(
+    "PRAGMA table_info('runtime_operations_reconciliation_intents')",
+  ).all();
+  if (columns.some(({ name }) => name === 'caller_namespace')) return;
+  const migrate = database.transaction(() => {
+    database.exec(`
+      CREATE TABLE runtime_operations_reconciliation_intents_v2 (
+        intent_id TEXT PRIMARY KEY,
+        service_instance_id TEXT NOT NULL,
+        caller_namespace TEXT NOT NULL,
+        expected_service_version INTEGER NOT NULL CHECK (expected_service_version > 0),
+        state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed')),
+        control_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (service_instance_id, caller_namespace, control_id)
+      );
+
+      INSERT INTO runtime_operations_reconciliation_intents_v2 (
+        intent_id, service_instance_id, caller_namespace, expected_service_version,
+        state, control_id, created_at, updated_at
+      )
+      SELECT intent.intent_id, intent.service_instance_id,
+        (
+          SELECT control.caller_namespace
+          FROM runtime_operations_controls AS control
+          WHERE control.control_id = intent.control_id
+            AND control.action = 'reconcile'
+            AND json_extract(control.target_json, '$.service_instance_id')
+              = intent.service_instance_id
+          ORDER BY control.created_at, control.caller_namespace
+          LIMIT 1
+        ),
+        intent.expected_service_version, intent.state, intent.control_id,
+        intent.created_at, intent.updated_at
+      FROM runtime_operations_reconciliation_intents AS intent;
+
+      DROP TABLE runtime_operations_reconciliation_intents;
+      ALTER TABLE runtime_operations_reconciliation_intents_v2
+        RENAME TO runtime_operations_reconciliation_intents;
+    `);
+  });
+  migrate.immediate();
 }
 
 function migrateInteractionControlStorage(database) {
@@ -1127,7 +1244,19 @@ export function initializeRuntimePersistence(database) {
   database.pragma('busy_timeout = 5000');
   database.pragma('foreign_keys = ON');
   database.exec(RUNTIME_SCHEMA);
+  migrateOperationsReconciliationIntents(database);
   addColumnIfMissing(database, 'runtime_turns', 'attempt_id', 'TEXT');
+  addColumnIfMissing(
+    database,
+    'runtime_conversations',
+    'queue_version',
+    'INTEGER NOT NULL DEFAULT 1 CHECK (queue_version > 0)',
+  );
+  database.prepare(`
+    UPDATE runtime_conversations
+    SET queue_version = last_queue_sequence + 1
+    WHERE queue_version < last_queue_sequence + 1
+  `).run();
   addColumnIfMissing(
     database,
     'runtime_turns',
@@ -1161,6 +1290,73 @@ export function initializeRuntimePersistence(database) {
   );
   addColumnIfMissing(database, 'runtime_turn_queue', 'wait_reason', 'TEXT');
   addColumnIfMissing(database, 'runtime_turn_queue', 'wait_detail_json', 'TEXT');
+  addColumnIfMissing(
+    database,
+    'runtime_reply_mapping_recoveries',
+    'recovery_version',
+    'INTEGER NOT NULL DEFAULT 1 CHECK (recovery_version > 0)',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_execution_recoveries',
+    'recovery_version',
+    'INTEGER NOT NULL DEFAULT 1 CHECK (recovery_version > 0)',
+  );
+  database.exec(`
+    CREATE TRIGGER IF NOT EXISTS runtime_turn_queue_insert_version
+    AFTER INSERT ON runtime_turn_queue
+    BEGIN
+      UPDATE runtime_conversations
+      SET queue_version = queue_version + 1
+      WHERE conversation_id = NEW.conversation_id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_turn_queue_update_version
+    AFTER UPDATE ON runtime_turn_queue
+    WHEN NEW.conversation_id IS NOT OLD.conversation_id
+      OR NEW.queue_sequence IS NOT OLD.queue_sequence
+      OR NEW.turn_id IS NOT OLD.turn_id
+      OR NEW.status IS NOT OLD.status
+      OR NEW.priority IS NOT OLD.priority
+      OR NEW.wait_reason IS NOT OLD.wait_reason
+      OR NEW.wait_detail_json IS NOT OLD.wait_detail_json
+      OR NEW.enqueued_at IS NOT OLD.enqueued_at
+    BEGIN
+      UPDATE runtime_conversations
+      SET queue_version = queue_version + 1
+      WHERE conversation_id = OLD.conversation_id;
+      UPDATE runtime_conversations
+      SET queue_version = queue_version + 1
+      WHERE conversation_id = NEW.conversation_id
+        AND NEW.conversation_id IS NOT OLD.conversation_id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_turn_queue_delete_version
+    AFTER DELETE ON runtime_turn_queue
+    BEGIN
+      UPDATE runtime_conversations
+      SET queue_version = queue_version + 1
+      WHERE conversation_id = OLD.conversation_id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_execution_recovery_state_versions
+    AFTER UPDATE OF state ON runtime_execution_recoveries
+    WHEN NEW.recovery_version = OLD.recovery_version AND NEW.state <> OLD.state
+    BEGIN
+      UPDATE runtime_execution_recoveries
+      SET recovery_version = recovery_version + 1
+      WHERE recovery_id = NEW.recovery_id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_reply_mapping_recovery_state_versions
+    AFTER UPDATE OF state ON runtime_reply_mapping_recoveries
+    WHEN NEW.recovery_version = OLD.recovery_version AND NEW.state <> OLD.state
+    BEGIN
+      UPDATE runtime_reply_mapping_recoveries
+      SET recovery_version = recovery_version + 1
+      WHERE recovery_id = NEW.recovery_id;
+    END;
+  `);
   addColumnIfMissing(
     database,
     'runtime_reply_mapping_recoveries',
@@ -1376,7 +1572,27 @@ export function initializeRuntimePersistence(database) {
     DROP TRIGGER IF EXISTS runtime_bound_reply_recovery_immutable;
     CREATE TRIGGER runtime_bound_reply_recovery_immutable
     BEFORE UPDATE ON runtime_reply_mapping_recoveries
-    WHEN OLD.state = 'bound'
+    WHEN OLD.state = 'bound' AND (
+      NEW.recovery_id IS NOT OLD.recovery_id
+      OR NEW.turn_id IS NOT OLD.turn_id
+      OR NEW.mapping_id IS NOT OLD.mapping_id
+      OR NEW.source_platform_message_id IS NOT OLD.source_platform_message_id
+      OR NEW.reason IS NOT OLD.reason
+      OR NEW.candidate_lineage_id IS NOT OLD.candidate_lineage_id
+      OR NEW.side_effect_status IS NOT OLD.side_effect_status
+      OR NEW.state IS NOT OLD.state
+      OR NEW.notice_event_sequence IS NOT OLD.notice_event_sequence
+      OR NEW.native_recovery_attempt_count IS NOT OLD.native_recovery_attempt_count
+      OR NEW.native_recovery_attempt_id IS NOT OLD.native_recovery_attempt_id
+      OR NEW.native_recovery_status IS NOT OLD.native_recovery_status
+      OR NEW.native_recovery_result_json IS NOT OLD.native_recovery_result_json
+      OR NEW.native_recovery_owner_service_instance_id
+        IS NOT OLD.native_recovery_owner_service_instance_id
+      OR NEW.native_recovery_claim_expires_at IS NOT OLD.native_recovery_claim_expires_at
+      OR NEW.bound_lineage_id IS NOT OLD.bound_lineage_id
+      OR NEW.created_at IS NOT OLD.created_at
+      OR NEW.updated_at IS NOT OLD.updated_at
+    )
     BEGIN
       SELECT RAISE(ABORT, 'bound reply recovery is immutable');
     END;

@@ -4039,7 +4039,11 @@ export function createExecutorStore({
     return fail.immediate();
   }
 
-  function cancelQueuedTurnInTransaction(turnId, cancelledAt) {
+  function cancelQueuedTurnInTransaction(
+    turnId,
+    cancelledAt,
+    reasonCode = 'conversation_stopped',
+  ) {
     const turn = loadTurn(database, turnId);
     if (turn.state !== 'queued' || turn.attempt_id !== null) {
       conflict('version_conflict', 'Only an unclaimed queued turn can be cancelled by stop.');
@@ -4055,7 +4059,7 @@ export function createExecutorStore({
         payload: {
           from_state: 'queued',
           to_state: 'cancelled',
-          reason_code: 'conversation_stopped',
+          reason_code: reasonCode,
         },
       },
       occurredAt: cancelledAt,
@@ -4087,6 +4091,69 @@ export function createExecutorStore({
     }
     persistEvent(database, turn, event, generateId);
     return event;
+  }
+
+  function clearUnstartedQueue({
+    conversation_id: conversationId,
+    through_queue_sequence: throughQueueSequence,
+    expected_queue_version: expectedQueueVersion,
+  }) {
+    if (typeof conversationId !== 'string' || conversationId.length === 0) {
+      throw new TypeError('conversation_id must be a non-empty string');
+    }
+    if (!Number.isSafeInteger(throughQueueSequence) || throughQueueSequence < 1) {
+      throw new TypeError('through_queue_sequence must be a positive safe integer');
+    }
+    if (!Number.isSafeInteger(expectedQueueVersion) || expectedQueueVersion < 1) {
+      throw new TypeError('expected_queue_version must be a positive safe integer');
+    }
+    const clear = database.transaction(() => {
+      const conversation = database.prepare(`
+        SELECT queue_version FROM runtime_conversations WHERE conversation_id = ?
+      `).get(conversationId);
+      if (!conversation) {
+        conflict('not_found', `Conversation ${conversationId} does not exist.`);
+      }
+      if (conversation.queue_version !== expectedQueueVersion) {
+        conflict('version_conflict', 'The queue aggregate version changed before clear.');
+      }
+      const clearedAt = now();
+      const acquired = database.prepare(`
+        UPDATE runtime_conversations
+        SET queue_version = queue_version + 1
+        WHERE conversation_id = ? AND queue_version = ?
+      `).run(conversationId, expectedQueueVersion);
+      if (acquired.changes !== 1) {
+        conflict('version_conflict', 'The queue aggregate lost its clear CAS.');
+      }
+      const rows = database.prepare(`
+        SELECT queue.turn_id
+        FROM runtime_turn_queue AS queue
+        JOIN runtime_turns AS turn ON turn.turn_id = queue.turn_id
+        WHERE queue.conversation_id = ?
+          AND queue.queue_sequence <= ?
+          AND queue.status = 'queued'
+          AND turn.state = 'queued'
+          AND turn.attempt_id IS NULL
+        ORDER BY queue.queue_sequence ASC
+      `).all(conversationId, throughQueueSequence);
+      const clearedTurnIds = [];
+      for (const { turn_id: turnId } of rows) {
+        cancelQueuedTurnInTransaction(turnId, clearedAt, 'queue_cleared_by_operator');
+        clearedTurnIds.push(turnId);
+      }
+      const committed = database.prepare(`
+        SELECT queue_version FROM runtime_conversations WHERE conversation_id = ?
+      `).get(conversationId);
+      return {
+        previous_version: expectedQueueVersion,
+        queue_version: committed.queue_version,
+        cleared_turn_ids: clearedTurnIds,
+        through_queue_sequence: throughQueueSequence,
+        committed_at: clearedAt,
+      };
+    });
+    return clear.immediate();
   }
 
   function synchronizeSteerReconciliationWithStopInTransaction(stopResult) {
@@ -4140,12 +4207,31 @@ export function createExecutorStore({
     }
   }
 
-  function stopConversation({ conversation_id: conversationId, stop_id: stopId }) {
+  function stopConversation({
+    conversation_id: conversationId,
+    stop_id: stopId,
+    target_turn_id: targetTurnId = null,
+    expected_turn_version: expectedTurnVersion = null,
+    clear_unstarted_queue: clearUnstartedQueue = true,
+  }) {
     if (typeof conversationId !== 'string' || conversationId.length === 0) {
       throw new TypeError('conversation_id must be a non-empty string');
     }
     if (typeof stopId !== 'string' || stopId.length === 0) {
       throw new TypeError('stop_id must be a non-empty string');
+    }
+    if ((targetTurnId === null) !== (expectedTurnVersion === null)) {
+      throw new TypeError('target_turn_id and expected_turn_version must be provided together');
+    }
+    if (targetTurnId !== null && (typeof targetTurnId !== 'string' || targetTurnId.length === 0)) {
+      throw new TypeError('target_turn_id must be a non-empty string');
+    }
+    if (expectedTurnVersion !== null
+      && (!Number.isSafeInteger(expectedTurnVersion) || expectedTurnVersion < 1)) {
+      throw new TypeError('expected_turn_version must be a positive safe integer');
+    }
+    if (typeof clearUnstartedQueue !== 'boolean') {
+      throw new TypeError('clear_unstarted_queue must be a boolean');
     }
     // The IMMEDIATE transaction is the linearization point shared with inbound
     // acceptance: its queue sequence snapshot is the durable stop cutoff.
@@ -4172,12 +4258,19 @@ export function createExecutorStore({
       const stoppedAt = now();
       const cutoff = conversation.last_queue_sequence;
       const activeRow = database.prepare(`
-        SELECT turn_id
+        SELECT turn_id, turn_version
         FROM runtime_turns
         WHERE conversation_id = ?
           AND state IN ('starting', 'running', 'waiting_user', 'redirecting', 'recovering')
         LIMIT 1
       `).get(conversationId);
+      if (targetTurnId !== null && (
+        !activeRow
+        || activeRow.turn_id !== targetTurnId
+        || activeRow.turn_version !== expectedTurnVersion
+      )) {
+        conflict('version_conflict', 'The exact active turn changed before stop.');
+      }
       let activeTurn = null;
       let attemptlessRecoveryStopped = false;
       let steering = null;
@@ -4349,7 +4442,7 @@ export function createExecutorStore({
           }
         }
       }
-      const queuedRows = database.prepare(`
+      const queuedRows = clearUnstartedQueue ? database.prepare(`
         SELECT queue.turn_id
         FROM runtime_turn_queue AS queue
         JOIN runtime_turns AS turn ON turn.turn_id = queue.turn_id
@@ -4358,7 +4451,7 @@ export function createExecutorStore({
           AND queue.status = 'queued'
           AND turn.state = 'queued'
         ORDER BY queue.queue_sequence ASC
-      `).all(conversationId, cutoff);
+      `).all(conversationId, cutoff) : [];
       const cancelledTurnIds = [];
       for (const { turn_id: turnId } of queuedRows) {
         cancelQueuedTurnInTransaction(turnId, stoppedAt);
@@ -5292,6 +5385,267 @@ export function createExecutorStore({
     `).get(conversationId);
     return blockingTurn === undefined
       && !workspaceLeases.hasBlockingBackgroundWork(conversationId);
+  }
+
+  function evictIdleExecutor({
+    conversation_id: conversationId,
+    executor_instance_id: executorInstanceId,
+    expected_executor_version: expectedExecutorVersion,
+  }) {
+    if (typeof conversationId !== 'string' || conversationId.length === 0) {
+      throw new TypeError('conversation_id must be a non-empty string');
+    }
+    if (typeof executorInstanceId !== 'string' || executorInstanceId.length === 0) {
+      throw new TypeError('executor_instance_id must be a non-empty string');
+    }
+    if (!Number.isSafeInteger(expectedExecutorVersion) || expectedExecutorVersion < 1) {
+      throw new TypeError('expected_executor_version must be a positive safe integer');
+    }
+    const evict = database.transaction(() => {
+      const resident = database.prepare(`
+        SELECT conversation_id, provider, owner_service_instance_id, owner_epoch
+        FROM runtime_executor_residents
+        WHERE conversation_id = ? AND provider = ?
+      `).get(conversationId, provider);
+      const attempt = database.prepare(`
+        SELECT executor_instance_id, attempt_no
+        FROM runtime_provider_attempts
+        WHERE conversation_id = ?
+        ORDER BY updated_at DESC, attempt_no DESC
+        LIMIT 1
+      `).get(conversationId);
+      const active = database.prepare(`
+        SELECT turn_version FROM runtime_turns
+        WHERE conversation_id = ?
+          AND state IN ('starting', 'running', 'waiting_user', 'redirecting', 'recovering')
+        LIMIT 1
+      `).get(conversationId);
+      if (!resident || attempt?.executor_instance_id !== executorInstanceId) {
+        conflict('not_found', 'The canonical executor target is not resident.');
+      }
+      const executorVersion = Math.max(
+        1,
+        resident.owner_epoch ?? 0,
+        active?.turn_version ?? 0,
+        attempt.attempt_no ?? 0,
+      );
+      if (executorVersion !== expectedExecutorVersion) {
+        conflict('version_conflict', 'The executor aggregate changed before eviction.');
+      }
+      if (!isConversationEvictable(conversationId)) {
+        conflict('version_conflict', 'The executor is no longer idle and evictable.');
+      }
+      const removed = database.prepare(`
+        DELETE FROM runtime_executor_residents
+        WHERE conversation_id = ? AND provider = ?
+          AND owner_epoch = ?
+          AND (owner_service_instance_id = ? OR owner_service_instance_id IS NULL)
+      `).run(
+        conversationId,
+        provider,
+        resident.owner_epoch,
+        serviceInstanceId,
+      );
+      if (removed.changes !== 1) {
+        conflict('version_conflict', 'The executor resident fence changed before eviction.');
+      }
+      return {
+        evicted: true,
+        executor_instance_id: executorInstanceId,
+        previous_version: executorVersion,
+        executor_version: executorVersion + 1,
+      };
+    });
+    return evict.immediate();
+  }
+
+  function decideRecovery({
+    recovery_id: recoveryId,
+    conversation_id: conversationId,
+    turn_id: turnId,
+    expected_recovery_version: expectedRecoveryVersion,
+    decision,
+  }) {
+    if (typeof recoveryId !== 'string' || recoveryId.length === 0
+      || typeof conversationId !== 'string' || conversationId.length === 0
+      || typeof turnId !== 'string' || turnId.length === 0) {
+      throw new TypeError('recovery_id, conversation_id, and turn_id are required strings');
+    }
+    if (!Number.isSafeInteger(expectedRecoveryVersion) || expectedRecoveryVersion < 1) {
+      throw new TypeError('expected_recovery_version must be a positive safe integer');
+    }
+    if (!['confirmed', 'rejected'].includes(decision)) {
+      throw new TypeError('decision must be confirmed or rejected');
+    }
+    const decide = database.transaction(() => {
+      const executionRecovery = database.prepare(`
+        SELECT recovery.*, interaction.request_json,
+          interaction.state AS interaction_state,
+          interaction.version AS interaction_version,
+          'execution' AS recovery_kind
+        FROM runtime_execution_recoveries AS recovery
+        JOIN runtime_interactions AS interaction
+          ON interaction.interaction_id = recovery.interaction_id
+        JOIN runtime_turns AS turn ON turn.turn_id = recovery.turn_id
+        WHERE recovery.recovery_id = ? AND recovery.turn_id = ?
+          AND turn.conversation_id = ?
+      `).get(recoveryId, turnId, conversationId);
+      const recovery = executionRecovery ?? database.prepare(`
+        SELECT recovery.*, interaction.interaction_id, interaction.request_json,
+          interaction.state AS interaction_state,
+          interaction.version AS interaction_version,
+          'reply_mapping' AS recovery_kind
+        FROM runtime_reply_mapping_recoveries AS recovery
+        JOIN runtime_interactions AS interaction
+          ON interaction.parent_type = 'recovery_control'
+          AND interaction.parent_id = recovery.recovery_id
+        JOIN runtime_turns AS turn ON turn.turn_id = recovery.turn_id
+        WHERE recovery.recovery_id = ? AND recovery.turn_id = ?
+          AND turn.conversation_id = ?
+      `).get(recoveryId, turnId, conversationId);
+      if (!recovery) conflict('not_found', 'The recovery aggregate does not exist.');
+      if (recovery.state !== 'waiting_decision'
+        || recovery.recovery_version !== expectedRecoveryVersion) {
+        conflict('version_conflict', 'The recovery decision lost its aggregate CAS.');
+      }
+      if (recovery.interaction_state !== 'pending') {
+        conflict('version_conflict', 'The recovery interaction is no longer pending.');
+      }
+      const decidedAt = now();
+      const request = JSON.parse(recovery.request_json);
+      const closedRequest = { ...request, state: 'cancelled', version: request.version + 1 };
+      validateInteractionRequest(closedRequest, { occurredAt: decidedAt });
+      const interactionUpdate = database.prepare(`
+        UPDATE runtime_interactions
+        SET state = 'cancelled', version = ?, request_json = ?, updated_at = ?
+        WHERE interaction_id = ? AND state = 'pending' AND version = ?
+      `).run(
+        closedRequest.version,
+        JSON.stringify(closedRequest),
+        decidedAt,
+        recovery.interaction_id,
+        recovery.interaction_version,
+      );
+      const recoveryState = decision === 'confirmed'
+        ? (recovery.recovery_kind === 'execution' ? 'authorized' : 'native_recovery_not_applicable')
+        : (recovery.recovery_kind === 'execution' ? 'stopped' : 'rejected');
+      const recoveryUpdate = recovery.recovery_kind === 'execution'
+        ? database.prepare(`
+          UPDATE runtime_execution_recoveries
+          SET state = ?, recovery_version = recovery_version + 1, updated_at = ?
+          WHERE recovery_id = ? AND turn_id = ? AND state = 'waiting_decision'
+            AND recovery_version = ?
+        `).run(
+          recoveryState,
+          decidedAt,
+          recoveryId,
+          turnId,
+          expectedRecoveryVersion,
+        )
+        : database.prepare(`
+          UPDATE runtime_reply_mapping_recoveries
+          SET state = ?, recovery_version = recovery_version + 1,
+            native_recovery_status = ?,
+            native_recovery_owner_service_instance_id = ?,
+            native_recovery_claim_expires_at = ?, updated_at = ?
+          WHERE recovery_id = ? AND turn_id = ? AND state = 'waiting_decision'
+            AND bound_lineage_id IS NULL AND recovery_version = ?
+        `).run(
+          recoveryState,
+          decision === 'confirmed' ? 'authorized_fallback' : 'rejected',
+          decision === 'confirmed' ? serviceInstanceId : null,
+          decision === 'confirmed' ? residentOwnerExpiresAt(decidedAt) : null,
+          decidedAt,
+          recoveryId,
+          turnId,
+          expectedRecoveryVersion,
+        );
+      if (interactionUpdate.changes !== 1 || recoveryUpdate.changes !== 1) {
+        conflict('version_conflict', 'The recovery decision lost its durable CAS.');
+      }
+      if (decision === 'rejected') {
+        if (recovery.recovery_kind === 'execution') {
+          const turn = loadTurn(database, turnId);
+          transitionInTransaction(database, {
+            turnId,
+            fromState: 'recovering',
+            toState: 'stopped',
+            fence: {
+              attempt_id: recovery.attempt_id,
+              attempt_no: recovery.attempt_no,
+              lease_epoch: recovery.lease_epoch,
+            },
+            provider,
+            serviceInstanceId,
+            occurredAt: decidedAt,
+            generateId,
+            reasonCode: 'execution_recovery_stopped_by_operator',
+            requireActiveLease: false,
+            retainLease: true,
+          });
+          database.prepare(`
+            UPDATE runtime_provider_attempts
+            SET state = 'stopped', side_effect_status = 'unknown', updated_at = ?
+            WHERE turn_id = ? AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+          `).run(
+            decidedAt,
+            turn.turn_id,
+            recovery.attempt_id,
+            recovery.attempt_no,
+            recovery.lease_epoch,
+          );
+        } else {
+          transitionAttemptlessInTransaction(database, {
+            turnId,
+            fromState: 'recovering',
+            toState: 'stopped',
+            occurredAt: decidedAt,
+            generateId,
+            reasonCode: 'reply_mapping_recovery_rejected',
+          });
+        }
+        database.prepare(`
+          UPDATE runtime_turn_queue
+          SET status = 'stopped', wait_reason = NULL
+          WHERE turn_id = ? AND status = 'claimed'
+        `).run(turnId);
+      } else if (recovery.recovery_kind === 'execution') {
+        database.prepare(`
+          UPDATE runtime_turn_queue
+          SET wait_reason = 'execution_recovery_authorized'
+          WHERE turn_id = ? AND status = 'claimed'
+        `).run(turnId);
+      } else {
+        const queued = database.prepare(`
+          UPDATE runtime_turn_queue
+          SET wait_reason = 'reply_mapping_recovery_binding'
+          WHERE turn_id = ? AND status = 'claimed'
+            AND wait_reason = 'reply_mapping_recovery_decision'
+        `).run(turnId);
+        if (queued.changes !== 1) {
+          conflict('version_conflict', 'The reply-mapping recovery lost its queue fence.');
+        }
+        completeReplyMappingRecovery({ recovery_id: recoveryId, turn_id: turnId }, {
+          status: 'authorized_fallback',
+          recovery_id: recoveryId,
+          side_effect_status: 'unknown',
+        });
+      }
+      const recoveryTable = recovery.recovery_kind === 'execution'
+        ? 'runtime_execution_recoveries'
+        : 'runtime_reply_mapping_recoveries';
+      const versionRow = database.prepare(`
+        SELECT recovery_version FROM ${recoveryTable}
+        WHERE recovery_id = ?
+      `).get(recoveryId);
+      return {
+        decision,
+        recovery_turn_id: null,
+        previous_version: expectedRecoveryVersion,
+        recovery_version: versionRow.recovery_version,
+      };
+    });
+    return decide.immediate();
   }
 
   function startWorkspaceBackgroundWork(turnContext, providerTaskId) {
@@ -8781,6 +9135,7 @@ export function createExecutorStore({
     claimNextQueuedTurn,
     claimOrphanedWorkspaceRecoveries,
     claimInteractionHandoff,
+    clearUnstartedQueue,
     completeSteer,
     commitInteractionAnswer,
     completeReplyMappingRecovery,
@@ -8811,6 +9166,8 @@ export function createExecutorStore({
     listWorkspaceLeaseObservability: workspaceLeases.listObservability,
     listWorkspaceReservationCandidates: listClaimableQueuedTurns,
     exhaustProviderRetries,
+    evictIdleExecutor,
+    decideRecovery,
     failSteer,
     getInteractionHandoffForRecovery,
     recordInteractionHandoffQueryUnproven,

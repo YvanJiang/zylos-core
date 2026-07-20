@@ -4,6 +4,7 @@ import {
   canonicalizeJson,
   createContractError,
 } from '../../contracts/public/index.js';
+import { createOperationsControlService } from '../control/operations-control-service.js';
 import { createRuntimeSnapshotPublisher } from '../observability/snapshot-publisher.js';
 import { createPermissionService } from '../permissions/permission-service.js';
 import { createExecutorStore } from '../persistence/executor-store.js';
@@ -148,6 +149,8 @@ export function createExecutorService({
   providerRetryJitterRatio = 0.2,
   providerRetryRandom = Math.random,
   maxResidentExecutorsPerBot = 20,
+  operationsPolicy = null,
+  operationsServiceNamespace = null,
   setTimeoutFn = setTimeout,
   clearTimeoutFn = clearTimeout,
   onDeadlineError = () => {},
@@ -329,6 +332,15 @@ export function createExecutorService({
       draining: lifecycle === 'closing',
       reconciling: workspaceRecoveryFlight !== null,
     }),
+  });
+  const operationsControl = operationsPolicy === null ? null : createOperationsControlService({
+    database,
+    serviceInstanceId,
+    deploymentPolicy: operationsPolicy,
+    runtimeStore: store,
+    serviceNamespace: operationsServiceNamespace,
+    now,
+    generateId,
   });
 
   function persistenceFailure(cause) {
@@ -1762,6 +1774,66 @@ export function createExecutorService({
     return settlement;
   }
 
+  async function executeOperationsControl(request, trustedTransportContext) {
+    if (operationsControl === null) {
+      throw new Error('Operations control is unavailable without a deployment policy.');
+    }
+    const result = await operationsControl.execute(request, trustedTransportContext);
+    if (request?.action === 'stop_active_turn' && result.status === 'completed') {
+      await performStop({
+        conversation_id: request.target.conversation_id,
+        stop_id: request.control_id,
+        target_turn_id: request.target.turn_id,
+        expected_turn_version: request.expected_version.version,
+        clear_unstarted_queue: false,
+      });
+    } else if (request?.action === 'reconcile' && result.status === 'accepted') {
+      try {
+        store.reconcileExpiredResidents();
+        adoptOrphanedWorkspaceRecoveries();
+        store.reconcileExpiredStartedInteractionHandoffs();
+        store.reconcileNonterminalTurns(
+          [...activeRuns.values()].map(({ turnContext }) => turnContext),
+          'sweep_reconciliation',
+        );
+        observabilityPublisher.recordReconciliation();
+        const terminal = operationsControl.completeReconciliation(request);
+        try { refresh(); } catch {}
+        return terminal;
+      } catch (error) {
+        return operationsControl.completeReconciliation(request, error);
+      }
+    } else if (request?.action === 'evict_idle_executor' && result.status === 'accepted') {
+      if (typeof adapter.evictIdle !== 'function') {
+        return operationsControl.completeEviction(request, {
+          code: 'unsupported_capability',
+          category: 'internal',
+          retryable: false,
+          side_effect_status: 'none',
+          user_message: 'The provider adapter does not support executor eviction.',
+        });
+      }
+      try {
+        const evicted = await adapter.evictIdle({
+          canEvict: (conversationId) => (
+            conversationId === request.target.conversation_id
+            && store.isConversationEvictable(conversationId)
+          ),
+          maxCount: 1,
+          targetConversationId: request.target.conversation_id,
+        });
+        if (!evicted.includes(request.target.conversation_id)) {
+          throw new Error('The provider adapter did not evict the canonical executor target.');
+        }
+        endedResidentFences.delete(request.target.conversation_id);
+        return operationsControl.completeEviction(request);
+      } catch (error) {
+        return operationsControl.completeEviction(request, error);
+      }
+    }
+    return result;
+  }
+
   async function performSteer(request) {
     // The durable running -> redirecting CAS selects the steer winner before
     // any provider-private cancellation is requested.
@@ -2481,6 +2553,7 @@ export function createExecutorService({
     close,
     deliverInteractionAnswer,
     evictIdleExecutors,
+    executeOperationsControl,
     expireInteraction,
     publishObservabilitySnapshot: observabilityPublisher.publish,
     reconcileWorkspaceRecoveries,
