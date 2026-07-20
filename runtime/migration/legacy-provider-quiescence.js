@@ -127,7 +127,7 @@ export function createLegacyProviderQuiescence({
     return { ...row, birth_identity: birth };
   }
 
-  function inspect() {
+  function inspectOnce() {
     try {
       tmux(['has-session', '-t', `=${session}`]);
     } catch (error) {
@@ -170,6 +170,18 @@ export function createLegacyProviderQuiescence({
     });
   }
 
+  function inspect() {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      try {
+        return inspectOnce();
+      } catch (error) {
+        if (error?.code !== 'ESRCH' || attempt === 7) throw error;
+        wait(10);
+      }
+    }
+    throw new Error('Legacy provider process ownership did not stabilize.');
+  }
+
   function hasExactSession() {
     try {
       tmux(['has-session', '-t', `=${session}`], { timeout: 1_000 });
@@ -195,8 +207,7 @@ export function createLegacyProviderQuiescence({
       }
       for (const row of tree.filter(({ state }) => !state.startsWith('T'))) {
         const identity = identities.find(({ pid }) => pid === row.pid);
-        currentIdentity(identity);
-        signalProcess(row.pid, 'SIGSTOP');
+        signalExactIdentity(identity, 'SIGSTOP');
       }
       const signature = tree.map(({ pid, pgid, state }) => `${pid}:${pgid}:${state[0]}`).sort().join(',');
       if (tree.every(({ state }) => state.startsWith('T')) && signature === previous) {
@@ -219,10 +230,11 @@ export function createLegacyProviderQuiescence({
     if (currentIdentity(observed.server) === null || currentIdentity(observed.pane) === null) {
       throw new Error('Legacy provider server or pane disappeared before suspension.');
     }
-    signalProcess(observed.server.pid, 'SIGSTOP');
+    if (!signalExactIdentity(observed.server, 'SIGSTOP')) {
+      throw new Error('Legacy provider server disappeared before suspension.');
+    }
     for (const member of observed.members) {
-      currentIdentity(member);
-      signalProcess(member.pid, 'SIGSTOP');
+      signalExactIdentity(member, 'SIGSTOP');
     }
     const members = stableStoppedTree(observed);
     const suspended = Object.freeze({ ...observed, members, suspended: true });
@@ -285,12 +297,14 @@ export function createLegacyProviderQuiescence({
     }
     if (phase !== 'resuming') onPhase('resuming', resumedRecord);
     for (const member of currentMembers.filter(({ state }) => state.startsWith('T'))) {
-      currentIdentity(member);
-      signalProcess(member.pid, 'SIGCONT');
+      if (!signalExactIdentity(member, 'SIGCONT')) {
+        throw new Error('Legacy provider member disappeared while resuming.');
+      }
     }
     if (currentServer.state.startsWith('T')) {
-      currentIdentity(record.server);
-      signalProcess(record.server.pid, 'SIGCONT');
+      if (!signalExactIdentity(record.server, 'SIGCONT')) {
+        throw new Error('Legacy provider server disappeared while resuming.');
+      }
     }
     const observed = inspect();
     if (!observed.active || observed.server.birth_identity !== record.server.birth_identity
@@ -329,7 +343,12 @@ export function createLegacyProviderQuiescence({
   function signalExactIdentity(identity, signal, identityOptions) {
     const current = currentIdentity(identity, identityOptions);
     if (current === null) return false;
-    signalProcess(current.pid, signal);
+    try {
+      signalProcess(current.pid, signal);
+    } catch (error) {
+      if (error?.code === 'ESRCH') return false;
+      throw error;
+    }
     return true;
   }
 

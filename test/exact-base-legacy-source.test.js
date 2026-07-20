@@ -210,6 +210,7 @@ describe('exact-base durable source fencing', () => {
     ).trim()));
     const signals = [];
     const calls = [];
+    let stopAttempts = 0;
     const quiescence = createLegacyProviderQuiescence({
       provider: 'claude',
       execFileSyncFn(file, args, options) {
@@ -219,12 +220,16 @@ describe('exact-base durable source fencing', () => {
       tmuxArgsPrefix: ['-L', server],
       signalProcess(pid, signal) {
         signals.push([pid, signal]);
+        if (signal === 'SIGSTOP' && ++stopAttempts === 3) {
+          throw Object.assign(new Error('fixture process exited before signal'), { code: 'ESRCH' });
+        }
         process.kill(pid, signal);
       },
     });
     const phases = [];
     const phaseJournal = { onPhase: (phase) => phases.push(phase) };
     const suspended = quiescence.suspend(null, phaseJournal);
+    expect(stopAttempts).toBeGreaterThanOrEqual(3);
     expect(suspended).toMatchObject({ active: true, suspended: true, session: 'claude-main' });
     expect(suspended.process_group_id).toBe(suspended.pane.pgid);
     expect(new Set(suspended.members.map(({ pgid }) => pgid))).toEqual(
