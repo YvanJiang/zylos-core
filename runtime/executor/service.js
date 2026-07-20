@@ -1852,7 +1852,7 @@ export function createExecutorService({
           cancelResidentHeartbeat(residentHeartbeat);
           residentHeartbeat = null;
         }
-        if (lifecycle === 'closed' && permissionSweep !== null) {
+        if (permissionSweep !== null) {
           cancelPermissionSweep(permissionSweep);
           permissionSweep = null;
         }

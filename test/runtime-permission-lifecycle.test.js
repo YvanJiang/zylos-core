@@ -884,6 +884,38 @@ describe('persistent bot permission confirmation', () => {
     database.close();
   });
 
+  test('cancels the permission expiry sweep even when provider shutdown fails', async () => {
+    const database = openDatabase();
+    const permissionSweepHandle = { unref() {} };
+    const cancelPermissionSweep = jest.fn();
+    const runtimeService = createExecutorService({
+      database,
+      adapter: {
+        async *execute() {},
+        async close() {
+          throw new Error('adapter close boom');
+        },
+      },
+      provider: 'claude',
+      serviceInstanceId: 'failed-close-permission-expiry',
+      generateId: deterministicIds('failed-close-permission-expiry'),
+      scheduleResidentHeartbeat() {
+        return { unref() {} };
+      },
+      cancelResidentHeartbeat() {},
+      schedulePermissionSweep() {
+        return permissionSweepHandle;
+      },
+      cancelPermissionSweep,
+    });
+    runtimeService.start();
+
+    await expect(runtimeService.close()).rejects.toThrow('adapter close boom');
+    expect(cancelPermissionSweep).toHaveBeenCalledTimes(1);
+    expect(cancelPermissionSweep).toHaveBeenCalledWith(permissionSweepHandle);
+    database.close();
+  });
+
   test('reconciles already-expired permission state immediately on service restart', async () => {
     const database = openDatabase();
     const file = database.prepare('PRAGMA database_list').all()
