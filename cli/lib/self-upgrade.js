@@ -35,7 +35,7 @@ import {
   verifyInstructionConservation,
   writeMigrationPrompt,
 } from './instruction-migration.js';
-import { deployManifestTemplate } from './runtime/tmux-env.js';
+import { deployManifestTemplate } from './runtime/runtime-env-manifest.js';
 import { writeCodexConfig } from './runtime-setup.js';
 import { getCoreEcosystemPath, restartManagedProcess } from './pm2.js';
 
@@ -1496,171 +1496,30 @@ export function createFinalizeState(ctx) {
     mode: ctx.mode,
   };
 }
-
-function writeFinalizeState(ctx) {
-  const statePath = path.join(ctx.tempDir, 'self-upgrade-finalize-state.json');
-  fs.writeFileSync(statePath, `${JSON.stringify(createFinalizeState(ctx), null, 2)}\n`, {
-    encoding: 'utf8',
-    mode: 0o600,
-  });
-  return statePath;
+function durableRuntimeGuardResult(error = (
+  'Legacy self-upgrade is disabled because the durable runtime owns upgrades.'
+)) {
+  return {
+    action: 'self_upgrade',
+    success: false,
+    from: null,
+    to: null,
+    failedStep: 0,
+    error,
+    steps: [],
+    rollback: { performed: false, steps: [] },
+    durableRuntimeOwner: true,
+  };
 }
 
-function runInstalledFinalizer(ctx) {
-  const finalizeScript = resolveInstalledPackageScript('cli', 'lib', 'self-upgrade-finalize.js');
-  if (!finalizeScript) {
-    throw new Error('newly installed self-upgrade finalizer not found');
-  }
-
-  const statePath = writeFinalizeState(ctx);
-  const result = spawnSync(process.execPath, [finalizeScript, statePath], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 180000,
-  });
-
-  if (result.error) {
-    throw result.error;
-  }
-
-  const output = String(result.stdout || '').trim();
-  if (!output) {
-    const err = String(result.stderr || '').trim() || `finalizer exited ${result.status}`;
-    throw new Error(err);
-  }
-
-  const parsed = JSON.parse(output);
-  if (result.status !== 0 && parsed?.success !== false) {
-    const err = String(result.stderr || '').trim() || `finalizer exited ${result.status}`;
-    throw new Error(err);
-  }
-
-  return parsed;
+// Normal CLI entry points are permanently fail-closed. Historical step helpers remain only so
+// one-time, offline migration tooling can read old artifacts; they cannot dispatch an upgrade.
+export function runSelfUpgrade() {
+  return durableRuntimeGuardResult();
 }
 
-export function runSelfUpgradeFinalize(state = {}, deps = {}) {
-  if (state.schemaVersion !== undefined && state.schemaVersion !== 1) {
-    return {
-      action: 'self_upgrade',
-      success: false,
-      from: state.from || null,
-      to: null,
-      failedStep: 5,
-      error: `unsupported finalize state schemaVersion: ${state.schemaVersion}`,
-      steps: [],
-      rollback: { performed: false, steps: [] },
-    };
-  }
-
-  const ctx = createContext({
-    tempDir: state.tempDir,
-    newVersion: state.newVersion || state.to,
-    mode: state.mode,
-  });
-  ctx.backupDir = state.backupDir || null;
-  ctx.servicesWereRunning = Array.isArray(state.servicesWereRunning) ? [...state.servicesWereRunning] : [];
-  ctx.from = state.from || null;
-  ctx.to = state.to || state.newVersion || null;
-
-  const steps = deps.steps || POST_INSTALL_STEPS;
-  const total = deps.total || 13;
-  let failedStep = null;
-
-  for (const stepFn of steps) {
-    const result = stepFn(ctx);
-    result.total = total;
-    ctx.steps.push(result);
-
-    if (result.status === 'failed') {
-      failedStep = result;
-      ctx.error = result.error;
-      break;
-    }
-  }
-
-  if (failedStep) {
-    return buildSelfUpgradeResult(ctx, failedStep, null, false);
-  }
-
-  return buildSelfUpgradeResult(ctx, null);
-}
-
-/**
- * Run the 13-step self-upgrade pipeline.
- * Template migration and Claude restart are handled by Claude after this completes.
- * Lock must be acquired by caller.
- *
- * @param {{ tempDir: string, newVersion: string, onStep?: function }} opts
- * @param {object} [deps] - Isolated self-upgrade seam for npm, PM2, version, rollback, and finalizer boundaries
- * @returns {object} Upgrade result
- */
-export function runSelfUpgrade({ tempDir, newVersion, mode, onStep } = {}, deps = {}) {
-  const ctx = createContext({ tempDir, newVersion, mode });
-
-  const getCurrentVersionFn = deps.getCurrentVersion ?? getCurrentVersion;
-  const current = getCurrentVersionFn();
-  if (current.success) {
-    ctx.from = current.version;
-  }
-  ctx.to = newVersion || null;
-
-  const preInstallSteps = deps.preInstallSteps ?? [
-    (stepCtx) => step1_backupCoreSkills(stepCtx, deps.step1),
-    step2_preUpgradeHook,
-    (stepCtx) => step3_stopCoreServices(stepCtx, deps.step3),
-    (stepCtx) => step4_npmInstallGlobal(stepCtx, deps.step4),
-  ];
-
-  const total = 13;
-  let failedStep = null;
-
-  for (const stepFn of preInstallSteps) {
-    const result = stepFn(ctx);
-    result.total = total;
-    ctx.steps.push(result);
-    if (onStep) onStep(result);
-
-    if (result.status === 'failed') {
-      failedStep = result;
-      ctx.error = result.error;
-      break;
-    }
-  }
-
-  if (failedStep) {
-    const rollbackFn = deps.rollbackSelf ?? rollbackSelf;
-    const rollbackResults = rollbackFn(ctx);
-    return buildSelfUpgradeResult(ctx, failedStep, rollbackResults);
-  }
-
-  try {
-    const finalizerFn = deps.runInstalledFinalizer ?? runInstalledFinalizer;
-    const finalizeResult = finalizerFn(ctx);
-    const finalizeSteps = Array.isArray(finalizeResult.steps) ? finalizeResult.steps : [];
-    for (const step of finalizeSteps) {
-      ctx.steps.push(step);
-      if (onStep) onStep(step);
-    }
-    return {
-      ...finalizeResult,
-      from: ctx.from,
-      steps: ctx.steps,
-      backupDir: finalizeResult.backupDir || ctx.backupDir,
-    };
-  } catch (err) {
-    const error = err.stderr?.toString().trim() || err.message;
-    failedStep = {
-      step: 5,
-      name: 'run_new_upgrade_finalizer',
-      status: 'failed',
-      error,
-      total,
-      duration: 0,
-    };
-    ctx.steps.push(failedStep);
-    if (onStep) onStep(failedStep);
-    return buildSelfUpgradeResult(ctx, failedStep, null, false);
-  }
+export function runSelfUpgradeFinalize() {
+  return durableRuntimeGuardResult();
 }
 
 // ---------------------------------------------------------------------------

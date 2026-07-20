@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+export { deployManifestTemplate } from './runtime-env-manifest.js';
+
 const VALID_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 const BASE_VARS = ['PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TERM', 'SHELL'];
@@ -83,15 +85,6 @@ export function parseRuntimeEnvManifest(content, warnings = []) {
  * Deploy runtime-env.manifest from template if it does not already exist.
  * @returns {'created'|'exists'|'template_missing'} Status of the deployment.
  */
-export function deployManifestTemplate(templatePath, zylosDir) {
-  const dest = path.join(zylosDir, '.zylos', 'runtime-env.manifest');
-  if (fs.existsSync(dest)) return 'exists';
-  if (!fs.existsSync(templatePath)) return 'template_missing';
-  fs.mkdirSync(path.dirname(dest), { recursive: true });
-  fs.copyFileSync(templatePath, dest);
-  return 'created';
-}
-
 /**
  * Load and parse runtime-env.manifest from ZYLOS_DIR/.zylos/.
  * Returns empty manifest if file is missing.

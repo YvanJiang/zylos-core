@@ -2567,6 +2567,8 @@ export function createCodexAppServerAdapter({
   }
 
   return Object.freeze({
+    provider: 'codex',
+    provider_transport: 'official_app_server',
     abort,
     cancel,
     close,

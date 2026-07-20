@@ -136,7 +136,19 @@ function loadCandidates(database, transactionTime) {
 
 function readCanonicalContent(database, candidate) {
   let row;
-  if (candidate.record_kind === 'operations_idempotency_conflict') {
+  if (candidate.record_kind === 'legacy_migration_payload') {
+    const [upgradeId, legacyKind, legacyRecordId] = JSON.parse(candidate.record_id);
+    row = database.prepare(`
+      SELECT * FROM runtime_legacy_migration_payloads
+      WHERE upgrade_id = ? AND legacy_kind = ? AND legacy_record_id = ?
+    `).get(upgradeId, legacyKind, legacyRecordId);
+  } else if (candidate.record_kind === 'legacy_migration_audit_payload') {
+    const [upgradeId, legacyKind, legacyRecordId] = JSON.parse(candidate.record_id);
+    row = database.prepare(`
+      SELECT * FROM runtime_legacy_migration_audit_payloads
+      WHERE upgrade_id = ? AND legacy_kind = ? AND legacy_record_id = ?
+    `).get(upgradeId, legacyKind, legacyRecordId);
+  } else if (candidate.record_kind === 'operations_idempotency_conflict') {
     const [callerNamespace, controlId, requestHash] = JSON.parse(candidate.record_id);
     row = database.prepare(`
       SELECT *
@@ -157,6 +169,21 @@ function readCanonicalContent(database, candidate) {
 }
 
 function disposeRecord(database, candidate) {
+  if (candidate.record_kind === 'legacy_migration_payload' && candidate.disposal_kind === 'delete') {
+    const [upgradeId, legacyKind, legacyRecordId] = JSON.parse(candidate.record_id);
+    return database.prepare(`
+      DELETE FROM runtime_legacy_migration_payloads
+      WHERE upgrade_id = ? AND legacy_kind = ? AND legacy_record_id = ?
+    `).run(upgradeId, legacyKind, legacyRecordId).changes;
+  }
+  if (candidate.record_kind === 'legacy_migration_audit_payload'
+    && candidate.disposal_kind === 'delete') {
+    const [upgradeId, legacyKind, legacyRecordId] = JSON.parse(candidate.record_id);
+    return database.prepare(`
+      DELETE FROM runtime_legacy_migration_audit_payloads
+      WHERE upgrade_id = ? AND legacy_kind = ? AND legacy_record_id = ?
+    `).run(upgradeId, legacyKind, legacyRecordId).changes;
+  }
   if (candidate.record_kind === 'normalized_event' && candidate.disposal_kind === 'delete') {
     return database.prepare(`
       DELETE FROM runtime_normalized_events WHERE event_id = ?
