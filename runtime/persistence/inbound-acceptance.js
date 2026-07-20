@@ -19,6 +19,13 @@ import {
   stageMainProjection,
 } from './main-projection.js';
 import { initializeRuntimePersistence } from './schema.js';
+import {
+  acceptPermissionCommandInTransaction,
+  bindPermissionToAcceptedTurnInTransaction,
+  DEFAULT_PERMISSION_CONFIRMATION_TIMEOUT_MS,
+  DEFAULT_PERMISSION_MAX_TIMED_DURATION_MS,
+  parsePermissionCommand,
+} from '../permissions/permission-service.js';
 
 export const INBOUND_ENVELOPE_KNOWN_FIELDS = Object.freeze([
   'contract',
@@ -387,6 +394,8 @@ export function acceptNormalInbound(
     generateId = defaultGenerateId,
     maxQueuedTurns = DEFAULT_MAX_QUEUED_TURNS,
     initialDeliveryOperation = 'create_main',
+    permissionMaxTimedDurationMs = DEFAULT_PERMISSION_MAX_TIMED_DURATION_MS,
+    permissionConfirmationTimeoutMs = DEFAULT_PERMISSION_CONFIRMATION_TIMEOUT_MS,
   } = {},
 ) {
   if (!Number.isSafeInteger(maxQueuedTurns) || maxQueuedTurns <= 0) {
@@ -394,6 +403,15 @@ export function acceptNormalInbound(
   }
   if (!['create_main', 'send_text'].includes(initialDeliveryOperation)) {
     throw new TypeError('initialDeliveryOperation must be create_main or send_text');
+  }
+  if (!Number.isSafeInteger(permissionMaxTimedDurationMs) || permissionMaxTimedDurationMs <= 0) {
+    throw new TypeError('permissionMaxTimedDurationMs must be a positive safe integer');
+  }
+  if (
+    !Number.isSafeInteger(permissionConfirmationTimeoutMs)
+    || permissionConfirmationTimeoutMs <= 0
+  ) {
+    throw new TypeError('permissionConfirmationTimeoutMs must be a positive safe integer');
   }
   const validated = validateInboundEnvelope(envelope);
   if (!validated.forwarded.actor.authenticated) {
@@ -410,6 +428,9 @@ export function acceptNormalInbound(
     extensionFields: Object.keys(validated.extensions),
   });
   initializeRuntimePersistence(database);
+  const permissionCommand = parsePermissionCommand(validated.forwarded, {
+    maxTimedDurationMs: permissionMaxTimedDurationMs,
+  });
 
   const commit = database.transaction(() => {
     const existingIdempotency = database.prepare(`
@@ -479,6 +500,31 @@ export function acceptNormalInbound(
         envelope.native_thread_or_topic_id,
         committedAt,
       );
+    }
+
+    if (permissionCommand !== null) {
+      const permissionResult = acceptPermissionCommandInTransaction(database, {
+        envelope: validated.forwarded,
+        command: permissionCommand,
+        conversationId: conversation.conversation_id,
+        payloadHash,
+        committedAt,
+        generateId,
+        confirmationTimeoutMs: permissionConfirmationTimeoutMs,
+      });
+      validateInboundResult(permissionResult);
+      database.prepare(`
+        INSERT INTO runtime_inbound_idempotency (
+          idempotency_key, inbound_event_id, payload_hash, first_result_json, committed_at
+        ) VALUES (?, ?, ?, ?, ?)
+      `).run(
+        envelope.idempotency_key,
+        envelope.inbound_event_id,
+        payloadHash,
+        JSON.stringify(permissionResult),
+        committedAt,
+      );
+      return permissionResult;
     }
 
     const lineage = resolveNormalLineage(
@@ -614,6 +660,13 @@ export function acceptNormalInbound(
         pendingRecovery ? 'lineage_resolution_pending' : null,
         committedAt,
       );
+      bindPermissionToAcceptedTurnInTransaction(database, {
+        turnId,
+        actorId: envelope.actor.actor_id,
+        conversationId: conversation.conversation_id,
+        acceptedAt: committedAt,
+        generateId,
+      });
     }
 
     const receivedEvent = buildLifecycleEvent({

@@ -272,6 +272,11 @@ const HOOK_EVENT_NAMES = Object.freeze(new Set([
 ]));
 const HOOK_HANDLER_TYPES = Object.freeze(new Set(['command', 'prompt', 'agent']));
 const HOOK_EXECUTION_MODES = Object.freeze(new Set(['sync', 'async']));
+const PROTECTED_APPROVAL_METHODS = Object.freeze(new Set([
+  'item/commandExecution/requestApproval',
+  'item/fileChange/requestApproval',
+  'item/permissions/requestApproval',
+]));
 const HOOK_TERMINAL_STATUSES = Object.freeze(new Set([
   'completed',
   'failed',
@@ -758,6 +763,7 @@ export function createCodexAppServerAdapter({
         ));
         return;
       }
+      if (group.auto_approved === true) providerRequests.delete(group.request_key);
       rememberConnectionFence(
         target,
         target.retired_server_requests,
@@ -1595,11 +1601,34 @@ export function createCodexAppServerAdapter({
       ))),
       mcp_form: components[0]?.mcp_form ?? null,
       response_sent: false,
+      auto_approved: false,
       resolved,
       resolveResolved,
       rejectResolved,
     };
     providerRequests.set(requestKey, group);
+    if (
+      PROTECTED_APPROVAL_METHODS.has(message.method)
+      && typeof run.controls?.authorizeProtectedAction === 'function'
+    ) {
+      const permission = run.controls.authorizeProtectedAction({
+        action_ref: `codex:${target.connection_id}:${requestId}:${message.method}`,
+        action_kind: message.method,
+      });
+      if (permission.trusted) {
+        const answers = new Map(components.map(({ component_key: componentKey }) => [
+          componentKey,
+          { kind: 'decision', decision: 'approve' },
+        ]));
+        group.response_sent = true;
+        group.auto_approved = true;
+        sendServerResponse(target, message.id, buildProviderResponse(group, answers));
+        group.resolved.then(() => {
+          providerRequests.delete(group.request_key);
+        }).catch((error) => failConnection(target, error));
+        return;
+      }
+    }
     const descriptors = components.map((component) => {
       nextInteractionNo += 1;
       const providerInteractionRef = `codex-app-server-interaction-${nextInteractionNo}`;
@@ -1880,7 +1909,7 @@ export function createCodexAppServerAdapter({
     });
   }
 
-  async function* execute(context) {
+  async function* execute(context, controls = null) {
     requireExecutionContext(context);
     const target = await ensureConnection();
     const threadId = await loadThread(target, context);
@@ -1905,6 +1934,7 @@ export function createCodexAppServerAdapter({
       hook_runs: new Map(),
       turn_id: null,
       terminal_status: null,
+      controls,
     };
     inFlightTurnStarts.add(run);
     try {

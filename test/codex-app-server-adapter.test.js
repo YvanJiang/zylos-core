@@ -1327,6 +1327,73 @@ describe('Codex app-server provider adapter', () => {
     await iterator.return();
   });
 
+  test('auto-approves native protected actions only after Core returns a trusted decision', async () => {
+    const authorizeProtectedAction = jest.fn(() => ({
+      trusted: true,
+      basis_kind: 'persistent_bot',
+      checked_policy_revision: 7,
+    }));
+    const server = createFakeAppServer({
+      afterTurnStart(details) {
+        sendStartedFileChange(details, 'trusted-file-change');
+        details.send({
+          id: 'trusted-provider-request',
+          method: 'item/fileChange/requestApproval',
+          params: {
+            threadId: details.threadId,
+            turnId: details.turnId,
+            itemId: 'trusted-file-change',
+            startedAtMs: 1,
+            reason: 'Trusted policy recheck.',
+          },
+        });
+      },
+      onClientResponse({ message, send }) {
+        send({
+          method: 'serverRequest/resolved',
+          params: { threadId: 'codex-thread-1', requestId: message.id },
+        });
+        send({
+          method: 'item/completed',
+          params: {
+            threadId: 'codex-thread-1',
+            turnId: 'codex-turn-1',
+            item: {
+              type: 'fileChange',
+              id: 'trusted-file-change',
+              status: 'completed',
+              changes: [],
+            },
+          },
+        });
+        send({
+          method: 'turn/completed',
+          params: {
+            threadId: 'codex-thread-1',
+            turn: { id: 'codex-turn-1', status: 'completed', items: [] },
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    const events = await collect(adapter.execute(executionContext(), {
+      authorizeProtectedAction,
+    }));
+
+    expect(authorizeProtectedAction).toHaveBeenCalledWith({
+      action_ref: expect.stringMatching(
+        /^codex:codex-app-server-1:s:trusted-provider-request:/,
+      ),
+      action_kind: 'item/fileChange/requestApproval',
+    });
+    expect(events).not.toContainEqual(expect.objectContaining({ kind: 'interaction_requested' }));
+    expect(server.received).toContainEqual({
+      id: 'trusted-provider-request',
+      result: { decision: 'accept' },
+    });
+  });
+
   test('fails closed when one provider request contains multiple questions', async () => {
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {

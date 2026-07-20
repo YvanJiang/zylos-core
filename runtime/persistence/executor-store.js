@@ -21,6 +21,7 @@ import {
   validateDeliveryCommand,
   validateInboundEnvelope,
 } from '../../contracts/public/index.js';
+import { bindPermissionToAcceptedTurnInTransaction } from '../permissions/permission-service.js';
 import { createDeliveryLaneKey } from './delivery-lane-key.js';
 import {
   buildInitialDeliveryCommand,
@@ -719,6 +720,7 @@ export function createExecutorStore({
       SELECT candidate.request_json
       FROM runtime_interactions AS candidate
       WHERE candidate.state = 'pending'
+        AND candidate.parent_type != 'security_control'
         AND NOT EXISTS (
           SELECT 1
           FROM runtime_interactions AS blocker
@@ -3108,6 +3110,13 @@ export function createExecutorStore({
           conversation_id, queue_sequence, turn_id, status, priority, enqueued_at
         ) VALUES (?, ?, ?, 'queued', 1, ?)
       `).run(current.conversation_id, queueSequence, priorityTurnId, completedAt);
+      bindPermissionToAcceptedTurnInTransaction(database, {
+        turnId: priorityTurnId,
+        actorId: envelope.actor.actor_id,
+        conversationId: current.conversation_id,
+        acceptedAt: completedAt,
+        generateId,
+      });
 
       const receivedEvent = buildLifecycleEvent({
         eventId: generateId('event'),
