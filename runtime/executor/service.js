@@ -779,6 +779,10 @@ export function createExecutorService({
         refresh();
         return recoveryClaim;
       }
+      if (recoveryClaim.status === 'native_recovery_in_flight') {
+        refresh();
+        return replyMappingRecovery;
+      }
       let nativeResult = {
         status: 'not_applicable',
         recovery_id: recoveryClaim.recovery_id,
@@ -798,6 +802,8 @@ export function createExecutorService({
           nativeResult = {
             status: 'failed',
             recovery_id: recoveryClaim.recovery_id,
+            native_recovery_attempt_id: recoveryClaim.native_recovery_attempt_id,
+            native_recovery_attempt_no: recoveryClaim.native_recovery_attempt_no,
             side_effect_status: error?.providerError?.side_effect_status ?? 'unknown',
           };
         }
@@ -805,11 +811,16 @@ export function createExecutorService({
         nativeResult = {
           status: 'lost',
           recovery_id: recoveryClaim.recovery_id,
+          native_recovery_attempt_id: recoveryClaim.native_recovery_attempt_id,
+          native_recovery_attempt_no: recoveryClaim.native_recovery_attempt_no,
           side_effect_status: 'unknown',
         };
       }
-      persist(() => store.completeReplyMappingRecovery(recoveryClaim, nativeResult));
+      const recoveryCompletion = persist(
+        () => store.completeReplyMappingRecovery(recoveryClaim, nativeResult),
+      );
       refresh();
+      if (recoveryCompletion.status === 'stopped') return recoveryCompletion;
     }
     let reservation = store.reserveNextExecutor({
       maxResidentExecutorsPerBot,

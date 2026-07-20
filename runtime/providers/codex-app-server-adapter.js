@@ -1807,6 +1807,30 @@ export function createCodexAppServerAdapter({
     return connecting;
   }
 
+  async function resumePersistedThread(target, threadId) {
+    if (!loadedThreads.has(threadId)) {
+      await sendRequest(target, 'thread/resume', {
+        threadId,
+        cwd,
+        approvalPolicy,
+        sandbox,
+      }, {
+        onResult: (response) => {
+          requireThreadResult(response, threadId);
+          for (const turnId of requireThreadHistory(response)) {
+            rememberConnectionFence(
+              target,
+              target.retired_run_keys,
+              activeRunKey(threadId, turnId),
+            );
+          }
+        },
+      });
+      loadedThreads.add(threadId);
+    }
+    return threadId;
+  }
+
   async function loadThread(target, context) {
     const persistedThreadId = context.lineage.provider_native_id;
     if (persistedThreadId === null) {
@@ -1820,26 +1844,7 @@ export function createCodexAppServerAdapter({
       loadedThreads.add(threadId);
       return threadId;
     }
-    if (!loadedThreads.has(persistedThreadId)) {
-      await sendRequest(target, 'thread/resume', {
-        threadId: persistedThreadId,
-        cwd,
-        approvalPolicy,
-        sandbox,
-      }, {
-        onResult: (response) => {
-          requireThreadResult(response, persistedThreadId);
-          for (const turnId of requireThreadHistory(response)) {
-            rememberConnectionFence(
-              target,
-              target.retired_run_keys,
-              activeRunKey(persistedThreadId, turnId),
-            );
-          }
-        },
-      });
-      loadedThreads.add(persistedThreadId);
-    }
+    await resumePersistedThread(target, persistedThreadId);
     return persistedThreadId;
   }
 
@@ -1862,32 +1867,15 @@ export function createCodexAppServerAdapter({
       throw new TypeError('Codex lineage recovery requires one complete persisted candidate fence');
     }
     const target = await ensureConnection();
-    if (!loadedThreads.has(candidate.provider_native_id)) {
-      await sendRequest(target, 'thread/resume', {
-        threadId: candidate.provider_native_id,
-        cwd,
-        approvalPolicy,
-        sandbox,
-      }, {
-        onResult: (response) => {
-          requireThreadResult(response, candidate.provider_native_id);
-          for (const turnId of requireThreadHistory(response)) {
-            rememberConnectionFence(
-              target,
-              target.retired_run_keys,
-              activeRunKey(candidate.provider_native_id, turnId),
-            );
-          }
-        },
-      });
-      loadedThreads.add(candidate.provider_native_id);
-    }
+    await resumePersistedThread(target, candidate.provider_native_id);
     return Object.freeze({
       status: 'recovered',
       recovery_id: request.recovery_id,
       lineage_id: candidate.lineage_id,
       provider: 'codex',
       provider_native_id: candidate.provider_native_id,
+      native_recovery_attempt_id: request.native_recovery_attempt_id,
+      native_recovery_attempt_no: request.native_recovery_attempt_no,
       side_effect_status: 'none',
     });
   }

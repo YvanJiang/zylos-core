@@ -304,6 +304,8 @@ describe('Codex app-server provider adapter', () => {
       lineage_id: request.candidate.lineage_id,
       provider: 'codex',
       provider_native_id: request.candidate.provider_native_id,
+      native_recovery_attempt_id: request.native_recovery_attempt_id,
+      native_recovery_attempt_no: request.native_recovery_attempt_no,
       side_effect_status: 'none',
     });
     expect(server.received.filter(({ method }) => method === 'thread/resume'))

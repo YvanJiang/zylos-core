@@ -451,7 +451,7 @@ export function validateNormalizedEvent(
         'queued',
         'starting',
         'recovering',
-        ...(value.kind === 'turn_state_changed' ? ['stopped'] : []),
+        ...(value.kind === 'turn_state_changed' ? ['stopped', 'cancelled'] : []),
       ].includes(value.phase)
     )
   ) {

@@ -389,6 +389,8 @@ const RUNTIME_SCHEMA = `
     native_recovery_attempt_id TEXT,
     native_recovery_status TEXT,
     native_recovery_result_json TEXT,
+    native_recovery_owner_service_instance_id TEXT,
+    native_recovery_claim_expires_at TEXT,
     bound_lineage_id TEXT REFERENCES runtime_lineages(lineage_id),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -757,6 +759,18 @@ export function initializeRuntimePersistence(database) {
   addColumnIfMissing(
     database,
     'runtime_reply_mapping_recoveries',
+    'native_recovery_owner_service_instance_id',
+    'TEXT',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_reply_mapping_recoveries',
+    'native_recovery_claim_expires_at',
+    'TEXT',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_reply_mapping_recoveries',
     'bound_lineage_id',
     'TEXT REFERENCES runtime_lineages(lineage_id)',
   );
@@ -859,16 +873,10 @@ export function initializeRuntimePersistence(database) {
     CREATE INDEX IF NOT EXISTS runtime_reply_mapping_recovery_source
       ON runtime_reply_mapping_recoveries(source_platform_message_id, state);
 
-    CREATE TRIGGER IF NOT EXISTS runtime_bound_message_mapping_immutable
+    DROP TRIGGER IF EXISTS runtime_bound_message_mapping_immutable;
+    CREATE TRIGGER runtime_bound_message_mapping_immutable
     BEFORE UPDATE ON runtime_message_mappings
-    WHEN OLD.binding_state = 'bound' AND (
-      NEW.mapping_id IS NOT OLD.mapping_id
-      OR NEW.conversation_id IS NOT OLD.conversation_id
-      OR NEW.turn_id IS NOT OLD.turn_id
-      OR NEW.lineage_id IS NOT OLD.lineage_id
-      OR NEW.binding_state IS NOT OLD.binding_state
-      OR NEW.mapping_version IS NOT OLD.mapping_version
-    )
+    WHEN OLD.binding_state = 'bound'
     BEGIN
       SELECT RAISE(ABORT, 'bound reply mapping is immutable');
     END;
@@ -919,13 +927,10 @@ export function initializeRuntimePersistence(database) {
       SELECT RAISE(ABORT, 'bound outbox mapping is immutable');
     END;
 
-    CREATE TRIGGER IF NOT EXISTS runtime_bound_reply_recovery_immutable
+    DROP TRIGGER IF EXISTS runtime_bound_reply_recovery_immutable;
+    CREATE TRIGGER runtime_bound_reply_recovery_immutable
     BEFORE UPDATE ON runtime_reply_mapping_recoveries
-    WHEN OLD.state = 'bound' AND (
-      NEW.state IS NOT OLD.state
-      OR NEW.bound_lineage_id IS NOT OLD.bound_lineage_id
-      OR NEW.mapping_id IS NOT OLD.mapping_id
-    )
+    WHEN OLD.state = 'bound'
     BEGIN
       SELECT RAISE(ABORT, 'bound reply recovery is immutable');
     END;

@@ -192,20 +192,41 @@ export function buildInitialDeliveryCommand({
 function resolveNormalLineage(database, envelope, conversationId, committedAt, generateId) {
   const replyToMessageId = envelope.reply.reply_to_message_id;
   if (replyToMessageId !== null) {
+    const boundRecoveries = database.prepare(`
+      SELECT DISTINCT recovery.bound_lineage_id AS lineage_id
+      FROM runtime_reply_mapping_recoveries AS recovery
+      JOIN runtime_turns AS turn ON turn.turn_id = recovery.turn_id
+      JOIN runtime_lineages AS lineage
+        ON lineage.lineage_id = recovery.bound_lineage_id
+       AND lineage.conversation_id = turn.conversation_id
+      WHERE turn.conversation_id = ?
+        AND recovery.source_platform_message_id = ?
+        AND recovery.state = 'bound'
+      LIMIT 2
+    `).all(conversationId, replyToMessageId);
+    if (boundRecoveries.length === 1) {
+      return {
+        lineage_id: boundRecoveries[0].lineage_id,
+        recovery: null,
+        pending_turn: null,
+      };
+    }
+
     const pending = database.prepare(`
       SELECT recovery.turn_id, turn.turn_version
       FROM runtime_reply_mapping_recoveries AS recovery
       JOIN runtime_turns AS turn ON turn.turn_id = recovery.turn_id
-      LEFT JOIN runtime_message_mappings AS mapping
-        ON mapping.mapping_id = recovery.mapping_id
       WHERE turn.conversation_id = ?
         AND recovery.state NOT IN ('bound', 'rejected', 'failed')
         AND (
           recovery.source_platform_message_id = ?
-          OR (
-            mapping.region = ? AND mapping.tenant_id = ?
-            AND mapping.channel = ? AND mapping.bot_id = ?
-            AND mapping.platform_message_id = ?
+          OR EXISTS (
+            SELECT 1
+            FROM runtime_message_mappings AS mapping
+            WHERE mapping.turn_id = recovery.turn_id
+              AND mapping.region = ? AND mapping.tenant_id = ?
+              AND mapping.channel = ? AND mapping.bot_id = ?
+              AND mapping.platform_message_id = ?
           )
         )
       ORDER BY recovery.created_at ASC
@@ -295,21 +316,21 @@ function resolveNormalLineage(database, envelope, conversationId, committedAt, g
       if (reason === null) return { lineage_id: mapped.lineage_id, recovery: null };
     }
 
-    const candidateIds = new Set();
-    if (
-      mapped?.lineage_id !== null
-      && mapped?.lineage_id !== undefined
-      && mapped.lineage_conversation_id === conversationId
-    ) {
-      candidateIds.add(mapped.lineage_id);
-    }
-    const current = database.prepare(`
+    const conversationLineages = database.prepare(`
       SELECT lineage_id
       FROM runtime_lineages
-      WHERE conversation_id = ? AND is_default = 1
-    `).get(conversationId);
-    if (current) candidateIds.add(current.lineage_id);
-    const candidateLineageId = candidateIds.size === 1 ? [...candidateIds][0] : null;
+      WHERE conversation_id = ?
+      ORDER BY created_at ASC, lineage_id ASC
+      LIMIT 2
+    `).all(conversationId);
+    const exactInvalidCandidate = reason === 'provider_lineage_invalid'
+      && mapped?.lineage_id !== null
+      && mapped?.lineage_id !== undefined
+      && mapped.lineage_conversation_id === conversationId
+      ? mapped.lineage_id
+      : null;
+    const candidateLineageId = exactInvalidCandidate
+      ?? (conversationLineages.length === 1 ? conversationLineages[0].lineage_id : null);
     const unknownAssociatedWork = database.prepare(`
       SELECT 1
       FROM runtime_normalized_events AS event

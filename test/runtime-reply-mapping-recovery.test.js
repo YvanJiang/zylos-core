@@ -38,6 +38,16 @@ function deterministicIds(namespace) {
   };
 }
 
+function createDeferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
+
 function normalEnvelope(suffix) {
   const fixture = inboundFixture.valid.find(
     ({ name }) => name === 'authenticated_dm_with_attachment',
@@ -94,6 +104,24 @@ function deliverOnlyPending(
     outbox_status: 'delivered',
   });
   return { command, result };
+}
+
+function retryableDeliveryFailure(command, resultAt) {
+  return {
+    ...deliveredResult(command, resultAt),
+    status: 'retryable_failure',
+    platform_message_id: null,
+    delivered_at: null,
+    error: {
+      code: 'delivery_transient',
+      category: 'channel',
+      retryable: true,
+      side_effect_status: 'none',
+      user_message: 'The channel is temporarily unavailable.',
+      occurred_at: resultAt,
+    },
+    result_at: resultAt,
+  };
 }
 
 function deliverUntilCommand(database, namespace, predicate, deliveryAt) {
@@ -418,6 +446,65 @@ describe('reply mapping provisional-lineage recovery', () => {
     database.close();
   });
 
+  test('marks a failed provider-native context invalid so the next reply enters recovery', () => {
+    const database = openTestDatabase();
+    const source = createDeliveredSource(database, 'native-invalid-production');
+    database.prepare(`
+      UPDATE runtime_lineages
+      SET provider = 'codex', provider_native_id = 'codex-thread-native-invalid',
+        provider_native_id_bound_at = '2026-07-20T00:59:00Z',
+        provider_native_state = 'valid'
+      WHERE lineage_id = ?
+    `).run(source.accepted.lineage_id);
+    const store = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-native-invalid-production',
+      now: () => '2026-07-20T01:00:01Z',
+      generateId: deterministicIds('native-invalid-production'),
+    });
+    const turn = store.claimNextQueuedTurn();
+    store.transitionTurn(turn, 'starting', 'running');
+    store.transitionTurn(turn, 'running', 'failed', {
+      reasonCode: 'executor_failed',
+      error: {
+        code: 'provider_context_invalid',
+        category: 'provider',
+        retryable: false,
+        side_effect_status: 'none',
+        user_message: 'The persisted provider context is invalid.',
+        occurred_at: '2026-07-20T01:00:01Z',
+      },
+    });
+    expect(database.prepare(`
+      SELECT provider_native_state FROM runtime_lineages WHERE lineage_id = ?
+    `).get(source.accepted.lineage_id)).toEqual({ provider_native_state: 'invalid' });
+
+    const pending = accept(
+      database,
+      replyEnvelope(
+        source.envelope,
+        'native-invalid-production-reply',
+        source.result.platform_message_id,
+      ),
+      'native-invalid-production-reply',
+    );
+    expect(pending).toMatchObject({
+      status: 'accepted',
+      lineage_id: null,
+      lineage_resolution_state: 'pending_recovery',
+    });
+    expect(database.prepare(`
+      SELECT reason, candidate_lineage_id FROM runtime_reply_mapping_recoveries
+      WHERE turn_id = ?
+    `).get(pending.turn_id)).toEqual({
+      reason: 'provider_lineage_invalid',
+      candidate_lineage_id: source.accepted.lineage_id,
+    });
+
+    database.close();
+  });
+
   test('rejects ordinary replies while recovery is pending without creating another turn', () => {
     const database = openTestDatabase();
     const source = createDeliveredSource(database, 'pending-reply');
@@ -469,6 +556,87 @@ describe('reply mapping provisional-lineage recovery', () => {
       'pending-reply-provisional-repeat',
     );
     expect(provisionalReply).toMatchObject({
+      status: 'rejected',
+      turn_id: pending.turn_id,
+      lineage_id: null,
+      lineage_resolution_state: 'pending_recovery',
+      error: { code: 'lineage_resolution_pending' },
+    });
+    expect(database.prepare('SELECT COUNT(*) AS count FROM runtime_turns').get().count)
+      .toBe(turnCount);
+
+    database.close();
+  });
+
+  test('associates a delivered text fallback mapping with the same pending recovery', () => {
+    const database = openTestDatabase();
+    const source = createDeliveredSource(database, 'pending-fallback-reply');
+    simulateMissingDeliveredMapping(database, source.result.platform_message_id);
+    database.prepare('DELETE FROM runtime_turn_queue WHERE turn_id = ?')
+      .run(source.accepted.turn_id);
+    database.prepare("UPDATE runtime_turns SET state = 'completed' WHERE turn_id = ?")
+      .run(source.accepted.turn_id);
+    const pending = accept(
+      database,
+      replyEnvelope(
+        source.envelope,
+        'pending-fallback-reply-first',
+        source.result.platform_message_id,
+      ),
+      'pending-fallback-reply-first',
+    );
+    const turnCount = database.prepare('SELECT COUNT(*) AS count FROM runtime_turns').get().count;
+    const outbox = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-pending-fallback-reply',
+      now: () => '2026-07-20T01:00:01Z',
+      generateId: deterministicIds('delivery-pending-fallback-reply'),
+      throttleMs: 0,
+    });
+    let createCommand = null;
+    for (let index = 0; index < 10 && createCommand === null; index += 1) {
+      const command = outbox.claimNext();
+      expect(command).not.toBeNull();
+      if (command.mapping.turn_id === pending.turn_id && command.operation === 'create_main') {
+        createCommand = command;
+      } else {
+        expect(outbox.recordResult(deliveredResult(
+          command,
+          '2026-07-20T01:00:01Z',
+        )).status).toBe('applied');
+      }
+    }
+    expect(createCommand).not.toBeNull();
+    expect(outbox.recordResult(retryableDeliveryFailure(
+      createCommand,
+      '2026-07-20T01:00:01Z',
+    ))).toMatchObject({ status: 'applied', outbox_status: 'retry_wait' });
+    const fallbackCommand = outbox.claimNext();
+    expect(fallbackCommand).toMatchObject({
+      operation: 'send_text',
+      mapping: {
+        turn_id: pending.turn_id,
+        binding_state: 'pending',
+        lineage_id: null,
+      },
+    });
+    expect(fallbackCommand.mapping.mapping_id).not.toBe(createCommand.mapping.mapping_id);
+    const fallbackResult = deliveredResult(fallbackCommand, '2026-07-20T01:00:02Z');
+    expect(outbox.recordResult(fallbackResult)).toMatchObject({
+      status: 'applied',
+      outbox_status: 'delivered',
+    });
+
+    const repeated = accept(
+      database,
+      replyEnvelope(
+        source.envelope,
+        'pending-fallback-reply-repeat',
+        fallbackResult.platform_message_id,
+      ),
+      'pending-fallback-reply-repeat',
+    );
+    expect(repeated).toMatchObject({
       status: 'rejected',
       turn_id: pending.turn_id,
       lineage_id: null,
@@ -564,6 +732,89 @@ describe('reply mapping provisional-lineage recovery', () => {
     database.close();
   });
 
+  test.each([
+    { claimed: false, expectedTurnState: 'cancelled', expectedQueueState: 'cancelled' },
+    { claimed: true, expectedTurnState: 'stopped', expectedQueueState: 'stopped' },
+  ])('stop terminalizes a $expectedTurnState reply recovery instead of stranding it', async ({
+    claimed,
+    expectedTurnState,
+    expectedQueueState,
+  }) => {
+    const database = openTestDatabase();
+    const source = createDeliveredSource(database, `stop-recovery-${expectedTurnState}`);
+    simulateMissingDeliveredMapping(database, source.result.platform_message_id);
+    database.prepare('DELETE FROM runtime_turn_queue WHERE turn_id = ?')
+      .run(source.accepted.turn_id);
+    database.prepare("UPDATE runtime_turns SET state = 'completed' WHERE turn_id = ?")
+      .run(source.accepted.turn_id);
+    const pending = accept(
+      database,
+      replyEnvelope(
+        source.envelope,
+        `stop-recovery-${expectedTurnState}-pending`,
+        source.result.platform_message_id,
+      ),
+      `stop-recovery-${expectedTurnState}-pending`,
+    );
+    const execute = jest.fn();
+    const service = createExecutorService({
+      database,
+      provider: 'codex',
+      adapter: { execute, recoverLineage: jest.fn(), close: async () => {} },
+      serviceInstanceId: `executor-stop-recovery-${expectedTurnState}`,
+      now: () => '2026-07-20T01:00:02Z',
+      generateId: deterministicIds(`stop-recovery-${expectedTurnState}`),
+      scheduleResidentHeartbeat: () => ({ unref() {} }),
+      cancelResidentHeartbeat: () => {},
+    });
+    if (claimed) {
+      await expect(service.runNext()).resolves.toMatchObject({
+        status: 'lineage_resolution_pending',
+        turn_id: pending.turn_id,
+      });
+    }
+
+    await expect(service.stop({
+      conversation_id: pending.conversation_id,
+      stop_id: `stop-recovery-${expectedTurnState}`,
+    })).resolves.toMatchObject({
+      conversation_id: pending.conversation_id,
+      provider_stop_status: 'not_applicable',
+      lease_released: true,
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(database.prepare(`
+      SELECT recovery.state AS recovery_state,
+        turn.state AS turn_state, queue.status AS queue_state
+      FROM runtime_reply_mapping_recoveries AS recovery
+      JOIN runtime_turns AS turn ON turn.turn_id = recovery.turn_id
+      JOIN runtime_turn_queue AS queue ON queue.turn_id = recovery.turn_id
+      WHERE recovery.turn_id = ?
+    `).get(pending.turn_id)).toEqual({
+      recovery_state: 'rejected',
+      turn_state: expectedTurnState,
+      queue_state: expectedQueueState,
+    });
+    const afterStop = accept(
+      database,
+      replyEnvelope(
+        source.envelope,
+        `stop-recovery-${expectedTurnState}-after`,
+        source.result.platform_message_id,
+      ),
+      `stop-recovery-${expectedTurnState}-after`,
+    );
+    expect(afterStop).toMatchObject({
+      status: 'accepted',
+      lineage_id: null,
+      lineage_resolution_state: 'pending_recovery',
+    });
+    expect(afterStop.turn_id).not.toBe(pending.turn_id);
+
+    await service.close();
+    database.close();
+  });
+
   test('attempts one unique native candidate only after notice delivery and binds before provider execution', async () => {
     const database = openTestDatabase();
     const source = createDeliveredSource(database, 'native-success');
@@ -598,6 +849,8 @@ describe('reply mapping provisional-lineage recovery', () => {
       lineage_id: request.candidate.lineage_id,
       provider: request.candidate.provider,
       provider_native_id: request.candidate.provider_native_id,
+      native_recovery_attempt_id: request.native_recovery_attempt_id,
+      native_recovery_attempt_no: request.native_recovery_attempt_no,
       side_effect_status: 'none',
     }));
     const service = createExecutorService({
@@ -683,6 +936,24 @@ describe('reply mapping provisional-lineage recovery', () => {
 
     await expect(service.runNext()).resolves.toEqual({ status: 'idle' });
     expect(recoverLineage).toHaveBeenCalledTimes(1);
+    const recoveredReply = accept(
+      database,
+      replyEnvelope(
+        source.envelope,
+        'native-success-recovered-reply',
+        source.result.platform_message_id,
+      ),
+      'native-success-recovered-reply',
+    );
+    expect(recoveredReply).toMatchObject({
+      status: 'accepted',
+      lineage_id: source.accepted.lineage_id,
+      lineage_resolution_state: 'bound',
+      error: null,
+    });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_reply_mapping_recoveries
+    `).get()).toEqual({ count: 1 });
     await service.close();
     database.close();
   });
@@ -690,18 +961,23 @@ describe('reply mapping provisional-lineage recovery', () => {
   test('does not guess without a unique candidate and creates an explicit recovery lineage', async () => {
     const database = openTestDatabase();
     const source = createDeliveredSource(database, 'no-candidate');
-    database.prepare('UPDATE runtime_lineages SET is_default = 0 WHERE conversation_id = ?')
-      .run(source.accepted.conversation_id);
+    database.prepare(`
+      INSERT INTO runtime_lineages (
+        lineage_id, conversation_id, lineage_kind, is_default, created_at
+      ) VALUES ('lineage-no-candidate-alternate', ?, 'normal', 0, ?)
+    `).run(source.accepted.conversation_id, source.accepted.committed_at);
     simulateMissingDeliveredMapping(database, source.result.platform_message_id);
     database.prepare('DELETE FROM runtime_turn_queue WHERE turn_id = ?')
       .run(source.accepted.turn_id);
     database.prepare("UPDATE runtime_turns SET state = 'completed' WHERE turn_id = ?")
       .run(source.accepted.turn_id);
-    const pending = accept(
-      database,
-      replyEnvelope(source.envelope, 'no-candidate-pending', source.result.platform_message_id),
+    const pendingEnvelope = replyEnvelope(
+      source.envelope,
       'no-candidate-pending',
+      source.result.platform_message_id,
     );
+    pendingEnvelope.content.text = 'Continue this request after safe lineage recovery.';
+    const pending = accept(database, pendingEnvelope, 'no-candidate-pending');
     expect(database.prepare(`
       SELECT candidate_lineage_id FROM runtime_reply_mapping_recoveries WHERE turn_id = ?
     `).get(pending.turn_id)).toEqual({ candidate_lineage_id: null });
@@ -710,6 +986,10 @@ describe('reply mapping provisional-lineage recovery', () => {
     const execute = jest.fn((context) => (async function* executeProvider() {
       expect(context.lineage_id).not.toBe(source.accepted.lineage_id);
       expect(context.provider_native_id).toBeNull();
+      expect(context.input.text).toContain('Zylos recovery handoff');
+      expect(context.input.text).toContain('Please inspect the attached report.');
+      expect(context.input.text).toContain('Continue this request after safe lineage recovery.');
+      expect(context.input.text).toContain('Existing Zylos memory');
       yield { type: 'turn_result', outcome: 'completed' };
     }()));
     const service = createExecutorService({
@@ -750,6 +1030,161 @@ describe('reply mapping provisional-lineage recovery', () => {
     database.close();
   });
 
+  test('fences an in-flight native recovery against concurrent executor services', async () => {
+    const database = openTestDatabase();
+    const source = createDeliveredSource(database, 'native-concurrent');
+    database.prepare(`
+      UPDATE runtime_lineages
+      SET provider = 'codex', provider_native_id = 'codex-thread-native-concurrent',
+        provider_native_id_bound_at = '2026-07-20T00:59:00Z',
+        provider_native_state = 'valid'
+      WHERE lineage_id = ?
+    `).run(source.accepted.lineage_id);
+    simulateMissingDeliveredMapping(database, source.result.platform_message_id);
+    database.prepare('DELETE FROM runtime_turn_queue WHERE turn_id = ?')
+      .run(source.accepted.turn_id);
+    database.prepare("UPDATE runtime_turns SET state = 'completed' WHERE turn_id = ?")
+      .run(source.accepted.turn_id);
+    const pending = accept(
+      database,
+      replyEnvelope(
+        source.envelope,
+        'native-concurrent-pending',
+        source.result.platform_message_id,
+      ),
+      'native-concurrent-pending',
+    );
+    const nativeStarted = createDeferred();
+    const nativeResult = createDeferred();
+    const executeA = jest.fn(() => (async function* executeProvider() {
+      yield { type: 'turn_result', outcome: 'completed' };
+    }()));
+    const executeB = jest.fn(() => (async function* executeProvider() {
+      yield { type: 'turn_result', outcome: 'completed' };
+    }()));
+    const recoverA = jest.fn(async (request) => {
+      nativeStarted.resolve(request);
+      return nativeResult.promise;
+    });
+    const serviceA = createExecutorService({
+      database,
+      provider: 'codex',
+      adapter: { execute: executeA, recoverLineage: recoverA, close: async () => {} },
+      serviceInstanceId: 'executor-native-concurrent-A',
+      now: () => '2026-07-20T01:00:02Z',
+      generateId: deterministicIds('native-concurrent-A'),
+      scheduleResidentHeartbeat: () => ({ unref() {} }),
+      cancelResidentHeartbeat: () => {},
+    });
+    const serviceB = createExecutorService({
+      database,
+      provider: 'codex',
+      adapter: { execute: executeB, recoverLineage: jest.fn(), close: async () => {} },
+      serviceInstanceId: 'executor-native-concurrent-B',
+      now: () => '2026-07-20T01:00:02Z',
+      generateId: deterministicIds('native-concurrent-B'),
+      scheduleResidentHeartbeat: () => ({ unref() {} }),
+      cancelResidentHeartbeat: () => {},
+    });
+
+    await serviceA.runNext();
+    deliverUntilTurn(database, pending.turn_id, 'native-concurrent-notice');
+    const firstRun = serviceA.runNext();
+    const nativeRequest = await nativeStarted.promise;
+    await expect(serviceB.runNext()).resolves.toMatchObject({
+      status: 'lineage_resolution_pending',
+      turn_id: pending.turn_id,
+      wait_reason: 'reply_mapping_native_recovery',
+    });
+    expect(executeA).not.toHaveBeenCalled();
+    expect(executeB).not.toHaveBeenCalled();
+    nativeResult.resolve({
+      status: 'recovered',
+      recovery_id: nativeRequest.recovery_id,
+      lineage_id: nativeRequest.candidate.lineage_id,
+      provider: nativeRequest.candidate.provider,
+      provider_native_id: nativeRequest.candidate.provider_native_id,
+      native_recovery_attempt_id: nativeRequest.native_recovery_attempt_id,
+      native_recovery_attempt_no: nativeRequest.native_recovery_attempt_no,
+      side_effect_status: 'none',
+    });
+    await expect(firstRun).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: pending.turn_id,
+    });
+    expect(recoverA).toHaveBeenCalledTimes(1);
+    expect(executeA).toHaveBeenCalledTimes(1);
+    expect(executeB).not.toHaveBeenCalled();
+
+    await serviceA.close();
+    await serviceB.close();
+    database.close();
+  });
+
+  test('rejects a mismatched recovered result instead of silently creating a fallback lineage', async () => {
+    const database = openTestDatabase();
+    const source = createDeliveredSource(database, 'native-mismatch');
+    database.prepare(`
+      UPDATE runtime_lineages
+      SET provider = 'codex', provider_native_id = 'codex-thread-native-mismatch',
+        provider_native_id_bound_at = '2026-07-20T00:59:00Z',
+        provider_native_state = 'valid'
+      WHERE lineage_id = ?
+    `).run(source.accepted.lineage_id);
+    simulateMissingDeliveredMapping(database, source.result.platform_message_id);
+    database.prepare('DELETE FROM runtime_turn_queue WHERE turn_id = ?')
+      .run(source.accepted.turn_id);
+    database.prepare("UPDATE runtime_turns SET state = 'completed' WHERE turn_id = ?")
+      .run(source.accepted.turn_id);
+    const pending = accept(
+      database,
+      replyEnvelope(source.envelope, 'native-mismatch-pending', source.result.platform_message_id),
+      'native-mismatch-pending',
+    );
+    const execute = jest.fn();
+    const recoverLineage = jest.fn(async (request) => ({
+      status: 'recovered',
+      recovery_id: request.recovery_id,
+      lineage_id: 'lineage-mismatched-provider-result',
+      provider: request.candidate.provider,
+      provider_native_id: request.candidate.provider_native_id,
+      native_recovery_attempt_id: request.native_recovery_attempt_id,
+      native_recovery_attempt_no: request.native_recovery_attempt_no,
+      side_effect_status: 'none',
+    }));
+    const service = createExecutorService({
+      database,
+      provider: 'codex',
+      adapter: { execute, recoverLineage, close: async () => {} },
+      serviceInstanceId: 'executor-native-mismatch',
+      now: () => '2026-07-20T01:00:02Z',
+      generateId: deterministicIds('native-mismatch'),
+      scheduleResidentHeartbeat: () => ({ unref() {} }),
+      cancelResidentHeartbeat: () => {},
+    });
+
+    await service.runNext();
+    deliverUntilTurn(database, pending.turn_id, 'native-mismatch-notice');
+    await expect(service.runNext()).rejects.toMatchObject({
+      persistenceFailure: true,
+      code: 'provider_context_invalid',
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(database.prepare(`
+      SELECT recovery.state, recovery.bound_lineage_id, turn.lineage_id
+      FROM runtime_reply_mapping_recoveries AS recovery
+      JOIN runtime_turns AS turn ON turn.turn_id = recovery.turn_id
+      WHERE recovery.turn_id = ?
+    `).get(pending.turn_id)).toEqual({
+      state: 'native_recovery_claimed',
+      bound_lineage_id: null,
+      lineage_id: null,
+    });
+
+    await service.close();
+    database.close();
+  });
+
   test('falls back to a linked recovery lineage after the single native attempt fails', async () => {
     const database = openTestDatabase();
     const source = createDeliveredSource(database, 'native-failure');
@@ -773,6 +1208,8 @@ describe('reply mapping provisional-lineage recovery', () => {
     const recoverLineage = jest.fn(async (request) => ({
       status: 'failed',
       recovery_id: request.recovery_id,
+      native_recovery_attempt_id: request.native_recovery_attempt_id,
+      native_recovery_attempt_no: request.native_recovery_attempt_no,
       side_effect_status: 'none',
     }));
     const execute = jest.fn(() => (async function* executeProvider() {
@@ -839,6 +1276,8 @@ describe('reply mapping provisional-lineage recovery', () => {
       lineage_id: request.candidate.lineage_id,
       provider: request.candidate.provider,
       provider_native_id: request.candidate.provider_native_id,
+      native_recovery_attempt_id: request.native_recovery_attempt_id,
+      native_recovery_attempt_no: request.native_recovery_attempt_no,
       side_effect_status: 'none',
     }));
     const execute = jest.fn(() => (async function* executeProvider() {
@@ -901,7 +1340,7 @@ describe('reply mapping provisional-lineage recovery', () => {
       provider: 'claude',
       adapter: { execute, recoverLineage, close: async () => {} },
       serviceInstanceId: 'executor-binding-rollback-restarted',
-      now: () => '2026-07-20T01:00:03Z',
+      now: () => '2026-07-20T01:01:03Z',
       generateId: deterministicIds('binding-rollback-restarted-service'),
       scheduleResidentHeartbeat: () => ({ unref() {} }),
       cancelResidentHeartbeat: () => {},
@@ -994,6 +1433,15 @@ describe('reply mapping provisional-lineage recovery', () => {
     expect(() => database.prepare(`
       UPDATE runtime_message_mappings SET lineage_id = ? WHERE platform_message_id = ?
     `).run(otherLineageId, notice.result.platform_message_id)).toThrow(/immutable/);
+    expect(() => database.prepare(`
+      UPDATE runtime_message_mappings
+      SET platform_message_id = platform_message_id || '-moved'
+      WHERE platform_message_id = ?
+    `).run(notice.result.platform_message_id)).toThrow(/immutable/);
+    expect(() => database.prepare(`
+      UPDATE runtime_message_mappings SET reason = 'mapping_corrupt'
+      WHERE platform_message_id = ?
+    `).run(notice.result.platform_message_id)).toThrow(/immutable/);
     expect(() => database.prepare(`
       DELETE FROM runtime_message_mappings WHERE platform_message_id = ?
     `).run(notice.result.platform_message_id)).toThrow(/cannot be deleted/);
