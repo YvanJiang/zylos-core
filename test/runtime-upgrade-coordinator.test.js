@@ -198,7 +198,10 @@ describe('runtime upgrade coordinator', () => {
       ],
     })).toEqual({
       batch_id: 'canonical-plan', rollback_reconciled: true,
-      records: [expect.objectContaining({ legacy_record_id: 'safe-c4' }), recurring],
+      record_refs: [
+        expect.objectContaining({ legacy_kind: 'c4', legacy_record_id: 'safe-c4' }),
+        expect.objectContaining({ legacy_kind: 'scheduler', legacy_record_id: 'recurring-next' }),
+      ],
     });
     const malformed = legacyEnvelope('wrong-identity');
     expect(() => service.planLegacyRollbackBatch({
@@ -637,7 +640,20 @@ describe('runtime upgrade coordinator', () => {
     await expect(coordinator.advance('upgrade-partial-invalidation', { legacyBatch: batch }))
       .rejects.toThrow('injected crash after source invalidation');
     expect(coordinator.loadEffect('upgrade-partial-invalidation', 'legacy-source-invalidate'))
-      .toMatchObject({ state: 'claimed', result: null, input: { batch_id: batch.batch_id } });
+      .toMatchObject({
+        state: 'claimed', result: null,
+        input: {
+          batch_id: batch.batch_id,
+          rollback_batch: {
+            record_refs: [expect.objectContaining({ legacy_record_id: 'partial-safe' })],
+          },
+        },
+      });
+    expect(fixture.database.prepare(`
+      SELECT input_json FROM runtime_upgrade_effects
+      WHERE upgrade_id = 'upgrade-partial-invalidation'
+        AND step_key = 'legacy-source-invalidate'
+    `).get().input_json).not.toContain('legacy-message-partial-safe');
     service.fail('upgrade-partial-invalidation', {
       boundary: 'legacy_source_invalidation', code: 'host_crash',
       message: 'host stopped after source rename',

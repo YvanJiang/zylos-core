@@ -207,7 +207,7 @@ export function createLegacySourceQueueAdapter({
     }) {
       if (!rollbackBatch || rollbackBatch.batch_id !== batchId
         || rollbackBatch.rollback_reconciled !== true
-        || !Array.isArray(rollbackBatch.records)) {
+        || !Array.isArray(rollbackBatch.record_refs)) {
         throw new Error('Legacy invalidation requires a canonical rollback batch.');
       }
       const stopProof = await stopLegacyDispatcher(Object.freeze({
@@ -231,14 +231,23 @@ export function createLegacySourceQueueAdapter({
       }
       if (sourceDocument === null) sourceDocument = await readAndVerify(auditPath, batchHash);
       const sourceRecords = new Map(sourceDocument.records.map((record) => [
-        `${record.kind}\u0000${record.legacy_record_id}`, hash(record),
+        `${record.kind}\u0000${record.legacy_record_id}`, record,
       ]));
-      for (const record of rollbackBatch.records) {
-        if (sourceRecords.get(`${record.kind}\u0000${record.legacy_record_id}`) !== hash(record)) {
+      const rollbackRecords = [];
+      for (const recordRef of rollbackBatch.record_refs) {
+        const record = sourceRecords.get(
+          `${recordRef.legacy_kind}\u0000${recordRef.legacy_record_id}`,
+        );
+        if (record === undefined || hash(record) !== recordRef.payload_hash) {
           throw new Error('Canonical rollback work is not an exact source-queue subset.');
         }
+        rollbackRecords.push(record);
       }
-      const rollbackDocument = structuredClone(rollbackBatch);
+      const rollbackDocument = {
+        batch_id: rollbackBatch.batch_id,
+        records: structuredClone(rollbackRecords),
+        rollback_reconciled: true,
+      };
       await materializeReadOnly(rollbackPath, rollbackDocument);
       if (sourcePresent) {
         await fs.rename(sourcePath, auditPath);

@@ -1046,17 +1046,28 @@ export function createRuntimeUpgradeService({
     return Object.freeze({
       batch_id: batch.batch_id,
       rollback_reconciled: true,
-      records: Object.freeze(analysis.analyzed
+      record_refs: Object.freeze(analysis.analyzed
         .filter(({ classification }) => ['migrated_pending', 'migrated_scheduler']
           .includes(classification.disposition))
-        .map(({ record }) => structuredClone(record))),
+        .map(({ record }) => Object.freeze({
+          legacy_kind: record.kind,
+          legacy_record_id: record.legacy_record_id,
+          payload_hash: hashInput(record),
+        }))),
     });
   }
 
   function reconcileLegacyRollback(upgradeId, batch) {
     requireText('upgradeId', upgradeId);
     const analysis = analyzeLegacyBatch(batch);
-    const replay = replayEvent(upgradeId, 'legacy-rollback-reconciliation', batch);
+    const reconciliationInput = Object.freeze({
+      batch_id: batch.batch_id,
+      batch_hash: analysis.batch_hash,
+      record_count: batch.records.length,
+    });
+    const replay = replayEvent(
+      upgradeId, 'legacy-rollback-reconciliation', reconciliationInput,
+    );
     if (replay) return replay;
     const commit = database.transaction(() => {
       const run = load(upgradeId);
@@ -1215,7 +1226,7 @@ export function createRuntimeUpgradeService({
       recordEvent({
         upgradeId, stepKey: 'legacy-rollback-reconciliation',
         fromState: 'rollback_required', toState: 'rollback_required',
-        input: batch, result, committedAt,
+        input: reconciliationInput, result, committedAt,
       });
       return result;
     });
@@ -1225,6 +1236,11 @@ export function createRuntimeUpgradeService({
   function migrateLegacy(upgradeId, batch) {
     const analysis = analyzeLegacyBatch(batch);
     const batchHash = analysis.batch_hash;
+    const migrationInput = Object.freeze({
+      batch_id: batch.batch_id,
+      batch_hash: batchHash,
+      record_count: batch.records.length,
+    });
     const invalidation = database.prepare(`
       SELECT result_json FROM runtime_upgrade_effects
       WHERE upgrade_id = ? AND step_key = 'legacy-source-invalidate'
@@ -1249,7 +1265,7 @@ export function createRuntimeUpgradeService({
     } else if (current.state !== 'migrating' && current.state !== 'health_check') {
       throw new Error(`Runtime upgrade ${upgradeId} cannot migrate from ${current.state}.`);
     }
-    const replay = replayEvent(upgradeId, 'legacy-migration', batch);
+    const replay = replayEvent(upgradeId, 'legacy-migration', migrationInput);
     if (replay) return replay;
     const commit = database.transaction(() => {
       const run = load(upgradeId);
@@ -1494,7 +1510,7 @@ export function createRuntimeUpgradeService({
       const result = decodeRun(load(upgradeId));
       recordEvent({
         upgradeId, stepKey: 'legacy-migration', fromState: 'migrating',
-        toState: 'health_check', input: batch, result, committedAt,
+        toState: 'health_check', input: migrationInput, result, committedAt,
       });
       return result;
     });
