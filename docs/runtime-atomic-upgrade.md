@@ -9,7 +9,8 @@ snapshot, release, legacy-source, executor, and notice adapters. It then:
 2. calls `advance(upgrade_id, input)` repeatedly, reopening SQLite and reconstructing the host
    whenever the process restarts;
 3. supplies the same legacy batch while the run is `drained` until the durable migration event
-   exists.
+   exists;
+4. calls `requestRollback(upgrade_id, failure)` when an adapter or validation failure is permanent.
 
 `attach()` takes `runtime/upgrade-owner.lock`, records the owning host/PID/UUID, safely adopts a
 crashed same-host owner, then atomically writes
@@ -29,6 +30,10 @@ required before any legacy record can be imported, so runtime-control records ca
 executable source path. After the transaction has written immutable migration records, compact facts,
 and fixed-class audit payloads, a second durable effect verifies and removes the temporary source file;
 the mixed raw batch therefore cannot outlive its 30-day/detail and 180-day/control split in SQLite.
+Invalidation also materializes a hash-bound rollback queue containing only uniquely routed, unstarted
+C4 and safe one-time scheduler work. A rollback restores that reconciled queue and requires old
+dispatcher restart proof; runtime control, ambiguous/running work, history, and unknown side effects
+can never re-enter the executable source. Commit deletes the unused rollback queue.
 
 Rollback verifies the durable restore effect, revokes every target-release executor registration,
 and parks only unexecuted turns imported by that upgrade by cancelling their queue rows while leaving

@@ -171,5 +171,6 @@ export function createInstalledRuntimeUpgradeHost({
     attach,
     get: (upgradeId) => upgradeService.get(upgradeId),
     ownership_marker_path: ownershipMarkerPath,
+    requestRollback: (upgradeId, failure) => upgradeService.fail(upgradeId, failure),
   });
 }

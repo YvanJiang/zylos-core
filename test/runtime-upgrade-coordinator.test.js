@@ -50,6 +50,7 @@ function createFixture() {
     snapshotDirectory: path.join(directory, 'snapshots'),
     legacyQueueFile: path.join(directory, 'legacy-control-queue.json'),
     legacyAuditDirectory: path.join(directory, 'legacy-audit'),
+    legacyDispatcher: { running: true, stop_count: 0, restart_count: 0 },
   };
 }
 
@@ -57,9 +58,16 @@ function legacySourceAdapter(fixture) {
   return createLegacySourceQueueAdapter({
     sourceQueueFile: fixture.legacyQueueFile,
     auditDirectory: fixture.legacyAuditDirectory,
-    stopLegacyDispatcher: async () => ({
-      stopped: true, stopped_at: '2026-07-20T10:00:05.500Z',
-    }),
+    stopLegacyDispatcher: async () => {
+      fixture.legacyDispatcher.running = false;
+      fixture.legacyDispatcher.stop_count += 1;
+      return { stopped: true, stopped_at: '2026-07-20T10:00:05.500Z' };
+    },
+    restartLegacyDispatcher: async () => {
+      fixture.legacyDispatcher.running = true;
+      fixture.legacyDispatcher.restart_count += 1;
+      return { restarted: true, restarted_at: '2026-07-20T10:00:06.750Z' };
+    },
   });
 }
 
@@ -253,6 +261,155 @@ describe('runtime upgrade coordinator', () => {
     await first;
     otherDatabase.close();
     fixture.database.close();
+  });
+
+  test('resumes an exact hash-authorized migrating batch through the coordinator after reopen', async () => {
+    const fixture = createFixture();
+    const service = createRuntimeUpgradeService({ database: fixture.database, generateId: ids('retry') });
+    service.preflight({
+      upgrade_id: 'upgrade-migrating-retry', from_release: 'release-A', to_release: 'release-B',
+      scope: { kind: 'installation', bot_id: null }, checks: checks(),
+    });
+    const snapshotAdapter = createSqliteSnapshotAdapter({
+      database: fixture.database, snapshotDirectory: fixture.snapshotDirectory,
+      openDatabase: (file, options) => new Database(file, options),
+    });
+    const releaseAdapter = createAtomicReleaseAdapter({
+      activeReleaseFile: fixture.activeReleaseFile,
+      releases: { 'release-A': fixture.releaseA, 'release-B': fixture.releaseB },
+    });
+    const batch = {
+      batch_id: 'coordinator-retry-batch',
+      records: [
+        { kind: 'c4', legacy_record_id: 'retry-first', legacy_state: 'delivered' },
+        { kind: 'c4', legacy_record_id: 'retry-second', legacy_state: 'failed' },
+      ],
+    };
+    writeLegacySource(fixture, batch);
+    let coordinator = createRuntimeUpgradeCoordinator({
+      database: fixture.database, upgradeService: service, snapshotAdapter, releaseAdapter,
+      legacySourceAdapter: legacySourceAdapter(fixture),
+    });
+    for (let step = 0; step < 8 && !service.isReleaseFenceActive('upgrade-migrating-retry'); step += 1) {
+      await coordinator.advance('upgrade-migrating-retry', { legacyBatch: batch });
+    }
+    expect(service.isReleaseFenceActive('upgrade-migrating-retry')).toBe(true);
+    expect(service.get('upgrade-migrating-retry')).toMatchObject({ state: 'drained' });
+    fixture.database.exec(`
+      CREATE TRIGGER fail_coordinator_migration
+      BEFORE INSERT ON runtime_legacy_migration_records
+      WHEN NEW.legacy_record_id = 'retry-second'
+      BEGIN SELECT RAISE(ABORT, 'injected coordinator migration failure'); END;
+    `);
+    let migrationError = null;
+    try {
+      await coordinator.advance('upgrade-migrating-retry', { legacyBatch: batch });
+    } catch (error) {
+      migrationError = error;
+    }
+    expect(migrationError?.message).toContain('injected coordinator migration failure');
+    expect(service.get('upgrade-migrating-retry')).toMatchObject({ state: 'migrating' });
+    fixture.database.close();
+
+    const reopened = new Database(fixture.databasePath);
+    reopened.exec('DROP TRIGGER fail_coordinator_migration');
+    const resumedService = createRuntimeUpgradeService({ database: reopened, generateId: ids('retry-reopen') });
+    coordinator = createRuntimeUpgradeCoordinator({
+      database: reopened, upgradeService: resumedService,
+      snapshotAdapter: createSqliteSnapshotAdapter({
+        database: reopened, snapshotDirectory: fixture.snapshotDirectory,
+        openDatabase: (file, options) => new Database(file, options),
+      }),
+      releaseAdapter, legacySourceAdapter: legacySourceAdapter(fixture),
+    });
+    expect(await coordinator.advance('upgrade-migrating-retry', { legacyBatch: batch }))
+      .toMatchObject({ state: 'health_check', migration: { retained: 2 } });
+    expect(reopened.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_legacy_migration_records
+      WHERE upgrade_id = 'upgrade-migrating-retry'
+    `).get().count).toBe(2);
+    reopened.close();
+  });
+
+  test('installed host requests rollback and restores a reconciled source after activation failure', async () => {
+    const fixture = createFixture();
+    const releaseAdapter = createAtomicReleaseAdapter({
+      activeReleaseFile: fixture.activeReleaseFile,
+      releases: { 'release-A': fixture.releaseA, 'release-B': fixture.releaseB },
+    });
+    fs.writeFileSync(fixture.activeReleaseFile, JSON.stringify({
+      release_ref: 'release-A', release_path: fixture.releaseA,
+    }));
+    let activationAttempts = 0;
+    const failingReleaseAdapter = {
+      ...releaseAdapter,
+      async activate() {
+        activationAttempts += 1;
+        throw new Error('permanent activation failure');
+      },
+    };
+    const preflight = {
+      upgrade_id: 'upgrade-host-rollback', from_release: 'release-A', to_release: 'release-B',
+      scope: { kind: 'installation', bot_id: null }, checks: checks(),
+    };
+    const batch = {
+      batch_id: 'host-rollback-batch',
+      records: [
+        { kind: 'c4', legacy_record_id: 'safe-pending', legacy_state: 'pending',
+          route: 'unique', legacy_queue_sequence: 1, envelope: legacyEnvelope('safe-pending') },
+        { kind: 'c4', legacy_record_id: 'unknown-running', legacy_state: 'running' },
+        { kind: 'runtime_control', legacy_record_id: 'forbidden-stop', legacy_state: 'pending' },
+      ],
+    };
+    writeLegacySource(fixture, batch);
+    let host = createInstalledRuntimeUpgradeHost({
+      database: fixture.database,
+      snapshotAdapter: createSqliteSnapshotAdapter({
+        database: fixture.database, snapshotDirectory: fixture.snapshotDirectory,
+        openDatabase: (file, options) => new Database(file, options),
+      }),
+      releaseAdapter: failingReleaseAdapter,
+      legacySourceAdapter: legacySourceAdapter(fixture),
+      zylosDir: fixture.directory, generateId: ids('host-rollback'),
+    });
+    await host.attach(preflight);
+    await host.advance(preflight.upgrade_id);
+    await host.advance(preflight.upgrade_id);
+    await host.advance(preflight.upgrade_id);
+    await host.advance(preflight.upgrade_id);
+    await host.advance(preflight.upgrade_id, { legacyBatch: batch });
+    await expect(host.advance(preflight.upgrade_id, { legacyBatch: batch }))
+      .rejects.toThrow('permanent activation failure');
+    expect(host.requestRollback(preflight.upgrade_id, {
+      boundary: 'release_activation', code: 'activation_failed',
+      message: 'target release could not activate',
+    })).toMatchObject({ state: 'rollback_required' });
+    fixture.database.close();
+
+    const reopened = new Database(fixture.databasePath);
+    host = createInstalledRuntimeUpgradeHost({
+      database: reopened,
+      snapshotAdapter: createSqliteSnapshotAdapter({
+        database: reopened, snapshotDirectory: fixture.snapshotDirectory,
+        openDatabase: (file, options) => new Database(file, options),
+      }),
+      releaseAdapter,
+      legacySourceAdapter: legacySourceAdapter(fixture),
+      zylosDir: fixture.directory, generateId: ids('host-rollback-reopen'),
+    });
+    expect(await host.advance(preflight.upgrade_id)).toMatchObject({
+      state: 'rollback_required', completed_step: 'rollback-restore',
+    });
+    expect(await host.advance(preflight.upgrade_id)).toMatchObject({
+      state: 'rollback_required', completed_step: 'legacy-source-rollback',
+    });
+    expect(await host.advance(preflight.upgrade_id)).toMatchObject({ state: 'rolled_back' });
+    expect(activationAttempts).toBe(1);
+    expect(fixture.legacyDispatcher).toMatchObject({ running: true, restart_count: 1 });
+    expect(JSON.parse(fs.readFileSync(fixture.legacyQueueFile, 'utf8')).records).toEqual([
+      expect.objectContaining({ legacy_record_id: 'safe-pending' }),
+    ]);
+    reopened.close();
   });
 
   test('installed host attaches and resumes the same durable upgrade ID after reopen', async () => {
@@ -505,11 +662,21 @@ describe('runtime upgrade coordinator', () => {
     expect(await coordinator.advance('upgrade-physical')).toMatchObject({
       state: 'rollback_required', completed_step: 'release-generation-restore',
     });
+    expect(await coordinator.advance('upgrade-physical')).toMatchObject({
+      state: 'rollback_required', completed_step: 'legacy-source-rollback',
+    });
     const rolledBack = await coordinator.advance('upgrade-physical');
     expect(rolledBack).toMatchObject({ state: 'rolled_back' });
     expect(await coordinator.advance('upgrade-physical')).toEqual(rolledBack);
     expect(JSON.parse(fs.readFileSync(fixture.activeReleaseFile, 'utf8'))).toMatchObject({
       release_ref: 'release-A', release_path: fixture.releaseA,
+    });
+    expect(fixture.legacyDispatcher).toMatchObject({
+      running: true, stop_count: 1, restart_count: 1,
+    });
+    expect(JSON.parse(fs.readFileSync(fixture.legacyQueueFile, 'utf8'))).toMatchObject({
+      batch_id: 'physical-batch', rollback_reconciled: true,
+      records: [expect.objectContaining({ legacy_record_id: 'physical-import' })],
     });
     expect(reopened.prepare(`
       SELECT COUNT(*) AS count FROM runtime_active_release_fences
@@ -563,6 +730,7 @@ describe('runtime upgrade coordinator', () => {
       GROUP BY step_key ORDER BY step_key
     `).all()).toEqual([
       { step_key: 'legacy-source-invalidate', count: 1 },
+      { step_key: 'legacy-source-rollback', count: 1 },
       { step_key: 'legacy-source-seal', count: 1 },
       { step_key: 'release-activate', count: 1 },
       { step_key: 'rollback-restore', count: 1 },
@@ -689,6 +857,9 @@ describe('runtime upgrade coordinator', () => {
       upgrade_id: 'upgrade-commit', release_ref: 'release-B', generation: 1,
     });
     expect(fs.existsSync(fixture.legacyPath)).toBe(true);
+    expect(await coordinator.advance('upgrade-commit')).toMatchObject({
+      state: 'committed', completed_step: 'legacy-source-commit',
+    });
     expect(await coordinator.advance('upgrade-commit')).toMatchObject({
       state: 'committed', completed_step: 'postcommit-cleanup',
     });

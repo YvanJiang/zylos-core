@@ -166,6 +166,7 @@ export function createLegacySourceQueueAdapter({
   sourceQueueFile,
   auditDirectory,
   stopLegacyDispatcher,
+  restartLegacyDispatcher,
 }) {
   for (const [name, value] of Object.entries({ sourceQueueFile, auditDirectory })) {
     if (typeof value !== 'string' || !path.isAbsolute(value)
@@ -176,6 +177,36 @@ export function createLegacySourceQueueAdapter({
   const sourcePath = path.resolve(sourceQueueFile);
   const auditRoot = path.resolve(auditDirectory);
   requireFunction('stopLegacyDispatcher', stopLegacyDispatcher);
+  requireFunction('restartLegacyDispatcher', restartLegacyDispatcher);
+
+  function isRollbackSafe(record) {
+    if (record?.kind === 'c4') {
+      return record.legacy_state === 'pending' && record.route === 'unique'
+        && typeof record.legacy_record_id === 'string'
+        && record.legacy_record_id.length > 0
+        && !/[\u0000-\u001f\u007f]/.test(record.legacy_record_id);
+    }
+    if (record?.kind !== 'scheduler' || record.legacy_state !== 'pending'
+      || record.schedule_type !== 'one-time' || !record.occurrence) return false;
+    const scheduledAt = Date.parse(record.scheduled_for);
+    const observedAt = Date.parse(record.observed_at);
+    return Number.isFinite(scheduledAt) && Number.isFinite(observedAt)
+      && Number.isSafeInteger(record.miss_threshold_ms)
+      && observedAt - scheduledAt <= record.miss_threshold_ms;
+  }
+
+  async function materializeReadOnly(file, document) {
+    try {
+      const existing = JSON.parse(await fs.readFile(file, 'utf8'));
+      if (hash(existing) !== hash(document)) throw new Error('Legacy rollback queue conflicts.');
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      const partial = `${file}.${crypto.randomUUID()}.partial`;
+      await fs.writeFile(partial, `${canonicalizeJson(document)}\n`, { mode: 0o600 });
+      await fs.rename(partial, file);
+    }
+    await fs.chmod(file, 0o400);
+  }
 
   async function readAndVerify(file, expectedHash) {
     const document = JSON.parse(await fs.readFile(file, 'utf8'));
@@ -195,13 +226,24 @@ export function createLegacySourceQueueAdapter({
       }
       await fs.mkdir(auditRoot, { recursive: true });
       const auditPath = path.join(auditRoot, `${hash({ batch_id: batchId, batch_hash: batchHash })}.json`);
+      const rollbackPath = path.join(
+        auditRoot, `${hash({ batch_id: batchId, batch_hash: batchHash, kind: 'rollback-safe' })}.json`,
+      );
       let sourcePresent = true;
+      let sourceDocument = null;
       try {
-        await readAndVerify(sourcePath, batchHash);
+        sourceDocument = await readAndVerify(sourcePath, batchHash);
       } catch (error) {
         if (error?.code !== 'ENOENT') throw error;
         sourcePresent = false;
       }
+      if (sourceDocument === null) sourceDocument = await readAndVerify(auditPath, batchHash);
+      const rollbackDocument = {
+        batch_id: sourceDocument.batch_id,
+        records: sourceDocument.records.filter(isRollbackSafe),
+        rollback_reconciled: true,
+      };
+      await materializeReadOnly(rollbackPath, rollbackDocument);
       if (sourcePresent) {
         await fs.rename(sourcePath, auditPath);
       }
@@ -214,6 +256,10 @@ export function createLegacySourceQueueAdapter({
         source_queue_ref: sourcePath,
         audit_queue_ref: auditPath,
         audit_sha256: await sha256File(auditPath),
+        rollback_queue_ref: rollbackPath,
+        rollback_queue_sha256: await sha256File(rollbackPath),
+        rollback_queue_record_count: rollbackDocument.records.length,
+        excluded_record_count: sourceDocument.records.length - rollbackDocument.records.length,
         legacy_dispatcher_stopped: true,
         legacy_dispatcher_stopped_at: stopProof.stopped_at,
         source_queue_read_only: true,
@@ -240,6 +286,64 @@ export function createLegacySourceQueueAdapter({
         audit_queue_removed: true,
       });
     },
+    async rollback({
+      step_id: stepId,
+      rollback_queue_ref: rollbackQueueRef,
+      rollback_queue_sha256: rollbackQueueSha256,
+    }) {
+      if (typeof rollbackQueueRef !== 'string'
+        || path.dirname(path.resolve(rollbackQueueRef)) !== auditRoot) {
+        throw new Error('Legacy rollback queue escaped its configured directory.');
+      }
+      let restoredDocument;
+      try {
+        if (await sha256File(sourcePath) !== rollbackQueueSha256) {
+          throw new Error('Restored legacy rollback queue conflicts with its durable hash.');
+        }
+        restoredDocument = JSON.parse(await fs.readFile(sourcePath, 'utf8'));
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+        if (await sha256File(rollbackQueueRef) !== rollbackQueueSha256) {
+          throw new Error('Legacy rollback queue changed before restoration.');
+        }
+        await fs.chmod(rollbackQueueRef, 0o600);
+        await fs.rename(rollbackQueueRef, sourcePath);
+        restoredDocument = JSON.parse(await fs.readFile(sourcePath, 'utf8'));
+      }
+      await fs.chmod(sourcePath, 0o600);
+      const restartProof = await restartLegacyDispatcher(Object.freeze({
+        step_id: stepId,
+        source_queue_ref: sourcePath,
+        rollback_queue_sha256: rollbackQueueSha256,
+      }));
+      if (restartProof?.restarted !== true || typeof restartProof.restarted_at !== 'string') {
+        throw new Error('Legacy rollback requires dispatcher restart proof.');
+      }
+      return Object.freeze({
+        step_id: stepId,
+        source_queue_ref: sourcePath,
+        rollback_queue_sha256: rollbackQueueSha256,
+        restored_record_count: restoredDocument.records.length,
+        legacy_dispatcher_restarted: true,
+        legacy_dispatcher_restarted_at: restartProof.restarted_at,
+      });
+    },
+    async commit({ rollback_queue_ref: rollbackQueueRef, rollback_queue_sha256: rollbackQueueSha256 }) {
+      if (typeof rollbackQueueRef !== 'string'
+        || path.dirname(path.resolve(rollbackQueueRef)) !== auditRoot) {
+        throw new Error('Legacy commit queue cleanup escaped its configured directory.');
+      }
+      try {
+        if (await sha256File(rollbackQueueRef) !== rollbackQueueSha256) {
+          throw new Error('Legacy rollback queue changed before commit cleanup.');
+        }
+        await fs.chmod(rollbackQueueRef, 0o600);
+        await fs.unlink(rollbackQueueRef);
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+      return Object.freeze({ rollback_queue_removed: true });
+    },
   });
 }
 
@@ -263,7 +367,12 @@ export function createRuntimeUpgradeCoordinator({
   if (legacySourceAdapter !== null
     && (!legacySourceAdapter || typeof legacySourceAdapter.invalidate !== 'function'
       || typeof legacySourceAdapter.seal !== 'function')) {
-    throw new TypeError('legacySourceAdapter must expose invalidate and seal or be null');
+    throw new TypeError('legacySourceAdapter must expose invalidate, seal, rollback, and commit');
+  }
+  if (legacySourceAdapter !== null
+    && (typeof legacySourceAdapter.rollback !== 'function'
+      || typeof legacySourceAdapter.commit !== 'function')) {
+    throw new TypeError('legacySourceAdapter must expose invalidate, seal, rollback, and commit');
   }
   requireFunction('snapshotAdapter.capture', snapshotAdapter.capture);
   requireFunction('snapshotAdapter.verify', snapshotAdapter.verify);
@@ -486,6 +595,12 @@ export function createRuntimeUpgradeCoordinator({
       }
       return upgradeService.migrateLegacy(upgradeId, legacyBatch);
     }
+    if (run.state === 'migrating') {
+      if (legacyBatch === null) {
+        return Object.freeze({ ...run, status: 'waiting_for_legacy_batch_retry' });
+      }
+      return upgradeService.migrateLegacy(upgradeId, legacyBatch);
+    }
     if (run.state === 'health_check') {
       const sourceInvalidation = loadEffect(upgradeId, 'legacy-source-invalidate');
       if (sourceInvalidation !== null
@@ -599,9 +714,44 @@ export function createRuntimeUpgradeCoordinator({
           ...upgradeService.get(upgradeId), completed_step: 'release-generation-restore',
         });
       }
+      if (sourceInvalidation !== null
+        && loadEffect(upgradeId, 'legacy-source-rollback')?.state !== 'completed') {
+        if (legacySourceAdapter === null) {
+          return Object.freeze({ ...run, status: 'waiting_for_legacy_source_rollback' });
+        }
+        await performEffect(
+          upgradeId,
+          'legacy-source-rollback',
+          {
+            upgrade_id: upgradeId,
+            rollback_queue_ref: sourceInvalidation.result.rollback_queue_ref,
+            rollback_queue_sha256: sourceInvalidation.result.rollback_queue_sha256,
+          },
+          (request) => legacySourceAdapter.rollback(request),
+        );
+        return Object.freeze({ ...run, completed_step: 'legacy-source-rollback' });
+      }
       return upgradeService.completeRollback(upgradeId);
     }
     if (run.state === 'committed') {
+      const sourceInvalidation = loadEffect(upgradeId, 'legacy-source-invalidate');
+      if (sourceInvalidation !== null
+        && loadEffect(upgradeId, 'legacy-source-commit')?.state !== 'completed') {
+        if (legacySourceAdapter === null) {
+          return Object.freeze({ ...run, status: 'waiting_for_legacy_source_commit' });
+        }
+        await performEffect(
+          upgradeId,
+          'legacy-source-commit',
+          {
+            upgrade_id: upgradeId,
+            rollback_queue_ref: sourceInvalidation.result.rollback_queue_ref,
+            rollback_queue_sha256: sourceInvalidation.result.rollback_queue_sha256,
+          },
+          (request) => legacySourceAdapter.commit(request),
+        );
+        return Object.freeze({ ...run, completed_step: 'legacy-source-commit' });
+      }
       if (loadEffect(upgradeId, 'postcommit-cleanup')?.state !== 'completed') {
         await performEffect(
           upgradeId,
