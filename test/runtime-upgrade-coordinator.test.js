@@ -54,7 +54,7 @@ function createFixture() {
   };
 }
 
-function legacySourceAdapter(fixture) {
+function legacySourceAdapter(fixture, { restartLegacyDispatcher } = {}) {
   return createLegacySourceQueueAdapter({
     sourceQueueFile: fixture.legacyQueueFile,
     auditDirectory: fixture.legacyAuditDirectory,
@@ -63,16 +63,43 @@ function legacySourceAdapter(fixture) {
       fixture.legacyDispatcher.stop_count += 1;
       return { stopped: true, stopped_at: '2026-07-20T10:00:05.500Z' };
     },
-    restartLegacyDispatcher: async () => {
+    restartLegacyDispatcher: restartLegacyDispatcher ?? (async ({ step_id: stepId }) => {
       fixture.legacyDispatcher.running = true;
       fixture.legacyDispatcher.restart_count += 1;
-      return { restarted: true, restarted_at: '2026-07-20T10:00:06.750Z' };
-    },
+      return {
+        step_id: stepId, restarted: true, restarted_at: '2026-07-20T10:00:06.750Z',
+      };
+    }),
   });
 }
 
 function writeLegacySource(fixture, batch) {
   fs.writeFileSync(fixture.legacyQueueFile, `${JSON.stringify(batch)}\n`, { mode: 0o600 });
+}
+
+function deliveredNoticeAdapter(database, deliveries = []) {
+  return {
+    async deliver({ upgrade_id: upgradeId, notice_ids: noticeIds }) {
+      for (const notice of noticeIds) {
+        const outbox = database.prepare(`
+          SELECT outbox.outbox_id, outbox.delivery_id
+          FROM runtime_legacy_migration_notices AS notice
+          JOIN runtime_outbox AS outbox ON outbox.outbox_id = notice.outbox_id
+          WHERE notice.upgrade_id = ? AND notice.legacy_kind = ?
+            AND notice.legacy_record_id = ?
+        `).get(upgradeId, notice.legacy_kind, notice.legacy_record_id);
+        const proof = {
+          status: 'delivered', delivery_id: outbox.delivery_id,
+          delivered_at: '2026-07-20T10:00:06.500Z',
+        };
+        database.prepare(`
+          UPDATE runtime_outbox SET status = 'delivered', result_json = ?, updated_at = ?
+          WHERE outbox_id = ?
+        `).run(JSON.stringify(proof), proof.delivered_at, outbox.outbox_id);
+        deliveries.push({ ...notice, ...proof });
+      }
+    },
+  };
 }
 
 function ids(prefix) {
@@ -132,6 +159,19 @@ function legacyEnvelope(legacyRecordId) {
   return document;
 }
 
+function legacyScheduledOccurrence(suffix) {
+  return {
+    schedule_id: `schedule-${suffix}`,
+    task_id: `task-${suffix}`,
+    occurrence_id: `occurrence-${suffix}`,
+    prompt: `Run ${suffix}.`,
+    occurred_at: '2026-07-20T09:59:00.000Z',
+    received_at: '2026-07-20T10:00:00.000Z',
+    region: 'global', tenant_id: 'tenant-upgrade', bot_id: 'bot-upgrade',
+    bound_conversation: null,
+  };
+}
+
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
     fs.rmSync(directory, { recursive: true, force: true });
@@ -139,6 +179,55 @@ afterEach(() => {
 });
 
 describe('runtime upgrade coordinator', () => {
+  test('derives rollback-safe work only through canonical legacy validation', () => {
+    const fixture = createFixture();
+    const service = createRuntimeUpgradeService({ database: fixture.database, generateId: ids('plan') });
+    const recurring = {
+      kind: 'scheduler', legacy_record_id: 'recurring-next', legacy_state: 'pending',
+      schedule_type: 'recurring', scheduled_for: '2026-07-20T09:59:00.000Z',
+      observed_at: '2026-07-20T10:00:00.000Z', miss_threshold_ms: 120_000,
+      occurrence: legacyScheduledOccurrence('recurring-next'),
+    };
+    expect(service.planLegacyRollbackBatch({
+      batch_id: 'canonical-plan',
+      records: [
+        { kind: 'c4', legacy_record_id: 'safe-c4', legacy_state: 'pending', route: 'unique',
+          legacy_queue_sequence: 1, envelope: legacyEnvelope('safe-c4') },
+        recurring,
+        { kind: 'runtime_control', legacy_record_id: 'never-safe', legacy_state: 'pending' },
+      ],
+    })).toEqual({
+      batch_id: 'canonical-plan', rollback_reconciled: true,
+      records: [expect.objectContaining({ legacy_record_id: 'safe-c4' }), recurring],
+    });
+    const malformed = legacyEnvelope('wrong-identity');
+    expect(() => service.planLegacyRollbackBatch({
+      batch_id: 'malformed-plan',
+      records: [{
+        kind: 'c4', legacy_record_id: 'expected-identity', legacy_state: 'pending',
+        route: 'unique', legacy_queue_sequence: 1, envelope: malformed,
+      }],
+    })).toThrow('exact legacy record identity');
+    expect(() => service.planLegacyRollbackBatch({
+      batch_id: 'bad-scheduler-plan',
+      records: [{ ...recurring, occurrence: { schedule_id: 'incomplete' } }],
+    })).toThrow();
+    expect(() => service.planLegacyRollbackBatch({
+      batch_id: 'bad-fifo-plan',
+      records: [
+        { kind: 'c4', legacy_record_id: 'fifo-one', legacy_state: 'pending', route: 'unique',
+          legacy_queue_sequence: 1, envelope: legacyEnvelope('fifo-one') },
+        { kind: 'c4', legacy_record_id: 'fifo-two', legacy_state: 'pending', route: 'unique',
+          legacy_queue_sequence: 1, envelope: legacyEnvelope('fifo-two') },
+      ],
+    })).toThrow('positive and strictly FIFO ordered');
+    expect(() => service.planLegacyRollbackBatch({
+      batch_id: 'trusted-scheduler-plan',
+      records: [{ ...recurring, permission_mode: 'trusted' }],
+    })).toThrow('permission_mode must be safe');
+    fixture.database.close();
+  });
+
   test('hashes upgrade IDs so snapshot files cannot escape the configured directory', async () => {
     const fixture = createFixture();
     const adapter = createSqliteSnapshotAdapter({
@@ -357,7 +446,18 @@ describe('runtime upgrade coordinator', () => {
       records: [
         { kind: 'c4', legacy_record_id: 'safe-pending', legacy_state: 'pending',
           route: 'unique', legacy_queue_sequence: 1, envelope: legacyEnvelope('safe-pending') },
-        { kind: 'c4', legacy_record_id: 'unknown-running', legacy_state: 'running' },
+        { kind: 'c4', legacy_record_id: 'unknown-running', legacy_state: 'running',
+          notification_target: {
+            region: 'global', tenant_id: 'tenant-upgrade', channel: 'telegram',
+            bot_id: 'bot-upgrade', chat_type: 'group', chat_id: 'chat-upgrade',
+            native_thread_or_topic_id: null,
+            native_thread_root_message_id: null,
+            native_thread_reply_target_message_id: null,
+          } },
+        { kind: 'scheduler', legacy_record_id: 'recurring-next', legacy_state: 'pending',
+          schedule_type: 'recurring', scheduled_for: '2026-07-20T09:59:00.000Z',
+          observed_at: '2026-07-20T10:00:00.000Z', miss_threshold_ms: 120_000,
+          occurrence: legacyScheduledOccurrence('host-recurring-next') },
         { kind: 'runtime_control', legacy_record_id: 'forbidden-stop', legacy_state: 'pending' },
       ],
     };
@@ -386,7 +486,26 @@ describe('runtime upgrade coordinator', () => {
     })).toMatchObject({ state: 'rollback_required' });
     fixture.database.close();
 
-    const reopened = new Database(fixture.databasePath);
+    let reopened = new Database(fixture.databasePath);
+    const noticeDeliveries = [];
+    const durableRestartProofs = new Map();
+    let crashAfterDispatcherRestart = true;
+    const crashSafeLegacyAdapter = legacySourceAdapter(fixture, {
+      async restartLegacyDispatcher({ step_id: stepId }) {
+        if (durableRestartProofs.has(stepId)) return durableRestartProofs.get(stepId);
+        fixture.legacyDispatcher.running = true;
+        fixture.legacyDispatcher.restart_count += 1;
+        const proof = {
+          step_id: stepId, restarted: true, restarted_at: '2026-07-20T10:00:06.750Z',
+        };
+        durableRestartProofs.set(stepId, proof);
+        if (crashAfterDispatcherRestart) {
+          crashAfterDispatcherRestart = false;
+          throw new Error('injected crash after dispatcher restart');
+        }
+        return proof;
+      },
+    });
     host = createInstalledRuntimeUpgradeHost({
       database: reopened,
       snapshotAdapter: createSqliteSnapshotAdapter({
@@ -394,21 +513,165 @@ describe('runtime upgrade coordinator', () => {
         openDatabase: (file, options) => new Database(file, options),
       }),
       releaseAdapter,
-      legacySourceAdapter: legacySourceAdapter(fixture),
+      legacySourceAdapter: crashSafeLegacyAdapter,
+      noticeAdapter: deliveredNoticeAdapter(reopened, noticeDeliveries),
       zylosDir: fixture.directory, generateId: ids('host-rollback-reopen'),
+    });
+    expect(await host.advance(preflight.upgrade_id)).toMatchObject({
+      state: 'rollback_required', completed_step: 'legacy-rollback-reconciliation',
+    });
+    expect(await host.advance(preflight.upgrade_id)).toMatchObject({
+      state: 'rollback_required', completed_step: 'legacy-source-seal',
+    });
+    expect(await host.advance(preflight.upgrade_id)).toMatchObject({
+      state: 'rollback_required', completed_step: 'notice-delivery',
     });
     expect(await host.advance(preflight.upgrade_id)).toMatchObject({
       state: 'rollback_required', completed_step: 'rollback-restore',
     });
     expect(await host.advance(preflight.upgrade_id)).toMatchObject({
-      state: 'rollback_required', completed_step: 'legacy-source-rollback',
+      state: 'rollback_required', completed_step: 'legacy-source-restore',
+    });
+    expect(JSON.parse(fs.readFileSync(fixture.legacyQueueFile, 'utf8')).records).toEqual([
+      expect.objectContaining({ legacy_record_id: 'safe-pending' }),
+      expect.objectContaining({ legacy_record_id: 'recurring-next' }),
+    ]);
+    await expect(host.advance(preflight.upgrade_id))
+      .rejects.toThrow('injected crash after dispatcher restart');
+    expect(reopened.prepare(`
+      SELECT state FROM runtime_upgrade_effects
+      WHERE upgrade_id = ? AND step_key = 'legacy-dispatcher-restart'
+    `).get(preflight.upgrade_id)).toEqual({ state: 'claimed' });
+    const consumedAfterRestart = JSON.parse(fs.readFileSync(fixture.legacyQueueFile, 'utf8'));
+    consumedAfterRestart.records = [];
+    fs.writeFileSync(fixture.legacyQueueFile, `${JSON.stringify(consumedAfterRestart)}\n`);
+    reopened.close();
+    reopened = new Database(fixture.databasePath);
+    host = createInstalledRuntimeUpgradeHost({
+      database: reopened,
+      snapshotAdapter: createSqliteSnapshotAdapter({
+        database: reopened, snapshotDirectory: fixture.snapshotDirectory,
+        openDatabase: (file, options) => new Database(file, options),
+      }),
+      releaseAdapter,
+      legacySourceAdapter: crashSafeLegacyAdapter,
+      noticeAdapter: deliveredNoticeAdapter(reopened, noticeDeliveries),
+      zylosDir: fixture.directory, generateId: ids('host-rollback-restart-reopen'),
+    });
+    expect(await host.advance(preflight.upgrade_id)).toMatchObject({
+      state: 'rollback_required', completed_step: 'legacy-dispatcher-restart',
     });
     expect(await host.advance(preflight.upgrade_id)).toMatchObject({ state: 'rolled_back' });
     expect(activationAttempts).toBe(1);
     expect(fixture.legacyDispatcher).toMatchObject({ running: true, restart_count: 1 });
-    expect(JSON.parse(fs.readFileSync(fixture.legacyQueueFile, 'utf8')).records).toEqual([
-      expect.objectContaining({ legacy_record_id: 'safe-pending' }),
+    expect(JSON.parse(fs.readFileSync(fixture.legacyQueueFile, 'utf8')).records).toEqual([]);
+    expect(noticeDeliveries).toEqual([
+      expect.objectContaining({ legacy_record_id: 'unknown-running', status: 'delivered' }),
     ]);
+    expect(reopened.prepare(`
+      SELECT legacy_record_id, disposition FROM runtime_legacy_migration_records
+      WHERE upgrade_id = ? ORDER BY legacy_record_id
+    `).all(preflight.upgrade_id)).toEqual([
+      { legacy_record_id: 'forbidden-stop', disposition: 'invalidated_audit_only' },
+      { legacy_record_id: 'recurring-next', disposition: 'restored_scheduler' },
+      { legacy_record_id: 'safe-pending', disposition: 'restored_pending' },
+      { legacy_record_id: 'unknown-running', disposition: 'quarantined_side_effect_unknown' },
+    ]);
+    expect(reopened.prepare(`
+      SELECT record_kind, retention_class FROM runtime_retention_entries
+      WHERE record_kind LIKE 'legacy_migration_%'
+      ORDER BY record_kind, retention_class
+    `).all()).toEqual([
+      { record_kind: 'legacy_migration_audit_payload', retention_class: 'security_audit_180d' },
+      ...Array.from({ length: 4 }, () => ({
+        record_kind: 'legacy_migration_payload', retention_class: 'terminal_detail_30d',
+      })),
+    ]);
+    reopened.close();
+  });
+
+  test('finishes a crash-interrupted source invalidation before rollback consumes its proof', async () => {
+    const fixture = createFixture();
+    const service = createRuntimeUpgradeService({ database: fixture.database, generateId: ids('partial') });
+    service.preflight({
+      upgrade_id: 'upgrade-partial-invalidation', from_release: 'release-A', to_release: 'release-B',
+      scope: { kind: 'installation', bot_id: null }, checks: checks(),
+    });
+    fs.writeFileSync(fixture.activeReleaseFile, JSON.stringify({
+      release_ref: 'release-A', release_path: fixture.releaseA,
+    }));
+    const batch = {
+      batch_id: 'partial-invalidation-batch',
+      records: [{
+        kind: 'c4', legacy_record_id: 'partial-safe', legacy_state: 'pending',
+        route: 'unique', legacy_queue_sequence: 1, envelope: legacyEnvelope('partial-safe'),
+      }],
+    };
+    writeLegacySource(fixture, batch);
+    const durableAdapter = legacySourceAdapter(fixture);
+    let crashAfterRename = true;
+    const crashingAdapter = {
+      ...durableAdapter,
+      async invalidate(request) {
+        const proof = await durableAdapter.invalidate(request);
+        if (crashAfterRename) {
+          crashAfterRename = false;
+          throw new Error('injected crash after source invalidation');
+        }
+        return proof;
+      },
+    };
+    const snapshotAdapter = createSqliteSnapshotAdapter({
+      database: fixture.database, snapshotDirectory: fixture.snapshotDirectory,
+      openDatabase: (file, options) => new Database(file, options),
+    });
+    const releaseAdapter = createAtomicReleaseAdapter({
+      activeReleaseFile: fixture.activeReleaseFile,
+      releases: { 'release-A': fixture.releaseA, 'release-B': fixture.releaseB },
+    });
+    let coordinator = createRuntimeUpgradeCoordinator({
+      database: fixture.database, upgradeService: service, snapshotAdapter, releaseAdapter,
+      legacySourceAdapter: crashingAdapter,
+    });
+    for (let step = 0; step < 4; step += 1) await coordinator.advance('upgrade-partial-invalidation');
+    await expect(coordinator.advance('upgrade-partial-invalidation', { legacyBatch: batch }))
+      .rejects.toThrow('injected crash after source invalidation');
+    expect(coordinator.loadEffect('upgrade-partial-invalidation', 'legacy-source-invalidate'))
+      .toMatchObject({ state: 'claimed', result: null, input: { batch_id: batch.batch_id } });
+    service.fail('upgrade-partial-invalidation', {
+      boundary: 'legacy_source_invalidation', code: 'host_crash',
+      message: 'host stopped after source rename',
+    });
+    fixture.database.close();
+
+    const reopened = new Database(fixture.databasePath);
+    const resumedService = createRuntimeUpgradeService({ database: reopened, generateId: ids('partial-reopen') });
+    coordinator = createRuntimeUpgradeCoordinator({
+      database: reopened, upgradeService: resumedService,
+      snapshotAdapter: createSqliteSnapshotAdapter({
+        database: reopened, snapshotDirectory: fixture.snapshotDirectory,
+        openDatabase: (file, options) => new Database(file, options),
+      }),
+      releaseAdapter, legacySourceAdapter: durableAdapter,
+    });
+    expect(await coordinator.advance('upgrade-partial-invalidation')).toMatchObject({
+      state: 'rollback_required', completed_step: 'legacy-source-invalidate',
+    });
+    expect(coordinator.loadEffect('upgrade-partial-invalidation', 'legacy-source-invalidate'))
+      .toMatchObject({ state: 'completed', claim_attempt: 2 });
+    expect((await coordinator.advance('upgrade-partial-invalidation')).completed_step)
+      .toBe('legacy-rollback-reconciliation');
+    expect((await coordinator.advance('upgrade-partial-invalidation')).completed_step)
+      .toBe('legacy-source-seal');
+    expect((await coordinator.advance('upgrade-partial-invalidation')).completed_step)
+      .toBe('rollback-restore');
+    expect((await coordinator.advance('upgrade-partial-invalidation')).completed_step)
+      .toBe('legacy-source-restore');
+    expect((await coordinator.advance('upgrade-partial-invalidation')).completed_step)
+      .toBe('legacy-dispatcher-restart');
+    expect(await coordinator.advance('upgrade-partial-invalidation')).toMatchObject({
+      state: 'rolled_back',
+    });
     reopened.close();
   });
 
@@ -522,6 +785,15 @@ describe('runtime upgrade coordinator', () => {
         kind: 'c4', legacy_record_id: 'physical-import', legacy_state: 'pending',
         route: 'unique', legacy_queue_sequence: 1, envelope: legacyEnvelope('physical-import'),
       }, {
+        kind: 'c4', legacy_record_id: 'physical-running-unknown', legacy_state: 'running',
+        notification_target: {
+          region: 'global', tenant_id: 'tenant-upgrade', channel: 'telegram',
+          bot_id: 'bot-upgrade', chat_type: 'group', chat_id: 'chat-upgrade',
+          native_thread_or_topic_id: null,
+          native_thread_root_message_id: null,
+          native_thread_reply_target_message_id: null,
+        },
+      }, {
         kind: 'global_provider_lineage', legacy_record_id: 'rolled-back-global-lineage',
         legacy_state: 'delivered', recent_c4_context: ['rolled back context'],
         memory_handoff: 'rolled back memory',
@@ -620,6 +892,15 @@ describe('runtime upgrade coordinator', () => {
         return releaseAdapter.restore(request);
       },
     };
+    const rollbackNoticeDeliveries = [];
+    const durableNoticeAdapter = deliveredNoticeAdapter(reopened, rollbackNoticeDeliveries);
+    let allowRollbackNoticeDelivery = false;
+    const gatedRollbackNoticeAdapter = {
+      async deliver(request) {
+        if (!allowRollbackNoticeDelivery) throw new Error('notice transport unavailable');
+        return durableNoticeAdapter.deliver(request);
+      },
+    };
     coordinator = createRuntimeUpgradeCoordinator({
       database: reopened, upgradeService: resumedService,
       snapshotAdapter: resumedSnapshotAdapter, releaseAdapter: resumedReleaseAdapter,
@@ -629,6 +910,7 @@ describe('runtime upgrade coordinator', () => {
       database: reopened, upgradeService: resumedService,
       snapshotAdapter: resumedSnapshotAdapter, releaseAdapter: resumedReleaseAdapter,
       legacySourceAdapter: legacySourceAdapter(fixture),
+      noticeAdapter: gatedRollbackNoticeAdapter,
       now: () => '2026-07-20T10:00:06.000Z',
     });
     expect(await coordinator.advance('upgrade-physical', {
@@ -656,6 +938,23 @@ describe('runtime upgrade coordinator', () => {
     resumedService.fail('upgrade-physical', {
       boundary: 'executor_health', code: 'fixture_failure', message: 'force rollback fixture',
     });
+    await expect(coordinator.advance('upgrade-physical'))
+      .rejects.toThrow('notice transport unavailable');
+    expect(JSON.parse(fs.readFileSync(fixture.activeReleaseFile, 'utf8'))).toMatchObject({
+      release_ref: 'release-B', release_path: fixture.releaseB,
+    });
+    expect(fixture.legacyDispatcher.running).toBe(false);
+    expect(reopened.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_upgrade_effects
+      WHERE upgrade_id = 'upgrade-physical' AND step_key = 'rollback-restore'
+    `).get().count).toBe(0);
+    allowRollbackNoticeDelivery = true;
+    expect(await coordinator.advance('upgrade-physical')).toMatchObject({
+      state: 'rollback_required', completed_step: 'notice-delivery',
+    });
+    expect(rollbackNoticeDeliveries).toEqual([
+      expect.objectContaining({ legacy_record_id: 'physical-running-unknown' }),
+    ]);
     expect(await coordinator.advance('upgrade-physical')).toMatchObject({
       state: 'rollback_required', completed_step: 'rollback-restore',
     });
@@ -663,7 +962,10 @@ describe('runtime upgrade coordinator', () => {
       state: 'rollback_required', completed_step: 'release-generation-restore',
     });
     expect(await coordinator.advance('upgrade-physical')).toMatchObject({
-      state: 'rollback_required', completed_step: 'legacy-source-rollback',
+      state: 'rollback_required', completed_step: 'legacy-source-restore',
+    });
+    expect(await coordinator.advance('upgrade-physical')).toMatchObject({
+      state: 'rollback_required', completed_step: 'legacy-dispatcher-restart',
     });
     const rolledBack = await coordinator.advance('upgrade-physical');
     expect(rolledBack).toMatchObject({ state: 'rolled_back' });
@@ -729,8 +1031,9 @@ describe('runtime upgrade coordinator', () => {
       WHERE upgrade_id = 'upgrade-physical'
       GROUP BY step_key ORDER BY step_key
     `).all()).toEqual([
+      { step_key: 'legacy-dispatcher-restart', count: 1 },
       { step_key: 'legacy-source-invalidate', count: 1 },
-      { step_key: 'legacy-source-rollback', count: 1 },
+      { step_key: 'legacy-source-restore', count: 1 },
       { step_key: 'legacy-source-seal', count: 1 },
       { step_key: 'release-activate', count: 1 },
       { step_key: 'rollback-restore', count: 1 },

@@ -30,16 +30,27 @@ required before any legacy record can be imported, so runtime-control records ca
 executable source path. After the transaction has written immutable migration records, compact facts,
 and fixed-class audit payloads, a second durable effect verifies and removes the temporary source file;
 the mixed raw batch therefore cannot outlive its 30-day/detail and 180-day/control split in SQLite.
-Invalidation also materializes a hash-bound rollback queue containing only uniquely routed, unstarted
-C4 and safe one-time scheduler work. A rollback restores that reconciled queue and requires old
-dispatcher restart proof; runtime control, ambiguous/running work, history, and unknown side effects
-can never re-enter the executable source. Commit deletes the unused rollback queue.
+Invalidation also materializes a hash-bound rollback queue selected by Core's canonical legacy
+classifier and public envelope/scheduler validators: only exact-identity, positive-FIFO, uniquely
+routed pending C4 and safe next occurrences of one-time, recurring, or interval schedules may enter
+it. A rollback after an activation or migration failure first reads the hash-bound full audit into
+immutable Core migration records, compact facts, 30-day detail, and 180-day runtime-control audit;
+unknown-side-effect notices must have durable delivery proof before release recovery can begin. The
+temporary mixed audit is then sealed. Queue restoration and dispatcher restart are separate durable
+effects: the former finishes while the dispatcher is stopped, and the latter requires a
+dispatcher-owned `step_id` proof that is replayable even if the restored queue has already progressed.
+Runtime control, ambiguous/running work, history, and unknown side effects can never re-enter the
+executable source. Commit deletes the unused rollback queue.
 
 Rollback verifies the durable restore effect, revokes every target-release executor registration,
 and parks only unexecuted turns imported by that upgrade by cancelling their queue rows while leaving
 the attemptless turns outside active states. A later upgrade may
 adopt the exact payload and turn after proving the prior run rolled back and no provider attempt exists.
 It does not replace the live SQLite database, so ingress accepted during maintenance remains durable.
+The service transaction refuses to terminalize `rolled_back` when a completed source invalidation
+lacks audit sealing, queue restoration, dispatcher restart, or delivered notice evidence. A claimed
+invalidation that crashed after stopping or renaming the source is resumed from its durable input
+before any rollback code consumes its result.
 
 Physical activation also advances the durable release-generation fence. After commit, a service
 may claim a conversation only when its registered `upgrade_id` and release ref match the applicable

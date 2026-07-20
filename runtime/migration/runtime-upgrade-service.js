@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import {
   canonicalizeJson,
   createIdempotencyKey,
+  validateInboundEnvelope,
   validateDeliveryCommand,
   validatePublicFixtureSafety,
 } from '../../contracts/public/index.js';
@@ -11,6 +12,7 @@ import { acceptNormalInbound } from '../persistence/inbound-acceptance.js';
 import { createExecutorStore } from '../persistence/executor-store.js';
 import {
   acceptScheduledOccurrence,
+  createScheduledOccurrenceEnvelope,
   decideScheduledOccurrence,
 } from '../scheduler/scheduler-queue.js';
 
@@ -435,6 +437,62 @@ export function createRuntimeUpgradeService({
       `).get(upgradeId);
       if (releaseFence && releaseFence.restored_at === null) {
         throw new Error('Rollback requires the durable release generation fence to be restored.');
+      }
+      const sourceInvalidation = database.prepare(`
+        SELECT state, result_json FROM runtime_upgrade_effects
+        WHERE upgrade_id = ? AND step_key = 'legacy-source-invalidate'
+      `).get(upgradeId);
+      if (sourceInvalidation !== undefined) {
+        if (sourceInvalidation.state !== 'completed') {
+          throw new Error('Rollback requires completed legacy source invalidation reconciliation.');
+        }
+        const reconciliation = database.prepare(`
+          SELECT 1 FROM runtime_upgrade_events
+          WHERE upgrade_id = ? AND step_key IN (
+            'legacy-migration', 'legacy-rollback-reconciliation'
+          ) LIMIT 1
+        `).get(upgradeId);
+        if (reconciliation === undefined) {
+          throw new Error('Rollback requires durable legacy migration or rollback reconciliation.');
+        }
+        const sourceProof = JSON.parse(sourceInvalidation.result_json);
+        const completedEffects = new Map(database.prepare(`
+          SELECT step_key, step_id, result_json FROM runtime_upgrade_effects
+          WHERE upgrade_id = ? AND step_key IN (
+            'legacy-source-seal', 'legacy-source-restore', 'legacy-dispatcher-restart'
+          ) AND state = 'completed'
+        `).all(upgradeId).map((effect) => [effect.step_key, effect]));
+        for (const stepKey of [
+          'legacy-source-seal', 'legacy-source-restore', 'legacy-dispatcher-restart',
+        ]) {
+          if (!completedEffects.has(stepKey)) {
+            throw new Error(`Rollback requires completed ${stepKey} effect.`);
+          }
+        }
+        const seal = JSON.parse(completedEffects.get('legacy-source-seal').result_json);
+        const sourceRestore = JSON.parse(completedEffects.get('legacy-source-restore').result_json);
+        const dispatcherRestart = JSON.parse(
+          completedEffects.get('legacy-dispatcher-restart').result_json,
+        );
+        if (seal.audit_queue_ref !== sourceProof.audit_queue_ref
+          || seal.audit_sha256 !== sourceProof.audit_sha256
+          || seal.audit_queue_removed !== true
+          || sourceRestore.source_queue_ref !== sourceProof.source_queue_ref
+          || sourceRestore.rollback_queue_sha256 !== sourceProof.rollback_queue_sha256
+          || sourceRestore.source_queue_restored !== true
+          || dispatcherRestart.source_queue_ref !== sourceProof.source_queue_ref
+          || dispatcherRestart.legacy_dispatcher_restarted !== true
+          || dispatcherRestart.dispatcher_restart_idempotency_key
+            !== completedEffects.get('legacy-dispatcher-restart').step_id) {
+          throw new Error('Rollback legacy source effects do not match invalidation proof.');
+        }
+        const pendingNotices = database.prepare(`
+          SELECT COUNT(*) AS count FROM runtime_legacy_migration_notices
+          WHERE upgrade_id = ? AND state = 'pending'
+        `).get(upgradeId).count;
+        if (pendingNotices > 0) {
+          throw new Error('Rollback requires delivered unknown-side-effect notices.');
+        }
       }
       const rollbackStore = createExecutorStore({
         database,
@@ -943,13 +1001,230 @@ export function createRuntimeUpgradeService({
     return { disposition: 'retained_history', notice: false, audit: {} };
   }
 
-  function migrateLegacy(upgradeId, batch) {
+  function analyzeLegacyBatch(batch) {
     if (!batch || typeof batch !== 'object' || Array.isArray(batch)) {
       throw new TypeError('legacy migration batch must be an object');
     }
     requireText('batch_id', batch.batch_id);
     if (!Array.isArray(batch.records)) throw new TypeError('legacy records must be an array');
-    const batchHash = hashInput(batch);
+    let previousLegacyQueueSequence = 0;
+    const identities = new Set();
+    const analyzed = batch.records.map((record) => {
+      const classification = classifyLegacyRecord(record);
+      const identity = `${record.kind}\u0000${record.legacy_record_id}`;
+      if (identities.has(identity)) {
+        throw new TypeError('legacy record identities must be unique within a batch');
+      }
+      identities.add(identity);
+      if (classification.disposition === 'migrated_pending') {
+        const validated = validateInboundEnvelope(record.envelope).forwarded;
+        if (validated.legacy?.legacy_record_id !== record.legacy_record_id
+          || validated.legacy?.legacy_state !== 'pending') {
+          throw new TypeError('pending C4 envelope must carry the exact legacy record identity');
+        }
+        if (!Number.isSafeInteger(record.legacy_queue_sequence)
+          || record.legacy_queue_sequence <= previousLegacyQueueSequence) {
+          throw new TypeError(
+            'pending unique C4 legacy_queue_sequence must be positive and strictly FIFO ordered',
+          );
+        }
+        previousLegacyQueueSequence = record.legacy_queue_sequence;
+      }
+      if (classification.disposition === 'migrated_scheduler') {
+        if (record.permission_mode !== undefined && record.permission_mode !== 'safe') {
+          throw new TypeError('legacy scheduler migration permission_mode must be safe');
+        }
+        createScheduledOccurrenceEnvelope(record.occurrence);
+      }
+      return Object.freeze({ record, classification });
+    });
+    return Object.freeze({ batch_hash: hashInput(batch), analyzed: Object.freeze(analyzed) });
+  }
+
+  function planLegacyRollbackBatch(batch) {
+    const analysis = analyzeLegacyBatch(batch);
+    return Object.freeze({
+      batch_id: batch.batch_id,
+      rollback_reconciled: true,
+      records: Object.freeze(analysis.analyzed
+        .filter(({ classification }) => ['migrated_pending', 'migrated_scheduler']
+          .includes(classification.disposition))
+        .map(({ record }) => structuredClone(record))),
+    });
+  }
+
+  function reconcileLegacyRollback(upgradeId, batch) {
+    requireText('upgradeId', upgradeId);
+    const analysis = analyzeLegacyBatch(batch);
+    const replay = replayEvent(upgradeId, 'legacy-rollback-reconciliation', batch);
+    if (replay) return replay;
+    const commit = database.transaction(() => {
+      const run = load(upgradeId);
+      if (!run || run.state !== 'rollback_required') {
+        throw new Error(`Runtime upgrade ${upgradeId} must be rollback_required.`);
+      }
+      const invalidation = database.prepare(`
+        SELECT result_json FROM runtime_upgrade_effects
+        WHERE upgrade_id = ? AND step_key = 'legacy-source-invalidate' AND state = 'completed'
+      `).get(upgradeId);
+      const invalidationProof = invalidation === undefined ? null : JSON.parse(invalidation.result_json);
+      if (invalidationProof?.batch_id !== batch.batch_id
+        || invalidationProof?.batch_hash !== analysis.batch_hash
+        || invalidationProof?.source_queue_read_only !== true) {
+        throw new Error('Legacy rollback reconciliation requires exact source invalidation proof.');
+      }
+      const committedAt = now();
+      for (const analyzed of analysis.analyzed) {
+        const { record } = analyzed;
+        const migratable = ['migrated_pending', 'migrated_scheduler']
+          .includes(analyzed.classification.disposition);
+        const classification = migratable ? {
+          disposition: analyzed.classification.disposition === 'migrated_pending'
+            ? 'restored_pending' : 'restored_scheduler',
+          notice: false,
+          audit: { ...analyzed.classification.audit, rollback_restored: true },
+        } : analyzed.classification;
+        database.prepare(`
+          INSERT INTO runtime_legacy_migration_records (
+            upgrade_id, legacy_kind, legacy_record_id, legacy_state, disposition,
+            payload_hash, audit_json, migrated_turn_id,
+            imported_by_upgrade, executable, read_only, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, 0, 1, ?)
+        `).run(
+          upgradeId, record.kind, record.legacy_record_id, record.legacy_state,
+          classification.disposition, hashInput(record),
+          JSON.stringify({ batch_id: batch.batch_id, ...classification.audit }), committedAt,
+        );
+        database.prepare(`
+          INSERT INTO runtime_legacy_migration_payloads (
+            upgrade_id, legacy_kind, legacy_record_id, payload_json, created_at
+          ) VALUES (?, ?, ?, ?, ?)
+        `).run(
+          upgradeId, record.kind, record.legacy_record_id, canonicalizeJson(record), committedAt,
+        );
+        if (record.kind === 'runtime_control') {
+          database.prepare(`
+            INSERT INTO runtime_legacy_migration_audit_payloads (
+              upgrade_id, legacy_kind, legacy_record_id, audit_payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+          `).run(
+            upgradeId, record.kind, record.legacy_record_id, canonicalizeJson(record), committedAt,
+          );
+        }
+        const durableFact = record.kind === 'scheduler'
+          ? {
+              kind: record.kind,
+              legacy_record_id: record.legacy_record_id,
+              legacy_state: record.legacy_state,
+              disposition: classification.disposition,
+              schedule_type: record.schedule_type ?? null,
+              scheduled_for: record.scheduled_for ?? null,
+              observed_at: record.observed_at ?? null,
+              definition: record.definition ?? null,
+              history: record.history ?? null,
+              occurrence: record.occurrence === undefined ? null : {
+                schedule_id: record.occurrence.schedule_id,
+                task_id: record.occurrence.task_id,
+                occurrence_id: record.occurrence.occurrence_id,
+                prompt: record.occurrence.prompt,
+                occurred_at: record.occurrence.occurred_at,
+                received_at: record.occurrence.received_at,
+                region: record.occurrence.region,
+                tenant_id: record.occurrence.tenant_id,
+                bot_id: record.occurrence.bot_id,
+                bound_conversation: record.occurrence.bound_conversation,
+              },
+            }
+          : (record.kind === 'c4' && ['delivered', 'failed'].includes(record.legacy_state)
+              ? {
+                  kind: record.kind,
+                  legacy_record_id: record.legacy_record_id,
+                  legacy_state: record.legacy_state,
+                  disposition: classification.disposition,
+                  conversation_id: record.conversation_id ?? null,
+                  history: record.history ?? null,
+                  summary: record.summary ?? null,
+                }
+              : null);
+        if (durableFact !== null) {
+          database.prepare(`
+            INSERT INTO runtime_legacy_migration_durable_facts (
+              upgrade_id, legacy_kind, legacy_record_id, fact_json, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+          `).run(
+            upgradeId, record.kind, record.legacy_record_id,
+            canonicalizeJson(durableFact), committedAt,
+          );
+        }
+        if (record.kind === 'global_provider_lineage') {
+          for (const message of record.outbound_messages) {
+            for (const field of [
+              'region', 'tenant_id', 'channel', 'bot_id', 'chat_type', 'chat_id',
+              'platform_message_id',
+            ]) requireText(`outbound_messages.${field}`, message?.[field]);
+            if (message.native_thread_or_topic_id !== null
+              && (typeof message.native_thread_or_topic_id !== 'string'
+                || message.native_thread_or_topic_id.length === 0)) {
+              throw new TypeError(
+                'outbound_messages.native_thread_or_topic_id must be a string or null',
+              );
+            }
+            database.prepare(`
+              INSERT INTO runtime_legacy_unmapped_messages (
+                region, tenant_id, channel, bot_id, chat_type, chat_id,
+                native_thread_or_topic_id, platform_message_id,
+                upgrade_id, legacy_kind, legacy_record_id,
+                recent_c4_context_json, memory_handoff, created_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'global_provider_lineage', ?, ?, ?, ?)
+            `).run(
+              message.region, message.tenant_id, message.channel, message.bot_id,
+              message.chat_type, message.chat_id, message.native_thread_or_topic_id,
+              message.platform_message_id, upgradeId, record.legacy_record_id,
+              canonicalizeJson(record.recent_c4_context), record.memory_handoff, committedAt,
+            );
+          }
+        }
+        if (classification.notice) {
+          const noticeCommand = buildLegacyNoticeCommand({
+            upgradeId, record, classification, committedAt, generateId,
+          });
+          database.prepare(`
+            INSERT INTO runtime_outbox (
+              outbox_id, delivery_id, aggregate_type, aggregate_id, turn_id, control_id,
+              lane_key, predecessor_delivery_id, aggregate_version, status, command_json,
+              priority, supersedable, terminal, next_attempt_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, 1, 'pending', ?, ?, 0, 1, ?, ?, ?)
+          `).run(
+            noticeCommand.outbox_id, noticeCommand.delivery_id,
+            noticeCommand.aggregate_type, noticeCommand.aggregate_id,
+            JSON.stringify(noticeCommand), noticeCommand.priority, noticeCommand.not_before,
+            committedAt, committedAt,
+          );
+          database.prepare(`
+            INSERT INTO runtime_legacy_migration_notices (
+              upgrade_id, legacy_kind, legacy_record_id, outbox_id, delivery_id,
+              state, created_at
+            ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+          `).run(
+            upgradeId, record.kind, record.legacy_record_id,
+            noticeCommand.outbox_id, noticeCommand.delivery_id, committedAt,
+          );
+        }
+      }
+      const result = decodeRun(load(upgradeId));
+      recordEvent({
+        upgradeId, stepKey: 'legacy-rollback-reconciliation',
+        fromState: 'rollback_required', toState: 'rollback_required',
+        input: batch, result, committedAt,
+      });
+      return result;
+    });
+    return commit.immediate();
+  }
+
+  function migrateLegacy(upgradeId, batch) {
+    const analysis = analyzeLegacyBatch(batch);
+    const batchHash = analysis.batch_hash;
     const invalidation = database.prepare(`
       SELECT result_json FROM runtime_upgrade_effects
       WHERE upgrade_id = ? AND step_key = 'legacy-source-invalidate'
@@ -964,24 +1239,6 @@ export function createRuntimeUpgradeService({
       || typeof invalidationProof?.audit_queue_ref !== 'string'
       || typeof invalidationProof?.audit_sha256 !== 'string') {
       throw new Error('Legacy migration requires exact durable source-queue invalidation proof.');
-    }
-    let previousLegacyQueueSequence = 0;
-    for (const record of batch.records) {
-      if (record?.kind !== 'c4' || record.legacy_state !== 'pending' || record.route !== 'unique') {
-        continue;
-      }
-      if (typeof record.legacy_record_id === 'string'
-        && (record.legacy_record_id.length === 0
-          || /[\u0000-\u001f\u007f]/.test(record.legacy_record_id))) {
-        continue;
-      }
-      if (!Number.isSafeInteger(record.legacy_queue_sequence)
-        || record.legacy_queue_sequence <= previousLegacyQueueSequence) {
-        throw new TypeError(
-          'pending unique C4 legacy_queue_sequence must be positive and strictly FIFO ordered',
-        );
-      }
-      previousLegacyQueueSequence = record.legacy_queue_sequence;
     }
     const current = get(upgradeId);
     if (current.state === 'drained') {
@@ -1008,8 +1265,7 @@ export function createRuntimeUpgradeService({
         now,
         generateId,
       });
-      for (const record of batch.records) {
-        const classification = classifyLegacyRecord(record);
+      for (const { record, classification } of analysis.analyzed) {
         let migratedTurnId = null;
         let importedByUpgrade = 0;
         if (['migrated_pending', 'migrated_scheduler'].includes(classification.disposition)) {
@@ -1364,6 +1620,8 @@ export function createRuntimeUpgradeService({
     get,
     isReleaseFenceActive,
     migrateLegacy,
+    planLegacyRollbackBatch,
+    reconcileLegacyRollback,
     preflight,
     prepareForcedDrain,
     recordSnapshot,

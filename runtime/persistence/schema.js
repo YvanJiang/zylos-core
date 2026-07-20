@@ -587,6 +587,7 @@ const RUNTIME_SCHEMA = `
     step_key TEXT NOT NULL,
     step_id TEXT NOT NULL UNIQUE,
     input_hash TEXT NOT NULL,
+    input_json TEXT NOT NULL DEFAULT '{}',
     state TEXT NOT NULL CHECK (state IN ('claimed', 'completed')),
     claim_owner TEXT NOT NULL,
     claim_attempt INTEGER NOT NULL CHECK (claim_attempt > 0),
@@ -646,7 +647,8 @@ const RUNTIME_SCHEMA = `
         'migrated_pending', 'quarantined_ambiguous',
         'quarantined_invalid_identity', 'quarantined_side_effect_unknown', 'retained_delivered',
         'retained_failed', 'archived_unmapped', 'retained_history',
-        'invalidated_audit_only', 'migrated_scheduler', 'skipped_missed'
+        'invalidated_audit_only', 'migrated_scheduler', 'skipped_missed',
+        'restored_pending', 'restored_scheduler'
       )
     ),
     payload_hash TEXT NOT NULL,
@@ -1660,6 +1662,9 @@ export function initializeRuntimePersistence(database) {
     'runtime_reply_mapping_recoveries',
     'recovery_version',
     'INTEGER NOT NULL DEFAULT 1 CHECK (recovery_version > 0)',
+  );
+  addColumnIfMissing(
+    database, 'runtime_upgrade_effects', 'input_json', "TEXT NOT NULL DEFAULT '{}'",
   );
   addColumnIfMissing(
     database,

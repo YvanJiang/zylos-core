@@ -179,22 +179,6 @@ export function createLegacySourceQueueAdapter({
   requireFunction('stopLegacyDispatcher', stopLegacyDispatcher);
   requireFunction('restartLegacyDispatcher', restartLegacyDispatcher);
 
-  function isRollbackSafe(record) {
-    if (record?.kind === 'c4') {
-      return record.legacy_state === 'pending' && record.route === 'unique'
-        && typeof record.legacy_record_id === 'string'
-        && record.legacy_record_id.length > 0
-        && !/[\u0000-\u001f\u007f]/.test(record.legacy_record_id);
-    }
-    if (record?.kind !== 'scheduler' || record.legacy_state !== 'pending'
-      || record.schedule_type !== 'one-time' || !record.occurrence) return false;
-    const scheduledAt = Date.parse(record.scheduled_for);
-    const observedAt = Date.parse(record.observed_at);
-    return Number.isFinite(scheduledAt) && Number.isFinite(observedAt)
-      && Number.isSafeInteger(record.miss_threshold_ms)
-      && observedAt - scheduledAt <= record.miss_threshold_ms;
-  }
-
   async function materializeReadOnly(file, document) {
     try {
       const existing = JSON.parse(await fs.readFile(file, 'utf8'));
@@ -217,7 +201,15 @@ export function createLegacySourceQueueAdapter({
   }
 
   return Object.freeze({
-    async invalidate({ step_id: stepId, batch_id: batchId, batch_hash: batchHash }) {
+    async invalidate({
+      step_id: stepId, batch_id: batchId, batch_hash: batchHash,
+      rollback_batch: rollbackBatch,
+    }) {
+      if (!rollbackBatch || rollbackBatch.batch_id !== batchId
+        || rollbackBatch.rollback_reconciled !== true
+        || !Array.isArray(rollbackBatch.records)) {
+        throw new Error('Legacy invalidation requires a canonical rollback batch.');
+      }
       const stopProof = await stopLegacyDispatcher(Object.freeze({
         step_id: stepId, batch_id: batchId, batch_hash: batchHash,
       }));
@@ -238,11 +230,15 @@ export function createLegacySourceQueueAdapter({
         sourcePresent = false;
       }
       if (sourceDocument === null) sourceDocument = await readAndVerify(auditPath, batchHash);
-      const rollbackDocument = {
-        batch_id: sourceDocument.batch_id,
-        records: sourceDocument.records.filter(isRollbackSafe),
-        rollback_reconciled: true,
-      };
+      const sourceRecords = new Map(sourceDocument.records.map((record) => [
+        `${record.kind}\u0000${record.legacy_record_id}`, hash(record),
+      ]));
+      for (const record of rollbackBatch.records) {
+        if (sourceRecords.get(`${record.kind}\u0000${record.legacy_record_id}`) !== hash(record)) {
+          throw new Error('Canonical rollback work is not an exact source-queue subset.');
+        }
+      }
+      const rollbackDocument = structuredClone(rollbackBatch);
       await materializeReadOnly(rollbackPath, rollbackDocument);
       if (sourcePresent) {
         await fs.rename(sourcePath, auditPath);
@@ -286,7 +282,19 @@ export function createLegacySourceQueueAdapter({
         audit_queue_removed: true,
       });
     },
-    async rollback({
+    async readAudit({
+      audit_queue_ref: auditQueueRef, audit_sha256: auditSha256, batch_hash: batchHash,
+    }) {
+      if (typeof auditQueueRef !== 'string'
+        || path.dirname(path.resolve(auditQueueRef)) !== auditRoot) {
+        throw new Error('Legacy audit queue read escaped its configured directory.');
+      }
+      if (await sha256File(auditQueueRef) !== auditSha256) {
+        throw new Error('Legacy audit queue changed before durable reconciliation.');
+      }
+      return readAndVerify(auditQueueRef, batchHash);
+    },
+    async restore({
       step_id: stepId,
       rollback_queue_ref: rollbackQueueRef,
       rollback_queue_sha256: rollbackQueueSha256,
@@ -311,21 +319,32 @@ export function createLegacySourceQueueAdapter({
         restoredDocument = JSON.parse(await fs.readFile(sourcePath, 'utf8'));
       }
       await fs.chmod(sourcePath, 0o600);
-      const restartProof = await restartLegacyDispatcher(Object.freeze({
-        step_id: stepId,
-        source_queue_ref: sourcePath,
-        rollback_queue_sha256: rollbackQueueSha256,
-      }));
-      if (restartProof?.restarted !== true || typeof restartProof.restarted_at !== 'string') {
-        throw new Error('Legacy rollback requires dispatcher restart proof.');
-      }
       return Object.freeze({
         step_id: stepId,
         source_queue_ref: sourcePath,
         rollback_queue_sha256: rollbackQueueSha256,
         restored_record_count: restoredDocument.records.length,
+        source_queue_restored: true,
+      });
+    },
+    async restart({ step_id: stepId, source_queue_ref: restoredSourceRef }) {
+      if (path.resolve(restoredSourceRef) !== sourcePath) {
+        throw new Error('Legacy dispatcher restart requires the exact restored source queue.');
+      }
+      const restartProof = await restartLegacyDispatcher(Object.freeze({
+        step_id: stepId,
+        source_queue_ref: sourcePath,
+      }));
+      if (restartProof?.restarted !== true || typeof restartProof.restarted_at !== 'string'
+        || restartProof.step_id !== stepId) {
+        throw new Error('Legacy rollback requires dispatcher-owned idempotent restart proof.');
+      }
+      return Object.freeze({
+        step_id: stepId,
+        source_queue_ref: sourcePath,
         legacy_dispatcher_restarted: true,
         legacy_dispatcher_restarted_at: restartProof.restarted_at,
+        dispatcher_restart_idempotency_key: stepId,
       });
     },
     async commit({ rollback_queue_ref: rollbackQueueRef, rollback_queue_sha256: rollbackQueueSha256 }) {
@@ -366,13 +385,14 @@ export function createRuntimeUpgradeCoordinator({
   }
   if (legacySourceAdapter !== null
     && (!legacySourceAdapter || typeof legacySourceAdapter.invalidate !== 'function'
-      || typeof legacySourceAdapter.seal !== 'function')) {
-    throw new TypeError('legacySourceAdapter must expose invalidate, seal, rollback, and commit');
-  }
-  if (legacySourceAdapter !== null
-    && (typeof legacySourceAdapter.rollback !== 'function'
+      || typeof legacySourceAdapter.readAudit !== 'function'
+      || typeof legacySourceAdapter.seal !== 'function'
+      || typeof legacySourceAdapter.restore !== 'function'
+      || typeof legacySourceAdapter.restart !== 'function'
       || typeof legacySourceAdapter.commit !== 'function')) {
-    throw new TypeError('legacySourceAdapter must expose invalidate, seal, rollback, and commit');
+    throw new TypeError(
+      'legacySourceAdapter must expose invalidate, readAudit, seal, restore, restart, and commit',
+    );
   }
   requireFunction('snapshotAdapter.capture', snapshotAdapter.capture);
   requireFunction('snapshotAdapter.verify', snapshotAdapter.verify);
@@ -388,13 +408,14 @@ export function createRuntimeUpgradeCoordinator({
 
   function loadEffect(upgradeId, stepKey) {
     const row = database.prepare(`
-      SELECT step_id, input_hash, state, claim_owner, claim_attempt,
+      SELECT step_id, input_hash, input_json, state, claim_owner, claim_attempt,
         claim_expires_at, result_json, committed_at, updated_at
       FROM runtime_upgrade_effects WHERE upgrade_id = ? AND step_key = ?
     `).get(upgradeId, stepKey);
     return row === undefined ? null : Object.freeze({
       step_id: row.step_id,
       input_hash: row.input_hash,
+      input: row.input_json === null ? null : Object.freeze(JSON.parse(row.input_json)),
       state: row.state,
       claim_owner: row.claim_owner,
       claim_attempt: row.claim_attempt,
@@ -422,11 +443,11 @@ export function createRuntimeUpgradeCoordinator({
       if (existing === null) {
         database.prepare(`
           INSERT INTO runtime_upgrade_effects (
-            upgrade_id, step_key, step_id, input_hash, state, claim_owner,
+            upgrade_id, step_key, step_id, input_hash, input_json, state, claim_owner,
             claim_attempt, claim_expires_at, result_json, committed_at, updated_at
-          ) VALUES (?, ?, ?, ?, 'claimed', ?, 1, ?, NULL, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, 'claimed', ?, 1, ?, NULL, ?, ?)
         `).run(
-          upgradeId, stepKey, stepId, expectedHash, effectClaimOwner,
+          upgradeId, stepKey, stepId, expectedHash, canonicalizeJson(input), effectClaimOwner,
           expiresAt, claimedAt, claimedAt,
         );
       } else {
@@ -516,6 +537,27 @@ export function createRuntimeUpgradeCoordinator({
     return complete.immediate();
   }
 
+  async function deliverPendingNotices(upgradeId, run) {
+    const pendingNotices = database.prepare(`
+      SELECT legacy_kind, legacy_record_id
+      FROM runtime_legacy_migration_notices
+      WHERE upgrade_id = ? AND state = 'pending'
+      ORDER BY legacy_kind, legacy_record_id
+    `).all(upgradeId);
+    if (pendingNotices.length === 0) return null;
+    if (noticeAdapter === null || typeof noticeAdapter.deliver !== 'function') {
+      return Object.freeze({ ...run, status: 'waiting_for_notice_delivery' });
+    }
+    await noticeAdapter.deliver(Object.freeze({
+      upgrade_id: upgradeId,
+      notice_ids: Object.freeze(pendingNotices.map((notice) => Object.freeze({ ...notice }))),
+    }));
+    for (const notice of pendingNotices) {
+      upgradeService.recordNoticeDelivered(upgradeId, notice.legacy_kind, notice.legacy_record_id);
+    }
+    return Object.freeze({ ...upgradeService.get(upgradeId), completed_step: 'notice-delivery' });
+  }
+
   async function advance(upgradeId, { legacyBatch = null } = {}) {
     const run = upgradeService.get(upgradeId);
     if (run.state === 'preflight') {
@@ -558,6 +600,7 @@ export function createRuntimeUpgradeCoordinator({
         return Object.freeze({ ...run, status: 'waiting_for_legacy_batch' });
       }
       const batchHash = hash(legacyBatch);
+      const rollbackBatch = upgradeService.planLegacyRollbackBatch(legacyBatch);
       if (loadEffect(upgradeId, 'legacy-source-invalidate')?.state !== 'completed') {
         if (legacySourceAdapter === null) {
           return Object.freeze({ ...run, status: 'waiting_for_legacy_source_invalidation' });
@@ -565,7 +608,12 @@ export function createRuntimeUpgradeCoordinator({
         await performEffect(
           upgradeId,
           'legacy-source-invalidate',
-          { upgrade_id: upgradeId, batch_id: legacyBatch.batch_id, batch_hash: batchHash },
+          {
+            upgrade_id: upgradeId,
+            batch_id: legacyBatch.batch_id,
+            batch_hash: batchHash,
+            rollback_batch: rollbackBatch,
+          },
           (request) => legacySourceAdapter.invalidate(request),
         );
         return Object.freeze({
@@ -620,27 +668,8 @@ export function createRuntimeUpgradeCoordinator({
         );
         return Object.freeze({ ...run, completed_step: 'legacy-source-seal' });
       }
-      const pendingNotices = database.prepare(`
-        SELECT legacy_kind, legacy_record_id
-        FROM runtime_legacy_migration_notices
-        WHERE upgrade_id = ? AND state = 'pending'
-        ORDER BY legacy_kind, legacy_record_id
-      `).all(upgradeId);
-      if (pendingNotices.length > 0) {
-        if (noticeAdapter === null || typeof noticeAdapter.deliver !== 'function') {
-          return Object.freeze({ ...run, status: 'waiting_for_notice_delivery' });
-        }
-        await noticeAdapter.deliver(Object.freeze({
-          upgrade_id: upgradeId,
-          notice_ids: Object.freeze(pendingNotices.map((notice) => Object.freeze({ ...notice }))),
-        }));
-        for (const notice of pendingNotices) {
-          upgradeService.recordNoticeDelivered(
-            upgradeId, notice.legacy_kind, notice.legacy_record_id,
-          );
-        }
-        return Object.freeze({ ...upgradeService.get(upgradeId), completed_step: 'notice-delivery' });
-      }
+      const noticeResult = await deliverPendingNotices(upgradeId, run);
+      if (noticeResult !== null) return noticeResult;
       if (executorAdapter === null || typeof executorAdapter.health !== 'function') {
         return Object.freeze({ ...run, status: 'waiting_for_executor_health' });
       }
@@ -663,12 +692,53 @@ export function createRuntimeUpgradeCoordinator({
     }
     if (run.state === 'ready_to_commit') return upgradeService.commit(upgradeId);
     if (run.state === 'rollback_required') {
-      const sourceInvalidation = loadEffect(upgradeId, 'legacy-source-invalidate');
+      let sourceInvalidation = loadEffect(upgradeId, 'legacy-source-invalidate');
+      if (sourceInvalidation !== null && sourceInvalidation.state !== 'completed') {
+        if (legacySourceAdapter === null) {
+          return Object.freeze({ ...run, status: 'waiting_for_legacy_source_invalidation' });
+        }
+        let invalidationInput = sourceInvalidation.input;
+        if (invalidationInput === null && legacyBatch !== null) {
+          invalidationInput = {
+            upgrade_id: upgradeId,
+            batch_id: legacyBatch.batch_id,
+            batch_hash: hash(legacyBatch),
+            rollback_batch: upgradeService.planLegacyRollbackBatch(legacyBatch),
+          };
+        }
+        if (invalidationInput === null) {
+          return Object.freeze({ ...run, status: 'waiting_for_legacy_batch_reconciliation' });
+        }
+        await performEffect(
+          upgradeId,
+          'legacy-source-invalidate',
+          invalidationInput,
+          (request) => legacySourceAdapter.invalidate(request),
+        );
+        return Object.freeze({ ...run, completed_step: 'legacy-source-invalidate' });
+      }
       const durableMigration = database.prepare(`
         SELECT 1 FROM runtime_upgrade_events
         WHERE upgrade_id = ? AND step_key = 'legacy-migration'
       `).get(upgradeId);
-      if (sourceInvalidation !== null && durableMigration !== undefined
+      const rollbackReconciliation = database.prepare(`
+        SELECT 1 FROM runtime_upgrade_events
+        WHERE upgrade_id = ? AND step_key = 'legacy-rollback-reconciliation'
+      `).get(upgradeId);
+      if (sourceInvalidation !== null && durableMigration === undefined
+        && rollbackReconciliation === undefined) {
+        if (legacySourceAdapter === null) {
+          return Object.freeze({ ...run, status: 'waiting_for_legacy_rollback_reconciliation' });
+        }
+        const auditBatch = await legacySourceAdapter.readAudit({
+          audit_queue_ref: sourceInvalidation.result.audit_queue_ref,
+          audit_sha256: sourceInvalidation.result.audit_sha256,
+          batch_hash: sourceInvalidation.result.batch_hash,
+        });
+        upgradeService.reconcileLegacyRollback(upgradeId, auditBatch);
+        return Object.freeze({ ...run, completed_step: 'legacy-rollback-reconciliation' });
+      }
+      if (sourceInvalidation !== null
         && loadEffect(upgradeId, 'legacy-source-seal')?.state !== 'completed') {
         if (legacySourceAdapter === null) {
           return Object.freeze({ ...run, status: 'waiting_for_legacy_source_seal' });
@@ -685,6 +755,8 @@ export function createRuntimeUpgradeCoordinator({
         );
         return Object.freeze({ ...run, completed_step: 'legacy-source-seal' });
       }
+      const noticeResult = await deliverPendingNotices(upgradeId, run);
+      if (noticeResult !== null) return noticeResult;
       const input = {
         upgrade_id: upgradeId,
         from_release: run.from_release,
@@ -715,21 +787,35 @@ export function createRuntimeUpgradeCoordinator({
         });
       }
       if (sourceInvalidation !== null
-        && loadEffect(upgradeId, 'legacy-source-rollback')?.state !== 'completed') {
+        && loadEffect(upgradeId, 'legacy-source-restore')?.state !== 'completed') {
         if (legacySourceAdapter === null) {
           return Object.freeze({ ...run, status: 'waiting_for_legacy_source_rollback' });
         }
         await performEffect(
           upgradeId,
-          'legacy-source-rollback',
+          'legacy-source-restore',
           {
             upgrade_id: upgradeId,
             rollback_queue_ref: sourceInvalidation.result.rollback_queue_ref,
             rollback_queue_sha256: sourceInvalidation.result.rollback_queue_sha256,
           },
-          (request) => legacySourceAdapter.rollback(request),
+          (request) => legacySourceAdapter.restore(request),
         );
-        return Object.freeze({ ...run, completed_step: 'legacy-source-rollback' });
+        return Object.freeze({ ...run, completed_step: 'legacy-source-restore' });
+      }
+      if (sourceInvalidation !== null
+        && loadEffect(upgradeId, 'legacy-dispatcher-restart')?.state !== 'completed') {
+        const sourceRestore = loadEffect(upgradeId, 'legacy-source-restore');
+        await performEffect(
+          upgradeId,
+          'legacy-dispatcher-restart',
+          {
+            upgrade_id: upgradeId,
+            source_queue_ref: sourceRestore.result.source_queue_ref,
+          },
+          (request) => legacySourceAdapter.restart(request),
+        );
+        return Object.freeze({ ...run, completed_step: 'legacy-dispatcher-restart' });
       }
       return upgradeService.completeRollback(upgradeId);
     }

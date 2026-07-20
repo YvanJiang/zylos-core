@@ -169,6 +169,41 @@ function recordVerifiedRestoreEffect(database, upgradeId, snapshot) {
       foreign_key_violations: 0,
     }),
   );
+  const sourceInvalidation = database.prepare(`
+    SELECT result_json FROM runtime_upgrade_effects
+    WHERE upgrade_id = ? AND step_key = 'legacy-source-invalidate' AND state = 'completed'
+  `).get(upgradeId);
+  if (sourceInvalidation !== undefined) {
+    const sourceProof = JSON.parse(sourceInvalidation.result_json);
+    for (const stepKey of [
+      'legacy-source-seal', 'legacy-source-restore', 'legacy-dispatcher-restart',
+    ]) {
+      const result = stepKey === 'legacy-source-seal'
+        ? {
+            audit_queue_ref: sourceProof.audit_queue_ref,
+            audit_sha256: sourceProof.audit_sha256,
+            audit_queue_removed: true,
+          }
+        : (stepKey === 'legacy-source-restore'
+            ? {
+                source_queue_ref: sourceProof.source_queue_ref,
+                rollback_queue_sha256: sourceProof.rollback_queue_sha256,
+                source_queue_restored: true,
+              }
+            : {
+                source_queue_ref: sourceProof.source_queue_ref,
+                legacy_dispatcher_restarted: true,
+                dispatcher_restart_idempotency_key: `${upgradeId}:${stepKey}`,
+              });
+      database.prepare(`
+        INSERT OR REPLACE INTO runtime_upgrade_effects (
+          upgrade_id, step_key, step_id, input_hash, state, claim_owner,
+          claim_attempt, claim_expires_at, result_json, committed_at, updated_at
+        ) VALUES (?, ?, ?, 'fixture-input-hash', 'completed', 'fixture',
+          1, NULL, ?, '2026-07-20T10:00:02.000Z', '2026-07-20T10:00:02.000Z')
+      `).run(upgradeId, stepKey, `${upgradeId}:${stepKey}`, JSON.stringify(result));
+    }
+  }
 }
 
 function recordVerifiedActivationEffect(database, upgradeId, releaseRef) {
@@ -206,6 +241,8 @@ function authorizeLegacyBatch(database, upgradeId, batch) {
       source_queue_ref: '/disposable/legacy-control-queue.json',
       audit_queue_ref: '/disposable/audit/legacy-control-queue.json',
       audit_sha256: batchHash,
+      rollback_queue_ref: '/disposable/audit/legacy-rollback-safe.json',
+      rollback_queue_sha256: batchHash,
     }),
   );
 }
@@ -790,6 +827,25 @@ describe('atomic runtime upgrade state machine', () => {
       snapshot_sha256: 'd'.repeat(64),
     };
     recordVerifiedRestoreEffect(database, 'upgrade-data-rollback', dataRollbackSnapshot);
+    database.prepare(`
+      DELETE FROM runtime_upgrade_effects
+      WHERE upgrade_id = 'upgrade-data-rollback' AND step_key = 'legacy-dispatcher-restart'
+    `).run();
+    expect(() => upgrade.completeRollback('upgrade-data-rollback'))
+      .toThrow('completed legacy-dispatcher-restart effect');
+    database.prepare(`
+      INSERT INTO runtime_upgrade_effects (
+        upgrade_id, step_key, step_id, input_hash, state, claim_owner,
+        claim_attempt, claim_expires_at, result_json, committed_at, updated_at
+      ) VALUES ('upgrade-data-rollback', 'legacy-dispatcher-restart',
+        'upgrade-data-rollback:legacy-dispatcher-restart', 'fixture-input-hash',
+        'completed', 'fixture', 1, NULL, ?,
+        '2026-07-20T10:00:02.000Z', '2026-07-20T10:00:02.000Z')
+    `).run(JSON.stringify({
+      source_queue_ref: '/disposable/legacy-control-queue.json',
+      legacy_dispatcher_restarted: true,
+      dispatcher_restart_idempotency_key: 'upgrade-data-rollback:legacy-dispatcher-restart',
+    }));
     upgrade.completeRollback('upgrade-data-rollback');
     expect(database.prepare(`
       SELECT turn.state, queue.status
