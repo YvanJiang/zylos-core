@@ -1159,7 +1159,11 @@ export function createClaudeConversationAdapter({
     });
   }
 
-  async function evictIdle({ canEvict, maxCount = Number.POSITIVE_INFINITY }) {
+  async function evictIdle({
+    canEvict,
+    maxCount = Number.POSITIVE_INFINITY,
+    targetConversationId = null,
+  }) {
     if (typeof canEvict !== 'function') {
       throw new TypeError('canEvict must be a function');
     }
@@ -1172,6 +1176,7 @@ export function createClaudeConversationAdapter({
     );
     for (const [conversationId, executor] of oldestFirst) {
       if (evicted.length >= maxCount) break;
+      if (targetConversationId !== null && conversationId !== targetConversationId) continue;
       if (
         executor.activeTurn !== null
         || executor.providerTurn !== null
