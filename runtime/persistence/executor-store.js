@@ -1,3 +1,5 @@
+import path from 'node:path';
+
 import {
   admitNormalizedEvent,
   canonicalizeJson,
@@ -31,6 +33,10 @@ import {
 } from './inbound-acceptance.js';
 import { initializeMainProjection, stageMainProjection } from './main-projection.js';
 import { initializeRuntimePersistence } from './schema.js';
+import {
+  createWorkspaceLeaseCoordinator,
+  normalizeWorkspaceRoot,
+} from '../workspace/lease-coordinator.js';
 
 const CANONICAL_TRANSITIONS = Object.freeze({
   queued: Object.freeze(['starting']),
@@ -55,6 +61,11 @@ const TERMINAL_STATES = new Set([
   'failed',
   'interrupted',
   'timed_out',
+]);
+const WORKSPACE_NOTIFICATION_BARRIER_CODES = new Set([
+  'provider_background_work_unknown',
+  'workspace_lease_expired',
+  'workspace_lease_orphaned',
 ]);
 
 const ANSWER_CONFLICT_CODES = new Set([
@@ -572,9 +583,17 @@ export function createExecutorStore({
   generateId,
   leaseDurationMs = 10_000,
   residentLeaseDurationMs = 60_000,
+  workspaceLeaseDurationMs = 10_000,
   interactionTimeoutMs = 10 * 60_000,
 }) {
   initializeRuntimePersistence(database);
+  const workspaceLeases = createWorkspaceLeaseCoordinator({
+    database,
+    serviceInstanceId,
+    now,
+    generateId,
+    leaseDurationMs: workspaceLeaseDurationMs,
+  });
 
   function assertResidentOwner(conversationId, expectedEpoch = null) {
     if (provider !== 'claude') return;
@@ -596,6 +615,17 @@ export function createExecutorStore({
   function assertTurnContextFence(turn, turnContext) {
     assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
     assertResidentOwner(turn.conversation_id, turnContext.resident?.owner_epoch ?? null);
+    if (turnContext.workspace !== null && turnContext.workspace !== undefined) {
+      workspaceLeases.assertCurrent(turnContext.workspace);
+    }
+  }
+
+  function assertTurnContextIsolationFence(turn, turnContext) {
+    assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
+    assertResidentOwner(turn.conversation_id, turnContext.resident?.owner_epoch ?? null);
+    if (turnContext.workspace !== null && turnContext.workspace !== undefined) {
+      workspaceLeases.assertHeldOrUncertain(turnContext.workspace);
+    }
   }
 
   function matchesInteractionHandoffDelivery({
@@ -689,7 +719,8 @@ export function createExecutorStore({
 
   function rebuildExecutorCache() {
     const rows = database.prepare(`
-      SELECT conversation_id, turn_id, status, wait_reason, queue_sequence, priority
+      SELECT conversation_id, turn_id, status, wait_reason, wait_detail_json,
+        queue_sequence, priority
       FROM runtime_turn_queue
       WHERE status IN ('queued', 'claimed')
       ORDER BY conversation_id ASC, priority DESC, queue_sequence ASC
@@ -709,7 +740,12 @@ export function createExecutorStore({
       if (row.status === 'claimed') projection.active_turn_id = row.turn_id;
       else {
         projection.queued_turn_ids.push(row.turn_id);
-        projection.wait_reason ??= row.wait_reason;
+        if (projection.wait_reason === null && row.wait_reason !== null) {
+          projection.wait_reason = row.wait_reason;
+          if (row.wait_detail_json !== null) {
+            projection.wait_detail = JSON.parse(row.wait_detail_json);
+          }
+        }
       }
     }
     return [...executors.values()];
@@ -798,6 +834,12 @@ export function createExecutorStore({
           FROM runtime_executor_leases AS lease
           WHERE lease.conversation_id = queue.conversation_id
             AND lease.lease_owner IS NOT NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM runtime_workspace_leases AS workspace
+          WHERE workspace.holder_turn_id = turn.turn_id
+            AND workspace.state IN ('active', 'uncertain')
         )
       ORDER BY turn.created_at ASC, turn.conversation_id ASC, queue.queue_sequence ASC
     `).all(claimableAt);
@@ -1650,7 +1692,7 @@ export function createExecutorStore({
     `).run(event.turn_version, occurredAt, turnId, turn.turn_version);
     const queueUpdate = database.prepare(`
       UPDATE runtime_turn_queue
-      SET wait_reason = 'executor_capacity'
+      SET wait_reason = 'executor_capacity', wait_detail_json = NULL
       WHERE turn_id = ? AND status = 'queued' AND wait_reason IS NOT 'executor_capacity'
     `).run(turnId);
     if (turnUpdate.changes !== 1 || queueUpdate.changes !== 1) {
@@ -1658,6 +1700,78 @@ export function createExecutorStore({
     }
     persistEvent(database, turn, event, generateId);
     return result;
+  }
+
+  function markWorkspaceWaitInTransaction(turnId, wait, occurredAt) {
+    const queued = database.prepare(`
+      SELECT turn.turn_id, turn.conversation_id, turn.turn_version,
+        queue.wait_reason, queue.wait_detail_json
+      FROM runtime_turns AS turn
+      JOIN runtime_turn_queue AS queue ON queue.turn_id = turn.turn_id
+      WHERE turn.turn_id = ? AND turn.state = 'queued' AND queue.status = 'queued'
+    `).get(turnId);
+    if (!queued) return null;
+    const waitDetail = {
+      workspace_root: wait.workspace_root,
+      mode: wait.mode,
+      conflicting_workspace_root: wait.conflicting_workspace_root,
+      holder_conversation_id: wait.holder_conversation_id,
+      holder_turn_id: wait.holder_turn_id,
+      holder_background_work_ids: wait.holder_background_work_ids,
+      recovery_required: wait.recovery_required === true,
+    };
+    const waitDetailJson = JSON.stringify(waitDetail);
+    if (
+      queued.wait_reason === 'workspace_lease'
+      && queued.wait_detail_json === waitDetailJson
+    ) {
+      return {
+        status: 'workspace_wait',
+        conversation_id: queued.conversation_id,
+        turn_id: queued.turn_id,
+        wait_reason: 'workspace_lease',
+        wait_detail: waitDetail,
+      };
+    }
+    const turn = loadTurn(database, turnId);
+    const event = buildEvent({
+      turn,
+      lastEvent: loadLastEvent(database, turnId),
+      fence: null,
+      provider: null,
+      descriptor: {
+        kind: 'turn_state_changed',
+        phase: 'queued',
+        payload: {
+          from_state: 'queued',
+          to_state: 'queued',
+          reason_code: 'workspace_lease',
+        },
+      },
+      occurredAt,
+      generateId,
+    });
+    const turnUpdate = database.prepare(`
+      UPDATE runtime_turns
+      SET turn_version = ?, committed_at = ?
+      WHERE turn_id = ? AND state = 'queued' AND turn_version = ?
+    `).run(event.turn_version, occurredAt, turnId, turn.turn_version);
+    const queueUpdate = database.prepare(`
+      UPDATE runtime_turn_queue
+      SET wait_reason = 'workspace_lease', wait_detail_json = ?
+      WHERE turn_id = ? AND status = 'queued'
+    `).run(waitDetailJson, turnId);
+    if (turnUpdate.changes !== 1 || queueUpdate.changes !== 1) {
+      conflict('stale_attempt', 'The workspace-wait projection changed concurrently.');
+    }
+    persistEvent(database, turn, event, generateId);
+    return {
+      status: 'workspace_wait',
+      conversation_id: queued.conversation_id,
+      turn_id: queued.turn_id,
+      wait_reason: 'workspace_lease',
+      wait_detail: waitDetail,
+    };
   }
 
   function isResidentConversation(conversationId) {
@@ -1795,15 +1909,61 @@ export function createExecutorStore({
     `).get(botId).count;
   }
 
-  function reserveNextExecutor({ maxResidentExecutorsPerBot, markCapacityWait = true }) {
+  function reserveNextExecutor({
+    maxResidentExecutorsPerBot,
+    markCapacityWait = true,
+    workspaceAccessByConversation = null,
+  }) {
     const reserve = database.transaction(() => {
       reconcileExpiredResidents();
-      const candidates = listClaimableQueuedTurns();
-      if (candidates.length === 0) return { status: 'idle' };
+      const claimable = listClaimableQueuedTurns();
+      if (claimable.length === 0) return { status: 'idle' };
+      const workspaceWaits = [];
+      const candidates = [];
+      for (const candidate of claimable) {
+        const workspaceAccess = workspaceAccessByConversation?.get(candidate.conversation_id);
+        if (!workspaceAccess) {
+          candidates.push(candidate);
+          continue;
+        }
+        if (provider === 'claude') {
+          const resident = isResidentConversation(candidate.conversation_id);
+          const checkedAt = now();
+          const hasCapacity = resident?.owner_service_instance_id === serviceInstanceId
+            || (resident && (!resident.owner_expires_at || resident.owner_expires_at <= checkedAt))
+            || (!resident && residentCountForBot(candidate.bot_id) < maxResidentExecutorsPerBot);
+          if (!hasCapacity) {
+            candidates.push(candidate);
+            continue;
+          }
+        }
+        const availability = workspaceLeases.inspect(workspaceAccess);
+        if (availability.status === 'wait') {
+          const wait = markWorkspaceWaitInTransaction(candidate.turn_id, availability, now());
+          if (wait) workspaceWaits.push(wait);
+        } else {
+          candidates.push(candidate);
+        }
+      }
+      if (candidates.length === 0) {
+        return workspaceWaits[0] ?? { status: 'idle' };
+      }
       if (provider !== 'claude') {
+        const selected = candidates[0];
+        const workspaceAccess = workspaceAccessByConversation?.get(selected.conversation_id);
+        const workspace = workspaceAccess ? workspaceLeases.acquire({
+          workspace_root: workspaceAccess.workspace_root,
+          mode: workspaceAccess.mode,
+          holder_conversation_id: selected.conversation_id,
+          holder_turn_id: selected.turn_id,
+        }) : null;
+        if (workspace?.status === 'wait') {
+          return markWorkspaceWaitInTransaction(selected.turn_id, workspace, now());
+        }
         return {
           status: 'ready',
-          conversation_id: candidates[0].conversation_id,
+          conversation_id: selected.conversation_id,
+          workspace,
         };
       }
 
@@ -1862,6 +2022,16 @@ export function createExecutorStore({
         }
       }
       if (selected) {
+        const workspaceAccess = workspaceAccessByConversation?.get(selected.conversation_id);
+        const workspace = workspaceAccess ? workspaceLeases.acquire({
+          workspace_root: workspaceAccess.workspace_root,
+          mode: workspaceAccess.mode,
+          holder_conversation_id: selected.conversation_id,
+          holder_turn_id: selected.turn_id,
+        }) : null;
+        if (workspace?.status === 'wait') {
+          return markWorkspaceWaitInTransaction(selected.turn_id, workspace, now());
+        }
         const usedAt = now();
         database.prepare(`
           UPDATE runtime_executor_residents
@@ -1874,6 +2044,11 @@ export function createExecutorStore({
           selected.conversation_id,
           serviceInstanceId,
         );
+        return {
+          status: 'ready',
+          conversation_id: selected.conversation_id,
+          workspace,
+        };
       }
 
       const waits = [];
@@ -1898,9 +2073,6 @@ export function createExecutorStore({
         }
       }
 
-      if (selected) {
-        return { status: 'ready', conversation_id: selected.conversation_id };
-      }
       if (waits.length > 0) return { status: 'capacity_wait', ...waits[0] };
       if (blocked.length > 0) {
         return {
@@ -1915,7 +2087,12 @@ export function createExecutorStore({
     return reserve.immediate();
   }
 
-  function claimNextQueuedTurn({ conversationId = null, requireResident = false } = {}) {
+  function claimNextQueuedTurn({
+    conversationId = null,
+    requireResident = false,
+    workspaceAccess = null,
+    workspaceLease = null,
+  } = {}) {
     const claim = database.transaction(() => {
       const claimableAt = now();
       const turn = database.prepare(`
@@ -2012,6 +2189,30 @@ export function createExecutorStore({
       ) {
         conflict('stale_attempt', 'The queued turn lost its resident executor reservation.');
       }
+      const workspace = workspaceLease === null
+        ? (workspaceAccess === null ? null : workspaceLeases.acquire({
+          workspace_root: workspaceAccess.workspace_root,
+          mode: workspaceAccess.mode,
+          holder_conversation_id: current.conversation_id,
+          holder_turn_id: current.turn_id,
+        }))
+        : workspaceLeases.assertCurrent(workspaceLease);
+      if (workspace?.status === 'wait') {
+        return markWorkspaceWaitInTransaction(current.turn_id, workspace, claimedAt);
+      }
+      if (
+        workspace !== null
+        && (
+          workspace.holder_conversation_id !== current.conversation_id
+          || workspace.holder_turn_id !== current.turn_id
+          || workspaceAccess !== null && (
+            workspace.workspace_root !== workspaceAccess.workspace_root
+            || workspace.mode !== workspaceAccess.mode
+          )
+        )
+      ) {
+        conflict('stale_workspace_lease', 'The workspace reservation does not match this turn.');
+      }
       const existingLease = database.prepare(`
         SELECT lease_epoch
         FROM runtime_executor_leases
@@ -2077,7 +2278,7 @@ export function createExecutorStore({
       );
       const queueUpdate = database.prepare(`
         UPDATE runtime_turn_queue
-        SET status = 'claimed', wait_reason = NULL
+        SET status = 'claimed', wait_reason = NULL, wait_detail_json = NULL
         WHERE turn_id = ? AND status = 'queued'
       `).run(current.turn_id);
       if (turnUpdate.changes !== 1 || queueUpdate.changes !== 1) {
@@ -2178,6 +2379,7 @@ export function createExecutorStore({
         resident: resident === null ? null : Object.freeze({
           owner_epoch: resident.owner_epoch,
         }),
+        workspace,
         executor_instance_id: executorInstanceId,
         attempt: fence,
       };
@@ -2268,6 +2470,7 @@ export function createExecutorStore({
         SET status = 'queued', wait_reason = 'provider_retry'
         WHERE turn_id = ? AND status = 'claimed'
       `).run(turn.turn_id);
+      if (turnContext.workspace) workspaceLeases.release(turnContext.workspace);
       const leaseUpdate = database.prepare(`
         UPDATE runtime_executor_leases
         SET lease_owner = NULL, turn_id = NULL, attempt_id = NULL,
@@ -2353,6 +2556,7 @@ export function createExecutorStore({
         reasonCode: 'provider_retry_exhausted',
         error,
       });
+      if (turnContext.workspace) workspaceLeases.release(turnContext.workspace);
       const attemptUpdate = database.prepare(`
         UPDATE runtime_provider_attempts
         SET state = 'failed', side_effect_status = 'none', error_json = ?, updated_at = ?
@@ -2680,11 +2884,18 @@ export function createExecutorStore({
     turnContext,
     fromState,
     toState,
-    { error = null, reasonCode = null, providerEventObserved = false } = {},
+    {
+      allowUncertainWorkspace = false,
+      error = null,
+      reasonCode = null,
+      recovery = null,
+      providerEventObserved = false,
+    } = {},
   ) {
     const transition = database.transaction(() => {
       let turn = loadTurn(database, turnContext.turn_id);
-      assertTurnContextFence(turn, turnContext);
+      if (allowUncertainWorkspace) assertTurnContextIsolationFence(turn, turnContext);
+      else assertTurnContextFence(turn, turnContext);
       const occurredAt = now();
       if (providerEventObserved) {
         recordProviderEventActivityInTransaction(turnContext, occurredAt);
@@ -2692,7 +2903,7 @@ export function createExecutorStore({
       if (toState === 'stopped') {
         turn = settleBlockingInteractionsForStop(turnContext, turn, occurredAt);
       }
-      const event = transitionInTransaction(database, {
+      let event = transitionInTransaction(database, {
         turnId: turnContext.turn_id,
         fromState,
         toState,
@@ -2704,6 +2915,82 @@ export function createExecutorStore({
         error,
         reasonCode: reasonCode ?? undefined,
       });
+      if (recovery !== null) {
+        if (toState !== 'recovering' || recovery?.error === null || !recovery?.error) {
+          conflict(
+            'validation_error',
+            'A recovery event requires a recovering transition and public error.',
+          );
+        }
+        turn = loadTurn(database, turnContext.turn_id);
+        const recoveryId = generateId('recovery');
+        event = buildEvent({
+          turn,
+          lastEvent: loadLastEvent(database, turn.turn_id),
+          fence: turnContext.attempt,
+          provider,
+          descriptor: {
+            kind: 'recovery_started',
+            phase: 'recovering',
+            payload: {
+              recovery_id: recoveryId,
+              recovery_of_turn_id: turn.turn_id,
+              recovery_of_lineage_id: turn.lineage_id,
+              side_effect_status: recovery.error.side_effect_status,
+            },
+            error: {
+              ...recovery.error,
+              occurred_at: recovery.error.occurred_at ?? occurredAt,
+            },
+          },
+          occurredAt,
+          generateId,
+        });
+        commitTurnEvent(database, {
+          turn,
+          event,
+          fence: turnContext.attempt,
+          nextState: 'recovering',
+          staleMessage: 'The recovery notification lost its provider attempt fence.',
+          generateId,
+        });
+        if (recovery.waitForDecision === true) {
+          turn = loadTurn(database, turnContext.turn_id);
+          event = buildEvent({
+            turn,
+            lastEvent: loadLastEvent(database, turn.turn_id),
+            fence: turnContext.attempt,
+            provider,
+            descriptor: {
+              kind: 'recovery_waiting_decision',
+              phase: 'recovering',
+              payload: {
+                recovery_id: recoveryId,
+                recovery_of_turn_id: turn.turn_id,
+                recovery_of_lineage_id: turn.lineage_id,
+                side_effect_status: recovery.error.side_effect_status,
+              },
+              error: {
+                ...recovery.error,
+                occurred_at: recovery.error.occurred_at ?? occurredAt,
+              },
+            },
+            occurredAt,
+            generateId,
+          });
+          commitTurnEvent(database, {
+            turn,
+            event,
+            fence: turnContext.attempt,
+            nextState: 'recovering',
+            staleMessage: 'The recovery decision boundary lost its provider attempt fence.',
+            generateId,
+          });
+        }
+      }
+      if (TERMINAL_STATES.has(toState) && toState !== 'timed_out' && turnContext.workspace) {
+        workspaceLeases.release(turnContext.workspace);
+      }
       if (toState === 'failed' && error?.code === 'provider_context_invalid') {
         database.prepare(`
           UPDATE runtime_lineages
@@ -3413,6 +3700,9 @@ export function createExecutorStore({
         generateId,
         reasonCode: 'steer_redirected',
         error: interruptionError,
+      });
+      workspaceLeases.releaseTurnAfterIsolation(oldTurn.turn_id, {
+        reason: 'steer_provider_isolation_confirmed',
       });
 
       if (row.stop_barrier_id !== null) {
@@ -4288,6 +4578,9 @@ export function createExecutorStore({
     if (turn.state !== 'stopped') {
       conflict('turn_terminal', 'The stopped turn no longer has stopped authority.');
     }
+    workspaceLeases.releaseTurnAfterIsolation(turn.turn_id, {
+      reason: 'stop_provider_isolation_confirmed',
+    });
     const lease = database.prepare(`
       SELECT lease_owner, turn_id, attempt_id, attempt_no, lease_epoch
       FROM runtime_executor_leases
@@ -4335,6 +4628,375 @@ export function createExecutorStore({
     const turn = loadTurn(database, turnContext.turn_id);
     assertTurnContextFence(turn, turnContext);
     return Object.freeze({ state: turn.state });
+  }
+
+  function assertRecoverableFence(turnContext) {
+    const turn = loadTurn(database, turnContext.turn_id);
+    assertTurnContextIsolationFence(turn, turnContext);
+    return Object.freeze({ state: turn.state });
+  }
+
+  function isWorkspaceRecoveryRequired(turnContext) {
+    return Boolean(turnContext.workspace)
+      && workspaceLeases.isRecoveryRequired(turnContext.workspace);
+  }
+
+  function isRecoveryNotificationDelivered(turnContext) {
+    const turn = loadTurn(database, turnContext.turn_id);
+    if (turn.state === 'timed_out') {
+      const timedOutTerminal = database.prepare(`
+        SELECT event_sequence
+        FROM runtime_normalized_events
+        WHERE turn_id = ?
+          AND json_extract(event_json, '$.kind') = 'turn_state_changed'
+          AND json_extract(event_json, '$.payload.to_state') = 'timed_out'
+        ORDER BY event_sequence DESC
+        LIMIT 1
+      `).get(turnContext.turn_id);
+      if (!timedOutTerminal) return false;
+      return database.prepare(`
+        SELECT 1
+        FROM runtime_outbox
+        WHERE turn_id = ? AND aggregate_type = 'turn_main' AND status = 'delivered'
+          AND CAST(json_extract(command_json, '$.event_sequence_through') AS INTEGER) >= ?
+        LIMIT 1
+      `).get(turnContext.turn_id, timedOutTerminal.event_sequence) !== undefined;
+    }
+    const recovery = database.prepare(`
+      SELECT event_sequence, json_extract(event_json, '$.error.code') AS error_code
+      FROM runtime_normalized_events
+      WHERE turn_id = ?
+        AND json_extract(event_json, '$.kind') IN (
+          'recovery_started', 'recovery_waiting_decision'
+        )
+      ORDER BY event_sequence DESC
+      LIMIT 1
+    `).get(turnContext.turn_id);
+    if (!recovery) return true;
+    if (!WORKSPACE_NOTIFICATION_BARRIER_CODES.has(recovery.error_code)) return true;
+    return database.prepare(`
+      SELECT 1
+      FROM runtime_outbox
+      WHERE turn_id = ? AND aggregate_type = 'turn_main' AND status = 'delivered'
+        AND CAST(json_extract(command_json, '$.event_sequence_through') AS INTEGER) >= ?
+      LIMIT 1
+    `).get(turnContext.turn_id, recovery.event_sequence) !== undefined;
+  }
+
+  function claimOrphanedWorkspaceRecoveries() {
+    const recoveries = [];
+    for (const candidate of workspaceLeases.listRecoveryCandidates()) {
+      const claim = database.transaction(() => {
+        const claimedAt = now();
+        const turn = loadTurn(database, candidate.holder_turn_id);
+        if (!['starting', 'running', 'waiting_user', 'recovering', 'timed_out'].includes(turn.state)) {
+          return null;
+        }
+        const executorLease = database.prepare(`
+          SELECT * FROM runtime_executor_leases
+          WHERE conversation_id = ? AND turn_id = ?
+        `).get(turn.conversation_id, turn.turn_id);
+        if (
+          !executorLease
+          || executorLease.lease_owner !== candidate.holder_service_instance_id
+          || executorLease.attempt_id !== turn.attempt_id
+          || executorLease.attempt_no !== turn.attempt_no
+          || executorLease.lease_epoch !== turn.lease_epoch
+          || executorLease.lease_expires_at > claimedAt
+        ) return null;
+
+        let resident = provider === 'claude'
+          ? isResidentConversation(turn.conversation_id)
+          : null;
+        if (
+          resident
+          && resident.owner_service_instance_id !== null
+          && resident.owner_service_instance_id !== candidate.holder_service_instance_id
+        ) return null;
+        if (resident?.owner_expires_at && resident.owner_expires_at > claimedAt) return null;
+
+        const executorClaimed = database.prepare(`
+          UPDATE runtime_executor_leases
+          SET lease_owner = ?, lease_expires_at = ?, updated_at = ?
+          WHERE conversation_id = ? AND turn_id = ? AND lease_owner = ?
+            AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+            AND lease_expires_at <= ?
+        `).run(
+          serviceInstanceId,
+          new Date(Date.parse(claimedAt) + leaseDurationMs).toISOString(),
+          claimedAt,
+          turn.conversation_id,
+          turn.turn_id,
+          candidate.holder_service_instance_id,
+          turn.attempt_id,
+          turn.attempt_no,
+          turn.lease_epoch,
+          claimedAt,
+        );
+        if (executorClaimed.changes !== 1) return null;
+
+        if (resident) {
+          const residentClaimed = database.prepare(`
+            UPDATE runtime_executor_residents
+            SET owner_service_instance_id = ?, owner_epoch = owner_epoch + 1,
+              owner_expires_at = ?, last_used_at = ?
+            WHERE conversation_id = ? AND provider = 'claude' AND owner_epoch = ?
+              AND (
+                owner_service_instance_id IS NULL
+                OR (
+                  owner_service_instance_id = ?
+                  AND (owner_expires_at IS NULL OR owner_expires_at <= ?)
+                )
+              )
+          `).run(
+            serviceInstanceId,
+            residentOwnerExpiresAt(claimedAt),
+            claimedAt,
+            turn.conversation_id,
+            resident.owner_epoch,
+            candidate.holder_service_instance_id,
+            claimedAt,
+          );
+          if (residentClaimed.changes !== 1) {
+            conflict('stale_attempt', 'The orphaned resident recovery lost its owner fence.');
+          }
+          resident = isResidentConversation(turn.conversation_id);
+        }
+
+        const workspace = workspaceLeases.adoptUncertainForRecovery(candidate);
+        const attempt = Object.freeze({
+          attempt_id: turn.attempt_id,
+          attempt_no: turn.attempt_no,
+          lease_epoch: turn.lease_epoch,
+        });
+        const envelope = JSON.parse(turn.envelope_json);
+        const recoveryContext = Object.freeze({
+          conversation_id: turn.conversation_id,
+          turn_id: turn.turn_id,
+          lineage_id: turn.lineage_id,
+          provider_native_id: turn.provider_native_id,
+          trace_id: envelope.trace_id,
+          input: envelope.content,
+          interaction_authority: envelope.actor?.authenticated === true
+            ? [{ type: 'actor', actor_id: envelope.actor.actor_id }]
+            : [],
+          resident: resident === null ? null : Object.freeze({
+            owner_epoch: resident.owner_epoch,
+          }),
+          workspace,
+          attempt,
+        });
+        if (turn.state === 'timed_out') {
+          return recoveryContext;
+        }
+        if (!['recovering', 'timed_out'].includes(turn.state)) {
+          transitionInTransaction(database, {
+            turnId: turn.turn_id,
+            fromState: turn.state,
+            toState: 'recovering',
+            fence: attempt,
+            provider,
+            serviceInstanceId,
+            occurredAt: claimedAt,
+            generateId,
+            reasonCode: 'workspace_lease_orphaned',
+          });
+        }
+        const recoveringTurn = loadTurn(database, turn.turn_id);
+        const recoveryError = {
+          code: 'workspace_lease_orphaned',
+          category: 'conflict',
+          retryable: false,
+          side_effect_status: 'unknown',
+          user_message: 'Workspace ownership expired during a service restart.',
+          occurred_at: claimedAt,
+        };
+        const recoveryId = generateId('recovery');
+        let event = buildEvent({
+          turn: recoveringTurn,
+          lastEvent: loadLastEvent(database, turn.turn_id),
+          fence: attempt,
+          provider,
+          descriptor: {
+            kind: 'recovery_started',
+            phase: 'recovering',
+            payload: {
+              recovery_id: recoveryId,
+              recovery_of_turn_id: turn.turn_id,
+              recovery_of_lineage_id: turn.lineage_id,
+              side_effect_status: 'unknown',
+            },
+            error: recoveryError,
+          },
+          occurredAt: claimedAt,
+          generateId,
+        });
+        commitTurnEvent(database, {
+          turn: recoveringTurn,
+          event,
+          fence: attempt,
+          nextState: recoveringTurn.state,
+          staleMessage: 'The orphaned workspace recovery lost its adopted fence.',
+          generateId,
+        });
+        const waitingTurn = loadTurn(database, turn.turn_id);
+        event = buildEvent({
+          turn: waitingTurn,
+          lastEvent: loadLastEvent(database, turn.turn_id),
+          fence: attempt,
+          provider,
+          descriptor: {
+            kind: 'recovery_waiting_decision',
+            phase: 'recovering',
+            payload: {
+              recovery_id: recoveryId,
+              recovery_of_turn_id: turn.turn_id,
+              recovery_of_lineage_id: turn.lineage_id,
+              side_effect_status: 'unknown',
+            },
+            error: recoveryError,
+          },
+          occurredAt: claimedAt,
+          generateId,
+        });
+        commitTurnEvent(database, {
+          turn: waitingTurn,
+          event,
+          fence: attempt,
+          nextState: waitingTurn.state,
+          staleMessage: 'The orphaned recovery decision boundary lost its adopted fence.',
+          generateId,
+        });
+        return recoveryContext;
+      });
+      const recovered = claim.immediate();
+      if (recovered) recoveries.push(recovered);
+    }
+    return recoveries;
+  }
+
+  function assertWorkspaceWritable(turnContext, approvalFence = undefined) {
+    const turn = loadTurn(database, turnContext.turn_id);
+    assertTurnContextFence(turn, turnContext);
+    if (!turnContext.workspace) {
+      conflict('stale_workspace_lease', 'The turn has no workspace lease fence.');
+    }
+    const workspace = workspaceLeases.assertWritable(turnContext.workspace);
+    if (approvalFence === undefined) return workspace;
+    if (!approvalFence || typeof approvalFence !== 'object' || Array.isArray(approvalFence)) {
+      conflict('provider_context_invalid', 'A Codex write approval requires a complete fence.');
+    }
+    const approvalWorkspace = approvalFence.workspace;
+    const providerAttempt = approvalFence.provider_attempt;
+    if (
+      !['item/commandExecution/requestApproval', 'item/fileChange/requestApproval']
+        .includes(approvalFence.action_kind)
+      || typeof approvalFence.connection_id !== 'string'
+      || approvalFence.connection_id.length === 0
+      || approvalFence.conversation_id !== turn.conversation_id
+      || approvalFence.core_turn_id !== turn.turn_id
+      || approvalFence.lineage_id !== turn.lineage_id
+      || approvalFence.executor_instance_id !== turnContext.executor_instance_id
+      || approvalFence.provider_thread_id !== turn.provider_native_id
+      || typeof approvalFence.provider_turn_id !== 'string'
+      || approvalFence.provider_turn_id.length === 0
+      || typeof approvalFence.provider_item_id !== 'string'
+      || approvalFence.provider_item_id.length === 0
+      || approvalFence.provider_approval_id !== null
+        && (typeof approvalFence.provider_approval_id !== 'string'
+          || approvalFence.provider_approval_id.length === 0)
+      || approvalFence.environment_id !== null
+      || !providerAttempt
+      || !sameFence(providerAttempt, turnContext.attempt)
+      || !approvalWorkspace
+      || approvalWorkspace.workspace_lease_id !== workspace.workspace_lease_id
+      || approvalWorkspace.workspace_root !== workspace.workspace_root
+      || approvalWorkspace.mode !== 'writable'
+      || approvalWorkspace.holder_service_instance_id !== serviceInstanceId
+      || approvalWorkspace.holder_conversation_id !== turn.conversation_id
+      || approvalWorkspace.holder_turn_id !== turn.turn_id
+      || approvalWorkspace.lease_epoch !== workspace.lease_epoch
+    ) {
+      conflict(
+        'provider_context_invalid',
+        'The Codex write approval does not match its durable turn, owner, or workspace fence.',
+      );
+    }
+    let canonicalCwd;
+    try {
+      canonicalCwd = normalizeWorkspaceRoot(approvalFence.cwd, {
+        base: workspace.workspace_root,
+      });
+    } catch {
+      conflict('provider_context_invalid', 'The Codex write approval has an invalid working directory.');
+    }
+    if (canonicalCwd !== workspace.workspace_root) {
+      conflict('provider_context_invalid', 'The Codex write approval changed its workspace cwd.');
+    }
+    if (!Array.isArray(approvalFence.write_paths) || approvalFence.write_paths.length === 0) {
+      conflict('provider_context_invalid', 'The Codex write approval has no bounded write path.');
+    }
+    for (const writePath of approvalFence.write_paths) {
+      let canonicalWritePath;
+      try {
+        canonicalWritePath = normalizeWorkspaceRoot(writePath, { base: workspace.workspace_root });
+      } catch {
+        conflict('provider_context_invalid', 'The Codex write approval has an invalid write path.');
+      }
+      if (
+        canonicalWritePath !== workspace.workspace_root
+        && !canonicalWritePath.startsWith(`${workspace.workspace_root}${path.sep}`)
+      ) {
+        conflict('provider_context_invalid', 'The Codex write approval escaped its workspace root.');
+      }
+    }
+    const checkedAt = now();
+    const writer = database.prepare(`
+      SELECT lease_expires_at
+      FROM runtime_executor_leases
+      WHERE conversation_id = ? AND lease_owner = ? AND turn_id = ?
+        AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+    `).get(
+      turn.conversation_id,
+      serviceInstanceId,
+      turn.turn_id,
+      turnContext.attempt.attempt_id,
+      turnContext.attempt.attempt_no,
+      turnContext.attempt.lease_epoch,
+    );
+    const attempt = database.prepare(`
+      SELECT state
+      FROM runtime_provider_attempts
+      WHERE attempt_id = ? AND turn_id = ? AND attempt_no = ? AND lease_epoch = ?
+        AND service_instance_id = ? AND executor_instance_id = ?
+    `).get(
+      turnContext.attempt.attempt_id,
+      turn.turn_id,
+      turnContext.attempt.attempt_no,
+      turnContext.attempt.lease_epoch,
+      serviceInstanceId,
+      turnContext.executor_instance_id,
+    );
+    if (
+      !writer
+      || writer.lease_expires_at <= checkedAt
+      || !attempt
+      || !['starting', 'running', 'waiting_user'].includes(attempt.state)
+    ) {
+      conflict('stale_attempt', 'The Codex write approval lost its current writer ownership.');
+    }
+    return Object.freeze({
+      status: 'current',
+      conversation_id: turn.conversation_id,
+      turn_id: turn.turn_id,
+      executor_instance_id: turnContext.executor_instance_id,
+      provider_native_id: turn.provider_native_id,
+      provider_turn_id: approvalFence.provider_turn_id,
+      provider_item_id: approvalFence.provider_item_id,
+      workspace_lease_id: workspace.workspace_lease_id,
+      workspace_lease_epoch: workspace.lease_epoch,
+      checked_at: checkedAt,
+    });
   }
 
   function recordProviderEventActivityInTransaction(turnContext, observedAt) {
@@ -4628,7 +5290,25 @@ export function createExecutorStore({
         )
       LIMIT 1
     `).get(conversationId);
-    return blockingTurn === undefined;
+    return blockingTurn === undefined
+      && !workspaceLeases.hasBlockingBackgroundWork(conversationId);
+  }
+
+  function startWorkspaceBackgroundWork(turnContext, providerTaskId) {
+    const turn = loadTurn(database, turnContext.turn_id);
+    assertTurnContextFence(turn, turnContext);
+    return workspaceLeases.startBackgroundWork(turnContext.workspace, {
+      provider_task_id: providerTaskId,
+    });
+  }
+
+  function finishWorkspaceBackgroundWork(turnContext, providerTaskId, outcome) {
+    const turn = loadTurn(database, turnContext.turn_id);
+    assertTurnContextFence(turn, turnContext);
+    return workspaceLeases.finishBackgroundWork(turnContext.workspace, {
+      provider_task_id: providerTaskId,
+      outcome,
+    });
   }
 
   function releaseExecutorResident(conversationId, ownerEpoch = null) {
@@ -5566,6 +6246,9 @@ export function createExecutorStore({
       if (released.changes !== 1) {
         conflict('stale_attempt', 'The timed-out turn lost its executor lease fence.');
       }
+      workspaceLeases.releaseTurnAfterIsolation(turn.turn_id, {
+        reason: 'timed_out_provider_isolation_confirmed',
+      });
       return true;
     });
     return release.immediate();
@@ -5575,13 +6258,28 @@ export function createExecutorStore({
     const release = database.transaction(() => {
       const releasedAt = now();
       const turn = loadTurn(database, turnContext.turn_id);
-      assertTurnContextFence(turn, turnContext);
-      if (turn.state !== 'recovering') {
+      assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
+      assertResidentOwner(turn.conversation_id, turnContext.resident?.owner_epoch ?? null);
+      if (turnContext.workspace) {
+        workspaceLeases.assertHeldOrUncertain(turnContext.workspace);
+      }
+      if (!['recovering', 'timed_out'].includes(turn.state)) {
         conflict(
           'illegal_transition',
-          `Turn ${turn.turn_id} is ${turn.state}; expected recovering before ownership release.`,
+          `Turn ${turn.turn_id} is ${turn.state}; expected recovering or timed_out before ownership release.`,
         );
       }
+      if (turnContext.workspace && !isRecoveryNotificationDelivered(turnContext)) {
+        conflict(
+          'recovery_notification_pending',
+          'Workspace recovery must wait for a delivered user notification.',
+        );
+      }
+      const workspaceReleased = turnContext.workspace
+        ? workspaceLeases.releaseAfterIsolation(turnContext.workspace, {
+          reason: 'provider_isolation_confirmed',
+        })
+        : null;
       const releasedLease = database.prepare(`
         UPDATE runtime_executor_leases
         SET lease_owner = NULL, turn_id = NULL, attempt_id = NULL,
@@ -5662,7 +6360,11 @@ export function createExecutorStore({
           conflict('version_conflict', 'The steer reconciliation lease result lost its CAS.');
         }
       }
-      return { lease_released: true, resident_released: residentReleased };
+      return {
+        lease_released: true,
+        resident_released: residentReleased,
+        workspace_released: workspaceReleased !== null,
+      };
     });
     return release.immediate();
   }
@@ -8069,12 +8771,15 @@ export function createExecutorStore({
     appendAdapterEvent,
     assertInteractionHandoffRecoveryNoticeDelivered,
     assertCurrentFence,
+    assertRecoverableFence,
+    assertWorkspaceWritable,
     beginSteer,
     beginInteractionHandoff,
     beginReplyMappingRecovery,
     bindProviderNativeId,
     claimNextReplyMappingRecoveryNotice,
     claimNextQueuedTurn,
+    claimOrphanedWorkspaceRecoveries,
     claimInteractionHandoff,
     completeSteer,
     commitInteractionAnswer,
@@ -8082,12 +8787,16 @@ export function createExecutorStore({
     markProviderFailure,
     markProviderStopUnknown,
     heartbeatOwnedResidents,
+    heartbeatOwnedWorkspaceLeases: workspaceLeases.heartbeatOwned,
     renewOwnedTurnLeases,
     isConversationEvictable,
+    isRecoveryNotificationDelivered,
+    isWorkspaceRecoveryRequired,
     markInteractionHandoffDeliveryUnknown,
     markInteractionHandoffPreSendFailure,
     markInteractionHandoffSendStarted,
     releaseExecutorResident,
+    releaseWorkspaceReservation: workspaceLeases.release,
     releaseRecoveringExecutorOwnership,
     reconcileExpiredResidents,
     recordProviderEventDiagnostic,
@@ -8096,10 +8805,14 @@ export function createExecutorStore({
     recordSteerReconciliationOutcome,
     recordStopProviderOutcome,
     expireInteraction,
+    finishWorkspaceBackgroundWork,
+    listPendingInteractionDeadlines,
+    listActiveWorkspaceLeases: workspaceLeases.listActive,
+    listWorkspaceLeaseObservability: workspaceLeases.listObservability,
+    listWorkspaceReservationCandidates: listClaimableQueuedTurns,
     exhaustProviderRetries,
     failSteer,
     getInteractionHandoffForRecovery,
-    listPendingInteractionDeadlines,
     recordInteractionHandoffQueryUnproven,
     reconcileExpiredStartedInteractionHandoffs,
     resolveInteractionHandoffDisposition,
@@ -8109,6 +8822,7 @@ export function createExecutorStore({
     requestInteraction,
     resumeTurnAfterPermission,
     reserveNextExecutor,
+    startWorkspaceBackgroundWork,
     scheduleProviderRetry,
     stopConversation,
     transitionTurn,

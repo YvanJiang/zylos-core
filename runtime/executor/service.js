@@ -6,6 +6,7 @@ import {
 } from '../../contracts/public/index.js';
 import { createPermissionService } from '../permissions/permission-service.js';
 import { createExecutorStore } from '../persistence/executor-store.js';
+import { resolveProviderWorkspaceAccess } from '../workspace/lease-coordinator.js';
 
 function defaultGenerateId(kind) {
   return `${kind}-${crypto.randomUUID()}`;
@@ -119,9 +120,15 @@ export function createExecutorService({
   leaseDurationMs = 30_000,
   residentLeaseDurationMs = 60_000,
   residentHeartbeatIntervalMs = 20_000,
+  workspaceRoot = process.cwd(),
+  workspaceLeaseDurationMs = 10_000,
+  workspaceHeartbeatIntervalMs = Math.min(3_000, workspaceLeaseDurationMs / 3),
   scheduleResidentHeartbeat = setInterval,
   cancelResidentHeartbeat = clearInterval,
-  turnLeaseRenewalIntervalMs = 10_000,
+  scheduleWorkspaceHeartbeat = setInterval,
+  cancelWorkspaceHeartbeat = clearInterval,
+  isolateOrphanedWorkspace = null,
+  turnLeaseRenewalIntervalMs = Math.min(10_000, leaseDurationMs / 3),
   scheduleTurnLeaseRenewal = setInterval,
   cancelTurnLeaseRenewal = clearInterval,
   nonterminalSweepIntervalMs = 30_000,
@@ -232,6 +239,30 @@ export function createExecutorService({
     throw new TypeError('cancelPermissionSweep must be a function');
   }
   if (
+    !Number.isFinite(workspaceLeaseDurationMs)
+    || workspaceLeaseDurationMs <= 0
+  ) {
+    throw new TypeError('workspaceLeaseDurationMs must be a positive finite number');
+  }
+  if (
+    !Number.isFinite(workspaceHeartbeatIntervalMs)
+    || workspaceHeartbeatIntervalMs <= 0
+    || workspaceHeartbeatIntervalMs >= workspaceLeaseDurationMs
+  ) {
+    throw new TypeError(
+      'workspaceHeartbeatIntervalMs must be positive and below the workspace lease',
+    );
+  }
+  if (typeof scheduleWorkspaceHeartbeat !== 'function') {
+    throw new TypeError('scheduleWorkspaceHeartbeat must be a function');
+  }
+  if (typeof cancelWorkspaceHeartbeat !== 'function') {
+    throw new TypeError('cancelWorkspaceHeartbeat must be a function');
+  }
+  if (isolateOrphanedWorkspace !== null && typeof isolateOrphanedWorkspace !== 'function') {
+    throw new TypeError('isolateOrphanedWorkspace must be a function or null');
+  }
+  if (
     !Number.isSafeInteger(maxResidentExecutorsPerBot)
     || maxResidentExecutorsPerBot <= 0
   ) {
@@ -246,6 +277,7 @@ export function createExecutorService({
     generateId,
     leaseDurationMs,
     residentLeaseDurationMs,
+    workspaceLeaseDurationMs,
     interactionTimeoutMs,
   });
   const permissionPolicy = createPermissionService({ database, now, generateId });
@@ -261,6 +293,7 @@ export function createExecutorService({
   const endedResidentFences = new Map();
   const pendingInteractionRecoveries = new Map();
   const pendingRecoveryIsolations = new Map();
+  const orphanedWorkspaceRecoveryTurnIds = new Set();
   const recoveringOwnershipReleases = new Map();
   const releasedRecoveringOwnershipTurnIds = new Set();
   const timedOutLeaseReleases = new Map();
@@ -269,10 +302,13 @@ export function createExecutorService({
   let lifecycle = 'open';
   let closePromise = null;
   let residentHeartbeat = null;
+  let workspaceHeartbeat = null;
   let turnLeaseRenewal = null;
   let nonterminalSweep = null;
   let permissionSweep = null;
   let residentHeartbeatFailure = null;
+  let workspaceHeartbeatFailure = null;
+  let workspaceRecoveryFlight = null;
 
   function persistenceFailure(cause) {
     const error = new Error(`Runtime persistence failed: ${cause.message}`, { cause });
@@ -344,12 +380,14 @@ export function createExecutorService({
   }
 
   function snapshot() {
+    refresh();
     return {
       service_instance_id: serviceInstanceId,
       executors: executors.map((executor) => ({
         ...executor,
         queued_turn_ids: [...executor.queued_turn_ids],
       })),
+      workspace_leases: store.listWorkspaceLeaseObservability(),
     };
   }
 
@@ -373,6 +411,7 @@ export function createExecutorService({
       permissionSweep?.unref?.();
     }
     store.reconcileExpiredResidents();
+    adoptOrphanedWorkspaceRecoveries();
     store.reconcileExpiredStartedInteractionHandoffs();
     store.reconcileNonterminalTurns([], 'startup_reconciliation');
     if (nonterminalSweep === null) {
@@ -444,6 +483,30 @@ export function createExecutorService({
       }, residentHeartbeatIntervalMs);
       residentHeartbeat?.unref?.();
     }
+    if (workspaceHeartbeat === null) {
+      workspaceHeartbeat = scheduleWorkspaceHeartbeat(async () => {
+        if (lifecycle !== 'open') return;
+        try {
+          store.heartbeatOwnedWorkspaceLeases();
+          workspaceHeartbeatFailure = null;
+        } catch (error) {
+          try {
+            await recoverExpiredWorkspaceRuns(error);
+          } catch (recoveryError) {
+            workspaceHeartbeatFailure = recoveryError;
+            return;
+          }
+        }
+        try {
+          adoptOrphanedWorkspaceRecoveries();
+          await reconcileWorkspaceRecoveries();
+          workspaceHeartbeatFailure = null;
+        } catch (error) {
+          workspaceHeartbeatFailure = error;
+        }
+      }, workspaceHeartbeatIntervalMs);
+      workspaceHeartbeat?.unref?.();
+    }
     refresh();
     reschedulePendingInteractionDeadlines();
     started = true;
@@ -508,6 +571,7 @@ export function createExecutorService({
     releasedRecoveringOwnershipTurnIds.add(turnContext.turn_id);
     recoveringOwnershipReleases.delete(turnContext.turn_id);
     pendingRecoveryIsolations.delete(turnContext.turn_id);
+    orphanedWorkspaceRecoveryTurnIds.delete(turnContext.turn_id);
     endedResidentFences.delete(turnContext.conversation_id);
     return result;
   }
@@ -587,17 +651,138 @@ export function createExecutorService({
     if (recovery.deliveryUnknown) cause.deliveryUnknown = recovery.deliveryUnknown;
     return recovery;
   }
-  function transitionToRecovery(activeRun, reasonCode = 'provider_execution_uncertain') {
-    const { state } = store.assertCurrentFence(activeRun.turnContext);
+  function transitionToRecovery(
+    activeRun,
+    reasonCode = 'provider_execution_uncertain',
+    error = null,
+    { allowUncertainWorkspace = false } = {},
+  ) {
+    const { state } = allowUncertainWorkspace
+      ? store.assertRecoverableFence(activeRun.turnContext)
+      : store.assertCurrentFence(activeRun.turnContext);
     persist(() => store.transitionTurn(activeRun.turnContext, state, 'recovering', {
+      allowUncertainWorkspace,
       error: null,
       reasonCode,
+      recovery: error === null ? null : {
+        error,
+        waitForDecision: error.side_effect_status === 'unknown',
+      },
     }));
     activeRun.durableSettled = true;
+    activeRun.forcedResult = resultFor(activeRun, 'recovering');
     refresh();
     cleanupActiveRun(activeRun);
     pendingRecoveryIsolations.set(activeRun.turnContext.turn_id, activeRun.turnContext);
-    return resultFor(activeRun, 'recovering');
+    return activeRun.forcedResult;
+  }
+
+  async function recoverExpiredWorkspaceRuns(heartbeatError) {
+    const affectedRuns = [...activeRuns.values()].filter(
+      (activeRun) => !activeRun.durableSettled
+        && store.isWorkspaceRecoveryRequired(activeRun.turnContext),
+    );
+    if (affectedRuns.length === 0) {
+      if (heartbeatError?.code === 'stale_workspace_lease') return;
+      throw heartbeatError;
+    }
+    for (const activeRun of affectedRuns) {
+      const { turnContext } = activeRun;
+      try {
+        transitionToRecovery(
+          activeRun,
+          'workspace_lease_expired',
+          {
+            code: 'workspace_lease_expired',
+            category: 'conflict',
+            retryable: false,
+            side_effect_status: 'unknown',
+            user_message: 'Workspace ownership expired while provider work was still active.',
+          },
+          { allowUncertainWorkspace: true },
+        );
+      } catch (recoveryFailure) {
+        workspaceHeartbeatFailure = recoveryFailure;
+        continue;
+      }
+    }
+    if (workspaceHeartbeatFailure === heartbeatError) workspaceHeartbeatFailure = null;
+  }
+
+  function adoptOrphanedWorkspaceRecoveries() {
+    for (const turnContext of store.claimOrphanedWorkspaceRecoveries()) {
+      pendingRecoveryIsolations.set(turnContext.turn_id, turnContext);
+      orphanedWorkspaceRecoveryTurnIds.add(turnContext.turn_id);
+    }
+  }
+
+  async function performWorkspaceRecoveryReconciliation() {
+    adoptOrphanedWorkspaceRecoveries();
+    const result = { isolated: [], notification_pending: [], isolation_pending: [] };
+    for (const [turnId, turnContext] of pendingRecoveryIsolations) {
+      if (!turnContext.workspace) continue;
+      if (!store.isRecoveryNotificationDelivered(turnContext)) {
+        result.notification_pending.push(turnId);
+        continue;
+      }
+      const orphaned = orphanedWorkspaceRecoveryTurnIds.has(turnId);
+      if (orphaned) {
+        if (isolateOrphanedWorkspace === null) {
+          result.isolation_pending.push(turnId);
+          continue;
+        }
+        const isolation = await isolateOrphanedWorkspace(Object.freeze({
+          conversation_id: turnContext.conversation_id,
+          turn_id: turnContext.turn_id,
+          workspace: Object.freeze({ ...turnContext.workspace }),
+          attempt: Object.freeze({ ...turnContext.attempt }),
+        }));
+        if (isolation !== true && isolation?.isolated !== true) {
+          result.isolation_pending.push(turnId);
+          continue;
+        }
+      } else {
+        if (typeof adapter.abort !== 'function') {
+          result.isolation_pending.push(turnId);
+          continue;
+        }
+        await adapter.abort(turnContext);
+      }
+      releaseRecoveringOwnership(turnContext);
+      result.isolated.push(turnId);
+    }
+    refresh();
+    return result;
+  }
+
+  function reconcileWorkspaceRecoveries() {
+    if (workspaceRecoveryFlight) return workspaceRecoveryFlight;
+    if (lifecycle !== 'open') {
+      return Promise.reject(new Error(
+        `Executor service is ${lifecycle}; it cannot reconcile workspace recovery.`,
+      ));
+    }
+    const flight = performWorkspaceRecoveryReconciliation();
+    workspaceRecoveryFlight = flight;
+    const clearFlight = () => {
+      if (workspaceRecoveryFlight === flight) workspaceRecoveryFlight = null;
+    };
+    flight.then(clearFlight, clearFlight);
+    return flight;
+  }
+
+  function beginUnknownBackgroundRecovery(activeRun) {
+    return transitionToRecovery(
+      activeRun,
+      'provider_background_work_unknown',
+      {
+        code: 'provider_background_work_unknown',
+        category: 'provider',
+        retryable: false,
+        side_effect_status: 'unknown',
+        user_message: 'Background workspace work ended without a confirmed outcome.',
+      },
+    );
   }
 
   async function retainRecoveringRun(activeRun) {
@@ -633,9 +818,29 @@ export function createExecutorService({
     }
     if (activeRun.durableSettled) {
       cleanupActiveRun(activeRun);
+      if (activeRun.forcedResult) return activeRun.forcedResult;
       throw error;
     }
     if (error.persistenceFailure) {
+      try {
+        store.listActiveWorkspaceLeases();
+        if (store.isWorkspaceRecoveryRequired(turnContext)) {
+          return transitionToRecovery(
+            activeRun,
+            'workspace_lease_expired',
+            {
+              code: 'workspace_lease_expired',
+              category: 'conflict',
+              retryable: false,
+              side_effect_status: 'unknown',
+              user_message: 'Workspace ownership expired while provider work was still active.',
+            },
+            { allowUncertainWorkspace: true },
+          );
+        }
+      } catch (recoveryFailure) {
+        error.recoveryFailure = recoveryFailure;
+      }
       if (typeof adapter.abort === 'function') {
         await adapter.abort(turnContext);
       }
@@ -645,6 +850,9 @@ export function createExecutorService({
     closingPermissionTurnIds.add(turnContext.turn_id);
     for (const controller of permissionControllers.get(turnContext.turn_id) ?? []) {
       controller.abort();
+    }
+    if (activeRun.backgroundUncertain) {
+      return beginUnknownBackgroundRecovery(activeRun);
     }
     if (isExplicitProviderError(error)) {
       const normalizedError = normalizeProviderError(error, now());
@@ -712,6 +920,9 @@ export function createExecutorService({
   }
 
   async function finishRun(activeRun) {
+    if (activeRun.durableSettled && activeRun.forcedResult) {
+      return activeRun.forcedResult;
+    }
     const controlStatus = committedControlStatus(activeRun);
     if (controlStatus !== null) {
       const recoveringIsolationProven = controlStatus === 'recovering'
@@ -730,6 +941,9 @@ export function createExecutorService({
       return resultFor(activeRun, controlStatus);
     }
     activeRun.ensureProviderStarted();
+    if (activeRun.backgroundUncertain) {
+      return beginUnknownBackgroundRecovery(activeRun);
+    }
     const terminalState = activeRun.outcome === 'cancelled'
       ? 'stopped'
       : (activeRun.outcome === 'failed' ? 'failed' : 'completed');
@@ -794,6 +1008,25 @@ export function createExecutorService({
           activeRun.pauseKind = 'interaction';
           refresh();
           return resultFor(activeRun, 'waiting_user', { request: record.request });
+        }
+        if (record?.type === 'background_work_started') {
+          activeRun.usesManagedRecords = true;
+          persist(() => store.startWorkspaceBackgroundWork(
+            activeRun.turnContext,
+            record.provider_task_id,
+          ));
+          continue;
+        }
+        if (record?.type === 'background_work_finished') {
+          activeRun.usesManagedRecords = true;
+          persist(() => store.finishWorkspaceBackgroundWork(
+            activeRun.turnContext,
+            record.provider_task_id,
+            record.outcome,
+          ));
+          if (record.outcome === 'unknown') activeRun.backgroundUncertain = true;
+          else if (record.outcome !== 'completed') activeRun.outcome = 'failed';
+          continue;
         }
         if (record?.kind === 'interaction_requested') {
           activeRun.ensureProviderStarted();
@@ -889,6 +1122,22 @@ export function createExecutorService({
         );
         if (released) endedResidentFences.delete(context.conversation_id);
       },
+      assertWorkspaceWrite(approvalFence = undefined) {
+        if (
+          approvalFence !== undefined
+          && (
+            committedControlStatus(activeRun) !== null
+            || activeRun.durableSettled
+            || activeRuns.get(turnContext.turn_id) !== activeRun
+            || approvalFence.provider_thread_id !== activeRun.currentProviderNativeId
+          )
+        ) {
+          const error = new Error('The Codex approval no longer matches the active provider run.');
+          error.code = 'stale_attempt';
+          throw error;
+        }
+        return persist(() => store.assertWorkspaceWritable(turnContext, approvalFence));
+      },
       authorizeProtectedAction(request) {
         return authorizeProtectedAction(request);
       },
@@ -957,12 +1206,34 @@ export function createExecutorService({
     });
   }
 
+  function reserveWithWorkspace({ markCapacityWait = true } = {}) {
+    const workspaceAccessByConversation = new Map(
+      store.listWorkspaceReservationCandidates().map((candidate) => [
+        candidate.conversation_id,
+        resolveProviderWorkspaceAccess(adapter, {
+          conversation_id: candidate.conversation_id,
+          turn_id: candidate.turn_id,
+          provider,
+        }, { defaultRoot: workspaceRoot }),
+      ]),
+    );
+    return {
+      reservation: store.reserveNextExecutor({
+        maxResidentExecutorsPerBot,
+        markCapacityWait,
+        workspaceAccessByConversation,
+      }),
+      workspaceAccessByConversation,
+    };
+  }
+
   async function runNext() {
     if (lifecycle !== 'open') {
       throw new Error(`Executor service is ${lifecycle}; it cannot claim another turn.`);
     }
     if (!started) start();
     if (residentHeartbeatFailure) throw persistenceFailure(residentHeartbeatFailure);
+    if (workspaceHeartbeatFailure) throw persistenceFailure(workspaceHeartbeatFailure);
     const replyMappingRecovery = store.claimNextReplyMappingRecoveryNotice();
     if (replyMappingRecovery !== null) {
       if (!replyMappingRecovery.notice_delivered) {
@@ -1042,27 +1313,59 @@ export function createExecutorService({
         };
       }
     }
-    let reservation = store.reserveNextExecutor({
-      maxResidentExecutorsPerBot,
-      markCapacityWait: false,
-    });
+    let reserved = reserveWithWorkspace({ markCapacityWait: false });
+    let { reservation } = reserved;
     if (reservation.status === 'idle') return reservation;
+    if (reservation.status === 'workspace_wait') {
+      refresh();
+      return reservation;
+    }
     if (reservation.status === 'capacity_wait') {
       await evictIdleExecutors();
       if (lifecycle !== 'open') {
         throw new Error(`Executor service is ${lifecycle}; it cannot claim another turn.`);
       }
-      reservation = store.reserveNextExecutor({ maxResidentExecutorsPerBot });
+      reserved = reserveWithWorkspace();
+      ({ reservation } = reserved);
+    }
+    if (reservation.status === 'workspace_wait') {
+      refresh();
+      return reservation;
     }
     if (reservation.status === 'capacity_wait') {
       refresh();
       return reservation;
     }
-    const turnContext = store.claimNextQueuedTurn({
-      conversationId: reservation.conversation_id,
-      requireResident: provider === 'claude',
-    });
+    let turnContext;
+    try {
+      turnContext = store.claimNextQueuedTurn({
+        conversationId: reservation.conversation_id,
+        requireResident: provider === 'claude',
+        workspaceAccess: reserved.workspaceAccessByConversation.get(
+          reservation.conversation_id,
+        ) ?? resolveProviderWorkspaceAccess(adapter, {
+          conversation_id: reservation.conversation_id,
+          provider,
+        }, { defaultRoot: workspaceRoot }),
+        workspaceLease: reservation.workspace ?? null,
+      });
+    } catch (error) {
+      if (reservation.workspace) {
+        try {
+          store.releaseWorkspaceReservation(reservation.workspace);
+        } catch {
+          // The original claim failure remains authoritative; expiry reconciles a lost fence.
+        }
+      }
+      throw error;
+    }
+    if (turnContext?.status === 'workspace_wait') {
+      if (reservation.workspace) store.releaseWorkspaceReservation(reservation.workspace);
+      refresh();
+      return turnContext;
+    }
     if (!turnContext) {
+      if (reservation.workspace) store.releaseWorkspaceReservation(reservation.workspace);
       refresh();
       return { status: 'idle' };
     }
@@ -1073,9 +1376,11 @@ export function createExecutorService({
     });
     const activeRun = {
       advancing: null,
+      backgroundUncertain: false,
       currentProviderNativeId: turnContext.provider_native_id,
       durableSettled: false,
       ensureProviderStarted: null,
+      forcedResult: null,
       iterator: null,
       outcome: null,
       pauseKind: null,
@@ -1115,6 +1420,9 @@ export function createExecutorService({
         provider_native_id: turnContext.provider_native_id,
         trace_id: turnContext.trace_id,
         executor_instance_id: turnContext.executor_instance_id,
+        workspace: turnContext.workspace === null
+          ? null
+          : Object.freeze({ ...turnContext.workspace }),
         input: turnContext.input,
         interaction: Object.freeze({
           authorized_subjects: Object.freeze(
@@ -1929,6 +2237,13 @@ export function createExecutorService({
       try {
         clearAllInteractionDeadlines();
         const shutdownFailures = [];
+        if (workspaceRecoveryFlight) {
+          try {
+            await workspaceRecoveryFlight;
+          } catch (error) {
+            shutdownFailures.push(error);
+          }
+        }
         const providerClosing = (async () => {
           if (typeof adapter.close !== 'function') return [];
           const result = await adapter.close();
@@ -2114,6 +2429,10 @@ export function createExecutorService({
           cancelResidentHeartbeat(residentHeartbeat);
           residentHeartbeat = null;
         }
+        if (lifecycle === 'closed' && workspaceHeartbeat !== null) {
+          cancelWorkspaceHeartbeat(workspaceHeartbeat);
+          workspaceHeartbeat = null;
+        }
         if (permissionSweep !== null) {
           cancelPermissionSweep(permissionSweep);
           permissionSweep = null;
@@ -2140,6 +2459,7 @@ export function createExecutorService({
     deliverInteractionAnswer,
     evictIdleExecutors,
     expireInteraction,
+    reconcileWorkspaceRecoveries,
     reconcileInteractionHandoff,
     resolveInteractionHandoff,
     runNext,

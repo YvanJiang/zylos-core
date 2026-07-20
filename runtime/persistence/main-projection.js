@@ -84,6 +84,11 @@ function projectRenderModel(renderModel, event) {
     text = 'Waiting for executor capacity.';
   } else if (
     event.kind === 'turn_state_changed'
+    && event.payload.reason_code === 'workspace_lease'
+  ) {
+    text = 'Waiting for another conversation to finish using this workspace.';
+  } else if (
+    event.kind === 'turn_state_changed'
     && event.payload.reason_code === 'reply_mapping_recovery_notice'
   ) {
     text = 'The replied-to message lineage needs recovery. Zylos will wait until this notice is delivered, then use only a uniquely verified lineage and will not replay work with unknown side effects.';
@@ -95,7 +100,10 @@ function projectRenderModel(renderModel, event) {
   } else if (
     event.kind === 'turn_state_changed'
     && event.payload.to_state === 'starting'
-    && renderModel.text === 'Waiting for executor capacity.'
+    && [
+      'Waiting for executor capacity.',
+      'Waiting for another conversation to finish using this workspace.',
+    ].includes(renderModel.text)
   ) {
     text = 'Starting execution.';
   } else if (event.kind === 'recovery_waiting_decision') {

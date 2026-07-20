@@ -199,6 +199,7 @@ describe('runtime executor service', () => {
       serviceInstanceId: 'executor-service-turn-lease-renewal',
       now: () => clock.now,
       generateId: deterministicIds('turn-lease-renewal'),
+      workspaceLeaseDurationMs: 60_000,
       scheduleTurnLeaseRenewal(callback, intervalMs) {
         expect(intervalMs).toBe(10_000);
         renewalTick = callback;
@@ -1789,6 +1790,18 @@ describe('runtime executor service', () => {
           attempt_id: 'attempt-executor-1',
           attempt_no: 1,
           lease_epoch: 1,
+        },
+        workspace: {
+          workspace_lease_id: 'workspace-lease-executor-1',
+          workspace_root: process.cwd(),
+          mode: 'writable',
+          status: 'current',
+          holder_service_instance_id: 'executor-service-A',
+          holder_conversation_id: accepted.conversation_id,
+          holder_turn_id: accepted.turn_id,
+          lease_epoch: 1,
+          acquired_at: '2026-07-19T07:01:00Z',
+          lease_expires_at: '2026-07-19T07:01:10.000Z',
         },
       },
     ]);

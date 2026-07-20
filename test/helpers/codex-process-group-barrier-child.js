@@ -77,7 +77,11 @@ const context = {
   attempt: { attempt_id: 'barrier-attempt', attempt_no: 1, lease_epoch: 1 },
 };
 
-for await (const _event of adapter.execute(context)) {
+for await (const _event of adapter.execute(context, {
+  assertWorkspaceWrite() {
+    return { status: 'current' };
+  },
+})) {
   // The fake turn has no normalized payload events.
 }
 await adapter.close();

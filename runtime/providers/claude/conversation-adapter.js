@@ -40,6 +40,13 @@ const CORE_MANAGED_CONTINUITY_ARGUMENTS = Object.freeze(new Set([
   'resume-session-at',
   'session-id',
 ]));
+const PROVIDER_READ_ONLY_TOOLS = Object.freeze(new Set([
+  'Glob',
+  'Grep',
+  'Read',
+  'WebFetch',
+  'WebSearch',
+]));
 
 function selectEnvironment(environment, allowlist = DEFAULT_ENVIRONMENT_ALLOWLIST) {
   const selected = {};
@@ -371,6 +378,22 @@ async function requestToolPermission(executor, toolName, input, sdkContext) {
       interrupt: true,
     };
   }
+  if (!PROVIDER_READ_ONLY_TOOLS.has(toolName)) {
+    if (typeof activeTurn.controls.assertWorkspaceWrite !== 'function') {
+      return {
+        behavior: 'deny',
+        message: 'Core workspace write fencing is unavailable for this provider attempt.',
+        interrupt: true,
+      };
+    }
+    try {
+      const assertion = activeTurn.controls.assertWorkspaceWrite();
+      if (assertion && typeof assertion.then === 'function') await assertion;
+    } catch (error) {
+      settleTurn(activeTurn, { error });
+      throw error;
+    }
+  }
   const interactionPolicy = activeTurn.controls.interactionPolicy;
   if (interactionPolicy) {
     const providerInteractionRef = sdkContext?.requestId
@@ -441,31 +464,100 @@ async function requestToolPermission(executor, toolName, input, sdkContext) {
   };
 }
 
+export async function enforceWorkspaceFenceBeforeTool(executor, input) {
+  if (
+    input?.hook_event_name !== 'PreToolUse'
+    || PROVIDER_READ_ONLY_TOOLS.has(input.tool_name)
+  ) return {};
+  const activeTurn = executor.providerTurn;
+  if (!activeTurn || activeTurn.resultSeen) {
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: 'The provider attempt is no longer active.',
+      },
+    };
+  }
+  try {
+    if (typeof activeTurn.controls.assertWorkspaceWrite !== 'function') {
+      throw new Error('Core workspace write fencing is unavailable for this provider attempt.');
+    }
+    await activeTurn.controls.assertWorkspaceWrite();
+    return {};
+  } catch (error) {
+    settleTurn(activeTurn, { error });
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: 'Core rejected a stale workspace write fence.',
+      },
+    };
+  }
+}
+
+function backgroundOutcome(message) {
+  return message?.status === 'completed' && message?.success !== false
+    ? 'completed'
+    : 'failed';
+}
+
 function updateBackgroundTasks(executor, message, now) {
-  if (message?.type !== 'system') return;
+  if (message?.type !== 'system') return [];
+  const records = [];
   if (message.subtype === 'background_tasks_changed' && Array.isArray(message.tasks)) {
-    const hadBackgroundTasks = executor.backgroundTaskIds.size > 0;
-    executor.backgroundTaskIds = new Set(
+    const nextTaskIds = new Set(
       message.tasks.map(({ task_id: taskId }) => taskId).filter(
         (taskId) => typeof taskId === 'string' && taskId.length > 0,
       ),
     );
-    if (hadBackgroundTasks && executor.backgroundTaskIds.size === 0) {
-      executor.lastUsedAt = now();
-      executor.notifySwitchable();
+    for (const taskId of nextTaskIds) {
+      if (!executor.backgroundTaskIds.has(taskId)) {
+        executor.backgroundTaskIds.add(taskId);
+        records.push({ type: 'background_work_started', provider_task_id: taskId });
+      }
     }
-    return;
+    // The SDK documents this as a level signal whose ordering relative to the
+    // task_notification outcome edge is unspecified. Keep removed IDs fenced
+    // until that outcome edge arrives; a stream end records them as unknown.
+    return records;
   }
-  if (typeof message.task_id !== 'string') return;
+  if (typeof message.task_id !== 'string') return records;
   if (message.subtype === 'task_started') {
-    executor.backgroundTaskIds.add(message.task_id);
+    if (!executor.backgroundTaskIds.has(message.task_id)) {
+      executor.backgroundTaskIds.add(message.task_id);
+      records.push({ type: 'background_work_started', provider_task_id: message.task_id });
+    }
   } else if (message.subtype === 'task_notification') {
     const removed = executor.backgroundTaskIds.delete(message.task_id);
+    if (removed) {
+      records.push({
+        type: 'background_work_finished',
+        provider_task_id: message.task_id,
+        outcome: backgroundOutcome(message),
+      });
+    }
     if (removed && executor.backgroundTaskIds.size === 0) {
       executor.lastUsedAt = now();
       executor.notifySwitchable();
     }
   }
+  return records;
+}
+
+function markUnfinishedBackgroundTasksUnknown(executor, now) {
+  if (executor.backgroundTaskIds.size === 0) return;
+  const turn = executor.providerTurn ?? executor.activeTurn;
+  for (const taskId of executor.backgroundTaskIds) {
+    turn?.output.push({
+      type: 'background_work_finished',
+      provider_task_id: taskId,
+      outcome: 'unknown',
+    });
+  }
+  executor.backgroundTaskIds.clear();
+  executor.lastUsedAt = now();
 }
 
 function createResidentExecutor({
@@ -532,6 +624,15 @@ function createResidentExecutor({
       input,
       sdkContext,
     );
+    options.hooks = {
+      ...(options.hooks ?? {}),
+      PreToolUse: [
+        {
+          hooks: [(input) => enforceWorkspaceFenceBeforeTool(executor, input)],
+        },
+        ...(options.hooks?.PreToolUse ?? []),
+      ],
+    };
     executor.query = executor.queryFactory({
       prompt: executor.input,
       options,
@@ -541,7 +642,35 @@ function createResidentExecutor({
         for await (const message of executor.query) {
           const sessionId = assertSessionIdentity(executor, message);
           await establishDurableSession(executor, sessionId);
-          updateBackgroundTasks(executor, message, now);
+          const providerTurnBeforeMessage = executor.providerTurn;
+          const backgroundRecords = updateBackgroundTasks(executor, message, now);
+          for (const record of backgroundRecords) {
+            providerTurnBeforeMessage?.output.push(record);
+            if (record.outcome === 'failed' && providerTurnBeforeMessage) {
+              providerTurnBeforeMessage.backgroundFailed = true;
+            }
+          }
+          if (
+            providerTurnBeforeMessage?.providerOutcome !== null
+            && executor.backgroundTaskIds.size === 0
+            && !providerTurnBeforeMessage.resultSeen
+          ) {
+            settleTurn(providerTurnBeforeMessage, {
+              outcome: providerTurnBeforeMessage.providerOutcome === 'cancelled'
+                ? 'cancelled'
+                : (providerTurnBeforeMessage.backgroundFailed
+                ? 'failed'
+                  : providerTurnBeforeMessage.providerOutcome),
+            });
+            if (executor.activeTurn === providerTurnBeforeMessage) executor.activeTurn = null;
+            if (executor.providerTurn === providerTurnBeforeMessage) {
+              executor.providerTurn = null;
+              executor.input.resume();
+            }
+            executor.lastUsedAt = now();
+            executor.notifySwitchable();
+            continue;
+          }
           if (
             message?.type === 'system'
             && message.subtype === 'session_state_changed'
@@ -562,19 +691,25 @@ function createResidentExecutor({
             const outcome = providerTurn.cancelRequested
               ? 'cancelled'
               : (message.subtype === 'success' ? 'completed' : 'failed');
-            settleTurn(providerTurn, { outcome });
-            if (executor.activeTurn === providerTurn) executor.activeTurn = null;
-            executor.lastUsedAt = now();
-            executor.notifySwitchable();
+            if (executor.backgroundTaskIds.size > 0) {
+              providerTurn.providerOutcome = outcome;
+            } else {
+              settleTurn(providerTurn, { outcome });
+              if (executor.activeTurn === providerTurn) executor.activeTurn = null;
+              executor.lastUsedAt = now();
+              executor.notifySwitchable();
+            }
           }
         }
       } catch (error) {
+        markUnfinishedBackgroundTasksUnknown(executor, now);
         rejectPendingPermissions(executor, error);
         settleUnfinishedTurns(executor, { error });
         executor.activeTurn = null;
         executor.providerTurn = null;
         executor.notifySwitchable();
       } finally {
+        markUnfinishedBackgroundTasksUnknown(executor, now);
         rejectPendingPermissions(executor, new Error('Claude provider query ended.'));
         settleUnfinishedTurns(executor);
         executor.activeTurn = null;
@@ -776,6 +911,8 @@ export function createClaudeConversationAdapter({
       messageUuid,
       output,
       pendingPermissions: new Map(),
+      providerOutcome: null,
+      backgroundFailed: false,
       resultSeen: false,
       text: '',
       toolNames: new Map(),
@@ -1107,12 +1244,23 @@ export function createClaudeConversationAdapter({
     return executors.has(conversationId);
   }
 
+  function getWorkspaceAccess() {
+    if (typeof safeQueryOptions.cwd !== 'string' || safeQueryOptions.cwd.length === 0) return null;
+    return Object.freeze({
+      root: safeQueryOptions.cwd,
+      mode: 'writable',
+      read_only_enforced: false,
+      authority: 'provider_sandbox',
+    });
+  }
+
   return Object.freeze({
     abort,
     cancel,
     close,
     evictIdle,
     execute,
+    getWorkspaceAccess,
     prepareInteractionAnswer,
     queryInteractionHandoffAcceptance,
     hasResident,

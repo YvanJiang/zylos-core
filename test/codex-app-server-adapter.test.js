@@ -111,9 +111,39 @@ function executionContext(overrides = {}) {
       authorized_subjects: [{ type: 'actor', actor_id: 'user-1' }],
       allowed_sources: ['main_card_reply', 'card_action'],
     },
+    executor_instance_id: 'executor-1',
+    workspace: {
+      workspace_lease_id: 'workspace-lease-1',
+      workspace_root: '/workspace',
+      mode: 'writable',
+      holder_service_instance_id: 'service-1',
+      holder_conversation_id: 'conversation-1',
+      holder_turn_id: 'turn-1',
+      lease_epoch: 11,
+      lease_expires_at: '2026-07-19T05:10:00Z',
+    },
     attempt: { attempt_id: 'attempt-1', attempt_no: 1, lease_epoch: 3 },
     ...overrides,
   };
+}
+
+function workspaceControls(overrides = {}) {
+  return {
+    assertWorkspaceWrite: jest.fn(() => ({ status: 'current' })),
+    ...overrides,
+  };
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+function executeAdapter(adapter, context, controls = workspaceControls()) {
+  return adapter.execute(context, controls);
 }
 
 async function collect(iterable) {
@@ -189,7 +219,188 @@ function sendStartedFileChange({ send, threadId, turnId }, itemId) {
   });
 }
 
+function sendStartedCommand({ send, threadId, turnId }, itemId, {
+  command = 'touch approved.txt',
+  cwd = '/workspace',
+} = {}) {
+  send({
+    method: 'item/started',
+    params: {
+      threadId,
+      turnId,
+      startedAtMs: 1,
+      item: {
+        type: 'commandExecution',
+        id: itemId,
+        command,
+        cwd,
+        status: 'inProgress',
+      },
+    },
+  });
+}
+
 describe('Codex app-server provider adapter', () => {
+  test('advertises the workspace access enforced by its configured sandbox', () => {
+    const spawnProcess = jest.fn();
+
+    expect(createCodexAppServerAdapter({
+      spawnProcess,
+      cwd: '/workspace',
+      sandbox: 'workspace-write',
+    }).getWorkspaceAccess()).toEqual({
+      root: '/workspace',
+      mode: 'writable',
+      read_only_enforced: false,
+      authority: 'core_workspace_lease',
+    });
+
+    expect(createCodexAppServerAdapter({
+      spawnProcess,
+      cwd: '/workspace/review',
+      sandbox: 'read-only',
+    }).getWorkspaceAccess()).toEqual({
+      root: '/workspace/review',
+      mode: 'read_only',
+      read_only_enforced: true,
+      authority: 'provider_sandbox',
+    });
+  });
+
+  test('rejects full access and any writable turn that would bypass synchronous approval', () => {
+    const spawnProcess = jest.fn();
+
+    expect(() => createCodexAppServerAdapter({
+      spawnProcess,
+      cwd: '/workspace',
+      sandbox: 'danger-full-access',
+      approvalPolicy: 'never',
+    })).toThrow(/danger-full-access/);
+    expect(() => createCodexAppServerAdapter({
+      spawnProcess,
+      cwd: '/workspace',
+      sandbox: 'workspace-write',
+      approvalPolicy: 'never',
+    })).toThrow(/on-request/);
+    expect(spawnProcess).not.toHaveBeenCalled();
+  });
+
+  test('fails closed before starting a writable turn without a current workspace fence', async () => {
+    const spawnProcess = jest.fn();
+    const adapter = createCodexAppServerAdapter({ spawnProcess, cwd: '/workspace' });
+
+    await expect(collect(adapter.execute(executionContext()))).rejects.toMatchObject({
+      code: 'unsupported_capability',
+    });
+    expect(spawnProcess).not.toHaveBeenCalled();
+  });
+
+  test('checks the current workspace fence before contacting app-server for a writable turn', async () => {
+    const spawnProcess = jest.fn();
+    const staleLease = Object.assign(new Error('stale workspace lease'), {
+      code: 'stale_workspace_lease',
+    });
+    const controls = workspaceControls({
+      assertWorkspaceWrite: jest.fn(() => {
+        throw staleLease;
+      }),
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess, cwd: '/workspace' });
+
+    await expect(collect(executeAdapter(adapter, executionContext(), controls)))
+      .rejects.toBe(staleLease);
+    expect(controls.assertWorkspaceWrite).toHaveBeenCalledTimes(1);
+    expect(spawnProcess).not.toHaveBeenCalled();
+  });
+
+  test('rechecks the workspace fence after thread binding and immediately before turn/start', async () => {
+    const server = createFakeAppServer();
+    const binding = deferred();
+    let current = true;
+    const staleLease = Object.assign(new Error('stale workspace lease'), {
+      code: 'stale_workspace_lease',
+    });
+    const controls = workspaceControls({
+      assertWorkspaceWrite: jest.fn(() => {
+        if (!current) throw staleLease;
+        return { status: 'current' };
+      }),
+    });
+    const context = executionContext({
+      bindProviderNativeId: jest.fn(() => binding.promise),
+      reportProviderFailure: jest.fn(),
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
+    const running = collect(executeAdapter(adapter, context, controls));
+    await waitFor(() => context.bindProviderNativeId.mock.calls.length === 1);
+    current = false;
+    binding.resolve();
+
+    await expect(running).rejects.toMatchObject({
+      code: 'provider_connection_lost',
+      cause: staleLease,
+      providerError: expect.objectContaining({ side_effect_status: 'unknown' }),
+    });
+    expect(controls.assertWorkspaceWrite).toHaveBeenCalledTimes(3);
+    expect(context.reportProviderFailure).toHaveBeenCalledWith(expect.objectContaining({
+      code: 'provider_connection_lost',
+      cause: staleLease,
+      providerError: expect.objectContaining({ side_effect_status: 'unknown' }),
+    }));
+    expect(server.received.filter(({ method }) => method === 'turn/start')).toHaveLength(0);
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
+  test('rechecks the workspace fence when app-server confirms turn/started', async () => {
+    const server = createFakeAppServer({ autoTurnStarted: false, afterTurnStart() {} });
+    let current = true;
+    const staleLease = Object.assign(new Error('stale workspace lease'), {
+      code: 'stale_workspace_lease',
+    });
+    const controls = workspaceControls({
+      assertWorkspaceWrite: jest.fn(() => {
+        if (!current) throw staleLease;
+        return { status: 'current' };
+      }),
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
+    const waiting = executeAdapter(
+      adapter,
+      executionContext(),
+      controls,
+    )[Symbol.asyncIterator]().next();
+    await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
+    current = false;
+    server.send({
+      method: 'turn/started',
+      params: {
+        threadId: 'codex-thread-1',
+        turn: { id: 'codex-turn-1', status: 'inProgress', items: [] },
+      },
+    });
+    server.send({
+      method: 'turn/completed',
+      params: {
+        threadId: 'codex-thread-1',
+        turn: { id: 'codex-turn-1', status: 'completed', items: [] },
+      },
+    });
+
+    await expect(waiting).rejects.toMatchObject({
+      code: 'provider_connection_lost',
+      cause: staleLease,
+      providerError: { side_effect_status: 'unknown' },
+    });
+    expect(controls.assertWorkspaceWrite).toHaveBeenCalledTimes(4);
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
   test('initializes one stdio connection and binds a new thread before starting its turn', async () => {
     const server = createFakeAppServer();
     const spawnProcess = jest.fn(() => server.child);
@@ -203,7 +414,7 @@ describe('Codex app-server provider adapter', () => {
       now: () => '2026-07-19T05:00:00Z',
     });
 
-    await expect(collect(adapter.execute(context))).resolves.toEqual([]);
+    await expect(collect(executeAdapter(adapter, context))).resolves.toEqual([]);
 
     expect(spawnProcess).toHaveBeenCalledTimes(1);
     expect(spawnProcess).toHaveBeenCalledWith(
@@ -229,11 +440,30 @@ describe('Codex app-server provider adapter', () => {
     expect(server.received[1]).toEqual({ method: 'initialized' });
     expect(server.received[2]).toEqual(expect.objectContaining({
       method: 'thread/start',
-      params: {
+      params: expect.objectContaining({
         cwd: '/workspace',
         approvalPolicy: 'on-request',
-        sandbox: 'workspace-write',
-      },
+        approvalsReviewer: 'user',
+        sandbox: 'read-only',
+        environments: [],
+        dynamicTools: [],
+        config: expect.objectContaining({
+          mcp_servers: {},
+          web_search: 'disabled',
+          features: expect.objectContaining({
+            apps: false,
+            hooks: false,
+            multi_agent: false,
+            multi_agent_v2: false,
+            enable_fanout: false,
+            collaboration_modes: false,
+            multi_agent_mode: false,
+            code_mode: false,
+            image_generation: false,
+            request_permissions: false,
+          }),
+        }),
+      }),
     }));
     expect(context.bindProviderNativeId).toHaveBeenCalledWith('codex-thread-1');
     expect(context.reportProviderState).toHaveBeenCalledWith({
@@ -253,6 +483,11 @@ describe('Codex app-server provider adapter', () => {
       params: expect.objectContaining({
         threadId: 'codex-thread-1',
         input: [{ type: 'text', text: 'Hello Codex' }],
+        cwd: '/workspace',
+        approvalPolicy: 'on-request',
+        approvalsReviewer: 'user',
+        sandboxPolicy: { type: 'readOnly', networkAccess: false },
+        environments: [],
       }),
     }));
   });
@@ -263,13 +498,13 @@ describe('Codex app-server provider adapter', () => {
     const adapter = createCodexAppServerAdapter({ spawnProcess });
 
     await Promise.all([
-      collect(adapter.execute(executionContext({
+      collect(executeAdapter(adapter, executionContext({
         turn_id: 'turn-A',
         lineage_id: 'lineage-A',
         lineage: { provider_native_id: 'codex-thread-A' },
         attempt: { attempt_id: 'attempt-A', attempt_no: 1, lease_epoch: 3 },
       }))),
-      collect(adapter.execute(executionContext({
+      collect(executeAdapter(adapter, executionContext({
         conversation_id: 'conversation-B',
         turn_id: 'turn-B',
         lineage_id: 'lineage-B',
@@ -288,6 +523,17 @@ describe('Codex app-server provider adapter', () => {
         expect.objectContaining({ params: expect.objectContaining({ threadId: 'codex-thread-A' }) }),
         expect.objectContaining({ params: expect.objectContaining({ threadId: 'codex-thread-B' }) }),
       ]));
+    for (const resume of server.received.filter(({ method }) => method === 'thread/resume')) {
+      expect(resume.params).toEqual(expect.objectContaining({
+        approvalPolicy: 'on-request',
+        approvalsReviewer: 'user',
+        sandbox: 'read-only',
+        config: expect.objectContaining({
+          mcp_servers: {},
+          web_search: 'disabled',
+        }),
+      }));
+    }
     expect(server.received.filter(({ method }) => method === 'turn/start')).toHaveLength(2);
   });
 
@@ -354,11 +600,14 @@ describe('Codex app-server provider adapter', () => {
         });
       },
     });
-    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
     const runAContext = executionContext({
       lineage: { provider_native_id: 'codex-thread-A' },
     });
-    const runA = adapter.execute(runAContext)[Symbol.asyncIterator]();
+    const runA = executeAdapter(adapter, runAContext)[Symbol.asyncIterator]();
     const interaction = await nextInteraction(runA);
     await deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
@@ -394,7 +643,7 @@ describe('Codex app-server provider adapter', () => {
       reportProviderFailure: reportRunBFailure,
       attempt: { attempt_id: 'attempt-B', attempt_no: 1, lease_epoch: 4 },
     });
-    const runB = adapter.execute(runBContext)[Symbol.asyncIterator]();
+    const runB = executeAdapter(adapter, runBContext)[Symbol.asyncIterator]();
     const waitingB = runB.next();
     await waitFor(() => server.received.some((message) => (
       message.method === 'turn/start' && message.params.threadId === 'codex-thread-B'
@@ -445,7 +694,7 @@ describe('Codex app-server provider adapter', () => {
     const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
     const server = createFakeAppServer({ respondToTurnStart: false });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
-    const waiting = adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]().next();
+    const waiting = executeAdapter(adapter, executionContext({ reportProviderFailure }))[Symbol.asyncIterator]().next();
     await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
 
     server.child.emit('close', 1, null);
@@ -460,7 +709,7 @@ describe('Codex app-server provider adapter', () => {
     const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
     const server = createFakeAppServer({ respondToTurnStart: false });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
-    const waiting = adapter.execute(executionContext({
+    const waiting = executeAdapter(adapter, executionContext({
       lineage: { provider_native_id: 'codex-thread-1' },
       reportProviderFailure,
     }))[Symbol.asyncIterator]().next();
@@ -486,7 +735,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
 
-    await expect(collect(adapter.execute(executionContext()))).rejects.toMatchObject({
+    await expect(collect(executeAdapter(adapter, executionContext()))).rejects.toMatchObject({
       providerError: { code: 'side_effect_unknown' },
     });
     expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
@@ -504,7 +753,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
 
-    await expect(adapter.execute(executionContext({
+    await expect(executeAdapter(adapter, executionContext({
       lineage: { provider_native_id: 'codex-thread-1' },
       reportProviderFailure,
     }))[Symbol.asyncIterator]().next()).rejects.toMatchObject({
@@ -522,7 +771,7 @@ describe('Codex app-server provider adapter', () => {
       lineage: { provider_native_id: 'codex-thread-1' },
       reportProviderFailure,
     });
-    const waiting = adapter.execute(context)[Symbol.asyncIterator]().next();
+    const waiting = executeAdapter(adapter, context)[Symbol.asyncIterator]().next();
     await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
     server.child.stdin.write = jest.fn(() => {
       throw new Error('forced synchronous control EPIPE');
@@ -584,40 +833,6 @@ describe('Codex app-server provider adapter', () => {
           },
         });
         send({
-          method: 'hook/started',
-          params: {
-            threadId,
-            turnId,
-            run: {
-              id: 'private-stop-hook-1',
-              eventName: 'stop',
-              handlerType: 'command',
-              executionMode: 'sync',
-              scope: 'turn',
-              status: 'running',
-              sourcePath: '/private/machine/hooks.json',
-              entries: [],
-            },
-          },
-        });
-        send({
-          method: 'hook/completed',
-          params: {
-            threadId,
-            turnId,
-            run: {
-              id: 'private-stop-hook-1',
-              eventName: 'stop',
-              handlerType: 'command',
-              executionMode: 'sync',
-              scope: 'turn',
-              status: 'completed',
-              sourcePath: '/private/machine/hooks.json',
-              entries: [{ kind: 'context', text: 'private hook output' }],
-            },
-          },
-        });
-        send({
           method: 'turn/completed',
           params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
         });
@@ -625,7 +840,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
 
-    const events = await collect(adapter.execute(executionContext()));
+    const events = await collect(executeAdapter(adapter, executionContext()));
     expect(events).toEqual([
       {
         kind: 'text_delta',
@@ -667,30 +882,7 @@ describe('Codex app-server provider adapter', () => {
         provider_native_id: 'codex-thread-1',
         payload: { text: 'Hello', end_offset: 5 },
       },
-      {
-        kind: 'tool_started',
-        provider_native_id: 'codex-thread-1',
-        payload: {
-          tool_use_id: 'provider-hook-1',
-          tool_name: 'provider_hook',
-          summary: 'Provider hook started.',
-          side_effect_status: 'unknown',
-        },
-      },
-      {
-        kind: 'tool_finished',
-        provider_native_id: 'codex-thread-1',
-        payload: {
-          tool_use_id: 'provider-hook-1',
-          tool_name: 'provider_hook',
-          summary: 'Provider hook completed.',
-          side_effect_status: 'unknown',
-        },
-      },
     ]);
-    expect(JSON.stringify(events)).not.toContain('/private/machine/hooks.json');
-    expect(JSON.stringify(events)).not.toContain('private hook output');
-    expect(JSON.stringify(events)).not.toContain('private-stop-hook-1');
     expect(JSON.stringify(server.received)).not.toContain('exec --json');
   });
 
@@ -740,7 +932,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
 
-    await expect(collect(adapter.execute(executionContext()))).resolves.toEqual([]);
+    await expect(collect(executeAdapter(adapter, executionContext()))).resolves.toEqual([]);
   });
 
   test('fails the supervised connection closed for an unsupported running item', async () => {
@@ -765,12 +957,12 @@ describe('Codex app-server provider adapter', () => {
       .mockImplementationOnce(() => replacementServer.child);
     const adapter = createCodexAppServerAdapter({ spawnProcess });
 
-    await expect(adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]().next())
+    await expect(executeAdapter(adapter, executionContext({ reportProviderFailure }))[Symbol.asyncIterator]().next())
       .rejects.toMatchObject({ providerError: { code: 'unsupported_capability' } });
     expect(reportProviderFailure).toHaveBeenCalledTimes(1);
     expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
 
-    const replacement = collect(adapter.execute(executionContext({
+    const replacement = collect(executeAdapter(adapter, executionContext({
       turn_id: 'turn-after-retirement',
       lineage: { provider_native_id: 'codex-thread-1' },
       attempt: { attempt_id: 'attempt-after-retirement', attempt_no: 1, lease_epoch: 4 },
@@ -800,10 +992,10 @@ describe('Codex app-server provider adapter', () => {
       signalProcessGroup,
       isProcessGroupAlive: () => processGroupAlive,
     });
-    await collect(adapter.execute(executionContext()));
+    await collect(executeAdapter(adapter, executionContext()));
 
     firstServer.child.emit('close', 1, null);
-    const replacement = collect(adapter.execute(executionContext({
+    const replacement = collect(executeAdapter(adapter, executionContext({
       turn_id: 'turn-after-group-exit',
       lineage: { provider_native_id: 'codex-thread-1' },
       attempt: { attempt_id: 'attempt-after-group-exit', attempt_no: 1, lease_epoch: 4 },
@@ -828,9 +1020,9 @@ describe('Codex app-server provider adapter', () => {
       spawnProcess,
       maxConnectionFenceEntries: 3,
     });
-    await collect(adapter.execute(executionContext()));
+    await collect(executeAdapter(adapter, executionContext()));
 
-    await expect(collect(adapter.execute(executionContext({
+    await expect(collect(executeAdapter(adapter, executionContext({
       turn_id: 'turn-fence-capacity',
       lineage: { provider_native_id: 'codex-thread-1' },
       attempt: { attempt_id: 'attempt-fence-capacity', attempt_no: 1, lease_epoch: 4 },
@@ -839,7 +1031,7 @@ describe('Codex app-server provider adapter', () => {
     });
     expect(firstServer.child.kill).toHaveBeenCalledWith('SIGTERM');
 
-    const replacement = collect(adapter.execute(executionContext({
+    const replacement = collect(executeAdapter(adapter, executionContext({
       turn_id: 'turn-after-fence-rotation',
       lineage: { provider_native_id: 'codex-thread-1' },
       attempt: { attempt_id: 'attempt-after-fence-rotation', attempt_no: 1, lease_epoch: 5 },
@@ -925,7 +1117,7 @@ describe('Codex app-server provider adapter', () => {
     const server = createFakeAppServer({ afterTurnStart });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
 
-    await expect(collect(adapter.execute(executionContext({ reportProviderFailure }))))
+    await expect(collect(executeAdapter(adapter, executionContext({ reportProviderFailure }))))
       .rejects.toMatchObject({ providerError: { side_effect_status: 'unknown' } });
     expect(reportProviderFailure).toHaveBeenCalledTimes(1);
     expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
@@ -952,13 +1144,19 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
 
-    await expect(collect(adapter.execute(executionContext({ reportProviderFailure }))))
+    await expect(collect(executeAdapter(adapter, executionContext({ reportProviderFailure }))))
       .rejects.toMatchObject({ providerError: { side_effect_status: 'unknown' } });
     expect(reportProviderFailure).toHaveBeenCalledTimes(1);
     expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
   });
 
-  test('normalizes image generation completion without interpreting its opaque status as success', async () => {
+  test.each([
+    'mcpToolCall',
+    'dynamicToolCall',
+    'collabAgentToolCall',
+    'webSearch',
+    'imageGeneration',
+  ])('fails closed if disabled %s execution appears despite the locked thread config', async (type) => {
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
         send({
@@ -967,42 +1165,45 @@ describe('Codex app-server provider adapter', () => {
             threadId,
             turnId,
             startedAtMs: 1,
-            item: { type: 'imageGeneration', id: 'image-1', status: 'inProgress' },
+            item: { type, id: `disabled-${type}`, status: 'inProgress' },
           },
-        });
-        send({
-          method: 'item/completed',
-          params: {
-            threadId,
-            turnId,
-            completedAtMs: 2,
-            item: {
-              type: 'imageGeneration',
-              id: 'image-1',
-              status: 'completed',
-              result: 'private result',
-              revisedPrompt: null,
-            },
-          },
-        });
-        send({
-          method: 'turn/completed',
-          params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
         });
       },
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
 
-    await expect(collect(adapter.execute(executionContext()))).resolves.toEqual([
-      expect.objectContaining({
-        kind: 'tool_started',
-        payload: expect.objectContaining({ summary: 'Image generation started.' }),
-      }),
-      expect.objectContaining({
-        kind: 'tool_finished',
-        payload: expect.objectContaining({ summary: 'Image generation finished.' }),
-      }),
-    ]);
+    await expect(collect(executeAdapter(adapter, executionContext()))).rejects.toMatchObject({
+      providerError: { code: 'unsupported_capability' },
+    });
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
+  test('fails closed if a disabled provider hook appears despite the locked thread config', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'hook/started',
+          params: {
+            threadId,
+            turnId,
+            run: {
+              id: 'disabled-hook',
+              eventName: 'stop',
+              handlerType: 'command',
+              executionMode: 'sync',
+              scope: 'turn',
+              status: 'running',
+            },
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(executeAdapter(adapter, executionContext()))).rejects.toMatchObject({
+      providerError: { code: 'unsupported_capability' },
+    });
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
   });
 
   test('fails the connection closed for an unknown notification scoped to the current turn', async () => {
@@ -1021,7 +1222,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
 
-    await expect(collect(adapter.execute(executionContext({ reportProviderFailure }))))
+    await expect(collect(executeAdapter(adapter, executionContext({ reportProviderFailure }))))
       .rejects.toMatchObject({ providerError: { code: 'unsupported_capability' } });
     expect(reportProviderFailure).toHaveBeenCalledTimes(1);
     expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
@@ -1049,7 +1250,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
 
-    await expect(collect(adapter.execute(executionContext({ reportProviderFailure }))))
+    await expect(collect(executeAdapter(adapter, executionContext({ reportProviderFailure }))))
       .rejects.toMatchObject({ providerError: { side_effect_status: 'unknown' } });
     expect(server.received).toContainEqual({
       id: 'stale-request',
@@ -1089,7 +1290,7 @@ describe('Codex app-server provider adapter', () => {
       },
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
-    const iterator = adapter.execute(executionContext())[Symbol.asyncIterator]();
+    const iterator = executeAdapter(adapter, executionContext())[Symbol.asyncIterator]();
 
     const interaction = await iterator.next();
 
@@ -1156,6 +1357,7 @@ describe('Codex app-server provider adapter', () => {
       },
       answer: { kind: 'decision', decision: 'approve' },
       result: { decision: 'accept' },
+      workspaceFenceChecks: 6,
     },
     {
       label: 'file approval',
@@ -1167,91 +1369,7 @@ describe('Codex app-server provider adapter', () => {
       },
       answer: { kind: 'decision', decision: 'deny' },
       result: { decision: 'decline' },
-    },
-    {
-      label: 'permission approval',
-      method: 'item/permissions/requestApproval',
-      params: {
-        itemId: 'permission-1',
-        startedAtMs: 1,
-        reason: 'Read an external directory?',
-        environmentId: null,
-        cwd: '/workspace',
-        permissions: { network: null, fileSystem: { read: ['/external'], write: [] } },
-      },
-      expected: {
-        kind: 'permission_approval',
-        prompt: expect.stringMatching(/Working directory: \/workspace[\s\S]*Requested permissions:.*"\/external"/),
-      },
-      answer: { kind: 'decision', decision: 'approve' },
-      result: {
-        permissions: { fileSystem: { read: ['/external'], write: [] } },
-        scope: 'turn',
-      },
-    },
-    {
-      label: 'MCP elicitation',
-      method: 'mcpServer/elicitation/request',
-      params: {
-        turnId: null,
-        serverName: 'provider-private',
-        mode: 'form',
-        message: 'Which environment should the tool use?',
-        requestedSchema: {
-          type: 'object',
-          properties: {
-            environment: {
-              type: 'string',
-              enum: ['staging', 'production'],
-              enumNames: ['Staging', 'Production'],
-            },
-          },
-          required: ['environment'],
-        },
-        _meta: null,
-      },
-      expected: {
-        kind: 'choice',
-        prompt: 'Which environment should the tool use?',
-        choices: [
-          { choice_id: 'staging', label: 'Staging' },
-          { choice_id: 'production', label: 'Production' },
-        ],
-      },
-      answer: { kind: 'choice', choice_id: 'staging' },
-      result: { action: 'accept', content: { environment: 'staging' }, _meta: null },
-    },
-    {
-      label: 'MCP astral choice using JSON Schema code-point length',
-      method: 'mcpServer/elicitation/request',
-      params: {
-        turnId: null,
-        serverName: 'provider-private',
-        mode: 'form',
-        message: 'Choose the symbol.',
-        requestedSchema: {
-          type: 'object',
-          properties: {
-            symbol: {
-              type: 'string',
-              enum: ['😀'],
-              enumNames: ['Face'],
-              default: '😀',
-              minLength: 1,
-              maxLength: 1,
-            },
-          },
-          required: ['symbol'],
-        },
-        _meta: null,
-      },
-      expected: {
-        kind: 'choice',
-        prompt: 'Choose the symbol.',
-        choices: [{ choice_id: '😀', label: 'Face' }],
-      },
-      answer: { kind: 'choice', choice_id: '😀' },
-      result: { action: 'accept', content: { symbol: '😀' }, _meta: null },
+      workspaceFenceChecks: 5,
     },
   ])('maps $label through a fenced provider-neutral interaction', async ({
     method,
@@ -1259,6 +1377,7 @@ describe('Codex app-server provider adapter', () => {
     expected,
     answer,
     result,
+    workspaceFenceChecks = 4,
   }) => {
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
@@ -1312,8 +1431,16 @@ describe('Codex app-server provider adapter', () => {
         });
       },
     });
-    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
-    const iterator = adapter.execute(executionContext())[Symbol.asyncIterator]();
+    const controls = workspaceControls();
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
+    const iterator = executeAdapter(
+      adapter,
+      executionContext(),
+      controls,
+    )[Symbol.asyncIterator]();
 
     let interaction = await iterator.next();
     while (interaction.value?.kind !== 'interaction_requested') interaction = await iterator.next();
@@ -1334,10 +1461,11 @@ describe('Codex app-server provider adapter', () => {
       status: answer.decision === 'deny' ? 'deny' : 'accepted',
     }));
     expect(server.received).toContainEqual({ id: 'provider-request-1', result });
+    expect(controls.assertWorkspaceWrite).toHaveBeenCalledTimes(workspaceFenceChecks);
     await iterator.return();
   });
 
-  test('auto-approves native protected actions only after Core returns a trusted decision', async () => {
+  test('auto-approves one native write only after Core validates its complete approval fence', async () => {
     const authorizeProtectedAction = jest.fn(() => ({
       trusted: true,
       basis_kind: 'persistent_bot',
@@ -1385,9 +1513,14 @@ describe('Codex app-server provider adapter', () => {
         });
       },
     });
-    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const assertWorkspaceWrite = jest.fn(() => ({ status: 'current' }));
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
 
     const events = await collect(adapter.execute(executionContext(), {
+      assertWorkspaceWrite,
       authorizeProtectedAction,
     }));
 
@@ -1401,6 +1534,333 @@ describe('Codex app-server provider adapter', () => {
     expect(server.received).toContainEqual({
       id: 'trusted-provider-request',
       result: { decision: 'accept' },
+    });
+    expect(assertWorkspaceWrite).toHaveBeenLastCalledWith({
+      action_kind: 'item/fileChange/requestApproval',
+      connection_id: 'codex-app-server-1',
+      conversation_id: 'conversation-1',
+      core_turn_id: 'turn-1',
+      cwd: '/workspace',
+      environment_id: null,
+      executor_instance_id: 'executor-1',
+      lineage_id: 'lineage-1',
+      provider_approval_id: null,
+      provider_attempt: { attempt_id: 'attempt-1', attempt_no: 1, lease_epoch: 3 },
+      provider_item_id: 'trusted-file-change',
+      provider_thread_id: 'codex-thread-1',
+      provider_turn_id: 'codex-turn-1',
+      workspace: expect.objectContaining({
+        workspace_lease_id: 'workspace-lease-1',
+        holder_conversation_id: 'conversation-1',
+        holder_turn_id: 'turn-1',
+        lease_epoch: 11,
+      }),
+      write_paths: ['/workspace/trusted-file-change.txt'],
+    });
+  });
+
+  test('chooses only one-shot accept when app-server advertises session approval alternatives', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart(details) {
+        sendStartedCommand(details, 'one-shot-command');
+        details.send({
+          id: 'one-shot-command-approval',
+          method: 'item/commandExecution/requestApproval',
+          params: {
+            threadId: details.threadId,
+            turnId: details.turnId,
+            itemId: 'one-shot-command',
+            startedAtMs: 1,
+            environmentId: null,
+            command: 'touch approved.txt',
+            cwd: '/workspace',
+            availableDecisions: ['accept', 'acceptForSession', 'decline'],
+          },
+        });
+      },
+      onClientResponse({ message, send }) {
+        send({
+          method: 'serverRequest/resolved',
+          params: { threadId: 'codex-thread-1', requestId: message.id },
+        });
+        send({
+          method: 'item/completed',
+          params: {
+            threadId: 'codex-thread-1',
+            turnId: 'codex-turn-1',
+            item: { type: 'commandExecution', id: 'one-shot-command', status: 'completed' },
+          },
+        });
+        send({
+          method: 'turn/completed',
+          params: {
+            threadId: 'codex-thread-1',
+            turn: { id: 'codex-turn-1', status: 'completed', items: [] },
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
+
+    await expect(collect(adapter.execute(executionContext(), {
+      assertWorkspaceWrite: jest.fn(() => ({ status: 'current' })),
+      authorizeProtectedAction: jest.fn(() => ({ trusted: true })),
+    }))).resolves.toEqual(expect.any(Array));
+    expect(server.received).toContainEqual({
+      id: 'one-shot-command-approval',
+      result: { decision: 'accept' },
+    });
+    const response = server.received.find(({ id, result }) => (
+      id === 'one-shot-command-approval' && result
+    ));
+    expect(JSON.stringify(response)).not.toMatch(
+      /acceptForSession|acceptWithExecpolicyAmendment|applyNetworkPolicyAmendment/,
+    );
+  });
+
+  test('declines command-level additional permissions instead of creating a sticky turn grant', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart(details) {
+        sendStartedCommand(details, 'sticky-permission-command');
+        details.send({
+          id: 'sticky-permission-approval',
+          method: 'item/commandExecution/requestApproval',
+          params: {
+            threadId: details.threadId,
+            turnId: details.turnId,
+            itemId: 'sticky-permission-command',
+            startedAtMs: 1,
+            environmentId: null,
+            command: 'touch approved.txt',
+            cwd: '/workspace',
+            additionalPermissions: {
+              network: null,
+              fileSystem: { read: [], write: ['/workspace'] },
+            },
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
+
+    await expect(collect(adapter.execute(executionContext(), {
+      assertWorkspaceWrite: jest.fn(() => ({ status: 'current' })),
+      authorizeProtectedAction: jest.fn(() => ({ trusted: true })),
+    }))).rejects.toMatchObject({
+      providerError: { code: 'unsupported_capability' },
+    });
+    expect(server.received).toContainEqual({
+      id: 'sticky-permission-approval',
+      result: { decision: 'decline' },
+    });
+    expect(server.received).not.toContainEqual({
+      id: 'sticky-permission-approval',
+      result: { decision: 'accept' },
+    });
+  });
+
+  test.each([
+    ['cwd', '/outside', null, null],
+    ['environment', '/workspace', 'remote-environment', null],
+    ['network', '/workspace', null, { host: 'example.com', protocol: 'https' }],
+  ])('declines a trusted command whose %s fence escapes the local workspace', async (
+    _label,
+    commandCwd,
+    environmentId,
+    networkApprovalContext,
+  ) => {
+    const server = createFakeAppServer({
+      afterTurnStart(details) {
+        sendStartedCommand(details, 'mismatched-command', { cwd: commandCwd });
+        details.send({
+          id: 'mismatched-command-approval',
+          method: 'item/commandExecution/requestApproval',
+          params: {
+            threadId: details.threadId,
+            turnId: details.turnId,
+            itemId: 'mismatched-command',
+            startedAtMs: 1,
+            environmentId,
+            command: 'touch approved.txt',
+            cwd: commandCwd,
+            networkApprovalContext,
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
+
+    await expect(collect(adapter.execute(executionContext(), {
+      assertWorkspaceWrite: jest.fn(() => ({ status: 'current' })),
+      authorizeProtectedAction: jest.fn(() => ({ trusted: true })),
+    }))).rejects.toMatchObject({
+      providerError: { code: 'side_effect_unknown' },
+    });
+    expect(server.received).toContainEqual({
+      id: 'mismatched-command-approval',
+      result: { decision: 'decline' },
+    });
+    expect(server.received).not.toContainEqual({
+      id: 'mismatched-command-approval',
+      result: { decision: 'accept' },
+    });
+  });
+
+  test('declines a protected write when its durable lease epoch becomes stale before approval', async () => {
+    const staleLease = Object.assign(new Error('stale workspace lease'), {
+      code: 'stale_workspace_lease',
+    });
+    const assertWorkspaceWrite = jest.fn((fence) => {
+      if (fence?.provider_item_id === 'stale-file-change') throw staleLease;
+      return { status: 'current' };
+    });
+    const server = createFakeAppServer({
+      afterTurnStart(details) {
+        sendStartedFileChange(details, 'stale-file-change');
+        details.send({
+          id: 'stale-auto-approval',
+          method: 'item/fileChange/requestApproval',
+          params: {
+            threadId: details.threadId,
+            turnId: details.turnId,
+            itemId: 'stale-file-change',
+            startedAtMs: 1,
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
+
+    await expect(collect(adapter.execute(executionContext(), {
+      assertWorkspaceWrite,
+      authorizeProtectedAction: jest.fn(() => ({ trusted: true })),
+    }))).rejects.toMatchObject({
+      code: 'provider_connection_lost',
+      cause: staleLease,
+      providerError: { side_effect_status: 'unknown' },
+    });
+    expect(server.received).toContainEqual({
+      id: 'stale-auto-approval',
+      result: { decision: 'decline' },
+    });
+    expect(server.received).not.toContainEqual({
+      id: 'stale-auto-approval',
+      result: { decision: 'accept' },
+    });
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
+  test('never returns session, persistent-policy, network-amendment, or permission grants', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          id: 'permission-grant-request',
+          method: 'item/permissions/requestApproval',
+          params: {
+            threadId,
+            turnId,
+            itemId: 'permission-grant-item',
+            startedAtMs: 1,
+            environmentId: null,
+            cwd: '/workspace',
+            reason: 'Request a broad grant.',
+            permissions: {
+              network: { enabled: true },
+              fileSystem: { read: [], write: ['/workspace'] },
+            },
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
+
+    await expect(collect(adapter.execute(executionContext(), {
+      assertWorkspaceWrite: jest.fn(() => ({ status: 'current' })),
+      authorizeProtectedAction: jest.fn(() => ({ trusted: true })),
+    }))).rejects.toMatchObject({
+      providerError: { code: 'unsupported_capability' },
+    });
+    expect(server.received).toContainEqual({
+      id: 'permission-grant-request',
+      result: { permissions: {}, scope: 'turn' },
+    });
+    expect(JSON.stringify(server.received)).not.toMatch(
+      /acceptForSession|acceptWithExecpolicyAmendment|applyNetworkPolicyAmendment|"scope":"session"/,
+    );
+  });
+
+  test('declines a well-formed MCP elicitation instead of exposing an external side-effect path', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          id: 'disabled-mcp-elicitation',
+          method: 'mcpServer/elicitation/request',
+          params: {
+            threadId,
+            turnId,
+            serverName: 'private-server',
+            mode: 'form',
+            message: 'Choose an environment.',
+            requestedSchema: {
+              type: 'object',
+              properties: { environment: { type: 'string', minLength: 1 } },
+              required: ['environment'],
+            },
+            _meta: null,
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(executeAdapter(adapter, executionContext()))).rejects.toMatchObject({
+      providerError: { code: 'unsupported_capability' },
+    });
+    expect(server.received).toContainEqual({
+      id: 'disabled-mcp-elicitation',
+      result: { action: 'decline', content: null, _meta: null },
+    });
+  });
+
+  test('rejects an app-server initiated dynamic tool call before it can execute', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          id: 'disabled-dynamic-tool-call',
+          method: 'item/tool/call',
+          params: {
+            threadId,
+            turnId,
+            callId: 'dynamic-call-1',
+            tool: 'writeFile',
+            arguments: { path: '/workspace/unapproved.txt' },
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(executeAdapter(adapter, executionContext()))).rejects.toMatchObject({
+      providerError: { code: 'unsupported_capability' },
+    });
+    expect(server.received).toContainEqual({
+      id: 'disabled-dynamic-tool-call',
+      error: { code: -32601, message: 'Unsupported or stale app-server request.' },
     });
   });
 
@@ -1438,7 +1898,7 @@ describe('Codex app-server provider adapter', () => {
       },
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
-    const iterator = adapter.execute(executionContext())[Symbol.asyncIterator]();
+    const iterator = executeAdapter(adapter, executionContext())[Symbol.asyncIterator]();
 
     await expect(iterator.next()).rejects.toMatchObject({
       providerError: { code: 'unsupported_capability' },
@@ -1474,7 +1934,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
 
-    await expect(adapter.execute(executionContext())[Symbol.asyncIterator]().next())
+    await expect(executeAdapter(adapter, executionContext())[Symbol.asyncIterator]().next())
       .rejects.toMatchObject({ providerError: { code: 'unsupported_capability' } });
     expect(server.received).toContainEqual({
       id: 'choice-with-other',
@@ -1512,7 +1972,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
 
-    await expect(adapter.execute(executionContext())[Symbol.asyncIterator]().next())
+    await expect(executeAdapter(adapter, executionContext())[Symbol.asyncIterator]().next())
       .rejects.toMatchObject({ providerError: { code: 'side_effect_unknown' } });
     expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
   });
@@ -1542,7 +2002,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
 
-    await expect(adapter.execute(executionContext())[Symbol.asyncIterator]().next())
+    await expect(executeAdapter(adapter, executionContext())[Symbol.asyncIterator]().next())
       .rejects.toMatchObject({ providerError: { code: 'unsupported_capability' } });
     expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
   });
@@ -1667,7 +2127,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
 
-    await expect(adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]().next())
+    await expect(executeAdapter(adapter, executionContext({ reportProviderFailure }))[Symbol.asyncIterator]().next())
       .rejects.toMatchObject({ providerError: { side_effect_status: 'unknown' } });
     expect(server.received).toContainEqual({
       id: 'malformed-provider-request',
@@ -1707,7 +2167,7 @@ describe('Codex app-server provider adapter', () => {
       },
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
-    const iterator = adapter.execute(executionContext())[Symbol.asyncIterator]();
+    const iterator = executeAdapter(adapter, executionContext())[Symbol.asyncIterator]();
     const interaction = await iterator.next();
 
     await expect(deliverPreparedInteractionAnswer(adapter, handoffDelivery(
@@ -1848,7 +2308,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
 
-    await expect(adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]().next())
+    await expect(executeAdapter(adapter, executionContext({ reportProviderFailure }))[Symbol.asyncIterator]().next())
       .rejects.toMatchObject({ providerError: { code: 'unsupported_capability' } });
     expect(server.received).toContainEqual({
       id: 'unsupported-mcp',
@@ -1877,7 +2337,7 @@ describe('Codex app-server provider adapter', () => {
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
 
     await expect(nextInteraction(
-      adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator](),
+      executeAdapter(adapter, executionContext({ reportProviderFailure }))[Symbol.asyncIterator](),
     ))
       .rejects.toMatchObject({ providerError: { code: 'side_effect_unknown' } });
     expect(reportProviderFailure).toHaveBeenCalledTimes(1);
@@ -1902,7 +2362,7 @@ describe('Codex app-server provider adapter', () => {
       },
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
-    const iterator = adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]();
+    const iterator = executeAdapter(adapter, executionContext({ reportProviderFailure }))[Symbol.asyncIterator]();
     const interaction = await nextInteraction(iterator);
     await deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
@@ -1950,7 +2410,7 @@ describe('Codex app-server provider adapter', () => {
       },
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
-    const iterator = adapter.execute(executionContext())[Symbol.asyncIterator]();
+    const iterator = executeAdapter(adapter, executionContext())[Symbol.asyncIterator]();
     const first = await nextInteraction(iterator);
     await deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       first.value.payload.provider_interaction_ref,
@@ -2063,7 +2523,7 @@ describe('Codex app-server provider adapter', () => {
     const persistedContext = executionContext({
       lineage: { provider_native_id: 'codex-thread-persisted' },
     });
-    const firstExecution = collect(adapter.execute(persistedContext));
+    const firstExecution = collect(executeAdapter(adapter, persistedContext));
     await waitFor(() => firstServer.received.some(({ method }) => method === 'turn/start'));
 
     firstServer.child.emit('close', 1, null);
@@ -2084,7 +2544,7 @@ describe('Codex app-server provider adapter', () => {
       },
     });
 
-    await expect(collect(adapter.execute(executionContext({
+    await expect(collect(executeAdapter(adapter, executionContext({
       turn_id: 'turn-2',
       lineage: { provider_native_id: 'codex-thread-persisted' },
       attempt: { attempt_id: 'attempt-2', attempt_no: 1, lease_epoch: 4 },
@@ -2140,7 +2600,7 @@ describe('Codex app-server provider adapter', () => {
       },
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
-    const iterator = adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]();
+    const iterator = executeAdapter(adapter, executionContext({ reportProviderFailure }))[Symbol.asyncIterator]();
     await expect(nextInteraction(iterator)).resolves.toMatchObject({
       done: false,
       value: { kind: 'interaction_requested' },
@@ -2165,7 +2625,7 @@ describe('Codex app-server provider adapter', () => {
       const server = createFakeAppServer({ afterTurnStart() {} });
       const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
       const context = executionContext({ lineage: { provider_native_id: 'codex-thread-1' } });
-      const iterator = adapter.execute(context)[Symbol.asyncIterator]();
+      const iterator = executeAdapter(adapter, context)[Symbol.asyncIterator]();
       const waiting = iterator.next();
       await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
 
@@ -2200,7 +2660,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     const context = executionContext({ lineage: { provider_native_id: 'codex-thread-1' } });
-    const waiting = adapter.execute(context)[Symbol.asyncIterator]().next();
+    const waiting = executeAdapter(adapter, context)[Symbol.asyncIterator]().next();
     await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
 
     await expect(adapter.interrupt({
@@ -2220,7 +2680,7 @@ describe('Codex app-server provider adapter', () => {
     const server = createFakeAppServer({ afterTurnStart() {} });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     const context = executionContext({ lineage: { provider_native_id: 'codex-thread-1' } });
-    const waiting = adapter.execute(context)[Symbol.asyncIterator]().next();
+    const waiting = executeAdapter(adapter, context)[Symbol.asyncIterator]().next();
     await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
 
     await expect(adapter.cancel(context, { reason })).resolves.toEqual({
@@ -2250,7 +2710,7 @@ describe('Codex app-server provider adapter', () => {
     const server = createFakeAppServer({ afterTurnStart() {} });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     const context = executionContext({ lineage: { provider_native_id: 'codex-thread-1' } });
-    const waiting = adapter.execute(context)[Symbol.asyncIterator]().next();
+    const waiting = executeAdapter(adapter, context)[Symbol.asyncIterator]().next();
     await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
 
     const aborting = adapter.abort(context);
@@ -2297,7 +2757,7 @@ describe('Codex app-server provider adapter', () => {
       isProcessGroupAlive: () => processGroupAlive,
     });
     const context = executionContext({ lineage: { provider_native_id: 'codex-thread-1' } });
-    const waiting = adapter.execute(context)[Symbol.asyncIterator]().next();
+    const waiting = executeAdapter(adapter, context)[Symbol.asyncIterator]().next();
     const waitingFailure = expect(waiting).rejects.toMatchObject({
       providerError: { side_effect_status: 'unknown' },
     });
@@ -2316,7 +2776,7 @@ describe('Codex app-server provider adapter', () => {
     const server = createFakeAppServer({ afterTurnStart() {} });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     const context = executionContext({ lineage: { provider_native_id: 'codex-thread-1' } });
-    const waiting = adapter.execute(context)[Symbol.asyncIterator]().next();
+    const waiting = executeAdapter(adapter, context)[Symbol.asyncIterator]().next();
     await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
     let settled = false;
     const interruption = adapter.interrupt({
@@ -2363,7 +2823,7 @@ describe('Codex app-server provider adapter', () => {
       clearTimeoutFn: jest.fn(),
     });
     const context = executionContext({ lineage: { provider_native_id: 'codex-thread-1' } });
-    const iterator = adapter.execute(context)[Symbol.asyncIterator]();
+    const iterator = executeAdapter(adapter, context)[Symbol.asyncIterator]();
     const waiting = iterator.next();
     await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
 
@@ -2404,7 +2864,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     const context = executionContext({ lineage: { provider_native_id: 'codex-thread-1' } });
-    const iterator = adapter.execute(context)[Symbol.asyncIterator]();
+    const iterator = executeAdapter(adapter, context)[Symbol.asyncIterator]();
     await nextInteraction(iterator);
 
     server.send({
@@ -2432,7 +2892,7 @@ describe('Codex app-server provider adapter', () => {
     const server = createFakeAppServer({ autoTurnStarted: false, afterTurnStart() {} });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     const context = executionContext({ lineage: { provider_native_id: 'codex-thread-1' } });
-    const waiting = adapter.execute(context)[Symbol.asyncIterator]().next();
+    const waiting = executeAdapter(adapter, context)[Symbol.asyncIterator]().next();
     await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
 
     await expect(adapter.interrupt({
@@ -2477,7 +2937,7 @@ describe('Codex app-server provider adapter', () => {
       },
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
-    const iterator = adapter.execute(executionContext())[Symbol.asyncIterator]();
+    const iterator = executeAdapter(adapter, executionContext())[Symbol.asyncIterator]();
     const interaction = await nextInteraction(iterator);
     const delivery = handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
@@ -2489,6 +2949,116 @@ describe('Codex app-server provider adapter', () => {
     await expect(deliverPreparedInteractionAnswer(adapter, delivery)).rejects.toThrow(/runtime fence/);
     expect(server.received).toHaveLength(before);
     await iterator.return();
+  });
+
+  test('rechecks the workspace fence immediately before approving a provider write', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        sendStartedFileChange({ send, threadId, turnId }, 'patch-stale-workspace');
+        send({
+          id: 'stale-workspace-approval',
+          method: 'item/fileChange/requestApproval',
+          params: {
+            threadId,
+            turnId,
+            itemId: 'patch-stale-workspace',
+            startedAtMs: 1,
+          },
+        });
+      },
+      onClientResponse({ message, send }) {
+        send({
+          method: 'serverRequest/resolved',
+          params: { threadId: 'codex-thread-1', requestId: message.id },
+        });
+      },
+    });
+    let current = true;
+    const staleLease = Object.assign(new Error('stale workspace lease'), {
+      code: 'stale_workspace_lease',
+    });
+    const controls = workspaceControls({
+      assertWorkspaceWrite: jest.fn(() => {
+        if (!current) throw staleLease;
+        return { status: 'current' };
+      }),
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
+    const iterator = executeAdapter(adapter, executionContext(), controls)[Symbol.asyncIterator]();
+    const interaction = await nextInteraction(iterator);
+    current = false;
+    const before = server.received.length;
+
+    await expect(deliverPreparedInteractionAnswer(adapter, handoffDelivery(
+      interaction.value.payload.provider_interaction_ref,
+      { kind: 'decision', decision: 'approve' },
+    ))).rejects.toMatchObject({
+      code: 'provider_connection_lost',
+      cause: staleLease,
+      providerError: { side_effect_status: 'unknown' },
+    });
+    expect(controls.assertWorkspaceWrite).toHaveBeenCalledTimes(6);
+    expect(server.received).toHaveLength(before + 1);
+    expect(server.received).toContainEqual({
+      id: 'stale-workspace-approval',
+      result: { decision: 'decline' },
+    });
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+    await iterator.return();
+  });
+
+  test('stops a writable app-server run when its workspace fence is stale at tool start', async () => {
+    let started;
+    const server = createFakeAppServer({
+      afterTurnStart(details) {
+        started = details;
+      },
+    });
+    let current = true;
+    const staleLease = Object.assign(new Error('stale workspace lease'), {
+      code: 'stale_workspace_lease',
+    });
+    const controls = workspaceControls({
+      assertWorkspaceWrite: jest.fn(() => {
+        if (!current) throw staleLease;
+        return { status: 'current' };
+      }),
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
+    const waiting = executeAdapter(
+      adapter,
+      executionContext(),
+      controls,
+    )[Symbol.asyncIterator]().next();
+    await waitFor(() => started !== undefined);
+    current = false;
+
+    started.send({
+      method: 'item/started',
+      params: {
+        threadId: started.threadId,
+        turnId: started.turnId,
+        item: {
+          type: 'commandExecution',
+          id: 'stale-workspace-command',
+          status: 'inProgress',
+        },
+      },
+    });
+
+    await expect(waiting).rejects.toMatchObject({
+      code: 'provider_connection_lost',
+      cause: staleLease,
+      providerError: { side_effect_status: 'unknown' },
+    });
+    expect(controls.assertWorkspaceWrite).toHaveBeenCalledTimes(5);
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
   });
 
   test('turns a synchronous provider-answer write failure into a fenced unknown delivery', async () => {
@@ -2504,7 +3074,7 @@ describe('Codex app-server provider adapter', () => {
       },
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
-    const iterator = adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]();
+    const iterator = executeAdapter(adapter, executionContext({ reportProviderFailure }))[Symbol.asyncIterator]();
     const interaction = await nextInteraction(iterator);
     server.child.stdin.write = jest.fn(() => {
       throw new Error('forced synchronous EPIPE');
@@ -2533,7 +3103,7 @@ describe('Codex app-server provider adapter', () => {
       },
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
-    const iterator = adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]();
+    const iterator = executeAdapter(adapter, executionContext({ reportProviderFailure }))[Symbol.asyncIterator]();
     const interaction = await nextInteraction(iterator);
 
     server.child.emit('close', 1, null);
@@ -2549,7 +3119,7 @@ describe('Codex app-server provider adapter', () => {
     const reportProviderFailure = jest.fn();
     const server = createFakeAppServer({ afterTurnStart() {} });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
-    const waiting = adapter.execute(executionContext({ reportProviderFailure }))[Symbol.asyncIterator]().next();
+    const waiting = executeAdapter(adapter, executionContext({ reportProviderFailure }))[Symbol.asyncIterator]().next();
     await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
 
     server.child.stdin.emit('error', new Error('EPIPE'));
@@ -2567,7 +3137,7 @@ describe('Codex app-server provider adapter', () => {
       return true;
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
-    await collect(adapter.execute(executionContext()));
+    await collect(executeAdapter(adapter, executionContext()));
 
     await expect(adapter.close()).resolves.toEqual([]);
     expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
@@ -2581,7 +3151,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     const context = executionContext({ conversation_id: 'conversation-active-close' });
-    const waiting = adapter.execute(context)[Symbol.asyncIterator]().next();
+    const waiting = executeAdapter(adapter, context)[Symbol.asyncIterator]().next();
     await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
 
     await expect(adapter.close()).resolves.toEqual(['conversation-active-close']);
@@ -2600,7 +3170,7 @@ describe('Codex app-server provider adapter', () => {
       spawnProcess: () => server.child,
       processTerminationGraceMs: 5,
     });
-    await collect(adapter.execute(executionContext()));
+    await collect(executeAdapter(adapter, executionContext()));
 
     await expect(adapter.close()).resolves.toEqual([]);
     expect(server.child.kill.mock.calls.map(([signal]) => signal)).toEqual(['SIGTERM', 'SIGKILL']);
@@ -2613,7 +3183,7 @@ describe('Codex app-server provider adapter', () => {
       spawnProcess: () => server.child,
       processTerminationGraceMs: 5,
     });
-    await collect(adapter.execute(executionContext()));
+    await collect(executeAdapter(adapter, executionContext()));
 
     await expect(adapter.close()).rejects.toMatchObject({
       providerError: { side_effect_status: 'unknown' },
@@ -2635,7 +3205,7 @@ describe('Codex app-server provider adapter', () => {
       signalProcessGroup,
       isProcessGroupAlive: () => true,
     });
-    await collect(adapter.execute(executionContext()));
+    await collect(executeAdapter(adapter, executionContext()));
 
     await expect(adapter.close()).rejects.toMatchObject({
       providerError: { side_effect_status: 'unknown' },

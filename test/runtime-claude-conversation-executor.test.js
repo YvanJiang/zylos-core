@@ -7,8 +7,13 @@ import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/inde
 
 import { createIdempotencyKey } from '../contracts/public/index.js';
 import { createExecutorService } from '../runtime/executor/service.js';
-import { createClaudeConversationAdapter } from '../runtime/providers/claude/conversation-adapter.js';
+import { createOutboxService } from '../runtime/delivery/outbox-service.js';
+import {
+  createClaudeConversationAdapter,
+  enforceWorkspaceFenceBeforeTool,
+} from '../runtime/providers/claude/conversation-adapter.js';
 import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { deliveredResult } from './helpers/delivered-result.js';
 
 const inboundFixture = JSON.parse(fs.readFileSync(
   new URL('../contracts/public/fixtures/inbound-envelope-v1.json', import.meta.url),
@@ -315,6 +320,34 @@ function createPermissionQuery({ sessionId }) {
   };
 }
 
+function createAutoAllowedWriteQuery({ sessionId }) {
+  const hookResults = [];
+  function query({ prompt, options }) {
+    const stream = (async function* generateSdkMessages() {
+      for await (const input of prompt) {
+        yield { type: 'system', subtype: 'init', session_id: sessionId };
+        hookResults.push(await options.hooks.PreToolUse[0].hooks[0]({
+          hook_event_name: 'PreToolUse',
+          tool_name: 'Bash',
+          tool_input: { command: 'touch guarded' },
+          tool_use_id: 'auto-allowed-write',
+        }));
+        yield {
+          type: 'result',
+          subtype: 'success',
+          session_id: sessionId,
+          result: `guarded ${input.message.content}`,
+        };
+        yield idleSession(sessionId);
+      }
+    }());
+    stream.interrupt = async () => ({ still_queued: [] });
+    stream.close = () => {};
+    return stream;
+  }
+  return { hookResults, query };
+}
+
 function createCaughtPermissionFailureQuery({ sessionId }) {
   const permissionRequested = deferred();
   function query({ prompt, options }) {
@@ -396,6 +429,7 @@ function createCaughtPermissionCancellationQuery({ sessionId }) {
 function createBackgroundQuery({ sessionId }) {
   const backgroundFinished = deferred();
   const notificationConsumed = deferred();
+  const resultEmitted = deferred();
 
   function query({ prompt }) {
     const stream = (async function* generateSdkMessages() {
@@ -423,6 +457,7 @@ function createBackgroundQuery({ sessionId }) {
           session_id: sessionId,
           result: 'background started',
         };
+        resultEmitted.resolve();
         yield idleSession(sessionId);
         await backgroundFinished.promise;
         yield {
@@ -430,6 +465,13 @@ function createBackgroundQuery({ sessionId }) {
           subtype: 'background_tasks_changed',
           session_id: sessionId,
           tasks: [],
+        };
+        yield {
+          type: 'system',
+          subtype: 'task_notification',
+          session_id: sessionId,
+          task_id: 'background-task-1',
+          status: 'completed',
         };
         notificationConsumed.resolve();
       }
@@ -439,7 +481,41 @@ function createBackgroundQuery({ sessionId }) {
     return stream;
   }
 
-  return { backgroundFinished, notificationConsumed, query };
+  return { backgroundFinished, notificationConsumed, query, resultEmitted };
+}
+
+function createEndingBackgroundQuery({ sessionId, outcome = 'unknown' }) {
+  function query({ prompt }) {
+    const stream = (async function* generateSdkMessages() {
+      for await (const input of prompt) {
+        yield { type: 'system', subtype: 'init', session_id: sessionId };
+        yield {
+          type: 'system',
+          subtype: 'task_started',
+          session_id: sessionId,
+          task_id: 'background-task-ending',
+        };
+        yield {
+          type: 'result',
+          subtype: 'success',
+          session_id: sessionId,
+          result: input.message.content,
+        };
+        if (outcome === 'unknown') return;
+        yield {
+          type: 'system',
+          subtype: 'task_notification',
+          session_id: sessionId,
+          task_id: 'background-task-ending',
+          status: outcome === 'failed' ? 'failed' : 'completed',
+        };
+      }
+    }());
+    stream.interrupt = async () => ({ still_queued: [] });
+    stream.close = () => {};
+    return stream;
+  }
+  return { query };
 }
 
 function createDelayedIdleQuery({ sessionId }) {
@@ -904,6 +980,24 @@ function readEvents(database, turnId) {
   `).all(turnId).map(({ event_json: eventJson }) => JSON.parse(eventJson));
 }
 
+function deliverTurnNotifications(database, turnId, suffix, deliveredAt) {
+  const outbox = createOutboxService({
+    database,
+    serviceInstanceId: `claude-delivery-${suffix}`,
+    now: () => deliveredAt,
+    generateId: deterministicIds(`claude-delivery-${suffix}`),
+    throttleMs: 0,
+  });
+  const delivered = [];
+  while (true) {
+    const command = outbox.claimNext();
+    if (!command) break;
+    outbox.recordResult(deliveredResult(command, deliveredAt));
+    if (command.mapping?.turn_id === turnId) delivered.push(command);
+  }
+  return delivered;
+}
+
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
     fs.rmSync(directory, { recursive: true, force: true });
@@ -944,6 +1038,73 @@ describe('Claude conversation executor', () => {
       query: () => {},
       queryOptions: { executableArgs: ['-cforeign-session'] },
     })).toThrow(/managed by Core lineage authority/);
+  });
+
+  test('fences auto-allowed and permission-bypass write tools before execution', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'workspace-pre-tool-fence');
+    const fake = createAutoAllowedWriteQuery({ sessionId: 'claude-session-workspace-fence' });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({
+        query: fake.query,
+        queryOptions: {
+          allowedTools: ['Bash'],
+          permissionMode: 'bypassPermissions',
+          allowDangerouslySkipPermissions: true,
+        },
+      }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-workspace-pre-tool-fence',
+      now: () => '2026-07-19T09:00:15Z',
+      generateId: deterministicIds('workspace-pre-tool-fence'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: accepted.turn_id,
+    });
+    expect(fake.hookResults).toEqual([{}]);
+
+    await service.close();
+    database.close();
+  });
+
+  test('denies an auto-allowed write when its workspace epoch is stale', async () => {
+    const stale = new Error('The workspace epoch is stale.');
+    stale.code = 'stale_workspace_lease';
+    let closedWith = null;
+    let toolExecuted = false;
+    const activeTurn = {
+      controls: {
+        assertWorkspaceWrite() { throw stale; },
+      },
+      output: {
+        close(error) { closedWith = error; },
+      },
+      resultSeen: false,
+    };
+
+    const decision = await enforceWorkspaceFenceBeforeTool(
+      { providerTurn: activeTurn },
+      {
+        hook_event_name: 'PreToolUse',
+        tool_name: 'Bash',
+        tool_input: { command: 'touch must-not-run' },
+        tool_use_id: 'stale-auto-allowed-write',
+      },
+    );
+    if (decision.hookSpecificOutput?.permissionDecision !== 'deny') toolExecuted = true;
+
+    expect(decision).toMatchObject({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+      },
+    });
+    expect(toolExecuted).toBe(false);
+    expect(closedWith).toBe(stale);
+    expect(activeTurn.resultSeen).toBe(true);
   });
 
   test('reports that Claude has no read-only same-handoff acceptance query', async () => {
@@ -1456,6 +1617,9 @@ describe('Claude conversation executor', () => {
     expect(database.prepare(`
       SELECT COUNT(*) AS count FROM runtime_executor_residents WHERE conversation_id = ?
     `).get(accepted.conversation_id)).toEqual({ count: 0 });
+    expect(database.prepare(`
+      SELECT state FROM runtime_workspace_leases WHERE holder_turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'released' });
 
     await service.close();
     database.close();
@@ -1845,14 +2009,121 @@ describe('Claude conversation executor', () => {
       generateId: deterministicIds('background'),
     });
 
-    await expect(service.runNext()).resolves.toMatchObject({ turn_id: accepted.turn_id });
+    let executionSettled = false;
+    const execution = service.runNext().finally(() => { executionSettled = true; });
+    await fake.resultEmitted.promise;
+    for (let index = 0; index < 10; index += 1) await Promise.resolve();
+    expect(executionSettled).toBe(false);
+    expect(service.snapshot().workspace_leases).toEqual({
+      complete: true,
+      items: [expect.objectContaining({
+        holder_turn_id: accepted.turn_id,
+        holder_background_work_id: 'background-work-background-1',
+      })],
+      error: null,
+    });
     clock = 1_000;
     await expect(service.evictIdleExecutors()).resolves.toEqual([]);
     fake.backgroundFinished.resolve();
     await fake.notificationConsumed.promise;
+    await expect(execution).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: accepted.turn_id,
+    });
+    expect(service.snapshot().workspace_leases.items).toEqual([]);
     await expect(service.evictIdleExecutors()).resolves.toEqual([]);
     clock = 1_101;
     await expect(service.evictIdleExecutors()).resolves.toEqual([accepted.conversation_id]);
+
+    await service.close();
+    database.close();
+  });
+
+  test('fails only after a known failed background task ends and then releases its workspace', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'background-failed');
+    const fake = createEndingBackgroundQuery({
+      sessionId: 'claude-session-background-failed',
+      outcome: 'failed',
+    });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-background-failed',
+      now: () => '2026-07-19T09:07:10Z',
+      generateId: deterministicIds('background-failed'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'failed',
+      turn_id: accepted.turn_id,
+    });
+    expect(database.prepare(`
+      SELECT state FROM runtime_workspace_background_work WHERE holder_turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'failed' });
+    expect(service.snapshot().workspace_leases.items).toEqual([]);
+
+    await service.close();
+    database.close();
+  });
+
+  test('waits for delivered recovery notice before isolating unknown background work', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'background-unknown');
+    const fake = createEndingBackgroundQuery({
+      sessionId: 'claude-session-background-unknown',
+      outcome: 'unknown',
+    });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-background-unknown',
+      now: () => '2026-07-19T09:07:20Z',
+      generateId: deterministicIds('background-unknown'),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'recovering',
+      turn_id: accepted.turn_id,
+    });
+    expect(database.prepare(`
+      SELECT state FROM runtime_workspace_background_work WHERE holder_turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'unknown' });
+    expect(database.prepare(`
+      SELECT state FROM runtime_workspace_leases WHERE holder_turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'active' });
+    expect(readEvents(database, accepted.turn_id).at(-2)).toMatchObject({
+      phase: 'recovering',
+      kind: 'recovery_started',
+      payload: expect.objectContaining({ side_effect_status: 'unknown' }),
+      error: expect.objectContaining({ side_effect_status: 'unknown' }),
+    });
+    expect(readEvents(database, accepted.turn_id).at(-1)).toMatchObject({
+      phase: 'recovering',
+      kind: 'recovery_waiting_decision',
+      payload: expect.objectContaining({ side_effect_status: 'unknown' }),
+    });
+    await expect(service.reconcileWorkspaceRecoveries()).resolves.toEqual({
+      isolated: [],
+      notification_pending: [accepted.turn_id],
+      isolation_pending: [],
+    });
+    expect(deliverTurnNotifications(
+      database,
+      accepted.turn_id,
+      'background-unknown',
+      '2026-07-19T09:07:21Z',
+    )).not.toHaveLength(0);
+    await expect(service.reconcileWorkspaceRecoveries()).resolves.toEqual({
+      isolated: [accepted.turn_id],
+      notification_pending: [],
+      isolation_pending: [],
+    });
+    expect(database.prepare(`
+      SELECT state FROM runtime_workspace_leases WHERE holder_turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'released' });
 
     await service.close();
     database.close();
