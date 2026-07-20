@@ -113,6 +113,15 @@ const RUNTIME_SCHEMA = `
     ON runtime_turns(conversation_id)
     WHERE state IN ('starting', 'running', 'waiting_user', 'redirecting', 'recovering');
 
+  CREATE TABLE IF NOT EXISTS runtime_stop_controls (
+    stop_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    stop_cutoff_queue_sequence INTEGER NOT NULL CHECK (stop_cutoff_queue_sequence >= 0),
+    active_turn_id TEXT REFERENCES runtime_turns(turn_id),
+    result_json TEXT NOT NULL,
+    committed_at TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS runtime_executor_residents (
     conversation_id TEXT PRIMARY KEY REFERENCES runtime_conversations(conversation_id),
     bot_id TEXT NOT NULL,
@@ -160,6 +169,21 @@ const RUNTIME_SCHEMA = `
     error_json TEXT NOT NULL,
     outbox_id TEXT NOT NULL UNIQUE,
     created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_provider_event_diagnostics (
+    diagnostic_id TEXT PRIMARY KEY,
+    turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    provider TEXT NOT NULL CHECK (provider IN ('claude', 'codex')),
+    attempt_id TEXT,
+    attempt_no INTEGER CHECK (attempt_no IS NULL OR attempt_no > 0),
+    lease_epoch INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0),
+    current_turn_state TEXT NOT NULL,
+    event_kind TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    descriptor_json TEXT NOT NULL,
+    observed_at TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS runtime_normalized_events (

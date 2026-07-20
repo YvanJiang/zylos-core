@@ -31,7 +31,14 @@ const CANONICAL_TRANSITIONS = Object.freeze({
   recovering: Object.freeze(['running', 'waiting_user', 'stopped', 'failed', 'interrupted']),
 });
 
-const TERMINAL_STATES = new Set(['completed', 'stopped', 'failed', 'interrupted', 'timed_out']);
+const TERMINAL_STATES = new Set([
+  'completed',
+  'stopped',
+  'cancelled',
+  'failed',
+  'interrupted',
+  'timed_out',
+]);
 
 const ANSWER_CONFLICT_CODES = new Set([
   'idempotency_conflict',
@@ -303,6 +310,7 @@ function transitionInTransaction(database, {
   reasonCode = `executor_${toState}`,
   error = null,
   requireActiveLease = true,
+  retainLease = false,
 }) {
   if (!CANONICAL_TRANSITIONS[fromState]?.includes(toState)) {
     conflict('illegal_transition', `Canonical transition ${fromState} -> ${toState} is not allowed.`);
@@ -359,7 +367,7 @@ function transitionInTransaction(database, {
     if (terminalQueueEntry.changes !== 1) {
       conflict('stale_attempt', 'The canonical terminal transition lost its queue claim.');
     }
-    if (toState === 'timed_out') return event;
+    if (toState === 'timed_out' || retainLease) return event;
     const released = database.prepare(`
       UPDATE runtime_executor_leases
       SET
@@ -976,7 +984,160 @@ export function createExecutorStore({
     return claim.immediate();
   }
 
-  function cancelUnsentInteractions(turnContext, turn, cancelledAt) {
+  function persistDeliveryUnknownInTransaction({
+    turn,
+    request,
+    handoff,
+    handoffVersion,
+    fence,
+    occurredAt,
+    error,
+    reasonCode,
+    recoverParent,
+    requireActiveLease = true,
+    auditContext = {},
+  }) {
+    if (error.side_effect_status !== 'unknown') {
+      conflict('provider_context_invalid', 'Unknown delivery requires unknown provider side effects.');
+    }
+    validateInteractionTransition({
+      from: 'answer_delivering',
+      to: 'delivery_unknown',
+      sendStarted: true,
+      occurredAt,
+    });
+    validateInteractionHandoffTransition({
+      from: 'delivering',
+      to: 'delivery_unknown',
+      sendStarted: true,
+      occurredAt,
+    });
+    const updatedRequest = {
+      ...request,
+      state: 'delivery_unknown',
+      version: request.version + 1,
+      handoff_state: 'delivery_unknown',
+    };
+    const updatedHandoff = {
+      ...handoff,
+      state: 'delivery_unknown',
+      reason_code: reasonCode,
+      error,
+      side_effect_status: 'unknown',
+    };
+    validateInteractionRequest(updatedRequest, { occurredAt });
+    validateInteractionHandoff(updatedHandoff, { occurredAt });
+    const interactionUpdate = database.prepare(`
+      UPDATE runtime_interactions
+      SET state = 'delivery_unknown', version = ?,
+        handoff_state = 'delivery_unknown', handoff_version = ?,
+        request_json = ?, updated_at = ?
+      WHERE interaction_id = ? AND state = 'answer_delivering' AND version = ?
+    `).run(
+      updatedRequest.version,
+      handoffVersion,
+      JSON.stringify(updatedRequest),
+      occurredAt,
+      request.interaction_id,
+      request.version,
+    );
+    const handoffUpdate = database.prepare(`
+      UPDATE runtime_interaction_handoffs
+      SET state = 'delivery_unknown', record_json = ?, updated_at = ?
+      WHERE handoff_id = ? AND state = 'delivering'
+        AND handoff_attempt_id = ? AND handoff_attempt_no = ?
+        AND provider_attempt_id = ? AND lease_epoch = ?
+    `).run(
+      JSON.stringify(updatedHandoff),
+      occurredAt,
+      handoff.handoff_id,
+      handoff.handoff_attempt_id,
+      handoff.handoff_attempt_no,
+      handoff.provider_attempt_id,
+      handoff.lease_epoch,
+    );
+    assertPairedInteractionHandoffCas(
+      interactionUpdate,
+      handoffUpdate,
+      'stale_attempt',
+      'The unknown interaction delivery lost its durable fence.',
+    );
+
+    let currentTurn = turn;
+    if (recoverParent) {
+      transitionInTransaction(database, {
+        turnId: turn.turn_id,
+        fromState: 'waiting_user',
+        toState: 'recovering',
+        fence,
+        provider,
+        serviceInstanceId,
+        occurredAt,
+        generateId,
+        reasonCode: 'interaction_answer_delivery_unknown',
+        requireActiveLease,
+      });
+      currentTurn = loadTurn(database, turn.turn_id);
+    }
+    const event = buildEvent({
+      turn: currentTurn,
+      lastEvent: loadLastEvent(database, currentTurn.turn_id),
+      fence,
+      provider,
+      descriptor: {
+        kind: 'interaction_answer_delivery_unknown',
+        phase: currentTurn.state,
+        payload: {
+          interaction_id: request.interaction_id,
+          ordinal: request.ordinal,
+          interaction_version: updatedRequest.version,
+          handoff_version: handoffVersion,
+          state: 'delivery_unknown',
+          handoff_state: 'delivery_unknown',
+        },
+        error,
+      },
+      occurredAt,
+      generateId,
+    });
+    commitTurnEvent(database, {
+      turn: currentTurn,
+      event,
+      fence,
+      nextState: currentTurn.state,
+      staleMessage: 'The unknown interaction delivery lost its provider attempt fence.',
+      generateId,
+    });
+    const auditId = generateId('audit');
+    database.prepare(`
+      INSERT INTO runtime_interaction_audit (
+        audit_id, interaction_id, handoff_id, outcome, provider_attempt_id,
+        lease_epoch, acknowledgement_json, created_at
+      ) VALUES (?, ?, ?, 'delivery_unknown', ?, ?, ?, ?)
+    `).run(
+      auditId,
+      request.interaction_id,
+      handoff.handoff_id,
+      handoff.provider_attempt_id,
+      handoff.lease_epoch,
+      JSON.stringify({
+        status: 'delivery_unknown',
+        reason_code: reasonCode,
+        ...auditContext,
+        error,
+      }),
+      occurredAt,
+    );
+    return {
+      auditId,
+      event,
+      turn: loadTurn(database, currentTurn.turn_id),
+      updatedHandoff,
+      updatedRequest,
+    };
+  }
+
+  function settleBlockingInteractionsForStop(turnContext, turn, cancelledAt) {
     const rows = database.prepare(`
       SELECT interaction.request_json, interaction.handoff_version,
         handoff.record_json AS handoff_json
@@ -984,15 +1145,45 @@ export function createExecutorStore({
       LEFT JOIN runtime_interaction_handoffs AS handoff
         ON handoff.interaction_id = interaction.interaction_id
       WHERE interaction.turn_id = ?
-        AND interaction.state IN ('pending', 'answer_committed')
+        AND interaction.state IN (
+          'pending', 'answer_committed', 'answer_delivering', 'delivery_unknown'
+        )
       ORDER BY interaction.ordinal ASC
     `).all(turn.turn_id);
     let currentTurn = turn;
     for (const row of rows) {
       const request = JSON.parse(row.request_json);
+      if (request.state === 'delivery_unknown') continue;
+      const handoff = row.handoff_json === null ? null : JSON.parse(row.handoff_json);
+      const sendStarted = handoff?.last_send_started_at !== null
+        && handoff?.last_send_started_at !== undefined;
+      if (request.state === 'answer_delivering' && sendStarted) {
+        const error = createContractError({
+          code: 'interaction_answer_delivery_unknown',
+          category: 'provider',
+          retryable: false,
+          sideEffectStatus: 'unknown',
+          userMessage: 'The answer send started before the parent was stopped; acknowledgement is unknown.',
+          occurredAt: cancelledAt,
+        });
+        const unknown = persistDeliveryUnknownInTransaction({
+          turn: currentTurn,
+          request,
+          handoff,
+          handoffVersion: row.handoff_version + 1,
+          fence: turnContext.attempt,
+          occurredAt: cancelledAt,
+          error,
+          reasonCode: 'parent_stopped_after_send_started',
+          recoverParent: false,
+        });
+        currentTurn = unknown.turn;
+        continue;
+      }
       validateInteractionTransition({
         from: request.state,
         to: 'cancelled',
+        sendStarted,
         occurredAt: cancelledAt,
       });
       let handoffVersion = row.handoff_version;
@@ -1002,11 +1193,11 @@ export function createExecutorStore({
         version: request.version + 1,
         terminal_reason: 'parent_stopped',
       };
-      if (row.handoff_json !== null) {
-        const handoff = JSON.parse(row.handoff_json);
+      if (handoff !== null) {
         validateInteractionHandoffTransition({
           from: handoff.state,
           to: 'cancelled',
+          sendStarted,
           occurredAt: cancelledAt,
         });
         const updatedHandoff = {
@@ -1018,17 +1209,32 @@ export function createExecutorStore({
         const handoffUpdate = database.prepare(`
           UPDATE runtime_interaction_handoffs
           SET state = 'cancelled', record_json = ?, updated_at = ?
-          WHERE handoff_id = ? AND state = 'pending'
+          WHERE handoff_id = ? AND state = ?
         `).run(
           JSON.stringify(updatedHandoff),
           cancelledAt,
           handoff.handoff_id,
+          handoff.state,
         );
         if (handoffUpdate.changes !== 1) {
           conflict('stale_attempt', 'Turn cancellation lost its pending interaction handoff.');
         }
         updatedRequest.handoff_state = 'cancelled';
         handoffVersion += 1;
+        database.prepare(`
+          INSERT INTO runtime_interaction_audit (
+            audit_id, interaction_id, handoff_id, outcome, provider_attempt_id,
+            lease_epoch, acknowledgement_json, created_at
+          ) VALUES (?, ?, ?, 'cancelled', ?, ?, ?, ?)
+        `).run(
+          generateId('audit'),
+          request.interaction_id,
+          handoff.handoff_id,
+          handoff.provider_attempt_id,
+          handoff.lease_epoch,
+          JSON.stringify({ status: 'cancelled', reason_code: 'parent_stopped' }),
+          cancelledAt,
+        );
       }
       validateInteractionRequest(updatedRequest, { occurredAt: cancelledAt });
       const interactionUpdate = database.prepare(`
@@ -1091,7 +1297,7 @@ export function createExecutorStore({
       assertTurnContextFence(turn, turnContext);
       const occurredAt = now();
       if (toState === 'stopped') {
-        turn = cancelUnsentInteractions(turnContext, turn, occurredAt);
+        turn = settleBlockingInteractionsForStop(turnContext, turn, occurredAt);
       }
       return transitionInTransaction(database, {
         turnId: turnContext.turn_id,
@@ -1107,6 +1313,280 @@ export function createExecutorStore({
       });
     });
     return transition.immediate();
+  }
+
+  function cancelQueuedTurnInTransaction(turnId, cancelledAt) {
+    const turn = loadTurn(database, turnId);
+    if (turn.state !== 'queued' || turn.attempt_id !== null) {
+      conflict('version_conflict', 'Only an unclaimed queued turn can be cancelled by stop.');
+    }
+    const event = buildEvent({
+      turn,
+      lastEvent: loadLastEvent(database, turn.turn_id),
+      fence: null,
+      provider: null,
+      descriptor: {
+        kind: 'turn_state_changed',
+        phase: 'cancelled',
+        payload: {
+          from_state: 'queued',
+          to_state: 'cancelled',
+          reason_code: 'conversation_stopped',
+        },
+      },
+      occurredAt: cancelledAt,
+      generateId,
+    });
+    const turnUpdate = database.prepare(`
+      UPDATE runtime_turns
+      SET state = 'cancelled', turn_version = ?, committed_at = ?
+      WHERE turn_id = ? AND state = 'queued' AND turn_version = ?
+        AND attempt_id IS NULL AND attempt_no IS NULL AND lease_epoch IS NULL
+    `).run(event.turn_version, cancelledAt, turn.turn_id, turn.turn_version);
+    const queueUpdate = database.prepare(`
+      UPDATE runtime_turn_queue
+      SET status = 'cancelled', wait_reason = NULL
+      WHERE turn_id = ? AND status = 'queued'
+    `).run(turn.turn_id);
+    if (turnUpdate.changes !== 1 || queueUpdate.changes !== 1) {
+      conflict('version_conflict', 'The stop cutoff lost a queued turn compare-and-swap.');
+    }
+    persistEvent(database, turn, event, generateId);
+    return event;
+  }
+
+  function stopConversation({ conversation_id: conversationId, stop_id: stopId }) {
+    if (typeof conversationId !== 'string' || conversationId.length === 0) {
+      throw new TypeError('conversation_id must be a non-empty string');
+    }
+    if (typeof stopId !== 'string' || stopId.length === 0) {
+      throw new TypeError('stop_id must be a non-empty string');
+    }
+    // The IMMEDIATE transaction is the linearization point shared with inbound
+    // acceptance: its queue sequence snapshot is the durable stop cutoff.
+    const stop = database.transaction(() => {
+      const existing = database.prepare(`
+        SELECT conversation_id, result_json
+        FROM runtime_stop_controls
+        WHERE stop_id = ?
+      `).get(stopId);
+      if (existing) {
+        if (existing.conversation_id !== conversationId) {
+          conflict('idempotency_conflict', 'The stop ID belongs to another conversation.');
+        }
+        return { ...JSON.parse(existing.result_json), deduplicated: true };
+      }
+      const conversation = database.prepare(`
+        SELECT last_queue_sequence
+        FROM runtime_conversations
+        WHERE conversation_id = ?
+      `).get(conversationId);
+      if (!conversation) {
+        conflict('conversation_not_found', `Conversation ${conversationId} does not exist.`);
+      }
+      const stoppedAt = now();
+      const cutoff = conversation.last_queue_sequence;
+      const activeRow = database.prepare(`
+        SELECT turn_id
+        FROM runtime_turns
+        WHERE conversation_id = ?
+          AND state IN ('starting', 'running', 'waiting_user', 'recovering')
+        LIMIT 1
+      `).get(conversationId);
+      let activeTurn = null;
+      if (activeRow) {
+        let turn = loadTurn(database, activeRow.turn_id);
+        const previousState = turn.state;
+        const turnContext = {
+          conversation_id: turn.conversation_id,
+          turn_id: turn.turn_id,
+          attempt: {
+            attempt_id: turn.attempt_id,
+            attempt_no: turn.attempt_no,
+            lease_epoch: turn.lease_epoch,
+          },
+        };
+        turn = settleBlockingInteractionsForStop(turnContext, turn, stoppedAt);
+        const terminalEvent = transitionInTransaction(database, {
+          turnId: turn.turn_id,
+          fromState: previousState,
+          toState: 'stopped',
+          fence: turnContext.attempt,
+          provider,
+          serviceInstanceId,
+          occurredAt: stoppedAt,
+          generateId,
+          reasonCode: 'conversation_stopped',
+          retainLease: true,
+        });
+        activeTurn = {
+          turn_id: turn.turn_id,
+          previous_state: previousState,
+          previous_version: turn.turn_version,
+          state: 'stopped',
+          turn_version: terminalEvent.turn_version,
+          attempt: { ...turnContext.attempt },
+        };
+      }
+      const queuedRows = database.prepare(`
+        SELECT queue.turn_id
+        FROM runtime_turn_queue AS queue
+        JOIN runtime_turns AS turn ON turn.turn_id = queue.turn_id
+        WHERE queue.conversation_id = ?
+          AND queue.queue_sequence <= ?
+          AND queue.status = 'queued'
+          AND turn.state = 'queued'
+        ORDER BY queue.queue_sequence ASC
+      `).all(conversationId, cutoff);
+      const cancelledTurnIds = [];
+      for (const { turn_id: turnId } of queuedRows) {
+        cancelQueuedTurnInTransaction(turnId, stoppedAt);
+        cancelledTurnIds.push(turnId);
+      }
+      const status = activeTurn
+        ? 'stopped'
+        : (cancelledTurnIds.length > 0 ? 'queue_cleared' : 'noop');
+      const result = {
+        status,
+        stop_id: stopId,
+        conversation_id: conversationId,
+        stop_cutoff_queue_sequence: cutoff,
+        active_turn: activeTurn,
+        cancelled_turn_ids: cancelledTurnIds,
+        provider_stop_status: activeTurn ? 'pending' : 'not_applicable',
+        lease_released: activeTurn === null,
+        provider_stop_updated_at: stoppedAt,
+        committed_at: stoppedAt,
+        deduplicated: false,
+      };
+      database.prepare(`
+        INSERT INTO runtime_stop_controls (
+          stop_id, conversation_id, stop_cutoff_queue_sequence,
+          active_turn_id, result_json, committed_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        stopId,
+        conversationId,
+        cutoff,
+        activeTurn?.turn_id ?? null,
+        JSON.stringify(result),
+        stoppedAt,
+      );
+      return result;
+    });
+    return stop.immediate();
+  }
+
+  function loadStopProviderOutcomeInTransaction(stopResult) {
+    if (!stopResult || typeof stopResult.stop_id !== 'string') {
+      throw new TypeError('stopResult must identify a durable stop control');
+    }
+    const row = database.prepare(`
+      SELECT conversation_id, result_json
+      FROM runtime_stop_controls
+      WHERE stop_id = ?
+    `).get(stopResult.stop_id);
+    if (!row) conflict('stop_not_found', `Stop ${stopResult.stop_id} does not exist.`);
+    if (row.conversation_id !== stopResult.conversation_id) {
+      conflict('idempotency_conflict', 'The stop ID belongs to another conversation.');
+    }
+    const current = JSON.parse(row.result_json);
+    if (current.active_turn?.turn_id !== stopResult.active_turn?.turn_id) {
+      conflict('version_conflict', 'The provider stop outcome lost its active turn fence.');
+    }
+    const currentStatus = current.provider_stop_status
+      ?? (current.active_turn ? 'pending' : 'not_applicable');
+    return { current, currentStatus, row };
+  }
+
+  function updateStopProviderOutcomeInTransaction(
+    stopResult,
+    providerStopStatus,
+    leaseReleased,
+  ) {
+    if (!['confirmed', 'isolated', 'uncertain', 'terminal_unconfirmed'].includes(
+      providerStopStatus,
+    )) {
+      throw new TypeError('providerStopStatus must be a canonical provider stop outcome');
+    }
+    if (typeof leaseReleased !== 'boolean') {
+      throw new TypeError('leaseReleased must be a boolean');
+    }
+    const { current, currentStatus, row } = loadStopProviderOutcomeInTransaction(stopResult);
+    if (currentStatus !== 'pending') {
+      return { ...current, deduplicated: stopResult.deduplicated === true };
+    }
+    const updated = {
+      ...current,
+      provider_stop_status: providerStopStatus,
+      lease_released: leaseReleased,
+      provider_stop_updated_at: now(),
+      deduplicated: false,
+    };
+    const write = database.prepare(`
+      UPDATE runtime_stop_controls
+      SET result_json = ?
+      WHERE stop_id = ? AND conversation_id = ? AND result_json = ?
+    `).run(
+      JSON.stringify(updated),
+      stopResult.stop_id,
+      stopResult.conversation_id,
+      row.result_json,
+    );
+    if (write.changes !== 1) {
+      conflict('version_conflict', 'The provider stop outcome lost its durable CAS.');
+    }
+    return { ...updated, deduplicated: stopResult.deduplicated === true };
+  }
+
+  function releaseStoppedExecutorLeaseInTransaction(stopResult) {
+    const activeTurn = stopResult?.active_turn;
+    if (!activeTurn) return false;
+    const turn = loadTurn(database, activeTurn.turn_id);
+    if (turn.state !== 'stopped') {
+      conflict('turn_terminal', 'The stopped turn no longer has stopped authority.');
+    }
+    const lease = database.prepare(`
+      SELECT lease_owner, turn_id, attempt_id, attempt_no, lease_epoch
+      FROM runtime_executor_leases
+      WHERE conversation_id = ?
+    `).get(turn.conversation_id);
+    if (!lease || lease.lease_owner === null) return true;
+    const released = database.prepare(`
+      UPDATE runtime_executor_leases
+      SET lease_owner = NULL, turn_id = NULL, attempt_id = NULL,
+        attempt_no = NULL, lease_expires_at = NULL, updated_at = ?
+      WHERE conversation_id = ? AND lease_owner = ? AND turn_id = ?
+        AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+    `).run(
+      now(),
+      turn.conversation_id,
+      serviceInstanceId,
+      turn.turn_id,
+      turn.attempt_id,
+      turn.attempt_no,
+      turn.lease_epoch,
+    );
+    if (released.changes !== 1) {
+      conflict('stale_attempt', 'The stopped turn lost its executor lease fence.');
+    }
+    return true;
+  }
+
+  function recordStopProviderOutcome(stopResult, providerStopStatus) {
+    const record = database.transaction(() => {
+      const { current, currentStatus } = loadStopProviderOutcomeInTransaction(stopResult);
+      if (currentStatus !== 'pending') {
+        return { ...current, deduplicated: stopResult.deduplicated === true };
+      }
+      const leaseReleased = releaseStoppedExecutorLeaseInTransaction(stopResult);
+      return updateStopProviderOutcomeInTransaction(
+        stopResult,
+        providerStopStatus,
+        leaseReleased,
+      );
+    });
+    return record.immediate();
   }
 
   function assertCurrentFence(turnContext) {
@@ -1229,6 +1709,60 @@ export function createExecutorStore({
       return event;
     });
     return append.immediate();
+  }
+
+  function recordProviderEventDiagnostic(
+    turnContext,
+    descriptor,
+    { reasonCode = 'stale_attempt' } = {},
+  ) {
+    if (!turnContext || typeof turnContext.turn_id !== 'string') {
+      throw new TypeError('turnContext must identify a turn');
+    }
+    if (typeof reasonCode !== 'string' || reasonCode.length === 0) {
+      throw new TypeError('reasonCode must be a non-empty string');
+    }
+    const turn = loadTurn(database, turnContext.turn_id);
+    const eventKind = descriptor?.type === 'normalized_event'
+      ? descriptor.event?.kind
+      : (descriptor?.kind ?? descriptor?.type ?? 'provider_event');
+    const diagnostic = {
+      diagnostic_id: generateId('provider-event-diagnostic'),
+      turn_id: turn.turn_id,
+      conversation_id: turn.conversation_id,
+      provider,
+      attempt_id: turnContext.attempt?.attempt_id ?? null,
+      attempt_no: turnContext.attempt?.attempt_no ?? null,
+      lease_epoch: turnContext.attempt?.lease_epoch ?? null,
+      current_turn_state: turn.state,
+      event_kind: typeof eventKind === 'string' && eventKind.length > 0
+        ? eventKind
+        : 'provider_event',
+      reason_code: reasonCode,
+      descriptor_json: JSON.stringify(descriptor ?? null),
+      observed_at: now(),
+    };
+    database.prepare(`
+      INSERT INTO runtime_provider_event_diagnostics (
+        diagnostic_id, turn_id, conversation_id, provider,
+        attempt_id, attempt_no, lease_epoch, current_turn_state,
+        event_kind, reason_code, descriptor_json, observed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      diagnostic.diagnostic_id,
+      diagnostic.turn_id,
+      diagnostic.conversation_id,
+      diagnostic.provider,
+      diagnostic.attempt_id,
+      diagnostic.attempt_no,
+      diagnostic.lease_epoch,
+      diagnostic.current_turn_state,
+      diagnostic.event_kind,
+      diagnostic.reason_code,
+      diagnostic.descriptor_json,
+      diagnostic.observed_at,
+    );
+    return Object.freeze(diagnostic);
   }
 
   function isConversationEvictable(conversationId) {
@@ -1898,31 +2432,48 @@ export function createExecutorStore({
     return expire.immediate();
   }
 
-  function markTimedOutProviderStopUnknown(expiration, providerStopStatus) {
+  function markProviderStopUnknown(terminalContext, providerStopStatus, stopResult = null) {
     const markUnknown = database.transaction(() => {
       if (typeof providerStopStatus !== 'string' || providerStopStatus.length === 0) {
         throw new TypeError('providerStopStatus must be a non-empty string');
+      }
+      if (!terminalContext || typeof terminalContext.turn_id !== 'string') {
+        throw new TypeError('terminalContext must identify a turn and attempt');
       }
       const existing = database.prepare(`
         SELECT incident_id, provider_stop_status, side_effect_status, disposition, outbox_id
         FROM runtime_provider_stop_incidents
         WHERE turn_id = ?
-      `).get(expiration.turn_id);
-      if (existing) return { status: 'manual_recovery_required', ...existing };
+      `).get(terminalContext.turn_id);
+      if (existing) {
+        const stoppedResult = stopResult
+          ? updateStopProviderOutcomeInTransaction(
+            stopResult,
+            existing.provider_stop_status,
+            false,
+          )
+          : null;
+        return {
+          status: 'manual_recovery_required',
+          ...existing,
+          ...(stoppedResult ? { stop_result: stoppedResult } : {}),
+        };
+      }
 
       const occurredAt = now();
-      const turn = loadTurn(database, expiration.turn_id);
-      if (turn.state !== 'timed_out') {
-        conflict('illegal_transition', 'Provider stop uncertainty requires a timed-out turn.');
+      const turn = loadTurn(database, terminalContext.turn_id);
+      if (!['timed_out', 'stopped'].includes(turn.state)) {
+        conflict('illegal_transition', 'Provider stop uncertainty requires a terminal stopped turn.');
       }
+      const expectedAttempt = terminalContext.attempt;
       if (
-        expiration.attempt?.attempt_id !== turn.attempt_id
-        || expiration.attempt?.attempt_no !== turn.attempt_no
-        || expiration.attempt?.lease_epoch !== turn.lease_epoch
+        expectedAttempt?.attempt_id !== turn.attempt_id
+        || expectedAttempt?.attempt_no !== turn.attempt_no
+        || expectedAttempt?.lease_epoch !== turn.lease_epoch
       ) {
-        conflict('stale_attempt', 'Provider stop uncertainty lost its timeout attempt fence.');
+        conflict('stale_attempt', 'Provider stop uncertainty lost its terminal attempt fence.');
       }
-      assertActiveFence(database, turn, expiration.attempt, serviceInstanceId);
+      assertActiveFence(database, turn, expectedAttempt, serviceInstanceId);
       const lane = database.prepare(`
         SELECT target_json, mapping_json
         FROM runtime_delivery_lanes
@@ -1970,8 +2521,10 @@ export function createExecutorStore({
         }),
         render_model: {
           title: 'Zylos',
-          phase: 'timed_out',
-          text: 'Execution timed out, but provider stop could not be confirmed. Manual recovery is required.',
+          phase: turn.state,
+          text: turn.state === 'timed_out'
+            ? 'Execution timed out, but provider stop could not be confirmed. Manual recovery is required.'
+            : 'Execution was stopped, but provider termination could not be confirmed. Manual recovery is required.',
           error,
           tools: [],
           interactions: [],
@@ -2022,6 +2575,9 @@ export function createExecutorStore({
         outboxId,
         occurredAt,
       );
+      const stoppedResult = stopResult
+        ? updateStopProviderOutcomeInTransaction(stopResult, providerStopStatus, false)
+        : null;
       return {
         status: 'manual_recovery_required',
         incident_id: incidentId,
@@ -2029,6 +2585,7 @@ export function createExecutorStore({
         side_effect_status: 'unknown',
         disposition: 'manual_recovery_required',
         outbox_id: outboxId,
+        ...(stoppedResult ? { stop_result: stoppedResult } : {}),
       };
     });
     return markUnknown.immediate();
@@ -2730,19 +3287,6 @@ export function createExecutorStore({
         assertActiveFence(database, turn, fence, serviceInstanceId);
         assertResidentOwner(turn.conversation_id);
       }
-      validateInteractionTransition({
-        from: 'answer_delivering',
-        to: 'delivery_unknown',
-        sendStarted: true,
-        occurredAt,
-      });
-      validateInteractionHandoffTransition({
-        from: 'delivering',
-        to: 'delivery_unknown',
-        sendStarted: true,
-        occurredAt,
-      });
-
       const error = providerError === null
         ? createContractError({
           code: 'interaction_answer_delivery_unknown',
@@ -2760,118 +3304,18 @@ export function createExecutorStore({
           userMessage: providerError.user_message,
           occurredAt: providerError.occurred_at ?? occurredAt,
         });
-      if (error.side_effect_status !== 'unknown') {
-        conflict('provider_context_invalid', 'Unknown delivery requires unknown provider side effects.');
-      }
-      const updatedRequest = {
-        ...request,
-        state: 'delivery_unknown',
-        version: request.version + 1,
-        handoff_state: 'delivery_unknown',
-      };
-      const updatedHandoff = {
-        ...handoff,
-        state: 'delivery_unknown',
-        reason_code: 'send_started_ack_missing',
+      const unknown = persistDeliveryUnknownInTransaction({
+        turn,
+        request,
+        handoff,
+        handoffVersion: row.handoff_version + 1,
+        fence,
+        occurredAt,
         error,
-        side_effect_status: 'unknown',
-      };
-      validateInteractionRequest(updatedRequest, { occurredAt });
-      validateInteractionHandoff(updatedHandoff, { occurredAt });
-      const nextHandoffVersion = row.handoff_version + 1;
-      const interactionUpdate = database.prepare(`
-        UPDATE runtime_interactions
-        SET state = 'delivery_unknown', version = ?, handoff_state = 'delivery_unknown',
-          handoff_version = ?, request_json = ?, updated_at = ?
-        WHERE interaction_id = ? AND state = 'answer_delivering' AND version = ?
-          AND handoff_state = 'delivering' AND handoff_version = ?
-      `).run(
-        updatedRequest.version,
-        nextHandoffVersion,
-        JSON.stringify(updatedRequest),
-        occurredAt,
-        request.interaction_id,
-        request.version,
-        row.handoff_version,
-      );
-      const handoffUpdate = database.prepare(`
-        UPDATE runtime_interaction_handoffs
-        SET state = 'delivery_unknown', record_json = ?, updated_at = ?
-        WHERE handoff_id = ? AND state = 'delivering'
-          AND handoff_attempt_id = ? AND handoff_attempt_no = ?
-          AND provider_attempt_id = ? AND lease_epoch = ?
-      `).run(
-        JSON.stringify(updatedHandoff),
-        occurredAt,
-        handoff.handoff_id,
-        handoff.handoff_attempt_id,
-        handoff.handoff_attempt_no,
-        handoff.provider_attempt_id,
-        handoff.lease_epoch,
-      );
-      assertPairedInteractionHandoffCas(
-        interactionUpdate,
-        handoffUpdate,
-        'stale_attempt',
-        'The unknown delivery result lost its durable fence.',
-      );
-
-      transitionInTransaction(database, {
-        turnId: turn.turn_id,
-        fromState: 'waiting_user',
-        toState: 'recovering',
-        fence,
-        provider,
-        serviceInstanceId,
-        occurredAt,
-        generateId,
-        reasonCode: 'interaction_answer_delivery_unknown',
+        reasonCode: 'send_started_ack_missing',
+        recoverParent: true,
         requireActiveLease: !expiredLeaseRecovery,
-      });
-      const recoveringTurn = loadTurn(database, turn.turn_id);
-      const event = buildEvent({
-        turn: recoveringTurn,
-        lastEvent: loadLastEvent(database, turn.turn_id),
-        fence,
-        provider,
-        descriptor: {
-          kind: 'interaction_answer_delivery_unknown',
-          phase: 'recovering',
-          payload: {
-            interaction_id: request.interaction_id,
-            ordinal: request.ordinal,
-            interaction_version: updatedRequest.version,
-            handoff_version: nextHandoffVersion,
-            state: 'delivery_unknown',
-            handoff_state: 'delivery_unknown',
-          },
-          error,
-        },
-        occurredAt,
-        generateId,
-      });
-      commitTurnEvent(database, {
-        turn: recoveringTurn,
-        event,
-        fence,
-        nextState: 'recovering',
-        staleMessage: 'The unknown delivery result lost its provider attempt fence.',
-        generateId,
-      });
-      const auditId = generateId('audit');
-      database.prepare(`
-        INSERT INTO runtime_interaction_audit (
-          audit_id, interaction_id, handoff_id, outcome, provider_attempt_id,
-          lease_epoch, acknowledgement_json, created_at
-        ) VALUES (?, ?, ?, 'delivery_unknown', ?, ?, ?, ?)
-      `).run(
-        auditId,
-        request.interaction_id,
-        handoff.handoff_id,
-        handoff.provider_attempt_id,
-        handoff.lease_epoch,
-        JSON.stringify({
-          status: 'delivery_unknown',
+        auditContext: {
           recovery_source: expiredLeaseRecovery ? 'expired_writer_lease' : 'live_send_failure',
           handoff_id: handoff.handoff_id,
           handoff_attempt_id: handoff.handoff_attempt_id,
@@ -2879,18 +3323,16 @@ export function createExecutorStore({
           provider_attempt_id: handoff.provider_attempt_id,
           lease_epoch: handoff.lease_epoch,
           last_send_started_at: handoff.last_send_started_at,
-          error,
-        }),
-        occurredAt,
-      );
+        },
+      });
       return {
         status: 'delivery_unknown',
         interaction_id: request.interaction_id,
         handoff_id: handoff.handoff_id,
-        audit_id: auditId,
+        audit_id: unknown.auditId,
         turn_id: turn.turn_id,
         turn_state: 'recovering',
-        turn_version: event.turn_version,
+        turn_version: unknown.event.turn_version,
       };
     });
     return markUnknown.immediate();
@@ -4151,7 +4593,7 @@ export function createExecutorStore({
     claimInteractionHandoff,
     commitInteractionAnswer,
     markProviderFailure,
-    markTimedOutProviderStopUnknown,
+    markProviderStopUnknown,
     heartbeatOwnedResidents,
     isConversationEvictable,
     markInteractionHandoffDeliveryUnknown,
@@ -4160,6 +4602,8 @@ export function createExecutorStore({
     releaseExecutorResident,
     releaseRecoveringExecutorOwnership,
     reconcileExpiredResidents,
+    recordProviderEventDiagnostic,
+    recordStopProviderOutcome,
     expireInteraction,
     getInteractionHandoffForRecovery,
     listPendingInteractionDeadlines,
@@ -4171,6 +4615,7 @@ export function createExecutorStore({
     requestInteraction,
     resumeTurnAfterPermission,
     reserveNextExecutor,
+    stopConversation,
     transitionTurn,
   });
 }
