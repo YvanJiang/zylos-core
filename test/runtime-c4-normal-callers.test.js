@@ -183,30 +183,21 @@ describe('normal C4 callers use durable Core contracts', () => {
     assert.equal(acceptedProcess.status, 0, acceptedProcess.stderr);
     const accepted = JSON.parse(acceptedProcess.stdout.trim());
     const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
-    const dormantOwner = createWebConsoleOutboxOwner({
-      database,
-      clients: new Set(),
-      serviceInstanceId: 'web-console-owner-no-consumers',
-      broadcast: () => { throw new Error('a dormant owner must not broadcast'); },
-    });
-    assert.deepEqual(await dormantOwner.drain(), { status: 'no_consumers', delivered: 0 });
     assert.equal(database.prepare(`
       SELECT status FROM runtime_outbox WHERE turn_id = ?
     `).get(accepted.turn_id).status, 'pending');
     const browserDeliveries = [];
     const owner = createWebConsoleOutboxOwner({
       database,
-      clients: new Set([{}]),
       serviceInstanceId: 'web-console-owner-round-trip',
       now: () => '2026-07-21T00:20:01.000Z',
-      broadcast(type, messages) {
-        browserDeliveries.push({ type, messages });
-        return 1;
+      deliverMessage(message, delivery) {
+        browserDeliveries.push(message);
+        return { platform_message_id: `mailbox:${delivery.delivery_id}` };
       },
     });
     assert.deepEqual(await owner.drain(), { status: 'delivered', delivered: 1 });
-    assert.equal(browserDeliveries[0].type, 'messages');
-    assert.match(browserDeliveries[0].messages[0].content, /Message received/);
+    assert.match(browserDeliveries[0].content, /Message received/);
     assert.equal(database.prepare(`
       SELECT status FROM runtime_outbox WHERE turn_id = ?
     `).get(accepted.turn_id).status, 'delivered');

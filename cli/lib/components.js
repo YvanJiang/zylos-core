@@ -3,9 +3,7 @@
  */
 
 import fs from 'node:fs';
-import crypto from 'node:crypto';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
 import { COMPONENTS_FILE } from './config.js';
 import { loadRegistry } from './registry.js';
 import { fetchLatestTag } from './github.js';
@@ -192,46 +190,10 @@ function localFallbackName(value) {
   return path.basename(value).replace(/\.(?:tar\.gz|tgz)$/i, '').replace(/^zylos-/, '') || 'local-component';
 }
 
-/**
- * Output task for Claude to execute via C4
- * In Scene B (terminal), also queues to C4 for delivery
- */
-export function outputTask(action, data) {
-  const task = {
-    type: `component_${action}`,
-    ...data,
-    timestamp: new Date().toISOString(),
-    reply_channel: 'telegram',  // Default reply channel
-  };
-
-  // Display task info for user
-  console.log('\n[ZYLOS_TASK]');
-  console.log(JSON.stringify(task, null, 2));
-  console.log('[/ZYLOS_TASK]\n');
-
-  // Queue task via C4 for Scene B (terminal execution)
-  // Core executor delivery makes the component available to the provider.
-  const c4ReceivePath = path.join(import.meta.dirname, '..', '..', 'skills', 'comm-bridge', 'scripts', 'c4-receive.js');
-
-  try {
-    const taskMessage = `[COMPONENT_TASK] ${JSON.stringify(task)}`;
-    // Use spawnSync with args array to avoid shell escaping issues
-    const result = spawnSync('node', [c4ReceivePath,
-      '--channel', 'zylos-cli', '--endpoint', 'local',
-      '--message-id', `component-${crypto.randomUUID()}`,
-      '--actor-id', 'local-cli-user', '--content', taskMessage,
-    ], {
-      stdio: 'pipe',
-      encoding: 'utf8'
-    });
-    if (result.status === 0) {
-      console.log('Task queued via C4. Claude will execute when idle.');
-      console.log('You will be notified via Telegram/Lark when complete.');
-    } else {
-      throw new Error(result.stderr || 'C4 queue failed');
-    }
-  } catch (err) {
-    // C4 not available - that's OK, user might be in Claude session
-    console.log('Note: C4 not available. If in Claude session, Claude will execute directly.');
-  }
+/** Report an installed component that still requires explicit operator setup. */
+export function reportOperatorSetupRequired(action, data) {
+  const readme = path.join(data.skillDir, 'README.md');
+  console.log(`\nComponent ${data.component} was installed, but automatic ${action} setup is unavailable.`);
+  console.log(`Review ${readme} and complete its operator setup before enabling the component.`);
+  return Object.freeze({ status: 'operator_setup_required', component: data.component, readme });
 }

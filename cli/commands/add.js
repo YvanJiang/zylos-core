@@ -20,7 +20,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
 import { SKILLS_DIR, COMPONENTS_DIR, BIN_DIR } from '../lib/config.js';
-import { loadComponents, saveComponents, resolveTarget, loadTargetRegistryInfo, outputTask } from '../lib/components.js';
+import {
+  loadComponents,
+  saveComponents,
+  resolveTarget,
+  loadTargetRegistryInfo,
+  reportOperatorSetupRequired,
+} from '../lib/components.js';
 import { acquireSource } from '../lib/download.js';
 import { generateManifest, saveMergeBaseline } from '../lib/manifest.js';
 import { parseSkillMd, detectComponentType } from '../lib/skill.js';
@@ -571,10 +577,10 @@ async function installDeclarative(resolved, skillDir, skipConfirm, jsonOutput, b
 }
 
 /**
- * Install an AI component (no SKILL.md — needs Claude to finish setup).
+ * Install an AI component that requires explicit operator setup.
  */
 function installAI(resolved, skillDir, branch) {
-  console.log(`\n${heading('Installing (AI mode — Claude will complete setup)...')}`);
+  console.log(`\n${heading('Installing (operator setup required)...')}`);
 
   // Resolve version from SKILL.md or package.json when not from a tag
   // When installing from branch, skip resolved.version (may be auto-populated by fetchLatestTag)
@@ -610,23 +616,9 @@ function installAI(resolved, skillDir, branch) {
   components[resolved.name] = aiEntry;
   saveComponents(components);
 
-  // Output task for Claude to read README and finish setup
-  outputTask('install', {
+  reportOperatorSetupRequired('install', {
     component: resolved.name,
-    repo: resolved.repo,
-    version: aiVersion,
-    branch: branch || null,
     skillDir,
-    dataDir: path.join(COMPONENTS_DIR, resolved.name),
-    isThirdParty: resolved.isThirdParty,
-    steps: [
-      `Read README.md in ${skillDir} for setup instructions`,
-      `Create data directory ${COMPONENTS_DIR}/${resolved.name} if needed`,
-      `Install npm dependencies if package.json exists`,
-      `Configure environment variables as needed`,
-      `Register PM2 service if applicable`,
-      `Update components.json setupComplete to true when done`,
-    ],
   });
 }
 

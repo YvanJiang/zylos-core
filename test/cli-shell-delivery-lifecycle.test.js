@@ -37,7 +37,7 @@ describe('shell Core outbox owner lifecycle', () => {
       async dispatchNext() {
         dispatchCalls += 1;
         await dispatchBlocked;
-        return { status: 'idle' };
+        return { status: 'delivered' };
       },
     });
 

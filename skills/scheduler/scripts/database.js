@@ -82,7 +82,10 @@ function initSchema() {
       current_occurrence_id TEXT,
       current_turn_id TEXT,
       last_core_state TEXT,
-      core_wait_reason TEXT
+      core_wait_reason TEXT,
+      missed_notice_attempt INTEGER NOT NULL DEFAULT 1
+        CHECK(missed_notice_attempt > 0),
+      missed_notice_retry_at INTEGER
     );
 
     -- Critical indexes for performance
@@ -123,6 +126,8 @@ function initSchema() {
     ['current_turn_id', 'TEXT DEFAULT NULL'],
     ['last_core_state', 'TEXT DEFAULT NULL'],
     ['core_wait_reason', 'TEXT DEFAULT NULL'],
+    ['missed_notice_attempt', 'INTEGER NOT NULL DEFAULT 1'],
+    ['missed_notice_retry_at', 'INTEGER DEFAULT NULL'],
   ]) {
     if (!taskColumns.has(name)) db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${definition}`);
   }

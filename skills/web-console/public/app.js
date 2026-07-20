@@ -191,19 +191,28 @@ class ZylosConsole {
 
   async loadConversations() {
     try {
-      const response = await fetch(`${this.basePath}/api/conversations/recent?limit=100`);
-      const conversations = await response.json();
+      let loaded = false;
+      while (true) {
+        const response = await fetch(
+          `${this.basePath}/api/poll?since_id=${this.lastMessageId}`,
+        );
+        if (!response.ok) throw new Error(`Conversation load failed (${response.status})`);
+        const conversations = await response.json();
+        if (conversations.length === 0) break;
 
-      if (conversations.length === 0) {
-        this.showEmptyState();
-        return;
+        loaded = true;
+        this.clearEmptyState();
+        conversations.forEach((msg) => this.addMessage(msg, false));
+        this.lastMessageId = Math.max(
+          this.lastMessageId,
+          ...conversations.map((message) => message.id),
+        );
+        if (conversations.length < 100) break;
       }
 
-      this.clearEmptyState();
-      conversations.forEach((msg) => this.addMessage(msg, false));
-
-      if (conversations.length > 0) {
-        this.lastMessageId = Math.max(this.lastMessageId, ...conversations.map((m) => m.id));
+      if (!loaded) {
+        this.showEmptyState();
+        return;
       }
 
       this.scrollToBottom();

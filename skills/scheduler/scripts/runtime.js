@@ -21,12 +21,16 @@ function taskOccurrence(task, { notificationText = null } = {}) {
       throw new TypeError(`Task ${task.id} has invalid bound_conversation_json`);
     }
   }
+  const missedNoticeAttempt = task.missed_notice_attempt ?? 1;
+  if (!Number.isSafeInteger(missedNoticeAttempt) || missedNoticeAttempt < 1) {
+    throw new TypeError(`Task ${task.id} has invalid missed_notice_attempt`);
+  }
   return {
     schedule_id: task.id,
     task_id: task.id,
     occurrence_id: notificationText === null
       ? `${task.id}:${task.next_run_at}`
-      : `${task.id}:${task.next_run_at}:missed-notice`,
+      : `${task.id}:${task.next_run_at}:missed-notice:${missedNoticeAttempt}`,
     prompt: notificationText ?? `[Scheduled Task: ${task.id}] ${task.prompt}`,
     occurred_at: scheduledAt,
     // A retry after a scheduler crash must reproduce the exact same envelope.

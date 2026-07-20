@@ -89,3 +89,47 @@ test('a missed occurrence persists one idempotent Core delivery notice instead o
   database.close();
   fs.rmSync(directory, { recursive: true, force: true });
 });
+
+test('a queue-full missed notice converges on a new durable backoff attempt after capacity frees', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-scheduler-runtime-'));
+  const database = new Database(path.join(directory, 'c4.db'));
+  const baseTask = {
+    id: 'task-missed-recovery', name: 'Recovery report', prompt: 'Run the report.',
+  };
+  for (let index = 0; index < 4; index += 1) {
+    const admitted = enqueueScheduledTask(database, {
+      ...baseTask, next_run_at: 1_784_304_000 + index,
+    }, { maxQueuedTurns: 4 });
+    assert.equal(admitted.status, 'accepted');
+  }
+  const notice = 'Recovery report missed its occurrence.';
+  const firstAttemptTask = {
+    ...baseTask, next_run_at: 1_784_304_100, missed_notice_attempt: 1,
+  };
+  const rejected = enqueueMissedScheduledTaskNotice(database, firstAttemptTask, notice, {
+    maxQueuedTurns: 4,
+  });
+  assert.equal(rejected.status, 'rejected');
+  assert.equal(rejected.error.code, 'queue_full');
+  assert.equal(rejected.deduplicated, false);
+
+  database.prepare(`
+    UPDATE runtime_turn_queue SET status = 'completed'
+    WHERE turn_id = (SELECT turn_id FROM runtime_turn_queue ORDER BY queue_sequence LIMIT 1)
+  `).run();
+  const secondAttemptTask = { ...firstAttemptTask, missed_notice_attempt: 2 };
+  const accepted = enqueueMissedScheduledTaskNotice(database, secondAttemptTask, notice, {
+    maxQueuedTurns: 4,
+  });
+  const replayed = enqueueMissedScheduledTaskNotice(database, secondAttemptTask, notice, {
+    maxQueuedTurns: 4,
+  });
+  assert.equal(accepted.status, 'accepted');
+  assert.deepEqual(replayed, { ...accepted, deduplicated: true });
+  assert.equal(database.prepare(`
+    SELECT COUNT(*) AS count FROM runtime_scheduler_occurrences
+    WHERE occurrence_id LIKE 'task-missed-recovery:%:missed-notice:%'
+  `).get().count, 2);
+  database.close();
+  fs.rmSync(directory, { recursive: true, force: true });
+});

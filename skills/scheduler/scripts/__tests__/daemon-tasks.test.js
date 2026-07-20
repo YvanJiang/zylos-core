@@ -5,7 +5,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { updateNextRunTime, processCompletedTasks } from '../daemon-tasks.js';
+import {
+  updateNextRunTime,
+  processCompletedTasks,
+  scheduleMissedNoticeRetry,
+} from '../daemon-tasks.js';
 import { now } from '../database.js';
 
 async function withDb(fn) {
@@ -197,6 +201,27 @@ describe('processCompletedTasks', () => {
 });
 
 describe('scheduler daemon failure backoff', () => {
+  it('durably advances only queue-full notice attempts with exponential backoff', async () => {
+    await withDb((database) => {
+      const task = insertTask(database, { id: 'queue-full-backoff' });
+      const first = scheduleMissedNoticeRetry(database, task, { code: 'queue_full' }, {
+        now: () => 1000,
+      });
+      assert.deepEqual(first, {
+        recorded: true, attempt: 2, retry_at: 1005, delay_seconds: 5,
+      });
+      assert.deepEqual(database.prepare(`
+        SELECT missed_notice_attempt, missed_notice_retry_at, status
+        FROM tasks WHERE id = ?
+      `).get(task.id), {
+        missed_notice_attempt: 2,
+        missed_notice_retry_at: 1005,
+        status: 'pending',
+      });
+      assert.equal(scheduleMissedNoticeRetry(database, task, { code: 'not_retryable' }), null);
+    });
+  });
+
   it('keeps a missed occurrence pending but sleeps after persistent Core notice failure', async () => {
     const originalZylosDir = process.env.ZYLOS_DIR;
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scheduler-loop-'));

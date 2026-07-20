@@ -11,6 +11,7 @@ const normalRuntimeFiles = [
   'skills/scheduler/scripts/daemon-tasks.js',
   'skills/web-console/scripts/server.js',
   'skills/web-console/scripts/core-outbox-owner.js',
+  'skills/web-console/scripts/db.js',
   'skills/web-console/scripts/send.js',
   'skills/web-console/public/app.js',
   'skills/shell/SKILL.md',
@@ -20,6 +21,8 @@ const normalRuntimeFiles = [
   'skills/restart-claude/SKILL.md',
   'skills/zylos-memory/SKILL.md',
   'cli/commands/init.js',
+  'cli/commands/add.js',
+  'cli/lib/components.js',
   'runtime/observability/executor-snapshot-client.js',
   'runtime/observability/health-projection.js',
   'runtime/scheduler/scheduler-observability.js',
@@ -59,6 +62,21 @@ describe('normal product paths have no retired runtime authority', () => {
       expect(source).not.toMatch(/reply via|c4-send\.js|latest message|parent chat fallback/i);
       expect(source).toMatch(/durable (outbox|delivery)/i);
     }
+  });
+
+  test('component installation has no terminal-observation or ownerless C4 fallback', () => {
+    const source = fs.readFileSync(path.resolve('cli/lib/components.js'), 'utf8');
+    expect(source).not.toMatch(/outputTask|ZYLOS_TASK|COMPONENT_TASK|zylos-cli|reply_channel|Claude session|c4-receive/i);
+    expect(source).toMatch(/operator setup/i);
+  });
+
+  test('Web Console routes consume only the monotonic channel mailbox projection', () => {
+    const source = fs.readFileSync(path.resolve('skills/web-console/scripts/server.js'), 'utf8');
+    const appSource = fs.readFileSync(path.resolve('skills/web-console/public/app.js'), 'utf8');
+    expect(source).toMatch(/DeliveryMailbox|deliveryMailbox\.list|syncCoreInbound/);
+    expect(source).not.toMatch(/getCoreMessages|event\.rowid|outbox_rowid|broadcast\('messages'/);
+    expect(appSource).toMatch(/api\/poll\?since_id=/);
+    expect(appSource).not.toMatch(/conversations\/recent\?limit=100/);
   });
 
   test('the exact Node suite cannot execute retired provider-interface tests', () => {

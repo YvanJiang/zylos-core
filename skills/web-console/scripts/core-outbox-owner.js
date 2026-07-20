@@ -5,17 +5,11 @@ import { createOutboxService } from '../../../runtime/delivery/outbox-service.js
 
 export function createWebConsoleOutboxOwner({
   database,
-  clients,
-  broadcast,
-  onDeliveredMessage = () => {},
+  deliverMessage,
   serviceInstanceId = `web-console-${crypto.randomUUID()}`,
   now = () => new Date().toISOString(),
 }) {
-  if (!(clients instanceof Set)) throw new TypeError('clients must be a Set');
-  if (typeof broadcast !== 'function') throw new TypeError('broadcast must be a function');
-  if (typeof onDeliveredMessage !== 'function') {
-    throw new TypeError('onDeliveredMessage must be a function');
-  }
+  if (typeof deliverMessage !== 'function') throw new TypeError('deliverMessage must be a function');
 
   const owner = createOutboxService({
     database,
@@ -26,33 +20,25 @@ export function createWebConsoleOutboxOwner({
     renderer: createChannelNeutralTextRenderer({
       now,
       async sendText(delivery) {
-        const outboxRow = database.prepare(`
-          SELECT rowid * 2 + 1 AS id
-          FROM runtime_outbox
-          WHERE delivery_id = ?
-        `
-        ).get(delivery.delivery_id);
-        if (!outboxRow) throw new Error('Web Console outbox row is unavailable.');
         const message = Object.freeze({
-          id: outboxRow.id,
+          delivery_id: delivery.delivery_id,
           direction: 'out',
           channel: 'web-console',
           endpoint_id: delivery.target.chat_id,
           content: delivery.text,
           timestamp: now(),
         });
-        const delivered = broadcast('messages', [message]);
-        if (!Number.isSafeInteger(delivered) || delivered < 1) {
-          throw new Error('No Web Console client accepted the delivery.');
+        const effect = await deliverMessage(message, delivery);
+        if (!effect || typeof effect.platform_message_id !== 'string'
+          || effect.platform_message_id.length === 0) {
+          throw new Error('Web Console mailbox did not confirm its durable delivery effect.');
         }
-        onDeliveredMessage(message);
-        return { platform_message_id: `web-console:${delivery.delivery_id}` };
+        return { platform_message_id: effect.platform_message_id };
       },
     }),
   });
 
   async function drain({ limit = 20 } = {}) {
-    if (clients.size === 0) return Object.freeze({ status: 'no_consumers', delivered: 0 });
     let delivered = 0;
     for (let count = 0; count < limit; count += 1) {
       const result = await owner.dispatchNext();
@@ -63,4 +49,28 @@ export function createWebConsoleOutboxOwner({
   }
 
   return Object.freeze({ drain });
+}
+
+export function createDrainBarrier({ drain }) {
+  if (typeof drain !== 'function') throw new TypeError('drain must be a function');
+  let accepting = true;
+  const active = new Set();
+
+  function run(options) {
+    if (!accepting) return Promise.resolve(Object.freeze({ status: 'stopped', delivered: 0 }));
+    const operation = Promise.resolve().then(() => drain(options));
+    active.add(operation);
+    operation.then(
+      () => active.delete(operation),
+      () => active.delete(operation),
+    );
+    return operation;
+  }
+
+  async function stop() {
+    accepting = false;
+    await Promise.allSettled([...active]);
+  }
+
+  return Object.freeze({ run, stop });
 }

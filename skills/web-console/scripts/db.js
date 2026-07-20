@@ -33,8 +33,93 @@ function openDb(dbPath = DB_PATH) {
       created_at INTEGER NOT NULL,
       consumed INTEGER NOT NULL DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS delivery_mailbox (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_key TEXT NOT NULL UNIQUE,
+      delivery_id TEXT UNIQUE,
+      direction TEXT NOT NULL CHECK(direction IN ('in', 'out')),
+      channel TEXT NOT NULL,
+      endpoint_id TEXT NOT NULL,
+      content TEXT NOT NULL,
+      timestamp TEXT NOT NULL
+    );
   `);
   return db;
+}
+
+export class DeliveryMailbox {
+  constructor(db) {
+    this.db = db;
+    this._insert = db.prepare(`
+      INSERT OR IGNORE INTO delivery_mailbox (
+        source_key, delivery_id, direction, channel, endpoint_id, content, timestamp
+      ) VALUES (?, ?, ?, 'web-console', ?, ?, ?)
+    `);
+    this._bySource = db.prepare('SELECT * FROM delivery_mailbox WHERE source_key = ?');
+  }
+
+  _store({ sourceKey, deliveryId = null, direction, endpointId, content, timestamp }) {
+    if (typeof sourceKey !== 'string' || sourceKey.length === 0) {
+      throw new TypeError('sourceKey must be a non-empty string');
+    }
+    if (!['in', 'out'].includes(direction)) throw new TypeError('direction must be in or out');
+    if (typeof endpointId !== 'string' || endpointId.length === 0) {
+      throw new TypeError('endpointId must be a non-empty string');
+    }
+    if (typeof content !== 'string') throw new TypeError('content must be a string');
+    if (typeof timestamp !== 'string' || Number.isNaN(Date.parse(timestamp))) {
+      throw new TypeError('timestamp must be an ISO timestamp');
+    }
+    this._insert.run(sourceKey, deliveryId, direction, endpointId, content, timestamp);
+    const row = this._bySource.get(sourceKey);
+    if (!row || row.delivery_id !== deliveryId || row.direction !== direction
+      || row.endpoint_id !== endpointId || row.content !== content) {
+      throw new Error('A Web Console mailbox source conflicts with its durable projection.');
+    }
+    return Object.freeze({
+      id: row.id,
+      direction: row.direction,
+      channel: row.channel,
+      endpoint_id: row.endpoint_id,
+      content: row.content,
+      timestamp: row.timestamp,
+      platform_message_id: `web-console-mailbox:${row.id}`,
+    });
+  }
+
+  projectInbound({ inboundEventId, endpointId, content, timestamp }) {
+    return this._store({
+      sourceKey: `inbound:${inboundEventId}`,
+      direction: 'in', endpointId, content, timestamp,
+    });
+  }
+
+  deliver({ deliveryId, endpointId, content, timestamp }) {
+    if (typeof deliveryId !== 'string' || deliveryId.length === 0) {
+      throw new TypeError('deliveryId must be a non-empty string');
+    }
+    return this._store({
+      sourceKey: `delivery:${deliveryId}`,
+      deliveryId, direction: 'out', endpointId, content, timestamp,
+    });
+  }
+
+  list({ sinceId = 0, limit = 100, latest = false } = {}) {
+    if (!Number.isSafeInteger(sinceId) || sinceId < 0) {
+      throw new TypeError('sinceId must be a non-negative safe integer');
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new TypeError('limit must be an integer from 1 to 1000');
+    }
+    const rows = this.db.prepare(`
+      SELECT id, direction, channel, endpoint_id, content, timestamp
+      FROM delivery_mailbox
+      WHERE id > ?
+      ORDER BY id ${latest ? 'DESC' : 'ASC'}
+      LIMIT ?
+    `).all(sinceId, limit);
+    return latest ? rows.reverse() : rows;
+  }
 }
 
 export class SessionStore {

@@ -13,6 +13,7 @@ import {
   processCompletedTasks as _processCompletedTasks,
   reconcileRunningTasks,
   recordScheduledAdmission,
+  scheduleMissedNoticeRetry,
   updateNextRunTime as _updateNextRunTime,
 } from './daemon-tasks.js';
 import { homedir } from 'node:os';
@@ -43,9 +44,10 @@ function getNextPendingTask() {
     SELECT * FROM tasks
     WHERE status = 'pending'
     AND next_run_at <= ?
+    AND (missed_notice_retry_at IS NULL OR missed_notice_retry_at <= ?)
     ORDER BY priority ASC, next_run_at ASC
     LIMIT 1
-  `).get(currentTime);
+  `).get(currentTime, currentTime);
 }
 
 /**
@@ -92,6 +94,7 @@ function persistMissedTaskNotice(task) {
     const admission = dispatchMissedScheduledTaskNotice(task, notice);
     if (admission.status === 'rejected') {
       console.error(`Missed-task notice for ${task.id} was rejected by the durable queue: ${admission.error.user_message}`);
+      scheduleMissedNoticeRetry(db, task, admission.error);
       return false;
     }
     return true;
@@ -116,7 +119,8 @@ function handleMissedTasks() {
     WHERE status = 'pending'
     AND type IN ('recurring', 'interval')
     AND next_run_at < ?
-  `).all(recentMissedThreshold);
+    AND (missed_notice_retry_at IS NULL OR missed_notice_retry_at <= ?)
+  `).all(recentMissedThreshold, currentTime);
 
   for (const task of missedTasks) {
     const decision = decideScheduledOccurrence({

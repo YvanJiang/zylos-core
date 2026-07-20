@@ -53,7 +53,7 @@ export function createDeliveryDrain({ dispatchNext, onError = () => {} }) {
       try {
         for (let count = 0; count < 20; count += 1) {
           const result = await dispatchNext();
-          if (result.status === 'idle') break;
+          if (stopped || result.status === 'idle') break;
         }
       } catch (error) {
         onError(error);
@@ -174,9 +174,6 @@ export async function shellCommand() {
     }
     return shutdownPromise;
   }
-  process.once('SIGINT', () => { void shutdown(); });
-  process.once('SIGTERM', () => { void shutdown(); });
-
   // Print banner
   console.log(bold('Zylos Shell'));
   console.log(dim('Interactive mode — type your message and press Enter.'));
@@ -190,6 +187,8 @@ export async function shellCommand() {
     prompt: cyan('you> '),
     terminal: process.stdin.isTTY !== false,
   });
+  process.once('SIGINT', () => { void shutdown(); });
+  process.once('SIGTERM', () => { void shutdown(); });
 
   rl.prompt();
 

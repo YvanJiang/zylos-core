@@ -2,7 +2,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, test } from '@jest/globals';
-import { openDb, SessionStore, PersistentUploadRegistry } from '../skills/web-console/scripts/db.js';
+import {
+  DeliveryMailbox,
+  openDb,
+  SessionStore,
+  PersistentUploadRegistry,
+} from '../skills/web-console/scripts/db.js';
+import { createDrainBarrier } from '../skills/web-console/scripts/core-outbox-owner.js';
 
 let tempDir;
 let db;
@@ -124,5 +130,88 @@ describe('PersistentUploadRegistry', () => {
 
     const reg2 = new PersistentUploadRegistry(db, { ttlMs: 30000 });
     expect(reg2.getMany([entry.id], 's1')).toHaveLength(1);
+  });
+});
+
+describe('DeliveryMailbox', () => {
+  test('assigns durable monotonic visibility cursors in actual mailbox order', () => {
+    const mailbox = new DeliveryMailbox(db);
+    const firstInbound = mailbox.projectInbound({
+      inboundEventId: 'inbound-1', endpointId: 'console', content: 'first',
+      timestamp: '2026-07-21T00:00:00.000Z',
+    });
+    const secondInbound = mailbox.projectInbound({
+      inboundEventId: 'inbound-2', endpointId: 'console', content: 'second',
+      timestamp: '2026-07-21T00:00:01.000Z',
+    });
+    const delayedFirstReply = mailbox.deliver({
+      deliveryId: 'delivery-1', endpointId: 'console', content: 'first reply',
+      timestamp: '2026-07-21T00:00:02.000Z',
+    });
+
+    expect([firstInbound.id, secondInbound.id, delayedFirstReply.id]).toEqual([1, 2, 3]);
+    expect(mailbox.list({ sinceId: secondInbound.id })).toEqual([
+      expect.objectContaining({ id: delayedFirstReply.id, content: 'first reply' }),
+    ]);
+  });
+
+  test('makes renderer retries idempotent and rejects conflicting replay content', () => {
+    const mailbox = new DeliveryMailbox(db);
+    const delivery = {
+      deliveryId: 'delivery-retry', endpointId: 'console', content: 'rendered text',
+      timestamp: '2026-07-21T00:00:00.000Z',
+    };
+    const first = mailbox.deliver(delivery);
+    const replay = mailbox.deliver(delivery);
+    expect(replay).toEqual(first);
+    expect(mailbox.list()).toHaveLength(1);
+    expect(() => mailbox.deliver({ ...delivery, content: 'conflicting text' }))
+      .toThrow(/conflicts with its durable projection/);
+  });
+
+  test('paginates more than 100 unseen rows without a later reply skipping backlog', () => {
+    const mailbox = new DeliveryMailbox(db);
+    for (let index = 1; index <= 150; index += 1) {
+      mailbox.projectInbound({
+        inboundEventId: `backlog-${index}`, endpointId: 'console', content: `message ${index}`,
+        timestamp: new Date(Date.UTC(2026, 6, 21, 0, 0, index)).toISOString(),
+      });
+    }
+    const reply = mailbox.deliver({
+      deliveryId: 'backlog-reply', endpointId: 'console', content: 'rendered reply',
+      timestamp: '2026-07-21T00:10:00.000Z',
+    });
+    const firstPage = mailbox.list({ sinceId: 0, limit: 100 });
+    const secondPage = mailbox.list({ sinceId: firstPage.at(-1).id, limit: 100 });
+
+    expect(firstPage).toHaveLength(100);
+    expect(secondPage).toHaveLength(51);
+    expect(secondPage.at(-1)).toMatchObject({ id: reply.id, content: 'rendered reply' });
+    expect(new Set([...firstPage, ...secondPage].map(({ id }) => id)).size).toBe(151);
+  });
+});
+
+describe('Web Console drain shutdown barrier', () => {
+  test('stop awaits the active fenced result and refuses every later claim', async () => {
+    let release;
+    let calls = 0;
+    const blocked = new Promise((resolve) => { release = resolve; });
+    const barrier = createDrainBarrier({
+      async drain() {
+        calls += 1;
+        await blocked;
+        return { status: 'delivered', delivered: 1 };
+      },
+    });
+    const active = barrier.run();
+    let stopped = false;
+    const stopping = barrier.stop().then(() => { stopped = true; });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+    expect(calls).toBe(1);
+    release();
+    await Promise.all([active, stopping]);
+    expect(await barrier.run()).toEqual({ status: 'stopped', delivered: 0 });
+    expect(calls).toBe(1);
   });
 });

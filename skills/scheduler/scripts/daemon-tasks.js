@@ -12,6 +12,38 @@ function occurrenceId(task) {
   return `${task.id}:${task.next_run_at}`;
 }
 
+export function scheduleMissedNoticeRetry(db, task, error, {
+  now: clock = now,
+} = {}) {
+  if (error?.code !== 'queue_full') return null;
+  const attempt = task.missed_notice_attempt ?? 1;
+  if (!Number.isSafeInteger(attempt) || attempt < 1) {
+    throw new TypeError('task.missed_notice_attempt must be a positive safe integer');
+  }
+  const delaySeconds = Math.min(300, 5 * (2 ** Math.min(attempt - 1, 6)));
+  const recordedAt = clock();
+  const retryAt = recordedAt + delaySeconds;
+  const update = db.prepare(`
+    UPDATE tasks
+    SET missed_notice_attempt = ?, missed_notice_retry_at = ?,
+        last_error = ?, updated_at = ?
+    WHERE id = ? AND status = 'pending' AND missed_notice_attempt = ?
+  `).run(
+    attempt + 1,
+    retryAt,
+    `Core queue full; missed notice retry ${attempt + 1} after ${delaySeconds}s.`,
+    recordedAt,
+    task.id,
+    attempt,
+  );
+  return Object.freeze({
+    recorded: update.changes === 1,
+    attempt: attempt + 1,
+    retry_at: retryAt,
+    delay_seconds: delaySeconds,
+  });
+}
+
 /**
  * Persist the durable Core admission in the local scheduling projection.
  * Core admission happens first, so a crash before this transaction is safe:
@@ -172,7 +204,8 @@ export function updateNextRunTime(db, task) {
     UPDATE tasks
     SET next_run_at = ?, status = 'pending', last_run_at = ?, updated_at = ?,
         current_occurrence_id = NULL, current_turn_id = NULL,
-        last_core_state = NULL, core_wait_reason = NULL
+        last_core_state = NULL, core_wait_reason = NULL,
+        missed_notice_attempt = 1, missed_notice_retry_at = NULL
     WHERE id = ?
   `).run(nextRun, now(), now(), task.id);
 

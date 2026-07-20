@@ -28,10 +28,15 @@ import {
   sniffImage,
   uploadKind
 } from './attachment-utils.js';
-import { openDb, SessionStore, PersistentUploadRegistry } from './db.js';
+import {
+  DeliveryMailbox,
+  openDb,
+  SessionStore,
+  PersistentUploadRegistry,
+} from './db.js';
 import { readExecutorObservability } from '../../../runtime/observability/executor-snapshot-client.js';
 import { projectRuntimeHealth } from '../../../runtime/observability/health-projection.js';
-import { createWebConsoleOutboxOwner } from './core-outbox-owner.js';
+import { createDrainBarrier, createWebConsoleOutboxOwner } from './core-outbox-owner.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -80,6 +85,7 @@ const AUTH_ENABLED = AUTH_PASSWORD.length > 0;
 const wcDb = openDb();
 const sessionStore = new SessionStore(wcDb);
 const uploadRegistry = new PersistentUploadRegistry(wcDb);
+const deliveryMailbox = new DeliveryMailbox(wcDb);
 
 fs.mkdirSync(MEDIA_DIR, { recursive: true });
 
@@ -190,62 +196,43 @@ async function readStatus() {
 }
 
 /**
- * Read delivered Web Console text from the authoritative Core outbox.
+ * Idempotently project canonical Core inbound facts into the channel-owned
+ * durable mailbox. The mailbox assigns visibility cursors only when a message
+ * becomes observable to this channel.
  */
-function getCoreMessages({
+function syncCoreInbound() {
+  const rows = db.prepare(`
+    SELECT inbound.inbound_event_id,
+      conversation.chat_id AS endpoint_id,
+      json_extract(inbound.envelope_json, '$.content.text') AS content,
+      inbound.committed_at AS timestamp
+    FROM runtime_inbound_events AS inbound
+    JOIN runtime_turns AS turn ON turn.inbound_event_id = inbound.inbound_event_id
+    JOIN runtime_conversations AS conversation
+      ON conversation.conversation_id = turn.conversation_id
+    WHERE json_extract(inbound.envelope_json, '$.channel') = 'web-console'
+      AND conversation.chat_id = 'console'
+    ORDER BY inbound.committed_at ASC, inbound.inbound_event_id ASC
+  `).all();
+  for (const row of rows) {
+    deliveryMailbox.projectInbound({
+      inboundEventId: row.inbound_event_id,
+      endpointId: row.endpoint_id,
+      content: row.content ?? '',
+      timestamp: row.timestamp,
+    });
+  }
+}
+
+function getMailboxMessages({
   channel = 'web-console', sinceId = 0, limit = 100, latest = false,
 } = {}) {
   if (channel !== 'web-console') return [];
-  const ordering = latest ? 'DESC' : 'ASC';
-  const rows = db.prepare(`
-    WITH channel_outbox AS (
-      SELECT rowid AS outbox_rowid, turn_id, status, command_json,
-        result_json, updated_at, created_at
-      FROM runtime_outbox
-      WHERE json_extract(command_json, '$.target.channel') = 'web-console'
-        AND json_extract(command_json, '$.target.chat_id') = 'console'
-    ), turn_anchor AS (
-      SELECT turn_id, MIN(outbox_rowid) AS outbox_rowid
-      FROM channel_outbox
-      WHERE turn_id IS NOT NULL
-      GROUP BY turn_id
-    ), displayed AS (
-      SELECT anchor.outbox_rowid * 2 AS id, 'in' AS direction,
-        json_extract(inbound.envelope_json, '$.channel') AS channel,
-        conversation.chat_id AS endpoint_id,
-        json_extract(inbound.envelope_json, '$.content.text') AS content,
-        inbound.committed_at AS timestamp
-      FROM runtime_inbound_events AS inbound
-      JOIN runtime_turns AS turn ON turn.inbound_event_id = inbound.inbound_event_id
-      JOIN runtime_conversations AS conversation
-        ON conversation.conversation_id = turn.conversation_id
-      JOIN turn_anchor AS anchor ON anchor.turn_id = turn.turn_id
-      WHERE json_extract(inbound.envelope_json, '$.channel') = 'web-console'
-        AND conversation.chat_id = 'console'
-      UNION ALL
-      SELECT outbox.outbox_rowid * 2 + 1 AS id, 'out' AS direction,
-        'web-console' AS channel,
-        json_extract(outbox.command_json, '$.target.chat_id') AS endpoint_id,
-        json_extract(outbox.command_json, '$.render_model.text') AS content,
-        COALESCE(
-          json_extract(outbox.result_json, '$.delivered_at'),
-          outbox.updated_at,
-          outbox.created_at
-        ) AS timestamp
-      FROM channel_outbox AS outbox
-      WHERE outbox.status = 'delivered'
-    )
-    SELECT id, direction, channel, endpoint_id, content, timestamp
-    FROM displayed
-    WHERE id > ?
-    ORDER BY id ${ordering}
-    LIMIT ?
-  `).all(sinceId, limit);
-  return latest ? rows.reverse() : rows;
+  return deliveryMailbox.list({ sinceId, limit, latest });
 }
 
 function getNewMessages(sinceId) {
-  return getCoreMessages({ sinceId, limit: 100 });
+  return getMailboxMessages({ sinceId, limit: 100 });
 }
 
 function parseProjectionCursor(value) {
@@ -270,7 +257,10 @@ function broadcast(type, data) {
       try {
         client.send(message);
         if (type === 'messages' && Array.isArray(data) && data.length > 0) {
-          clientCursors.set(client, Math.max(...data.map(({ id }) => id)));
+          clientCursors.set(client, Math.max(
+            clientCursors.get(client) ?? 0,
+            ...data.map(({ id }) => id),
+          ));
         }
         delivered += 1;
       } catch {
@@ -283,26 +273,20 @@ function broadcast(type, data) {
 
 const deliveryOwner = createWebConsoleOutboxOwner({
   database: db,
-  clients,
   serviceInstanceId: `web-console-${SERVICE_BIRTH_ID}`,
-  broadcast,
+  deliverMessage(message, delivery) {
+    return deliveryMailbox.deliver({
+      deliveryId: delivery.delivery_id,
+      endpointId: message.endpoint_id,
+      content: message.content,
+      timestamp: message.timestamp,
+    });
+  },
 });
+const deliveryBarrier = createDrainBarrier({ drain: (options) => deliveryOwner.drain(options) });
 
 async function drainWebOutbox() {
-  await deliveryOwner.drain();
-}
-
-async function drainWebOutboxForHttpPoll() {
-  const pollConsumer = Object.freeze({ transport: 'http-poll' });
-  const pollOwner = createWebConsoleOutboxOwner({
-    database: db,
-    clients: new Set([pollConsumer]),
-    serviceInstanceId: `web-console-http-${SERVICE_BIRTH_ID}`,
-    broadcast(type, data) {
-      return type === 'messages' && Array.isArray(data) ? 1 : 0;
-    },
-  });
-  return pollOwner.drain();
+  return deliveryBarrier.run();
 }
 
 function normalizeAttachmentIds(value) {
@@ -439,31 +423,30 @@ async function checkUpdates() {
     broadcast('status', currentStatus);
   }
 
-  // Each subscribed client advances only its own durable projection cursor.
-  // Project inbound before rendering its outbox so an owner cannot skip the
-  // user's immediately preceding message by advancing to an outbound id.
-  for (const client of clients) {
-    const newMessages = getNewMessages(clientCursors.get(client) ?? 0);
-    if (newMessages.length > 0 && client.readyState === 1) {
-      try {
-        client.send(JSON.stringify({ type: 'messages', data: newMessages }));
-        clientCursors.set(client, Math.max(...newMessages.map(({ id }) => id)));
-      } catch {
-        clients.delete(client);
-      }
+  function flushClient(client) {
+    const cursor = clientCursors.get(client) ?? 0;
+    const newMessages = getNewMessages(cursor);
+    if (newMessages.length === 0 || client.readyState !== 1) return;
+    try {
+      client.send(JSON.stringify({ type: 'messages', data: newMessages }));
+      clientCursors.set(client, Math.max(cursor, ...newMessages.map(({ id }) => id)));
+    } catch {
+      clients.delete(client);
     }
   }
 
+  syncCoreInbound();
+  for (const client of clients) flushClient(client);
   await drainWebOutbox();
+  for (const client of clients) flushClient(client);
 }
 
 // Poll only while there are subscribed consumers. This bounds snapshot work
 // and avoids advancing durable observability snapshots for an unused console.
-let updateInFlight = false;
-setInterval(() => {
-  if (clients.size === 0 || updateInFlight) return;
-  updateInFlight = true;
-  checkUpdates().catch(() => {}).finally(() => { updateInFlight = false; });
+let updateInFlight = null;
+const updateTimer = setInterval(() => {
+  if (clients.size === 0 || updateInFlight !== null) return;
+  updateInFlight = checkUpdates().catch(() => {}).finally(() => { updateInFlight = null; });
 }, 2000);
 
 /**
@@ -554,7 +537,8 @@ app.get('/api/conversations', (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
     const channel = req.query.channel || 'web-console';
-    res.json(getCoreMessages({ channel, limit, latest: true }));
+    syncCoreInbound();
+    res.json(getMailboxMessages({ channel, limit, latest: true }));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -566,8 +550,8 @@ app.get('/api/conversations', (req, res) => {
 app.get('/api/conversations/recent', (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 100;
-
-    res.json(getCoreMessages({ limit, latest: true }));
+    syncCoreInbound();
+    res.json(getMailboxMessages({ limit, latest: true }));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -679,7 +663,8 @@ app.get('/api/inbound-media/:filename', (req, res) => {
 app.get('/api/poll', async (req, res) => {
   try {
     const sinceId = parseProjectionCursor(req.query.since_id);
-    await drainWebOutboxForHttpPoll();
+    syncCoreInbound();
+    await drainWebOutbox();
     res.json(getNewMessages(sinceId));
   } catch (err) {
     res.status(err.status || 500).json({ error: err.message });
@@ -751,14 +736,28 @@ server.listen(PORT, BIND_HOST, () => {
   console.log(`Database: ${DB_PATH}`);
 });
 
-// Graceful shutdown
+// Graceful shutdown: stop new claims, await every fenced dispatch result, then
+// close channel/Core databases. This prevents a normal stop from stranding a
+// command after its durable mailbox side effect but before Core recordResult.
+let shutdownPromise = null;
 function shutdown() {
+  if (shutdownPromise !== null) return shutdownPromise;
   console.log('Shutting down...');
-  wss.close();
-  if (db) db.close();
-  if (wcDb) wcDb.close();
-  process.exit(0);
+  clearInterval(updateTimer);
+  const serverClosed = server.listening
+    ? new Promise((resolve) => server.close(() => resolve()))
+    : Promise.resolve();
+  for (const client of wss.clients) client.close(1001, 'Server shutting down');
+  shutdownPromise = (async () => {
+    await deliveryBarrier.stop();
+    if (updateInFlight !== null) await updateInFlight;
+    await serverClosed;
+    wss.close();
+    if (db) db.close();
+    if (wcDb) wcDb.close();
+  })();
+  return shutdownPromise;
 }
 
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+process.once('SIGINT', () => { void shutdown(); });
+process.once('SIGTERM', () => { void shutdown(); });

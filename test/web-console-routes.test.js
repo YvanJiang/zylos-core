@@ -9,7 +9,6 @@ import WebSocket from '../skills/web-console/node_modules/ws/wrapper.mjs';
 import { createIdempotencyKey } from '../contracts/public/index.js';
 import { acceptCompatibilityInbound } from '../runtime/compatibility/c4-channel-fallback.js';
 import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
-import { createWebConsoleOutboxOwner } from '../skills/web-console/scripts/core-outbox-owner.js';
 
 const SERVER_PATH = path.resolve('skills/web-console/scripts/server.js');
 const SQLITE_MODULE = path.resolve('skills/web-console/node_modules/better-sqlite3/lib/index.js');
@@ -128,9 +127,25 @@ async function startServer({ maxUploadMb = 20 } = {}) {
   throw new Error(`server did not start: ${output}`);
 }
 
-function stopServer(active) {
+async function stopServer(active) {
   if (!active) return;
-  active.child.kill('SIGTERM');
+  if (active.child.exitCode === null) {
+    let forced = false;
+    active.child.kill('SIGTERM');
+    await new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        if (active.child.exitCode === null) {
+          forced = true;
+          active.child.kill('SIGKILL');
+        }
+      }, 3000);
+      active.child.once('close', () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
+    if (forced) throw new Error('Web Console did not complete its drain shutdown barrier');
+  }
   fs.rmSync(active.root, { recursive: true, force: true });
 }
 
@@ -161,8 +176,8 @@ beforeEach(() => {
   ctx = null;
 });
 
-afterEach(() => {
-  stopServer(ctx);
+afterEach(async () => {
+  await stopServer(ctx);
 });
 
 describe('web-console attachment routes', () => {
@@ -343,7 +358,7 @@ describe('web-console attachment routes', () => {
     const db = new Database(ctx.dbPath);
     const accepted = acceptCompatibilityInbound(db, {
       inbound_event_id: 'web-history-event', trace_id: 'web-history-trace',
-      occurred_at: '2026-07-21T01:00:00.000Z', received_at: '2026-07-21T01:00:00.000Z',
+      occurred_at: '2020-01-01T00:00:00.000Z', received_at: '2020-01-01T00:00:00.000Z',
       region: 'global', tenant_id: 'web-history-tenant', channel: 'web-console',
       bot_id: 'zylos', chat_type: 'dm', chat_id: 'console',
       native_thread_or_topic_id: null, message_id: 'web-history-message',
@@ -351,25 +366,22 @@ describe('web-console attachment routes', () => {
       content: { kind: 'text', text: 'canonical inbound text', attachments: [] },
       reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
       source_ref: 'web-history-source',
-    }, { now: () => '2026-07-21T01:00:00.000Z' });
-    const owner = createWebConsoleOutboxOwner({
-      database: db,
-      clients: new Set([{}]),
-      serviceInstanceId: 'web-history-owner',
-      now: () => '2026-07-21T01:00:01.000Z',
-      broadcast: () => 1,
-    });
-    expect(await owner.drain()).toEqual({ status: 'delivered', delivered: 1 });
-    expect(db.prepare('SELECT status FROM runtime_outbox WHERE turn_id = ?')
-      .get(accepted.turn_id).status).toBe('delivered');
+    }, { now: () => '2020-01-01T00:00:00.000Z' });
     db.close();
+
+    const poll = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    expect(poll.status).toBe(200);
+    const deliveredDb = new Database(ctx.dbPath);
+    expect(deliveredDb.prepare('SELECT status FROM runtime_outbox WHERE turn_id = ?')
+      .get(accepted.turn_id).status).toBe('delivered');
+    deliveredDb.close();
 
     const response = await fetch(`${ctx.baseUrl}/api/conversations/recent?limit=10`);
     expect(response.status).toBe(200);
     const history = await response.json();
     expect(history.map(({ direction, content }) => ({ direction, content }))).toEqual([
       { direction: 'in', content: 'canonical inbound text' },
-      { direction: 'out', content: 'Message received.' },
+      { direction: 'out', content: expect.stringContaining('Message received.') },
     ]);
   });
 
@@ -411,8 +423,41 @@ describe('web-console attachment routes', () => {
     reopened.close();
     expect(messages.map(({ direction, content }) => ({ direction, content }))).toEqual([
       { direction: 'in', content: 'poll-only inbound' },
-      { direction: 'out', content: 'Message received.' },
+      { direction: 'out', content: expect.stringContaining('Message received.') },
     ]);
+  });
+
+  test('HTTP mailbox pagination exposes more than 100 mixed rows without a cursor gap', async () => {
+    ctx = await startServer();
+    const mailboxDb = new Database(path.join(ctx.root, 'web-console', 'web-console.db'));
+    const insert = mailboxDb.prepare(`
+      INSERT INTO delivery_mailbox (
+        source_key, delivery_id, direction, channel, endpoint_id, content, timestamp
+      ) VALUES (?, ?, ?, 'web-console', 'console', ?, ?)
+    `);
+    mailboxDb.transaction(() => {
+      for (let index = 1; index <= 151; index += 1) {
+        const outbound = index % 3 === 0;
+        insert.run(
+          `route-backlog:${index}`,
+          outbound ? `route-delivery:${index}` : null,
+          outbound ? 'out' : 'in',
+          `route message ${index}`,
+          new Date(Date.UTC(2026, 6, 21, 0, 0, index)).toISOString(),
+        );
+      }
+    })();
+    mailboxDb.close();
+
+    const first = await (await fetch(`${ctx.baseUrl}/api/poll?since_id=0`)).json();
+    const second = await (await fetch(
+      `${ctx.baseUrl}/api/poll?since_id=${first.at(-1).id}`,
+    )).json();
+    const all = [...first, ...second];
+    expect(first).toHaveLength(100);
+    expect(second).toHaveLength(51);
+    expect(all.map(({ id }) => id)).toEqual(Array.from({ length: 151 }, (_, index) => index + 1));
+    expect(new Set(all.map(({ direction }) => direction))).toEqual(new Set(['in', 'out']));
   });
 
   test('HTTP polling renders a durable security notice with no turn event', async () => {
@@ -447,9 +492,10 @@ describe('web-console attachment routes', () => {
 
     const response = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
     expect(response.status).toBe(200);
-    expect((await response.json()).map(({ direction, content }) => ({ direction, content }))).toEqual([
-      { direction: 'out', content: command.render_model.text },
-    ]);
+    const delivered = await response.json();
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toMatchObject({ direction: 'out' });
+    expect(delivered[0].content).toContain(command.render_model.text);
 
     const reopened = new Database(ctx.dbPath);
     expect(reopened.prepare('SELECT status FROM runtime_outbox WHERE outbox_id = ?')
