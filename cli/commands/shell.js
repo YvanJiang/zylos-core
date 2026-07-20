@@ -79,6 +79,51 @@ export async function shellCommand() {
   ));
   const { socketPath, serviceInstanceId } = createShellRuntimeIdentity();
 
+  // Install stop fencing before any socket, database owner, or polling timer
+  // can exist. Node delivers signals between turns, so all resources registered
+  // during this synchronous startup are visible to the same cleanup barrier.
+  let server = null;
+  let database = null;
+  let deliveryDrain = null;
+  let deliveryTimer = null;
+  let rl = null;
+  let cleanupPromise = null;
+  function cleanup() {
+    if (cleanupPromise !== null) return cleanupPromise;
+    if (deliveryTimer !== null) clearInterval(deliveryTimer);
+    cleanupPromise = (async () => {
+      if (deliveryDrain !== null) await deliveryDrain.stop();
+      if (server !== null) {
+        await new Promise((resolve) => {
+          const close = () => {
+            server.off('error', close);
+            if (server.listening) server.close(() => resolve());
+            else resolve();
+          };
+          if (server.listening) close();
+          else {
+            server.once('listening', close);
+            server.once('error', close);
+          }
+        });
+      }
+      if (database !== null) database.close();
+      try { fs.unlinkSync(socketPath); } catch {}
+    })();
+    return cleanupPromise;
+  }
+
+  let shutdownPromise = null;
+  function shutdown() {
+    if (shutdownPromise === null) {
+      shutdownPromise = cleanup();
+      if (rl !== null && !rl.closed) rl.close();
+    }
+    return shutdownPromise;
+  }
+  process.once('SIGINT', () => { void shutdown(); });
+  process.once('SIGTERM', () => { void shutdown(); });
+
   // Clean up own socket file if it exists
   try { fs.unlinkSync(socketPath); } catch {}
 
@@ -91,7 +136,7 @@ export async function shellCommand() {
   // Start Unix socket server to receive responses
   let pendingResolve = null;
 
-  const server = net.createServer((conn) => {
+  server = net.createServer((conn) => {
     let data = '';
     conn.setEncoding('utf8');
     conn.on('error', () => {}); // ignore client disconnect errors
@@ -105,7 +150,7 @@ export async function shellCommand() {
         // or a late reply after the 120s timeout cleared pendingResolve).
         // Print immediately and restore the prompt so the user can keep typing.
         process.stdout.write(`\n${formatResponse(data)}\n\n`);
-        rl.prompt();
+        rl?.prompt();
       }
     });
   });
@@ -123,7 +168,7 @@ export async function shellCommand() {
   });
 
   fs.mkdirSync(path.dirname(CORE_DATABASE_PATH), { recursive: true });
-  const database = new Database(CORE_DATABASE_PATH);
+  database = new Database(CORE_DATABASE_PATH);
   database.pragma('journal_mode = WAL');
   database.pragma('busy_timeout = 5000');
   database.pragma('foreign_keys = ON');
@@ -142,41 +187,13 @@ export async function shellCommand() {
       },
     }),
   });
-  const deliveryDrain = createDeliveryDrain({
+  deliveryDrain = createDeliveryDrain({
     dispatchNext: () => deliveryOwner.dispatchNext(),
     onError(error) {
       console.error(`Shell delivery owner: ${error.message}`);
     },
   });
-  const deliveryTimer = setInterval(() => { void deliveryDrain.drain(); }, 250);
-
-  // Cleanup on exit (guard against double invocation)
-  let rl = null;
-  let cleanupPromise = null;
-  function cleanup() {
-    if (cleanupPromise !== null) return cleanupPromise;
-    clearInterval(deliveryTimer);
-    cleanupPromise = (async () => {
-      await deliveryDrain.stop();
-      if (server.listening) {
-        await new Promise((resolve) => server.close(() => resolve()));
-      }
-      database.close();
-      try { fs.unlinkSync(socketPath); } catch {}
-    })();
-    return cleanupPromise;
-  }
-
-  let shutdownPromise = null;
-  function shutdown() {
-    if (shutdownPromise === null) {
-      shutdownPromise = cleanup();
-      if (rl !== null && !rl.closed) rl.close();
-    }
-    return shutdownPromise;
-  }
-  process.once('SIGINT', () => { void shutdown(); });
-  process.once('SIGTERM', () => { void shutdown(); });
+  deliveryTimer = setInterval(() => { void deliveryDrain.drain(); }, 250);
   // Print banner
   console.log(bold('Zylos Shell'));
   console.log(dim('Interactive mode — type your message and press Enter.'));

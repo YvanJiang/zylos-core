@@ -212,7 +212,7 @@ function syncCoreInbound() {
       ON conversation.conversation_id = turn.conversation_id
     WHERE json_extract(inbound.envelope_json, '$.channel') = 'web-console'
       AND conversation.chat_id = 'console'
-    ORDER BY inbound.committed_at ASC, inbound.inbound_event_id ASC
+    ORDER BY conversation.conversation_id ASC, turn.queue_sequence ASC
   `).all();
   for (const row of rows) {
     deliveryMailbox.projectInbound({

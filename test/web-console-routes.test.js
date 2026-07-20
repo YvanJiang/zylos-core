@@ -385,6 +385,39 @@ describe('web-console attachment routes', () => {
     ]);
   });
 
+  test('mailbox projection preserves Core queue FIFO when accepted timestamps run backward', async () => {
+    ctx = await startServer();
+    const db = new Database(ctx.dbPath);
+    const base = {
+      region: 'global', tenant_id: 'web-fifo-tenant', channel: 'web-console',
+      bot_id: 'zylos', chat_type: 'dm', chat_id: 'console',
+      native_thread_or_topic_id: null,
+      actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+    };
+    acceptCompatibilityInbound(db, {
+      ...base,
+      inbound_event_id: 'web-fifo-first', trace_id: 'web-fifo-first-trace',
+      occurred_at: '2026-07-21T00:00:02.000Z', received_at: '2026-07-21T00:00:02.000Z',
+      message_id: 'web-fifo-first-message',
+      content: { kind: 'text', text: 'accepted first', attachments: [] },
+      source_ref: 'web-fifo-first-source',
+    }, { now: () => '2026-07-21T00:00:02.000Z' });
+    acceptCompatibilityInbound(db, {
+      ...base,
+      inbound_event_id: 'web-fifo-second', trace_id: 'web-fifo-second-trace',
+      occurred_at: '2026-07-21T00:00:01.000Z', received_at: '2026-07-21T00:00:01.000Z',
+      message_id: 'web-fifo-second-message',
+      content: { kind: 'text', text: 'accepted second', attachments: [] },
+      source_ref: 'web-fifo-second-source',
+    }, { now: () => '2026-07-21T00:00:01.000Z' });
+    db.close();
+
+    const messages = await (await fetch(`${ctx.baseUrl}/api/poll?since_id=0`)).json();
+    expect(messages.filter(({ direction }) => direction === 'in').map(({ content }) => content))
+      .toEqual(['accepted first', 'accepted second']);
+  });
+
   test('HTTP polling consumes and renders the authoritative Core outbox without WebSocket clients', async () => {
     ctx = await startServer();
     const db = new Database(ctx.dbPath);

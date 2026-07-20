@@ -29,6 +29,15 @@ describe('shell Core outbox owner lifecycle', () => {
     expect(source).not.toMatch(/process\.pid|process\.kill|zylos-shell-\(\\d\+\)/);
   });
 
+  test('installs signal fencing before creating any delivery-capable runtime resource', () => {
+    const source = fs.readFileSync(path.resolve('cli/commands/shell.js'), 'utf8');
+    const handler = source.indexOf("process.once('SIGTERM'");
+    expect(handler).toBeGreaterThan(-1);
+    for (const resource of ['net.createServer(', 'new Database(', 'setInterval(']) {
+      expect(handler).toBeLessThan(source.indexOf(resource));
+    }
+  });
+
   test('stop waits for the current fenced dispatch result and prevents another claim', async () => {
     let releaseDispatch;
     let dispatchCalls = 0;
