@@ -63,11 +63,32 @@
       "then": {
         "required": ["schedule"],
         "properties": {
-          "channel": { "const": "scheduler" },
-          "chat_type": { "const": "synthetic" },
-          "native_thread_or_topic_id": { "type": "null" },
           "actor": { "properties": { "type": { "const": "scheduler" } } }
         },
+        "allOf": [{
+          "if": {
+            "properties": {
+              "schedule": {
+                "properties": { "bound_conversation": { "const": true } },
+                "required": ["bound_conversation"]
+              }
+            },
+            "required": ["schedule"]
+          },
+          "then": {
+            "properties": {
+              "channel": { "not": { "const": "scheduler" } },
+              "chat_type": { "not": { "const": "synthetic" } }
+            }
+          },
+          "else": {
+            "properties": {
+              "channel": { "const": "scheduler" },
+              "chat_type": { "const": "synthetic" },
+              "native_thread_or_topic_id": { "type": "null" }
+            }
+          }
+        }],
         "not": { "required": ["legacy"] }
       }
     },
@@ -93,6 +114,7 @@
   "additionalProperties": true,
   "x-zylos-semantic-constraints": {
     "scheduler_synthetic_chat_id": "scheduler:<bot_id>:<task_id>",
+    "scheduler_bound_conversation": "when true, preserve the full non-synthetic conversation identity",
     "reply_changes_conversation_identity": false,
     "idempotency_key": "recompute_after_schema_validation"
   },
@@ -178,7 +200,8 @@
         "schedule_id": { "$ref": "#/$defs/opaque_id" },
         "task_id": { "$ref": "#/$defs/opaque_id" },
         "occurrence_id": { "$ref": "#/$defs/opaque_id" },
-        "bound_conversation": { "type": "boolean" }
+        "bound_conversation": { "type": "boolean" },
+        "notification_text": { "type": "string", "minLength": 1 }
       },
       "additionalProperties": true
     },

@@ -28,6 +28,7 @@ describe('zylos.inbound-envelope v1.0', () => {
       'native_thread_or_topic',
       'reply_preserves_group_conversation',
       'scheduler_synthetic_conversation',
+      'scheduler_bound_group_conversation',
       'legacy_compatibility_fields',
     ]);
 

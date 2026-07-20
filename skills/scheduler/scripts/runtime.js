@@ -3,14 +3,16 @@
  * Monitors Claude's execution state and handles inter-process communication
  */
 
-import { execFileSync } from 'child_process';
 import { readFileSync, existsSync } from 'fs';
 import { homedir } from 'os';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { join } from 'path';
+import Database from 'better-sqlite3';
+
+import { acceptScheduledOccurrence } from '../../../runtime/scheduler/scheduler-queue.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || join(homedir(), 'zylos');
 const STATUS_FILE = join(ZYLOS_DIR, 'activity-monitor', 'agent-status.json');
+const CORE_DATABASE_PATH = join(ZYLOS_DIR, 'comm-bridge', 'c4.db');
 
 /**
  * Read agent status from ~/zylos/activity-monitor/agent-status.json
@@ -26,80 +28,69 @@ export function readStatusFile() {
   }
 }
 
-/**
- * Find the c4-receive.js path, trying production location first, then development
- * @returns {string} Path to c4-receive.js
- */
-function findC4ReceivePath() {
-  // Method 1: Production location (priority for efficiency in deployed environment)
-  const productionPath = join(homedir(), 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
-  if (existsSync(productionPath)) {
-    return productionPath;
-  }
-
-  // Method 2: Development location (fallback for source tree testing)
-  // Current file: .../skills/scheduler/scripts/runtime.js
-  // Target file:  .../skills/comm-bridge/scripts/c4-receive.js
-  const currentFile = fileURLToPath(import.meta.url);
-  const skillsDir = join(dirname(currentFile), '..', '..');
-  const devPath = join(skillsDir, 'comm-bridge', 'scripts', 'c4-receive.js');
-
-  if (existsSync(devPath)) {
-    return devPath;
-  }
-
-  // If both fail, return production path (will fail with clear error message)
-  return productionPath;
+function timestampFromSeconds(seconds) {
+  return new Date(seconds * 1_000).toISOString();
 }
 
-/**
- * Send a message to Claude via C4 Communication Bridge
- * @param {string} message - Message to send
- * @param {object} options - Dispatch options
- * @param {number} options.priority - Message priority 1-3 (default: 3)
- * @param {boolean} options.blockQueueUntilIdle - Whether to wait for sustained idle
- *   and hold subsequent dispatch until execution settles (default: false)
- * @param {boolean} options.requireIdle - Legacy alias for blockQueueUntilIdle
- * @param {string} options.replyChannel - Reply channel (e.g., 'telegram')
- * @param {string} options.replyEndpoint - Reply endpoint (e.g., user ID)
- * @returns {boolean} True if successful
- */
-export function sendViaC4(message, options = {}) {
-  const {
-    priority = 3,
-    blockQueueUntilIdle = false,
-    requireIdle = false,
-    replyChannel = null,
-    replyEndpoint = null
-  } = options;
+function taskOccurrence(task, receivedAt, { notificationText = null } = {}) {
+  const scheduledAt = timestampFromSeconds(task.next_run_at);
+  let boundConversation = null;
+  if (task.bound_conversation_json !== null && task.bound_conversation_json !== undefined) {
+    try {
+      boundConversation = JSON.parse(task.bound_conversation_json);
+    } catch {
+      throw new TypeError(`Task ${task.id} has invalid bound_conversation_json`);
+    }
+  }
+  return {
+    schedule_id: task.id,
+    task_id: task.id,
+    occurrence_id: notificationText === null
+      ? `${task.id}:${task.next_run_at}`
+      : `${task.id}:${task.next_run_at}:missed-notice`,
+    prompt: notificationText ?? `[Scheduled Task: ${task.id}] ${task.prompt}\n\n---- After completing this task, run: ~/zylos/.claude/skills/scheduler/scripts/cli.js done ${task.id}`,
+    occurred_at: scheduledAt,
+    received_at: receivedAt,
+    region: process.env.ZYLOS_REGION ?? 'global',
+    tenant_id: process.env.ZYLOS_TENANT_ID ?? 'default',
+    bot_id: process.env.ZYLOS_BOT_ID ?? 'zylos',
+    bound_conversation: boundConversation,
+    ...(notificationText === null ? {} : { notification_text: notificationText }),
+  };
+}
 
+export function enqueueScheduledTask(database, task, {
+  now = () => new Date().toISOString(),
+  generateId,
+  maxQueuedTurns,
+} = {}) {
+  const options = { now, ...(generateId ? { generateId } : {}), ...(maxQueuedTurns ? { maxQueuedTurns } : {}) };
+  return acceptScheduledOccurrence(database, taskOccurrence(task, now()), options);
+}
+
+export function enqueueMissedScheduledTaskNotice(database, task, notificationText, {
+  now = () => new Date().toISOString(),
+  generateId,
+  maxQueuedTurns,
+} = {}) {
+  const options = { now, ...(generateId ? { generateId } : {}), ...(maxQueuedTurns ? { maxQueuedTurns } : {}) };
+  return acceptScheduledOccurrence(database, taskOccurrence(task, now(), { notificationText }), options);
+}
+
+export function dispatchScheduledTask(task, options = {}) {
+  const database = new Database(options.databasePath ?? CORE_DATABASE_PATH);
   try {
-    const c4ReceivePath = findC4ReceivePath();
+    return enqueueScheduledTask(database, task, options);
+  } finally {
+    database.close();
+  }
+}
 
-    // Build c4-receive.js command arguments
-    const args = [c4ReceivePath];
-
-    // Source and reply configuration from task's reply settings
-    if (replyChannel) {
-      args.push('--channel', replyChannel);
-      if (replyEndpoint) {
-        args.push('--endpoint', replyEndpoint);
-      }
-    } else {
-      args.push('--no-reply');
-    }
-
-    if (blockQueueUntilIdle || requireIdle) {
-      args.push('--block-queue-until-idle');
-    }
-
-    args.push('--priority', String(priority), '--content', message);
-
-    // Use execFileSync to avoid shell injection - passes arguments directly
-    execFileSync('node', args, { stdio: 'pipe', timeout: 10000 });
-    return true;
-  } catch (error) {
-    console.error('Failed to send via C4:', error.message);
-    return false;
+export function dispatchMissedScheduledTaskNotice(task, notificationText, options = {}) {
+  const database = new Database(options.databasePath ?? CORE_DATABASE_PATH);
+  try {
+    return enqueueMissedScheduledTaskNotice(database, task, notificationText, options);
+  } finally {
+    database.close();
   }
 }

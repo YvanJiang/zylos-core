@@ -17,7 +17,7 @@ function escapeLike(str) {
 }
 
 const ALLOWED_UPDATE_COLUMNS = new Set([
-  'name', 'prompt', 'priority', 'require_idle', 'reply_channel', 'reply_endpoint',
+  'name', 'prompt', 'priority', 'require_idle', 'reply_channel', 'reply_endpoint', 'bound_conversation_json',
   'miss_threshold', 'type', 'cron_expression', 'interval_seconds', 'next_run_at', 'timezone', 'updated_at'
 ]);
 
@@ -50,6 +50,7 @@ Add Options:
                           Legacy alias: --require-idle
   --reply-channel "<source>"      Reply channel (e.g., "telegram", "lark")
   --reply-endpoint "<endpoint>"  Reply endpoint (e.g., "8101553026", "chat_id topic_id")
+  --bound-conversation-json "<json>"  Full Core conversation identity for a chat-bound occurrence
   --miss-threshold <seconds>  Skip if overdue by more than this (default=300)
 
 Update Options (same as Add, plus):
@@ -210,6 +211,17 @@ function cmdAdd(args, options) {
   // Parse reply-channel and reply-endpoint
   const replyChannel = options['reply-channel'] || null;
   const replyEndpoint = options['reply-endpoint'] || null;
+  let boundConversationJson = null;
+  if (options['bound-conversation-json']) {
+    try {
+      const parsed = JSON.parse(options['bound-conversation-json']);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not object');
+      boundConversationJson = JSON.stringify(parsed);
+    } catch {
+      console.error('Error: bound-conversation-json must be a JSON object');
+      return;
+    }
+  }
 
   // Parse miss-threshold
   const missThreshold = options['miss-threshold']
@@ -229,9 +241,9 @@ function cmdAdd(args, options) {
       cron_expression, interval_seconds,
       next_run_at, priority, status,
       require_idle, miss_threshold,
-      reply_channel, reply_endpoint,
+      reply_channel, reply_endpoint, bound_conversation_json,
       created_at, updated_at, timezone
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     taskId,
     options.name || prompt.substring(0, 40),  // Default name to truncated prompt
@@ -245,6 +257,7 @@ function cmdAdd(args, options) {
     missThreshold,
     replyChannel,
     replyEndpoint,
+    boundConversationJson,
     currentTime,
     currentTime,
     getDefaultTimezone()

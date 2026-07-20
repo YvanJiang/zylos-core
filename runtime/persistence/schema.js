@@ -82,6 +82,20 @@ const RUNTIME_SCHEMA = `
     committed_at TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS runtime_scheduler_occurrences (
+    schedule_id TEXT NOT NULL,
+    occurrence_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    bound_conversation INTEGER NOT NULL CHECK (bound_conversation IN (0, 1)),
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),
+    status TEXT NOT NULL CHECK (status IN ('accepted', 'rejected')),
+    envelope_json TEXT NOT NULL,
+    committed_at TEXT NOT NULL,
+    PRIMARY KEY (schedule_id, occurrence_id),
+    UNIQUE (turn_id)
+  );
+
   CREATE TABLE IF NOT EXISTS runtime_turns (
     turn_id TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),

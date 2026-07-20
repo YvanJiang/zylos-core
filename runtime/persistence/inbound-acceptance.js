@@ -390,8 +390,15 @@ function resolveNormalLineage(database, envelope, conversationId, committedAt, g
     database.prepare(`
       INSERT INTO runtime_lineages (
         lineage_id, conversation_id, lineage_kind, is_default, created_at
-      ) VALUES (?, ?, 'normal', 1, ?)
-    `).run(lineage.lineage_id, conversationId, committedAt);
+      ) VALUES (?, ?, ?, 1, ?)
+    `).run(
+      lineage.lineage_id,
+      conversationId,
+      envelope.source.kind === 'scheduler' && envelope.chat_type === 'synthetic'
+        ? 'scheduler'
+        : 'normal',
+      committedAt,
+    );
   }
   return { ...lineage, recovery: null, pending_turn: null };
 }
@@ -435,7 +442,11 @@ export function acceptNormalInbound(
   const payloadHash = createPayloadHash(envelope, {
     scope: 'inbound',
     knownFields: INBOUND_ENVELOPE_KNOWN_FIELDS,
-    extensionFields: Object.keys(validated.extensions),
+    extensionFields: [
+      ...Object.keys(validated.extensions),
+      ...(Object.hasOwn(validated.forwarded, 'schedule') ? ['schedule'] : []),
+      ...(Object.hasOwn(validated.forwarded, 'legacy') ? ['legacy'] : []),
+    ],
   });
   initializeRuntimePersistence(database);
   const permissionCommand = parsePermissionCommand(validated.forwarded, {
@@ -738,7 +749,11 @@ export function acceptNormalInbound(
       aggregateVersion: queueFull ? 2 : 1,
       eventSequenceThrough: queueFull ? 2 : 1,
       phase: queueFull ? 'failed' : 'received',
-      text: queueFull ? queueFullError.user_message : 'Message received.',
+      text: queueFull
+        ? queueFullError.user_message
+        : (envelope.source.kind === 'scheduler'
+          ? (envelope.schedule.notification_text ?? 'Scheduled occurrence queued.')
+          : 'Message received.'),
       error: queueFullError,
       terminal: queueFull,
       operation: initialDeliveryOperation,
@@ -809,6 +824,24 @@ export function acceptNormalInbound(
       committed_at: committedAt,
     };
     validateInboundResult(result);
+    if (validated.forwarded.source.kind === 'scheduler') {
+      database.prepare(`
+        INSERT INTO runtime_scheduler_occurrences (
+          schedule_id, occurrence_id, task_id, bound_conversation, conversation_id,
+          turn_id, status, envelope_json, committed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        validated.forwarded.schedule.schedule_id,
+        validated.forwarded.schedule.occurrence_id,
+        validated.forwarded.schedule.task_id,
+        validated.forwarded.schedule.bound_conversation ? 1 : 0,
+        conversation.conversation_id,
+        turnId,
+        result.status,
+        JSON.stringify(validated.forwarded),
+        committedAt,
+      );
+    }
     database.prepare(`
       INSERT INTO runtime_inbound_idempotency (
         idempotency_key, inbound_event_id, payload_hash, first_result_json, committed_at
