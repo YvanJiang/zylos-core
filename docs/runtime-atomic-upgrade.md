@@ -18,6 +18,15 @@ crashed same-host owner, then atomically writes
 self-upgrade launcher and its installed finalizer now fail closed unconditionally; they contain no
 executable upgrade route. A live lock owner is never displaced merely because its lock is old.
 
+The executor service writes the installed orchestration inputs to
+`runtime/upgrade-plans/<upgrade_id>.json` before attaching the Global26 run. On every daemon start,
+it queries Core SQLite for the oldest resumable run and reconstructs the same snapshot, release,
+legacy-source, and target-health adapters before normal turn polling begins. A missing or
+conflicting plan fails closed. A committed run retains its plan until post-commit cleanup is
+durably recorded; a rolled-back run resumes only the restored release. The active-release launcher
+then lets the supervisor restart from the exact durable release pointer, preventing old and new
+runtime paths from executing concurrently.
+
 External adapter effects use `upgrade_id:step_key` as their idempotency key and take a durable
 SQLite claim before invocation. The coordinator renews the claim while the adapter is live; only a
 genuinely expired claim can be replayed by a new coordinator. The snapshot adapter

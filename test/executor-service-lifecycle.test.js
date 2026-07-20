@@ -1,0 +1,287 @@
+import fs from 'node:fs';
+import { createRequire } from 'node:module';
+import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
+
+import { afterEach, describe, expect, test } from '@jest/globals';
+
+const require = createRequire(new URL('../skills/comm-bridge/package.json', import.meta.url));
+const Database = require('better-sqlite3');
+
+import {
+  createExecutorServiceHost,
+  requestExecutorService,
+} from '../runtime/executor/service-host.js';
+import { runExecutorDaemon } from '../runtime/executor/daemon.js';
+import {
+  cleanupObsoleteLifecycleArtifacts,
+  legacyLifecycleArtifactPaths,
+} from '../runtime/migration/legacy-lifecycle-artifacts.js';
+
+const directories = [];
+const hosts = [];
+
+afterEach(async () => {
+  await Promise.allSettled(hosts.splice(0).map((host) => host.close()));
+  for (const directory of directories.splice(0)) {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+function fixture() {
+  const tempRoot = fs.existsSync('/tmp') ? fs.realpathSync('/tmp') : os.tmpdir();
+  const directory = fs.mkdtempSync(path.join(tempRoot, 'zylos-executor-host-'));
+  directories.push(directory);
+  return {
+    directory,
+    database: new Database(path.join(directory, 'c4.db')),
+    socketPath: path.join(directory, 'runtime', 'executor-service.sock'),
+  };
+}
+
+function inertAdapter(provider = 'claude') {
+  return Object.freeze({
+    provider,
+    provider_transport: 'injected_test_seam',
+    async *execute() {},
+    async close() { return []; },
+  });
+}
+
+describe('executor service lifecycle host', () => {
+  test('reports canonical Core identity and health and acknowledges graceful shutdown', async () => {
+    const state = fixture();
+    const host = createExecutorServiceHost({
+      database: state.database,
+      adapter: inertAdapter(),
+      provider: 'claude',
+      serviceInstanceId: 'service-fixture-1',
+      hostId: 'host-fixture-1',
+      socketPath: state.socketPath,
+      workspaceRoot: state.directory,
+      pollIntervalMs: 10,
+    });
+    hosts.push(host);
+    await host.start();
+
+    await expect(requestExecutorService(state.socketPath, { action: 'health' }))
+      .resolves.toMatchObject({
+        ok: true,
+        result: {
+          executor: { provider: 'claude', service_instance_id: 'service-fixture-1' },
+          snapshot: {
+            contract: 'zylos.observability-snapshot',
+            core_service_instance_id: 'service-fixture-1',
+            service: {
+              health: 'healthy',
+              service_instance_id: 'service-fixture-1',
+              host_id: 'host-fixture-1',
+            },
+          },
+        },
+      });
+
+    await expect(requestExecutorService(state.socketPath, { action: 'shutdown' }))
+      .resolves.toMatchObject({
+        ok: true,
+        result: { status: 'completed', service_instance_id: 'service-fixture-1' },
+      });
+    await host.closed;
+    expect(fs.existsSync(state.socketPath)).toBe(false);
+  });
+
+  test('refuses to replace a non-socket control path', async () => {
+    const state = fixture();
+    fs.mkdirSync(path.dirname(state.socketPath), { recursive: true });
+    fs.writeFileSync(state.socketPath, 'preserve-me');
+    const host = createExecutorServiceHost({
+      database: state.database,
+      adapter: inertAdapter(),
+      provider: 'claude',
+      serviceInstanceId: 'service-fixture-2',
+      socketPath: state.socketPath,
+      workspaceRoot: state.directory,
+    });
+    hosts.push(host);
+
+    await expect(host.start()).rejects.toThrow('non-socket control path');
+    expect(fs.readFileSync(state.socketPath, 'utf8')).toBe('preserve-me');
+  });
+
+  test('refuses to replace a live executor control socket', async () => {
+    const state = fixture();
+    fs.mkdirSync(path.dirname(state.socketPath), { recursive: true });
+    const existing = net.createServer((socket) => {
+      socket.once('data', () => socket.end('{"ok":true}\n'));
+    });
+    await new Promise((resolve, reject) => {
+      existing.once('error', reject);
+      existing.listen(state.socketPath, resolve);
+    });
+    const host = createExecutorServiceHost({
+      database: state.database,
+      adapter: inertAdapter(),
+      provider: 'claude',
+      serviceInstanceId: 'service-fixture-live-conflict',
+      socketPath: state.socketPath,
+      workspaceRoot: state.directory,
+    });
+    hosts.push(host);
+
+    await expect(host.start()).rejects.toThrow('already active');
+    expect(existing.listening).toBe(true);
+    await new Promise((resolve, reject) => existing.close((error) => (error ? reject(error) : resolve())));
+    fs.rmSync(state.socketPath, { force: true });
+  });
+
+  test('runs the owning resource cleanup when remote shutdown completes', async () => {
+    const state = fixture();
+    const cleanup = [];
+    const host = createExecutorServiceHost({
+      database: state.database,
+      adapter: inertAdapter(),
+      provider: 'claude',
+      serviceInstanceId: 'service-fixture-resource-cleanup',
+      socketPath: state.socketPath,
+      workspaceRoot: state.directory,
+      onClose: async () => cleanup.push('closed'),
+    });
+    hosts.push(host);
+    await host.start();
+
+    await requestExecutorService(state.socketPath, { action: 'shutdown' });
+    await host.closed;
+    expect(cleanup).toEqual(['closed']);
+  });
+
+  test('routes upgrade requests through the installed runtime owner', async () => {
+    const state = fixture();
+    const requests = [];
+    const host = createExecutorServiceHost({
+      database: state.database,
+      adapter: inertAdapter(),
+      provider: 'claude',
+      serviceInstanceId: 'service-fixture-upgrade',
+      socketPath: state.socketPath,
+      workspaceRoot: state.directory,
+      onUpgrade: async (request) => {
+        requests.push(request);
+        return { success: true, state: 'committed', from: 'release-A', to: 'release-B' };
+      },
+    });
+    hosts.push(host);
+    await host.start();
+
+    await expect(requestExecutorService(state.socketPath, {
+      action: 'upgrade',
+      target: { release: 'release-B' },
+    })).resolves.toMatchObject({
+      ok: true,
+      result: { success: true, state: 'committed', to: 'release-B' },
+    });
+    expect(requests).toEqual([{ action: 'upgrade', target: { release: 'release-B' } }]);
+    await host.closed;
+    expect(fs.existsSync(state.socketPath)).toBe(false);
+  });
+});
+
+describe('executor daemon resource ownership', () => {
+  test('exits for supervisor restart after a resumed rollback restores the old release', async () => {
+    const state = fixture();
+    const events = [];
+    const database = { close: () => events.push('database-close') };
+    const upgradeHandler = async () => ({ state: 'committed' });
+    upgradeHandler.resumeBlocking = async () => {
+      events.push('upgrade-resume');
+      return { state: 'rolled_back' };
+    };
+    const daemon = await runExecutorDaemon({
+      zylosDir: state.directory,
+      Database: function DatabaseFixture() { return database; },
+      createAdapter: () => { throw new Error('stale target adapter must not be created'); },
+      createUpgradeHandler: () => upgradeHandler,
+      createHost: () => { throw new Error('stale target host must not be created'); },
+    });
+
+    expect(daemon.restartRequired).toBe(true);
+    expect(events).toEqual(['upgrade-resume', 'database-close']);
+  });
+
+  test('exits for supervisor restart after a resumed upgrade commits', async () => {
+    const state = fixture();
+    const events = [];
+    const database = { close: () => events.push('database-close') };
+    const upgradeHandler = async () => ({ state: 'committed' });
+    upgradeHandler.resumeBlocking = async () => {
+      events.push('upgrade-resume');
+      return { state: 'committed', success: true };
+    };
+    const daemon = await runExecutorDaemon({
+      zylosDir: state.directory,
+      Database: function DatabaseFixture() { return database; },
+      createAdapter: () => { throw new Error('old adapter must not be created'); },
+      createUpgradeHandler: () => upgradeHandler,
+      createHost: () => { throw new Error('old host must not be created'); },
+    });
+
+    expect(daemon.restartRequired).toBe(true);
+    expect(events).toEqual(['upgrade-resume', 'database-close']);
+  });
+
+  test('gives the service host sole ownership of closing the Core database', async () => {
+    const state = fixture();
+    const events = [];
+    const database = { close: () => events.push('database-close') };
+    let hostOptions;
+    const host = {
+      closed: Promise.resolve(),
+      async start() { events.push('host-start'); },
+      async close() {
+        events.push('host-close');
+        await hostOptions.onClose();
+      },
+    };
+    const daemon = await runExecutorDaemon({
+      zylosDir: state.directory,
+      Database: function DatabaseFixture() { return database; },
+      createAdapter: () => inertAdapter(),
+      createUpgradeHandler: () => async () => ({ state: 'committed' }),
+      createHost: (options) => {
+        hostOptions = options;
+        return host;
+      },
+    });
+
+    await daemon.close();
+    expect(events).toEqual(['host-start', 'host-close', 'database-close']);
+  });
+});
+
+describe('one-time lifecycle cleanup', () => {
+  test('removes exact obsolete artifacts only after durable commit', () => {
+    const state = fixture();
+    const artifacts = legacyLifecycleArtifactPaths(state.directory);
+    for (const artifact of artifacts) {
+      if (artifact.endsWith('activity-monitor')) {
+        fs.mkdirSync(artifact, { recursive: true });
+        fs.writeFileSync(path.join(artifact, 'legacy-service.js'), 'legacy');
+      } else {
+        fs.mkdirSync(path.dirname(artifact), { recursive: true });
+        fs.writeFileSync(artifact, 'legacy');
+      }
+    }
+
+    expect(() => cleanupObsoleteLifecycleArtifacts({
+      zylosDir: state.directory,
+      upgradeState: 'ready_to_commit',
+    })).toThrow('durably committed');
+    expect(artifacts.every((artifact) => fs.existsSync(artifact))).toBe(true);
+
+    expect(cleanupObsoleteLifecycleArtifacts({
+      zylosDir: state.directory,
+      upgradeState: 'committed',
+    })).toEqual({ removed: artifacts });
+    expect(artifacts.every((artifact) => !fs.existsSync(artifact))).toBe(true);
+  });
+});

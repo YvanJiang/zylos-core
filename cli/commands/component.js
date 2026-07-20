@@ -11,10 +11,12 @@ import { loadRegistry } from '../lib/registry.js';
 import { loadComponents, saveComponents } from '../lib/components.js';
 import { checkForUpdates, getLocalSourceUpgradeError, getRepo, runUpgrade, downloadToTemp, readChangelog, filterChangelog, cleanupTemp } from '../lib/upgrade.js';
 import {
-  checkForCoreUpdates, runSelfUpgrade,
+  checkForCoreUpdates,
   downloadCoreToTemp, readChangelog as readCoreChangelog,
   cleanupTemp as cleanupCoreTemp, cleanupBackup,
 } from '../lib/self-upgrade.js';
+import { executorServiceSocketPath } from '../lib/executor-service-lifecycle.js';
+import { requestExecutorService } from '../../runtime/executor/service-host.js';
 import { detectChanges } from '../lib/manifest.js';
 import { parseSkillMd } from '../lib/skill.js';
 import { linkBins, unlinkBins } from '../lib/bin.js';
@@ -758,12 +760,15 @@ async function handleUpgradeFlow(component, { jsonOutput, skipConfirm, skipEval,
 
       if (result.rollback?.performed) {
         console.log(`\n${bold('Auto-rollback performed:')}`);
-        for (const r of result.rollback.steps) {
+        for (const r of result.rollback.steps ?? []) {
           if (r.success) {
             console.log(`  ${success(r.action)}`);
           } else {
             console.log(`  ${error(r.action)}`);
           }
+        }
+        if (!Array.isArray(result.rollback.steps)) {
+          console.log(`  ${success(`Runtime restored to ${result.from}`)}`);
         }
       }
     }
@@ -1123,12 +1128,28 @@ async function upgradeSelfCore({ branch, beta = false, mode = 'merge' } = {}) {
     }
 
     // 6. Execute self-upgrade — show progress in real time
-    const result = runSelfUpgrade({
-      tempDir,
-      newVersion: check.latest,
-      mode,
-      onStep: !jsonOutput ? printStep : undefined,
-    });
+    let result;
+    try {
+      const response = await requestExecutorService(executorServiceSocketPath(ZYLOS_DIR), {
+        action: 'upgrade',
+        target: {
+          release: check.latest || (branch ? `branch:${branch}` : null),
+          branch: branch ?? null,
+          mode,
+          downloaded_source: tempDir,
+        },
+      }, { timeoutMs: 30 * 60_000 });
+      result = response.ok
+        ? response.result
+        : { action: 'self_upgrade', success: false, failedStep: 0, error: response.error };
+    } catch (cause) {
+      result = {
+        action: 'self_upgrade',
+        success: false,
+        failedStep: 0,
+        error: `Executor upgrade control failed: ${cause.message}`,
+      };
+    }
 
     // Output result
     if (jsonOutput) {
@@ -1143,20 +1164,6 @@ async function upgradeSelfCore({ branch, beta = false, mode = 'merge' } = {}) {
       }
       output.reply = formatC4Reply('self-upgrade', { ...result, changelog: coreChangelog });
       console.log(JSON.stringify(output, null, 2));
-      // Auto-restart for instruction file changes (CLAUDE.md / AGENTS.md).
-      // Settings hook changes are handled by sync-settings-hooks.js directly,
-      // which enqueues /exit from the newly installed package — avoiding the
-      // bootstrap problem where the old component.js lacks restart logic.
-      if (result.success && result.instructionFilesRebuilt) {
-        try {
-          const activeRuntime = getZylosConfig().runtime ?? 'claude';
-          if (activeRuntime === 'claude') {
-            const c4ControlPath = path.join(ZYLOS_DIR, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-control.js');
-            const { spawnSync } = await import('child_process');
-            spawnSync('node', [c4ControlPath, 'enqueue', '--content', '/exit', '--priority', '1', '--block-queue-until-idle', '--no-ack-suffix'], { stdio: 'pipe' });
-          }
-        } catch { /* non-fatal */ }
-      }
     } else if (result.success) {
       console.log(`\n${success(`${bold('zylos-core')} upgraded: ${dim(result.from)} → ${bold(result.to)}`)}`);
       if (coreChangelog) {

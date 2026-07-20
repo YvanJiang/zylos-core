@@ -9,10 +9,10 @@
 #   curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/install.sh | bash -s -- --branch <branch-name>
 #
 # Full non-interactive deployment:
-#   curl -fsSL .../install.sh | bash -s -- -y --setup-token sk-ant-oat01-xxx --domain example.com --https
+#   curl -fsSL .../install.sh | bash -s -- -y --setup-token sk-ant-oat01-xxx
 #
 # Install with Codex runtime:
-#   curl -fsSL .../install.sh | bash -s -- -y --runtime codex --domain example.com --https
+#   curl -fsSL .../install.sh | bash -s -- -y --runtime codex
 #
 # Install with custom API base URLs:
 #   curl -fsSL .../install.sh | bash -s -- -y --base-url https://claude-proxy.example.com
@@ -49,7 +49,7 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     # Flags that take a value — forward both flag and value to zylos init
-    --timezone|--setup-token|--api-key|--codex-api-key|--base-url|--codex-base-url|--domain|--web-password|--runtime)
+    --timezone|--setup-token|--api-key|--codex-api-key|--base-url|--codex-base-url|--runtime)
       if [ -z "${2:-}" ]; then
         echo "[zylos] Error: $1 requires a value" >&2
         exit 1
@@ -58,7 +58,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     # Boolean flags — forward as-is to zylos init
-    -y|--yes|-q|--quiet|--https|--no-https|--caddy|--no-caddy|-h|--help)
+    -y|--yes|-q|--quiet|-h|--help)
       INIT_ARGS+=("$1")
       shift
       ;;
@@ -187,16 +187,6 @@ ensure_git() {
   ok "git: installed"
 }
 
-# ── Prerequisite: tmux ────────────────────────────────────────
-ensure_tmux() {
-  if command -v tmux &>/dev/null; then
-    ok "tmux: $(tmux -V)"
-    return
-  fi
-  install_system_package tmux
-  ok "tmux: installed"
-}
-
 # ── Prerequisite: Node.js (via nvm) ──────────────────────────
 ensure_node() {
   # Check if Node.js + npm exist and meet minimum version
@@ -270,7 +260,7 @@ FISH_EOF
       printf '\n# Added by zylos installer\n%s\n' "$local_bin_export" >> "$shell_rc"
     fi
 
-    # 2. ~/zylos/bin — component CLIs (caddy, etc.)
+    # 2. ~/zylos/bin — installed component CLIs
     #    Idempotency: grep for "zylos-managed: bin PATH" marker (matches init.js pattern)
     local zylos_marker='# zylos-managed: bin PATH'
     local zylos_bin_export="export PATH=\"\$HOME/zylos/bin:\$PATH\""
@@ -371,15 +361,15 @@ if ! _has_yes_flag && [ -t 0 -o -e /dev/tty ]; then
   echo "  │                                                        │"
   printf '%b' "${NC}"
   printf "  ${DIM}│${NC}  ${DIM}Zylos currently assumes a trusted environment.${NC}     ${DIM}│${NC}\n"
-  printf "  ${DIM}│${NC}  ${DIM}It runs with full system access as the current${NC}     ${DIM}│${NC}\n"
-  printf "  ${DIM}│${NC}  ${DIM}user — it can execute commands, read/write${NC}          ${DIM}│${NC}\n"
-  printf "  ${DIM}│${NC}  ${DIM}files, and access the network on your behalf.${NC}      ${DIM}│${NC}\n"
+  printf "  ${DIM}│${NC}  ${DIM}The executor uses provider permission prompts and${NC}   ${DIM}│${NC}\n"
+  printf "  ${DIM}│${NC}  ${DIM}workspace-write isolation, but approved actions can${NC}   ${DIM}│${NC}\n"
+  printf "  ${DIM}│${NC}  ${DIM}still modify files and access the network.${NC}            ${DIM}│${NC}\n"
   printf '%b' "${DIM}"
   echo "  │                                                        │"
   printf '%b' "${NC}"
   printf "  ${DIM}│${NC}  ${YELLOW}⚠ Dangerous: If untrusted people can reach${NC}         ${DIM}│${NC}\n"
   printf "  ${DIM}│${NC}  ${YELLOW}this machine or talk to the bot, they can${NC}          ${DIM}│${NC}\n"
-  printf "  ${DIM}│${NC}  ${YELLOW}execute anything as your user.${NC}                     ${DIM}│${NC}\n"
+  printf "  ${DIM}│${NC}  ${YELLOW}request privileged or destructive actions.${NC}          ${DIM}│${NC}\n"
   printf '%b' "${DIM}"
   echo "  │                                                        │"
   echo "  └────────────────────────────────────────────────────────┘"
@@ -416,7 +406,6 @@ echo ""
 
 ensure_curl
 ensure_git
-ensure_tmux
 ensure_node
 
 echo ""
@@ -498,6 +487,7 @@ else
     _show_source_hint
   else
     echo ""
+    return "$init_exit"
   fi
 fi
 

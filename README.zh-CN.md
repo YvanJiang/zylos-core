@@ -36,7 +36,7 @@ Zylos 给它一个生命。跨重启的持久记忆。你睡觉时自动工作�
 curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/install.sh | bash
 ```
 
-一键安装所有依赖（git、tmux、Node.js、zylos CLI），并自动运行 `zylos init` 完成初始化。
+一键安装所需工具（git、Node.js、PM2、Zylos CLI 和所选 provider 前置依赖），并自动运行 `zylos init` 启动 Core executor service。
 
 <details>
 <summary>非交互式安装（Docker、CI/CD、无界面服务器）</summary>
@@ -49,11 +49,7 @@ curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/in
 curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/install.sh | bash -s -- \
   -y \
   --setup-token sk-ant-oat01-xxx \
-  --timezone Asia/Shanghai \
-  --domain agent.example.com \
-  --https \
-  --caddy \
-  --web-password MySecurePass123
+  --timezone Asia/Shanghai
 ```
 
 **何时自动进入非交互模式？**
@@ -73,10 +69,6 @@ curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/in
 | `--base-url <url>` | 给 Claude Code 设置自定义 API 地址 | — |
 | `--codex-base-url <url>` | 给 Codex 设置自定义 API 地址 | — |
 | `--timezone <tz>` | [IANA 时区](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)，如 `Asia/Shanghai`、`America/New_York`、`Europe/London` | 系统默认 |
-| `--domain <domain>` | Caddy 反向代理域名，如 `agent.example.com` | 无 |
-| `--https` / `--no-https` | 启用或禁用 HTTPS | 设置域名时默认 `--https` |
-| `--caddy` / `--no-caddy` | 安装或跳过 Caddy Web 服务器 | 安装 |
-| `--web-password <pass>` | Web 控制台密码 | 自动生成 |
 
 **环境变量：**
 
@@ -90,9 +82,6 @@ curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/in
 | `ANTHROPIC_BASE_URL` | `--base-url` |
 | `OPENAI_API_KEY` | `--codex-api-key` |
 | `OPENAI_BASE_URL` | `--codex-base-url` |
-| `ZYLOS_DOMAIN` | `--domain` |
-| `ZYLOS_PROTOCOL`（`https` 或 `http`） | `--https` / `--no-https` |
-| `ZYLOS_WEB_PASSWORD` | `--web-password` |
 
 **退出码：** `0` = 成功，`1` = 致命错误（如无效 token），`2` = 部分成功（如 Caddy 下载失败但其他步骤正常）。
 
@@ -134,13 +123,12 @@ zylos init
 ```bash
 docker run -d --name zylos \
   -e CLAUDE_CODE_OAUTH_TOKEN=YOUR_TOKEN_HERE \
-  -p 3456:3456 \
   -v zylos-data:/home/zylos/zylos \
   -v claude-config:/home/zylos/.claude \
   ghcr.io/zylos-ai/zylos-core:latest
 ```
 
-打开 `http://localhost:3456` 访问 Web 控制台。通过 `docker logs zylos | grep -A2 "Web Console"` 查看密码。更多配置（Docker Compose、环境变量、群晖 NAS 等）请参阅 [Docker 部署指南](docs/docker.md)。
+使用 `docker exec zylos zylos status` 读取 Core 权威健康状态。更多配置（Docker Compose、环境变量、群晖 NAS 等）请参阅 [Docker 部署指南](docs/docker.md)。
 
 </details>
 
@@ -180,19 +168,16 @@ curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/in
 > ```
 
 `zylos init` 可重复运行，支持交互式和非交互式两种模式。它会：
-1. 安装缺失的工具（tmux、git、PM2、Claude Code 或 Codex）
+1. 安装缺失的工具（git、PM2，以及 Claude 或 Codex provider 前置依赖）
 2. 配置认证（Claude：浏览器登录、API key 或 [setup token](https://code.claude.com/docs/en/authentication)；Codex：API key 或 device auth）
 3. 创建 `~/zylos/` 目录，包含记忆、技能和服务
-4. 启动所有后台服务，并在 tmux 会话中启动 AI 智能体
+4. 启动长期运行的 Core executor service
 
 **与你的智能体对话：**
 
 ```bash
 # 交互式命令行 — 最简单的对话方式
 zylos shell
-
-# 或连接到智能体 tmux 会话（Ctrl+B d 退出）
-zylos attach
 
 # 或添加消息通道
 zylos add telegram
@@ -219,12 +204,12 @@ graph TB
         C4["C4 通信桥<br/>(统一网关 · SQLite 审计)"]
         MEM["记忆<br/>(Inside Out 架构)"]
         SCH["调度器<br/>(自主任务派发)"]
-        AM["活动监控<br/>(守护 · 心跳 · 自动恢复)"]
+        AM["Executor Service<br/>(健康 · 控制 · 恢复)"]
         HTTP["HTTP 层<br/>(Caddy · 文件共享 · HTTPS)"]
     end
 
     subgraph Brain["🧠 AI 运行时 — 大脑"]
-        CC["Claude Code / Codex<br/>(tmux 会话中)"]
+        CC["Claude Agent SDK / Codex<br/>(官方 app-server)"]
     end
 
     TG & LK & WC --> C4
@@ -240,7 +225,7 @@ graph TB
 | C4 通信桥 | 统一消息网关，带审计追踪 | SQLite、优先级队列 |
 | 记忆 | 跨重启的持久身份和上下文 | Inside Out 分层架构 |
 | 调度器 | 你不在时自主派发任务 | Cron、自然语言输入、空闲门控 |
-| 活动监控 | 崩溃恢复、心跳、健康检查 | PM2、多层保护 |
+| Executor Service | 持久执行、健康、控制和恢复 | Core SQLite、PM2 监督 |
 | HTTP 层 | Web 访问、文件共享、组件路由 | Caddy、自动 HTTPS |
 
 ---
@@ -345,7 +330,6 @@ zylos add hxa-connect
 
 ```bash
 zylos init                    # 初始化 Zylos 环境
-zylos attach                  # 连接到智能体 tmux 会话
 zylos runtime <name>          # 切换 AI 运行时（claude 或 codex）
 zylos doctor                  # 诊断并自动修复安装问题
 zylos status                  # 查看运行中的服务

@@ -50,3 +50,23 @@ export function findAnyBlockingRuntimeUpgrade(database) {
     LIMIT 1
   `).get() ?? null;
 }
+
+export function findResumableRuntimeUpgrade(database) {
+  const blocking = findAnyBlockingRuntimeUpgrade(database);
+  if (blocking !== null) return blocking;
+  return database.prepare(`
+    SELECT run.upgrade_id, run.scope_kind, run.bot_id, run.state, run.state_version
+    FROM runtime_upgrade_runs AS run
+    WHERE run.state NOT IN ('committed', 'rolled_back')
+       OR (
+         run.state = 'committed'
+         AND NOT EXISTS (
+           SELECT 1 FROM runtime_upgrade_events AS event
+           WHERE event.upgrade_id = run.upgrade_id
+             AND event.step_key = 'postcommit-cleanup'
+         )
+       )
+    ORDER BY run.created_at ASC
+    LIMIT 1
+  `).get() ?? null;
+}
