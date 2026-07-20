@@ -2190,13 +2190,16 @@ export function createCodexAppServerAdapter({
     });
   }
 
-  async function cancel(context) {
+  async function cancel(context, { reason = 'stop' } = {}) {
+    if (!['stop', 'steer'].includes(reason)) {
+      throw new TypeError('Codex cancellation reason must be stop or steer.');
+    }
     let result;
     try {
       result = await interrupt({
         turn_id: context?.turn_id,
         attempt: context?.attempt,
-        reason: 'stop',
+        reason,
       });
     } catch (cause) {
       const error = cause instanceof Error
