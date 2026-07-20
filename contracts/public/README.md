@@ -276,3 +276,27 @@ delivery uncertainty, service-instance replacement, all seven control targets, p
 metadata, result-version progress, projection gaps/restarts, unsupported major/state behavior,
 and the no-control/no-direct-Core Luna boundary. Consumers must validate these payloads with
 their own implementation rather than copying Core's validation result.
+
+## Five-repository compatibility release gate
+
+Core owns the single producer/consumer release gate for the five migration repositories. Run it
+from this repository before publishing any public contract change:
+
+```bash
+npm run test:contracts:five-repo
+```
+
+The gate runs the Core contract suites and the focused contract suites in `zylos-feishu`,
+`zylos-lark`, `zylos-dashboard`, and `luna-pet` against this checkout's authoritative
+`contracts/public` directory. It fails closed unless every repository exits successfully. The
+matrix covers ingress, normalized events, interactions, delivery, observability/control, and the
+Dashboard-to-Luna projection, including required/null/optional fields, major rejection, additive
+same-major compatibility, critical enum rejection, the public error shape, version conflicts, and
+independent computation from raw JCS/idempotency fixtures.
+
+By default the four consumers are resolved from the migration workspace's named integration
+worktrees. CI or another release checkout can set `ZYLOS_RUNTIME_MIGRATION_WORKSPACE` and override
+individual repositories with `ZYLOS_FEISHU_CONTRACT_REPO`, `ZYLOS_LARK_CONTRACT_REPO`,
+`ZYLOS_DASHBOARD_CONTRACT_REPO`, and `ZYLOS_LUNA_CONTRACT_REPO`. The gate passes the Core contract
+directory through `ZYLOS_CORE_PUBLIC_CONTRACTS_DIR`; consumer tests must recompute values with their
+own implementation and must not accept precomputed Core validation results as evidence.
