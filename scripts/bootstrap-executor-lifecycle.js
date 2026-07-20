@@ -11,6 +11,7 @@ import { pathToFileURL } from 'node:url';
 import { startExecutorService } from '../cli/lib/executor-service-lifecycle.js';
 import { createInstalledExecutorUpgradeHandler } from '../runtime/migration/installed-executor-upgrade.js';
 import { createLegacyProviderQuiescence } from '../runtime/migration/legacy-provider-quiescence.js';
+import { readChannelAuthorityManifest } from '../runtime/migration/channel-authority-manifest.js';
 
 const MANIFEST_NAME = 'base-executor-bootstrap.json';
 
@@ -119,6 +120,7 @@ function prepareManifest({
   targetReleasePath,
   fromPackageTarball,
   targetPackageTarball,
+  channelAuthorityManifest,
   installMode,
 }) {
   let existing = null;
@@ -131,6 +133,9 @@ function prepareManifest({
       target_release_path: requireDirectory('targetReleasePath', targetReleasePath),
       from_package_tarball: requireFile('fromPackageTarball', fromPackageTarball),
       target_package_tarball: requireFile('targetPackageTarball', targetPackageTarball),
+      channel_authority_manifest: requireFile(
+        'channelAuthorityManifest', channelAuthorityManifest,
+      ),
       install_mode: installMode,
     };
     for (const [key, value] of Object.entries(requested)) {
@@ -148,8 +153,12 @@ function prepareManifest({
     target_release_path: requireDirectory('targetReleasePath', targetReleasePath),
     from_package_tarball: requireFile('fromPackageTarball', fromPackageTarball),
     target_package_tarball: requireFile('targetPackageTarball', targetPackageTarball),
+    channel_authority_manifest: requireFile(
+      'channelAuthorityManifest', channelAuthorityManifest,
+    ),
     from_package_sha256: sha256(fromPackageTarball),
     target_package_sha256: sha256(targetPackageTarball),
+    channel_authority_sha256: sha256(channelAuthorityManifest),
     install_mode: installMode,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
@@ -184,6 +193,7 @@ export async function runBaseToExecutorBootstrap({
   targetReleasePath = null,
   fromPackageTarball = null,
   targetPackageTarball = null,
+  channelAuthorityManifest = null,
   installMode = null,
   resume = false,
   Database = null,
@@ -204,7 +214,7 @@ export async function runBaseToExecutorBootstrap({
       ? JSON.parse(fs.readFileSync(manifestFile, 'utf8'))
       : prepareManifest({
         manifestFile, fromReleasePath, targetReleasePath,
-        fromPackageTarball, targetPackageTarball, installMode,
+        fromPackageTarball, targetPackageTarball, channelAuthorityManifest, installMode,
       });
     fromPath = requireDirectory('fromReleasePath', manifest.from_release_path);
     targetPath = requireDirectory('targetReleasePath', manifest.target_release_path);
@@ -212,6 +222,13 @@ export async function runBaseToExecutorBootstrap({
   } else {
     fromPath = requireDirectory('fromReleasePath', fromReleasePath);
     targetPath = requireDirectory('targetReleasePath', targetReleasePath);
+  }
+  const authority = managedLifecycle
+    ? readChannelAuthorityManifest(manifest.channel_authority_manifest)
+    : (channelAuthorityManifest === null ? null : readChannelAuthorityManifest(channelAuthorityManifest));
+  if (managedLifecycle && sha256(manifest.channel_authority_manifest)
+    !== manifest.channel_authority_sha256) {
+    throw new Error('Channel authority manifest changed after bootstrap preparation.');
   }
   const DatabaseConstructor = Database ?? createRequire(path.join(
     installationRoot, '.claude', 'skills', 'comm-bridge', 'package.json',
@@ -227,6 +244,7 @@ export async function runBaseToExecutorBootstrap({
       currentReleaseRef: 'branch:exact-base-bootstrap',
       provider: configuredProvider(installationRoot),
       allowLegacyFromRelease: true,
+      legacyChannelAuthority: authority,
       legacyProviderQuiescence: createLegacyProviderQuiescence({
         provider: configuredProvider(installationRoot), execFileSyncFn,
         tmuxArgsPrefix: handlerOverrides.legacyTmuxArgsPrefix ?? [],
@@ -264,9 +282,12 @@ export async function runBaseToExecutorBootstrap({
       }
     }
     if (result?.state !== 'committed') {
-      throw new Error(
+      const error = new Error(
         `Executor lifecycle bootstrap did not commit; rollback state is ${result?.state ?? 'unknown'}: ${result?.error ?? 'unknown error'}`,
       );
+      error.rollbackPending = result?.state === 'rollback_failed';
+      error.rollbackState = result?.state ?? 'unknown';
+      throw error;
     }
     if (result.success !== true) {
       const error = new Error(
@@ -294,6 +315,12 @@ export async function runBaseToExecutorBootstrap({
   return result;
 }
 
+export function bootstrapFailureExitCode(error) {
+  if (error?.committed === true) return 2;
+  if (error?.rollbackPending === true) return 3;
+  return 1;
+}
+
 function argument(name) {
   const index = process.argv.indexOf(name);
   return index === -1 ? null : process.argv[index + 1];
@@ -307,12 +334,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
       targetReleasePath: argument('--target-release'),
       fromPackageTarball: argument('--from-package'),
       targetPackageTarball: argument('--target-package'),
+      channelAuthorityManifest: argument('--channel-authority-manifest'),
       installMode: argument('--install-mode'),
       resume: process.argv.includes('--resume'),
     });
     process.stdout.write(`${JSON.stringify(result)}\n`);
   } catch (error) {
     console.error(error);
-    process.exitCode = error?.committed === true ? 2 : 1;
+    process.exitCode = bootstrapFailureExitCode(error);
   }
 }

@@ -14,9 +14,11 @@ import { createInstalledRuntimeUpgradeHost } from './installed-runtime-upgrade-h
 import { driveInstalledRuntimeUpgrade } from './executor-upgrade-driver.js';
 import { legacyLifecycleArtifactPaths } from './legacy-lifecycle-artifacts.js';
 import {
-  extractAndFenceLegacyBaseBatch,
+  fenceLegacyBaseBatch,
+  readLegacyBaseBatch,
   reconcileLegacyBaseRollback,
 } from './legacy-base-source.js';
+import { validateChannelAuthorityManifest } from './channel-authority-manifest.js';
 import { findResumableRuntimeUpgrade } from './upgrade-state.js';
 
 const LEGACY_SERVICE_NAMES = Object.freeze([
@@ -146,6 +148,17 @@ function readUpgradePlan(planFile, expectedUpgradeId, {
   const fromReleaseKind = plan.from_release_kind ?? 'executor';
   if (!['executor', 'legacy_base'].includes(fromReleaseKind)) {
     throw new Error(`Runtime upgrade plan ${expectedUpgradeId} has an invalid source kind.`);
+  }
+  if (fromReleaseKind === 'legacy_base') {
+    if (typeof plan.legacy_provider_execution_active !== 'boolean'
+      || typeof plan.legacy_source_fenced !== 'boolean'
+      || typeof plan.legacy_observed_at !== 'string') {
+      throw new Error(`Runtime upgrade plan ${expectedUpgradeId} lacks legacy execution facts.`);
+    }
+    const authority = validateChannelAuthorityManifest(plan.channel_authority);
+    if (authority.sha256 !== plan.channel_authority_sha256) {
+      throw new Error(`Runtime upgrade plan ${expectedUpgradeId} channel authority hash conflicts.`);
+    }
   }
   const fromPackageVersion = readPackageRelease(fromReleasePath, {
     legacySource: fromReleaseKind === 'legacy_base',
@@ -530,6 +543,7 @@ export function createInstalledExecutorUpgradeHandler({
   packlistFn = execFileSync,
   packageLifecycle = null,
   legacyProviderQuiescence = null,
+  legacyChannelAuthority = null,
   noticeDeliveryTimeoutMs = 30_000,
   startTargetHealth = startTargetHealthProcess,
   targetHealthProofTimeoutMs = 30_000,
@@ -551,6 +565,11 @@ export function createInstalledExecutorUpgradeHandler({
     || typeof legacyProviderQuiescence.commit !== 'function')) {
     throw new TypeError('legacyProviderQuiescence is required for exact-base migration');
   }
+  const channelAuthority = allowLegacyFromRelease
+    ? validateChannelAuthorityManifest(
+      legacyChannelAuthority?.document ?? legacyChannelAuthority,
+    )
+    : null;
   if (typeof startTargetHealth !== 'function') throw new TypeError('startTargetHealth must be a function');
   if (!Number.isSafeInteger(targetHealthProofTimeoutMs) || targetHealthProofTimeoutMs <= 0) {
     throw new TypeError('targetHealthProofTimeoutMs must be a positive safe integer');
@@ -611,9 +630,7 @@ export function createInstalledExecutorUpgradeHandler({
         const durablePlan = JSON.parse(fs.readFileSync(
           upgradePlanPath(planDirectory, upgradeId), 'utf8',
         ));
-        const expectedActive = durablePlan.legacy_batch.records.some((record) => (
-          record.kind === 'c4' && record.legacy_record_id === `provider-session:${provider}`
-        ));
+        const expectedActive = durablePlan.legacy_provider_execution_active;
         if (providerExecution.active !== expectedActive) {
           throw new Error('Legacy provider execution changed after durable source fencing.');
         }
@@ -709,11 +726,21 @@ export function createInstalledExecutorUpgradeHandler({
     const state = readLegacyServiceState(upgradeId);
     return providerQuiescence.commit(
       state.provider_execution,
-      providerPhaseJournal(legacyServiceStateFile(upgradeId), state),
+      {
+        phase: state.provider_phase,
+        ...providerPhaseJournal(legacyServiceStateFile(upgradeId), state),
+      },
     );
   }
 
   async function executePlan(plan) {
+    if (!fs.existsSync(activeReleaseFile)) {
+      atomicJson(activeReleaseFile, {
+        release_ref: plan.preflight.from_release,
+        release_path: plan.from_release_path,
+        upgrade_id: null,
+      });
+    }
     const releases = {
       [plan.preflight.from_release]: requireDirectory('from_release_path', plan.from_release_path),
       [plan.preflight.to_release]: requireDirectory('to_release_path', plan.to_release_path),
@@ -855,6 +882,20 @@ export function createInstalledExecutorUpgradeHandler({
         `Runtime upgrade ${upgradeId} is ${blocking?.state ?? 'prepared'} but cannot resume: ${error.message}`,
       );
     }
+    if (plan.from_release_kind === 'legacy_base') {
+      fenceLegacyBaseBatch({
+        database,
+        expectedBatch: plan.legacy_batch,
+        batchId: plan.legacy_batch.batch_id,
+        provider,
+        channelAuthority: plan.channel_authority,
+        observedAt: plan.legacy_observed_at,
+      });
+      if (plan.legacy_source_fenced !== true) {
+        plan = Object.freeze({ ...plan, legacy_source_fenced: true });
+        atomicJson(planFile, plan);
+      }
+    }
     return executePlan(plan);
   }
 
@@ -885,25 +926,27 @@ export function createInstalledExecutorUpgradeHandler({
       packlistFn,
     });
     const upgradeId = `upgrade-${crypto.randomUUID()}`;
-    const legacyBatch = allowLegacyFromRelease
-      ? extractAndFenceLegacyBaseBatch({
-        database, batchId: `${upgradeId}-legacy-base`, provider,
-        providerActive: providerQuiescence.inspect().active,
-        observedAt: now(),
-      })
-      : Object.freeze({ batch_id: `${upgradeId}-empty`, records: Object.freeze([]) });
+    const observedAt = now();
+    let providerExecution;
+    let legacyBatch;
+    try {
+      providerExecution = allowLegacyFromRelease
+        ? providerQuiescence.inspect() : Object.freeze({ active: false });
+      legacyBatch = allowLegacyFromRelease
+        ? readLegacyBaseBatch({
+          database, batchId: `${upgradeId}-legacy-base`, provider,
+          channelAuthority, observedAt,
+        })
+        : Object.freeze({ batch_id: `${upgradeId}-empty`, records: Object.freeze([]) });
+    } catch (error) {
+      fs.rmSync(prepared.releasePath, { recursive: true, force: true });
+      throw error;
+    }
     const legacyQueueFile = path.join(installationRoot, 'runtime', 'upgrade-input', `${upgradeId}.json`);
     atomicJson(legacyQueueFile, legacyBatch);
     if (fromRelease === prepared.releaseRef) {
       fs.rmSync(prepared.releasePath, { recursive: true, force: true });
       throw new Error('Target executor release must differ from the active release.');
-    }
-    if (!fs.existsSync(activeReleaseFile)) {
-      atomicJson(activeReleaseFile, {
-        release_ref: fromRelease,
-        release_path: packageRoot,
-        upgrade_id: null,
-      });
     }
     const preflight = {
       upgrade_id: upgradeId,
@@ -919,7 +962,7 @@ export function createInstalledExecutorUpgradeHandler({
         normal_runtime_paths: 'new_only',
       },
     };
-    const plan = Object.freeze({
+    let plan = Object.freeze({
       schema_version: 1,
       upgrade_id: upgradeId,
       preflight,
@@ -933,8 +976,35 @@ export function createInstalledExecutorUpgradeHandler({
       to_package_version: prepared.packageVersion,
       provider,
       from_release_kind: allowLegacyFromRelease ? 'legacy_base' : 'executor',
+      ...(allowLegacyFromRelease ? {
+        legacy_provider_execution_active: providerExecution.active,
+        legacy_source_fenced: false,
+        legacy_observed_at: observedAt,
+        channel_authority: channelAuthority.document,
+        channel_authority_sha256: channelAuthority.sha256,
+      } : {}),
     });
-    atomicJson(upgradePlanPath(planDirectory, upgradeId), plan);
+    const planFile = upgradePlanPath(planDirectory, upgradeId);
+    atomicJson(planFile, plan);
+    if (allowLegacyFromRelease) {
+      try {
+        fenceLegacyBaseBatch({
+          database,
+          expectedBatch: legacyBatch,
+          batchId: legacyBatch.batch_id,
+          provider,
+          channelAuthority,
+          observedAt,
+        });
+      } catch (error) {
+        fs.rmSync(planFile, { force: true });
+        fs.rmSync(legacyQueueFile, { force: true });
+        fs.rmSync(prepared.releasePath, { recursive: true, force: true });
+        throw error;
+      }
+      plan = Object.freeze({ ...plan, legacy_source_fenced: true });
+      atomicJson(planFile, plan);
+    }
     return executePlan(plan);
   }
 

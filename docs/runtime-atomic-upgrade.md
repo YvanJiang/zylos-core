@@ -27,6 +27,16 @@ durably recorded; a rolled-back run resumes only the restored release. The activ
 then lets the supervisor restart from the exact durable release pointer, preventing old and new
 runtime paths from executing concurrently.
 
+The one-time exact-base bootstrap also requires the installed channel prerequisite to atomically
+publish `runtime/channel-authority.json` before the installer runs. It uses contract
+`zylos.channel-authority`, schema version 1, and exactly one authenticated-event scope per migrated
+channel. Each scope records `channel`, `region`, `tenant_id`, `bot_id`, `verified_at`,
+`verification_source`, and `provider_instance_id`; Feishu requires region `cn` and Lark requires
+region `global`. Core copies the validated non-secret facts and their canonical SHA-256 into the
+durable upgrade plan before fencing the old source. A missing, changed, duplicate, or mismatched
+scope fails before source mutation. Provider execution activity is a separate plan fact and never
+selects or synthesizes a user reply target.
+
 External adapter effects use `upgrade_id:step_key` as their idempotency key and take a durable
 SQLite claim before invocation. The coordinator renews the claim while the adapter is live; only a
 genuinely expired claim can be replayed by a new coordinator. The snapshot adapter

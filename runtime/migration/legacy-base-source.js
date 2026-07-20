@@ -1,5 +1,8 @@
 /** One-time exact-base source extraction and execution fencing. */
 
+import { canonicalizeJson } from '../../contracts/public/index.js';
+import { authorityScopeFor } from './channel-authority-manifest.js';
+
 const FENCE_PREFIX = 'zylos_executor_migration_fence_';
 
 function tableExists(database, table) {
@@ -65,27 +68,35 @@ function parseLegacyRoute(row) {
   };
 }
 
-function notificationTarget(row) {
+function notificationTarget(row, channelAuthority) {
   const route = parseLegacyRoute(row);
   if (route === null) return null;
+  const authority = authorityScopeFor(channelAuthority, row.channel);
+  if (authority === null) {
+    throw new Error(`Legacy channel ${row.channel} has no unique authenticated authority scope.`);
+  }
   return {
-    region: 'global', tenant_id: 'legacy-exact-base', channel: row.channel,
-    bot_id: 'legacy-exact-base', chat_type: route.chat_type, chat_id: route.chat_id,
+    region: authority.region, tenant_id: authority.tenant_id, channel: row.channel,
+    bot_id: authority.bot_id, chat_type: route.chat_type, chat_id: route.chat_id,
     native_thread_or_topic_id: route.native_thread_or_topic_id,
     native_thread_root_message_id: route.native_thread_root_message_id,
     native_thread_reply_target_message_id: route.native_thread_reply_target_message_id,
   };
 }
 
-function pendingEnvelope(row, route, batchId, recordId, observedAt) {
+function pendingEnvelope(row, route, batchId, recordId, observedAt, channelAuthority) {
+  const authority = authorityScopeFor(channelAuthority, row.channel);
+  if (authority === null) {
+    throw new Error(`Legacy channel ${row.channel} has no unique authenticated authority scope.`);
+  }
   return {
     contract: 'zylos.inbound-envelope', contract_version: '1.0',
     inbound_event_id: `legacy-c4-event:${row.id}`,
     idempotency_key: `legacy-c4:${recordId}`,
     trace_id: `legacy-c4-trace:${row.id}`,
     occurred_at: safeTime(row.timestamp, observedAt), received_at: observedAt,
-    region: 'global', tenant_id: 'legacy-exact-base',
-    channel: row.channel, bot_id: 'legacy-exact-base',
+    region: authority.region, tenant_id: authority.tenant_id,
+    channel: row.channel, bot_id: authority.bot_id,
     chat_type: route.chat_type, chat_id: route.chat_id,
     native_thread_or_topic_id: route.native_thread_or_topic_id,
     message_id: route.message_id,
@@ -119,85 +130,97 @@ export function dropLegacyBaseIngressFence(database) {
   return Object.freeze({ removed_fences: triggers.map(({ name }) => name) });
 }
 
-export function extractAndFenceLegacyBaseBatch({
+function buildLegacyBaseBatch({
   database,
   batchId,
   provider,
-  providerActive = false,
+  channelAuthority,
   observedAt = new Date().toISOString(),
 }) {
   if (typeof batchId !== 'string' || batchId.length === 0) throw new TypeError('batchId is required');
   if (!['claude', 'codex'].includes(provider)) throw new TypeError('provider is invalid');
-  return database.transaction(() => {
-    installFence(database);
-    const conversations = tableExists(database, 'conversations')
-      ? database.prepare(`
+  const conversations = tableExists(database, 'conversations')
+    ? database.prepare(`
         SELECT id, timestamp, direction, channel, endpoint_id, content, status
         FROM conversations ORDER BY id
       `).all()
-      : [];
-    const controls = tableExists(database, 'control_queue')
-      ? database.prepare(`
+    : [];
+  const controls = tableExists(database, 'control_queue')
+    ? database.prepare(`
         SELECT id, content, status, created_at, updated_at FROM control_queue ORDER BY id
       `).all()
-      : [];
-    let sequence = 0;
-    const records = [];
-    for (const row of conversations) {
-      const recordId = `conversation:${row.id}`;
-      const state = ['pending', 'running', 'delivered', 'failed'].includes(row.status)
-        ? row.status : 'failed';
-      if (row.direction === 'in' && state === 'pending') {
-        const target = parseLegacyRoute(row);
-        const route = target === null ? 'ambiguous' : 'unique';
-        if (route === 'unique') sequence += 1;
-        records.push({
-          kind: 'c4', legacy_record_id: recordId, legacy_state: 'pending', route,
-          ...(route === 'unique' ? {
-            legacy_queue_sequence: sequence,
-            envelope: pendingEnvelope(row, target, batchId, recordId, observedAt),
-          } : {}),
-        });
-      } else if (row.direction === 'in' && state === 'running') {
-        const target = notificationTarget(row);
-        if (target === null) {
-          throw new Error(`Running legacy C4 record ${row.id} has no durable notification target.`);
-        }
-        records.push({
-          kind: 'c4', legacy_record_id: recordId, legacy_state: 'running',
-          notification_target: target,
-        });
-      } else {
-        records.push({
-          kind: 'c4', legacy_record_id: recordId,
-          legacy_state: state === 'running' ? 'delivered' : state,
-          history: {
-            direction: row.direction, channel: row.channel,
-            endpoint_id: row.endpoint_id, content: row.content,
-            occurred_at: safeTime(row.timestamp, observedAt), final_status: state,
-          },
-        });
+    : [];
+  let sequence = 0;
+  const records = [];
+  for (const row of conversations) {
+    const recordId = `conversation:${row.id}`;
+    const state = ['pending', 'running', 'delivered', 'failed'].includes(row.status)
+      ? row.status : 'failed';
+    if (row.direction === 'in' && state === 'pending') {
+      const target = parseLegacyRoute(row);
+      const route = target === null ? 'ambiguous' : 'unique';
+      if (route === 'unique') sequence += 1;
+      records.push({
+        kind: 'c4', legacy_record_id: recordId, legacy_state: 'pending', route,
+        ...(route === 'unique' ? {
+          legacy_queue_sequence: sequence,
+          envelope: pendingEnvelope(
+            row, target, batchId, recordId, observedAt, channelAuthority,
+          ),
+        } : {}),
+      });
+    } else if (row.direction === 'in' && state === 'running') {
+      const target = notificationTarget(row, channelAuthority);
+      if (target === null) {
+        throw new Error(`Running legacy C4 record ${row.id} has no durable notification target.`);
       }
-    }
-    for (const row of controls) {
       records.push({
-        kind: 'runtime_control', legacy_record_id: `control:${row.id}`,
-        legacy_state: typeof row.status === 'string' ? row.status : 'failed',
-        audit: { content: row.content, created_at: row.created_at, updated_at: row.updated_at },
+        kind: 'c4', legacy_record_id: recordId, legacy_state: 'running',
+        notification_target: target,
+      });
+    } else {
+      records.push({
+        kind: 'c4', legacy_record_id: recordId,
+        legacy_state: state === 'running' ? 'delivered' : state,
+        history: {
+          direction: row.direction, channel: row.channel,
+          endpoint_id: row.endpoint_id, content: row.content,
+          occurred_at: safeTime(row.timestamp, observedAt), final_status: state,
+        },
       });
     }
-    const recentTargetRow = [...conversations].reverse().find((row) => notificationTarget(row) !== null);
-    if (providerActive && recentTargetRow === undefined) {
-      throw new Error('Active legacy provider has no durable user notification target.');
+  }
+  for (const row of controls) {
+    records.push({
+      kind: 'runtime_control', legacy_record_id: `control:${row.id}`,
+      legacy_state: typeof row.status === 'string' ? row.status : 'failed',
+      audit: { content: row.content, created_at: row.created_at, updated_at: row.updated_at },
+    });
+  }
+  return Object.freeze({ batch_id: batchId, records: Object.freeze(records) });
+}
+
+export function readLegacyBaseBatch(options) {
+  return options.database.transaction(() => buildLegacyBaseBatch(options)).deferred();
+}
+
+export function fenceLegacyBaseBatch({ database, expectedBatch, ...options }) {
+  if (!expectedBatch || typeof expectedBatch !== 'object') {
+    throw new TypeError('expectedBatch is required');
+  }
+  return database.transaction(() => {
+    installFence(database);
+    const actual = buildLegacyBaseBatch({ database, ...options });
+    if (canonicalizeJson(actual) !== canonicalizeJson(expectedBatch)) {
+      throw new Error('Legacy source changed before durable execution fencing.');
     }
-    if (providerActive) {
-      records.push({
-        kind: 'c4', legacy_record_id: `provider-session:${provider}`,
-        legacy_state: 'running', notification_target: notificationTarget(recentTargetRow),
-      });
-    }
-    return Object.freeze({ batch_id: batchId, records: Object.freeze(records) });
+    return actual;
   }).immediate();
+}
+
+export function extractAndFenceLegacyBaseBatch(options) {
+  const expectedBatch = readLegacyBaseBatch(options);
+  return fenceLegacyBaseBatch({ ...options, expectedBatch });
 }
 
 export function reconcileLegacyBaseRollback({ database, rollbackBatch }) {

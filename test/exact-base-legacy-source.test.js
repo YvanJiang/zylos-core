@@ -14,6 +14,7 @@ import { createLegacyProviderQuiescence } from '../runtime/migration/legacy-prov
 import { createInstalledExecutorUpgradeHandler } from '../runtime/migration/installed-executor-upgrade.js';
 import { createExecutorService } from '../runtime/executor/service.js';
 import { createOutboxService } from '../runtime/delivery/outbox-service.js';
+import { validateInboundEnvelope } from '../contracts/public/index.js';
 import { deliveredResult } from './helpers/delivered-result.js';
 
 const roots = [];
@@ -77,7 +78,48 @@ function writeRelease(root, { legacy = false } = {}) {
   fs.writeFileSync(path.join(root, '.npmignore'), 'retired-tmux-runtime.js\n');
 }
 
+function channelAuthority() {
+  return {
+    schema_version: 1,
+    contract: 'zylos.channel-authority',
+    scopes: [
+      {
+        channel: 'feishu', region: 'cn', tenant_id: 'tenant-feishu', bot_id: 'app-feishu',
+        verified_at: '2026-07-20T00:00:00.000Z',
+        verification_source: 'authenticated_event', provider_instance_id: 'feishu-owner-one',
+      },
+      {
+        channel: 'lark', region: 'global', tenant_id: 'tenant-lark', bot_id: 'app-lark',
+        verified_at: '2026-07-20T00:00:00.000Z',
+        verification_source: 'authenticated_event', provider_instance_id: 'lark-owner-one',
+      },
+    ],
+  };
+}
+
 describe('exact-base durable source fencing', () => {
+  test('fails before fencing when a routed channel lacks authenticated authority', () => {
+    const database = exactBaseDatabase();
+    database.prepare(`
+      INSERT INTO conversations (direction, channel, endpoint_id, content, status)
+      VALUES ('in', 'feishu', 'chat-no-authority|type:p2p|msg:message-one', 'pending', 'pending')
+    `).run();
+    expect(() => extractAndFenceLegacyBaseBatch({
+      database,
+      batchId: 'upgrade-missing-authority',
+      provider: 'claude',
+      channelAuthority: {
+        schema_version: 1, contract: 'zylos.channel-authority', scopes: [],
+      },
+      observedAt: '2026-07-21T00:00:00.000Z',
+    })).toThrow('no unique authenticated authority scope');
+    expect(() => database.prepare(`
+      INSERT INTO conversations (direction, channel, endpoint_id, content)
+      VALUES ('in', 'feishu', 'still-open', 'not fenced')
+    `).run()).not.toThrow();
+    database.close();
+  });
+
   test('atomically captures pending/running/control state and rejects late ingress', () => {
     const database = exactBaseDatabase();
     database.prepare(`
@@ -95,7 +137,7 @@ describe('exact-base durable source fencing', () => {
       database,
       batchId: 'upgrade-exact-base-fixture',
       provider: 'codex',
-      providerActive: true,
+      channelAuthority: channelAuthority(),
       observedAt: '2026-07-21T00:00:00.000Z',
     });
     expect(batch.records).toEqual(expect.arrayContaining([
@@ -114,8 +156,8 @@ describe('exact-base durable source fencing', () => {
       expect.objectContaining({
         kind: 'c4', legacy_record_id: 'conversation:2', legacy_state: 'running',
         notification_target: {
-          region: 'global', tenant_id: 'legacy-exact-base', channel: 'lark',
-          bot_id: 'legacy-exact-base', chat_type: 'thread', chat_id: 'chat-two',
+          region: 'global', tenant_id: 'tenant-lark', channel: 'lark',
+          bot_id: 'app-lark', chat_type: 'thread', chat_id: 'chat-two',
           native_thread_or_topic_id: 'thread-two',
           native_thread_root_message_id: 'root-two',
           native_thread_reply_target_message_id: 'message-two',
@@ -125,13 +167,17 @@ describe('exact-base durable source fencing', () => {
         kind: 'runtime_control', legacy_record_id: 'control:1', legacy_state: 'pending',
       }),
       expect.objectContaining({
-        kind: 'c4', legacy_record_id: 'provider-session:codex', legacy_state: 'running',
-      }),
-      expect.objectContaining({
         kind: 'c4', legacy_record_id: 'conversation:4', legacy_state: 'pending',
         route: 'ambiguous',
       }),
     ]));
+    const pending = batch.records.find(({ legacy_record_id: id }) => id === 'conversation:1');
+    expect(validateInboundEnvelope(pending.envelope).forwarded).toEqual(pending.envelope);
+    expect(pending.envelope).toMatchObject({
+      region: 'cn', tenant_id: 'tenant-feishu', bot_id: 'app-feishu', channel: 'feishu',
+    });
+    expect(batch.records.some(({ legacy_record_id: id }) => id.startsWith('provider-session:')))
+      .toBe(false);
     expect(() => database.prepare(`
       INSERT INTO conversations (direction, channel, endpoint_id, content) VALUES ('in','lark','late','late')
     `).run()).toThrow('legacy source fenced');
@@ -161,8 +207,13 @@ describe('exact-base durable source fencing', () => {
     tmuxServers.set(server, Number(execFileSync(
       'tmux', ['-L', server, 'display-message', '-p', '#{pid}'], { encoding: 'utf8' },
     ).trim()));
+    const signals = [];
     const quiescence = createLegacyProviderQuiescence({
       provider: 'claude', execFileSyncFn: execFileSync, tmuxArgsPrefix: ['-L', server],
+      signalProcess(pid, signal) {
+        signals.push([pid, signal]);
+        process.kill(pid, signal);
+      },
     });
     const phases = [];
     const phaseJournal = { onPhase: (phase) => phases.push(phase) };
@@ -186,18 +237,37 @@ describe('exact-base durable source fencing', () => {
     expect(execFileSync('ps', ['-o', 'state=', '-p', String(suspended.pane.pid)], {
       encoding: 'utf8',
     }).trim()).toMatch(/^T/);
+    const missingIdentity = {
+      ...suspended,
+      members: [...suspended.members, {
+        ...suspended.members.at(-1), pid: 999_999, birth_identity: 'missing exact member',
+      }],
+    };
+    const signalsBeforeMissingResume = signals.length;
+    expect(() => quiescence.resume(missingIdentity, phaseJournal))
+      .toThrow('every recorded process identity');
+    expect(signals).toHaveLength(signalsBeforeMissingResume);
     expect(quiescence.resume(suspended, phaseJournal)).toMatchObject({ resumed: true });
     expect(execFileSync('ps', ['-o', 'state=', '-p', String(suspended.pane.pid)], {
       encoding: 'utf8',
     }).trim()).not.toMatch(/^T/);
     const suspendedAgain = quiescence.suspend(null, phaseJournal);
-    expect(quiescence.commit(suspendedAgain, phaseJournal)).toMatchObject({ removed: true });
+    const partialCommitRetry = {
+      ...suspendedAgain,
+      members: [...suspendedAgain.members, {
+        ...suspendedAgain.members.at(-1), pid: 999_998, birth_identity: 'already removed member',
+      }],
+    };
+    expect(quiescence.commit(partialCommitRetry, { phase: 'committing', ...phaseJournal }))
+      .toMatchObject({ removed: true });
+    expect(quiescence.commit(suspendedAgain, { phase: 'removed', ...phaseJournal }))
+      .toMatchObject({ removed: true, already_removed: true });
     expect(quiescence.inspect()).toMatchObject({ active: false });
     for (const pid of suspendedAgain.members.map(({ pid }) => pid)) {
       expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
     }
     expect(phases).toEqual([
-      'suspending', 'suspended', 'resuming', 'resuming', 'resumed',
+      'suspending', 'suspended', 'resuming', 'resuming', 'resuming', 'resumed',
       'suspending', 'suspended', 'committing', 'removed',
     ]);
   });
@@ -229,7 +299,8 @@ describe('exact-base durable source fencing', () => {
         available_at INTEGER, last_error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
       );
       INSERT INTO conversations (direction, channel, endpoint_id, content, status)
-      VALUES ('in', 'feishu', 'chat-commit|type:p2p|msg:message-commit', 'pending commit work', 'pending');
+      VALUES ('in', 'feishu', 'chat-running|type:p2p|msg:message-running', 'uncertain running work', 'running'),
+             ('in', 'feishu', 'chat-commit|type:p2p|msg:message-commit', 'pending commit work', 'pending');
     `);
     const server = `zylos-issue27-commit-${process.pid}-${Date.now()}`;
     execFileSync('tmux', [
@@ -291,6 +362,7 @@ describe('exact-base durable source fencing', () => {
         currentReleasePath: fromRelease,
         currentReleaseRef: 'branch:exact-base-bootstrap',
         provider: 'claude', allowLegacyFromRelease: true,
+        legacyChannelAuthority: channelAuthority(),
         execFileSyncFn: fixtureExec,
         legacyProviderQuiescence: createLegacyProviderQuiescence({
           provider: 'claude', execFileSyncFn: fixtureExec, tmuxArgsPrefix: ['-L', server],
@@ -369,6 +441,8 @@ describe('exact-base durable source fencing', () => {
         'tmux', ['-L', server, 'has-session', '-t', '=claude-main'], { stdio: 'ignore' },
       )).not.toThrow();
       expect(database.prepare('SELECT status FROM conversations WHERE id = 1').get().status)
+        .toBe('failed');
+      expect(database.prepare('SELECT status FROM conversations WHERE id = 2').get().status)
         .toBe('pending');
       database.prepare(`
         INSERT INTO conversations (direction, channel, endpoint_id, content, status)
@@ -390,7 +464,8 @@ describe('exact-base durable source fencing', () => {
       expect(deliveredNotices).toEqual(expect.arrayContaining([
         expect.objectContaining({
           target: expect.objectContaining({
-            chat_type: 'dm', chat_id: 'chat-commit',
+            region: 'cn', tenant_id: 'tenant-feishu', bot_id: 'app-feishu',
+            chat_type: 'dm', chat_id: 'chat-running',
             native_thread_root_message_id: null,
             native_thread_reply_target_message_id: null,
           }),
@@ -407,11 +482,11 @@ describe('exact-base durable source fencing', () => {
       expect(fs.existsSync(path.join(active.release_path, 'retired-tmux-runtime.js'))).toBe(false);
       expect(database.prepare(`
         SELECT disposition FROM runtime_legacy_migration_records
-        WHERE legacy_kind = 'c4' AND legacy_record_id = 'conversation:1'
+        WHERE legacy_kind = 'c4' AND legacy_record_id = 'conversation:2'
       `).all()).toContainEqual({ disposition: 'migrated_pending' });
       expect(database.prepare(`
         SELECT disposition FROM runtime_legacy_migration_records
-        WHERE legacy_kind = 'c4' AND legacy_record_id = 'conversation:2'
+        WHERE legacy_kind = 'c4' AND legacy_record_id = 'conversation:3'
       `).get()).toEqual({ disposition: 'migrated_pending' });
     } finally {
       stopDeliveryOwner = true;

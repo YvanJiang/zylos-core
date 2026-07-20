@@ -52,7 +52,15 @@ function descendants(rows, rootPid) {
 }
 
 function birthIdentity(execFileSyncFn, pid) {
-  const value = String(run(execFileSyncFn, 'ps', ['-o', 'lstart=', '-p', String(pid)])).trim();
+  let value;
+  try {
+    value = String(run(execFileSyncFn, 'ps', ['-o', 'lstart=', '-p', String(pid)])).trim();
+  } catch (error) {
+    if (error?.status === 1 || error?.code === 'ESRCH') {
+      throw Object.assign(new Error(`Process ${pid} disappeared.`), { code: 'ESRCH' });
+    }
+    throw error;
+  }
   if (value.length === 0) throw Object.assign(new Error(`Process ${pid} disappeared.`), { code: 'ESRCH' });
   return value;
 }
@@ -95,7 +103,7 @@ export function createLegacyProviderQuiescence({
   const session = sessionFor(provider);
   const tmux = (args, options) => run(execFileSyncFn, 'tmux', [...tmuxArgsPrefix, ...args], options);
 
-  function currentIdentity(expected) {
+  function currentIdentity(expected, { mismatchIsMissing = false } = {}) {
     const row = processRows(execFileSyncFn).find(({ pid }) => pid === expected.pid);
     if (!row) return null;
     let birth;
@@ -105,6 +113,7 @@ export function createLegacyProviderQuiescence({
     }
     if (row.ppid !== expected.ppid || row.pgid !== expected.pgid || row.sid !== expected.sid
       || birth !== expected.birth_identity) {
+      if (mismatchIsMissing) return null;
       throw new Error(`Legacy provider PID ${expected.pid} was reused or changed identity.`);
     }
     return { ...row, birth_identity: birth };
@@ -152,6 +161,16 @@ export function createLegacyProviderQuiescence({
     });
   }
 
+  function hasExactSession() {
+    try {
+      tmux(['has-session', '-t', `=${session}`], { timeout: 1_000 });
+      return true;
+    } catch (error) {
+      if (error?.status === 1) return false;
+      throw error;
+    }
+  }
+
   function stableStoppedTree(record) {
     let previous = null;
     let identities = record.members.map((member) => ({ ...member }));
@@ -171,7 +190,10 @@ export function createLegacyProviderQuiescence({
       }
       const signature = tree.map(({ pid, pgid, state }) => `${pid}:${pgid}:${state[0]}`).sort().join(',');
       if (tree.every(({ state }) => state.startsWith('T')) && signature === previous) {
-        return Object.freeze(identities.map((identity) => Object.freeze({ ...identity })));
+        const currentPids = new Set(tree.map(({ pid }) => pid));
+        return Object.freeze(identities
+          .filter(({ pid }) => currentPids.has(pid))
+          .map((identity) => Object.freeze({ ...identity })));
       }
       previous = signature;
       wait(10);
@@ -184,8 +206,9 @@ export function createLegacyProviderQuiescence({
     if (!observed.active) return observed;
     validateRecord(observed, session);
     onPhase('suspending', observed);
-    currentIdentity(observed.server);
-    for (const member of observed.members) currentIdentity(member);
+    if (currentIdentity(observed.server) === null || currentIdentity(observed.pane) === null) {
+      throw new Error('Legacy provider server or pane disappeared before suspension.');
+    }
     signalProcess(observed.server.pid, 'SIGSTOP');
     signalProcess(-observed.process_group_id, 'SIGSTOP');
     const members = stableStoppedTree(observed);
@@ -198,8 +221,30 @@ export function createLegacyProviderQuiescence({
     if (record?.active !== true) return Object.freeze({ resumed: false, session });
     validateRecord(record, session);
     onPhase('resuming', record);
-    currentIdentity(record.server);
-    for (const member of record.members) currentIdentity(member);
+    const currentServer = currentIdentity(record.server);
+    const currentPane = currentIdentity(record.pane);
+    if (currentServer === null || currentPane === null) {
+      throw new Error('Legacy provider resume requires its exact server and pane identities.');
+    }
+    if (!currentServer.state.startsWith('T') || !currentPane.state.startsWith('T')) {
+      throw new Error('Legacy provider resume requires its exact server and pane to remain stopped.');
+    }
+    for (const member of record.members) {
+      const current = currentIdentity(member);
+      if (current === null) {
+        throw new Error('Legacy provider resume requires every recorded process identity.');
+      }
+      if (!current.state.startsWith('T')) {
+        throw new Error('Legacy provider resume requires every recorded process to remain stopped.');
+      }
+    }
+    const currentGroup = processRows(execFileSyncFn)
+      .filter(({ pgid }) => pgid === record.process_group_id);
+    const recordedGroup = record.members.filter(({ pgid }) => pgid === record.process_group_id);
+    if (currentGroup.length !== recordedGroup.length
+      || currentGroup.some(({ pid }) => !recordedGroup.some((member) => member.pid === pid))) {
+      throw new Error('Legacy provider process group membership changed before resume.');
+    }
     signalProcess(-record.process_group_id, 'SIGCONT');
     for (const member of record.members.filter(({ pgid }) => pgid !== record.process_group_id)) {
       signalProcess(member.pid, 'SIGCONT');
@@ -215,69 +260,79 @@ export function createLegacyProviderQuiescence({
     return result;
   }
 
-  function exactSurvivors(record) {
-    return record.members.filter((member) => currentIdentity(member) !== null);
+  function exactSurvivors(record, options) {
+    return record.members.filter((member) => currentIdentity(member, options) !== null);
   }
 
-  function waitForExit(record, timeoutMs) {
+  function waitForExit(record, timeoutMs, identityOptions) {
     const deadline = Date.now() + timeoutMs;
-    let survivors = exactSurvivors(record);
+    let survivors = exactSurvivors(record, identityOptions);
     while (survivors.length > 0 && Date.now() < deadline) {
       wait(10);
-      survivors = exactSurvivors(record);
+      survivors = exactSurvivors(record, identityOptions);
     }
     return survivors;
   }
 
-  function waitForIdentityExit(identity, timeoutMs) {
+  function waitForIdentityExit(identity, timeoutMs, identityOptions) {
     const deadline = Date.now() + timeoutMs;
-    let survivor = currentIdentity(identity);
+    let survivor = currentIdentity(identity, identityOptions);
     while (survivor !== null && Date.now() < deadline) {
       wait(10);
-      survivor = currentIdentity(identity);
+      survivor = currentIdentity(identity, identityOptions);
     }
     return survivor;
   }
 
-  function commit(record, { onPhase = () => {} } = {}) {
+  function commit(record, { phase = 'suspended', onPhase = () => {} } = {}) {
     if (record?.active !== true) return Object.freeze({ removed: false, session });
     validateRecord(record, session);
-    const server = currentIdentity(record.server);
-    const initialSurvivors = exactSurvivors(record);
-    if (server === null && initialSurvivors.length === 0) {
+    const reconcilingCommit = ['committing', 'removed'].includes(phase);
+    let server = currentIdentity(record.server, { mismatchIsMissing: reconcilingCommit });
+    // A suspended exact server cannot answer a client query. Its validated
+    // process identity is sufficient until it is continued below.
+    const sessionActive = server !== null || hasExactSession();
+    const identityOptions = { mismatchIsMissing: reconcilingCommit && !sessionActive };
+    if (server === null && sessionActive) server = currentIdentity(record.server, identityOptions);
+    const initialSurvivors = exactSurvivors(record, identityOptions);
+    if (phase === 'removed' && !sessionActive && server === null
+      && initialSurvivors.length === 0) {
       return Object.freeze({ removed: true, session, already_removed: true });
     }
-    if (server === null || initialSurvivors.length !== record.members.length) {
+    if (!reconcilingCommit
+      && (server === null || initialSurvivors.length !== record.members.length)) {
       throw new Error('Legacy provider ownership became partial before commit.');
     }
-    onPhase('committing', record);
-    signalProcess(record.server.pid, 'SIGCONT');
-    try {
-      tmux(['kill-session', '-t', `=${session}`]);
-    } catch (error) {
-      if (error?.status !== 1) throw error;
+    if (phase !== 'removed') onPhase('committing', record);
+    if (server !== null) {
+      signalProcess(record.server.pid, 'SIGCONT');
+      try {
+        tmux(['kill-session', '-t', `=${session}`]);
+      } catch (error) {
+        if (error?.status !== 1) throw error;
+      }
     }
-    let survivors = exactSurvivors(record);
+    let survivors = exactSurvivors(record, identityOptions);
     for (const member of survivors) signalProcess(member.pid, 'SIGTERM');
     for (const member of survivors) {
       try { signalProcess(member.pid, 'SIGCONT'); } catch (error) {
         if (error?.code !== 'ESRCH') throw error;
       }
     }
-    survivors = waitForExit(record, 1_000);
+    survivors = waitForExit(record, 1_000, identityOptions);
     for (const member of survivors) {
-      currentIdentity(member);
+      currentIdentity(member, identityOptions);
       signalProcess(member.pid, 'SIGKILL');
     }
-    survivors = waitForExit(record, 1_000);
-    let serverSurvivor = currentIdentity(record.server);
+    survivors = waitForExit(record, 1_000, identityOptions);
+    let serverSurvivor = currentIdentity(record.server, identityOptions);
     if (serverSurvivor !== null) {
       signalProcess(serverSurvivor.pid, 'SIGTERM');
-      serverSurvivor = waitForIdentityExit(record.server, 500);
+      serverSurvivor = waitForIdentityExit(record.server, 500, identityOptions);
     }
     if (serverSurvivor !== null) {
       signalProcess(serverSurvivor.pid, 'SIGKILL');
-      serverSurvivor = waitForIdentityExit(record.server, 500);
+      serverSurvivor = waitForIdentityExit(record.server, 500, identityOptions);
     }
     if (survivors.length > 0 || serverSurvivor !== null) {
       throw new Error('Legacy provider processes remained after commit cleanup.');
@@ -287,9 +342,6 @@ export function createLegacyProviderQuiescence({
       throw new Error('Legacy provider session remained after commit cleanup.');
     } catch (error) {
       if (error?.status !== 1) throw error;
-    }
-    if (processRows(execFileSyncFn).some(({ pgid }) => pgid === record.process_group_id)) {
-      throw new Error('Legacy provider process group remained after commit cleanup.');
     }
     onPhase('removed', record);
     return Object.freeze({ removed: true, session });

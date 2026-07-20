@@ -115,22 +115,28 @@ export function buildExecutorDoctorReport({
   });
 }
 
-async function collectReport() {
-  const configuredProvider = getZylosConfig().runtime === 'codex' ? 'codex' : 'claude';
-  const initialized = fs.existsSync(CONFIG_DIR)
-    && fs.existsSync(path.join(ZYLOS_DIR, 'pm2', 'ecosystem.config.cjs'));
-  const coreHealth = initialized
-    ? await getExecutorServiceHealth({ zylosDir: ZYLOS_DIR })
-    : { ok: false, error: 'not_initialized' };
+export async function collectExecutorDoctorReport({
+  zylosDir = ZYLOS_DIR,
+  configDir = CONFIG_DIR,
+  readConfig = getZylosConfig,
+  commandExistsFn = commandExists,
+  getCoreHealth = getExecutorServiceHealth,
+  claudeAuthenticated = isClaudeAuthenticated,
+  codexAuthenticated = isCodexAuthenticated,
+} = {}) {
+  const configuredProvider = readConfig().runtime === 'codex' ? 'codex' : 'claude';
+  const initialized = fs.existsSync(configDir)
+    && fs.existsSync(path.join(zylosDir, 'pm2', 'ecosystem.config.cjs'));
+  const coreHealth = await getCoreHealth({ zylosDir });
   const provider = SUPPORTED_PROVIDERS.has(coreHealth.provider)
     ? coreHealth.provider
     : configuredProvider;
-  const providerInstalled = commandExists(provider);
+  const providerInstalled = commandExistsFn(provider);
   let providerAuthStatus = 'failure';
   if (providerInstalled) {
     try {
       providerAuthStatus = (
-        provider === 'codex' ? isCodexAuthenticated() : isClaudeAuthenticated()
+        provider === 'codex' ? codexAuthenticated() : claudeAuthenticated()
       ) ? 'success' : 'failure';
     } catch {
       providerAuthStatus = 'uncertain';
@@ -138,14 +144,14 @@ async function collectReport() {
   }
   const configuredProviderInstalled = provider === configuredProvider
     ? providerInstalled
-    : commandExists(configuredProvider);
+    : commandExistsFn(configuredProvider);
   let configuredProviderAuthStatus = provider === configuredProvider
     ? providerAuthStatus
     : 'failure';
   if (provider !== configuredProvider && configuredProviderInstalled) {
     try {
       configuredProviderAuthStatus = (
-        configuredProvider === 'codex' ? isCodexAuthenticated() : isClaudeAuthenticated()
+        configuredProvider === 'codex' ? codexAuthenticated() : claudeAuthenticated()
       ) ? 'success' : 'failure';
     } catch {
       configuredProviderAuthStatus = 'uncertain';
@@ -153,7 +159,7 @@ async function collectReport() {
   }
   return buildExecutorDoctorReport({
     initialized,
-    pm2Installed: commandExists('pm2'),
+    pm2Installed: commandExistsFn('pm2'),
     provider,
     configuredProvider,
     providerInstalled,
@@ -189,7 +195,7 @@ function display(report) {
 export async function doctorCommand(args) {
   const jsonMode = args.includes('--json');
   const checkOnly = args.includes('--check');
-  let report = await collectReport();
+  let report = await collectExecutorDoctorReport();
 
   const providerMismatch = report.issues.some(({ id }) => id === 'provider_identity_mismatch');
   if (!report.passed && !checkOnly && report.initialized && report.supervisor.ready
@@ -199,7 +205,7 @@ export async function doctorCommand(args) {
       zylosDir: ZYLOS_DIR,
       expectedProvider: report.provider.configured_name,
     });
-    if (repair.ok) report = await collectReport();
+    if (repair.ok) report = await collectExecutorDoctorReport();
   }
 
   if (jsonMode) console.log(JSON.stringify(report, null, 2));

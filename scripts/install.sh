@@ -289,6 +289,7 @@ install_zylos() {
   local use_sudo=false
   local zylos_dir="${ZYLOS_DIR:-$HOME/zylos}"
   local bootstrap_manifest="$zylos_dir/runtime/base-executor-bootstrap.json"
+  local channel_authority_manifest="$zylos_dir/runtime/channel-authority.json"
   local installed_bin=""
   local installed_root=""
   if command -v zylos &>/dev/null; then
@@ -298,13 +299,17 @@ install_zylos() {
     installed_bin="$(command -v zylos)"
     installed_root="$(node -e 'const fs=require("fs"),path=require("path");process.stdout.write(path.dirname(path.dirname(fs.realpathSync(process.argv[1]))))' "$installed_bin")"
     if [ -f "$bootstrap_manifest" ]; then
-      local bootstrap_state resume_entry resume_status
+      local bootstrap_state resume_entry resume_status cleanup_entry
       bootstrap_state="$(node -e 'const fs=require("fs");const m=JSON.parse(fs.readFileSync(process.argv[1]));process.stdout.write(String(m.state||""))' "$bootstrap_manifest")"
       if [ "$bootstrap_state" != "supervisor_started" ] && [ "$bootstrap_state" != "base_restored" ]; then
         resume_entry="$(node -e 'const fs=require("fs"),path=require("path");const m=JSON.parse(fs.readFileSync(process.argv[1]));process.stdout.write(path.join(m.target_release_path,"scripts","bootstrap-executor-lifecycle.js"))' "$bootstrap_manifest")"
         warn "Resuming the durable exact-base executor migration (${bootstrap_state})."
         resume_status=0
         node "$resume_entry" --resume --zylos-dir "$zylos_dir" || resume_status=$?
+        if [ "$resume_status" -eq 0 ]; then
+          cleanup_entry="$(dirname "$resume_entry")/cleanup-bootstrap-staging.js"
+          node "$cleanup_entry" --zylos-dir "$zylos_dir" || return $?
+        fi
         return "$resume_status"
       fi
     fi
@@ -362,16 +367,20 @@ install_zylos() {
       --target-release "$bootstrap_backup/target-release" \
       --from-package "$bootstrap_backup/exact-base-package.tgz" \
       --target-package "$bootstrap_backup/executor-package.tgz" \
+      --channel-authority-manifest "$channel_authority_manifest" \
       --install-mode "$install_mode" || bootstrap_status=$?
     if [ "$bootstrap_status" -ne 0 ]; then
       if [ "$bootstrap_status" -eq 2 ]; then
         warn "Executor migration committed, but completion is pending; rerun this installer to resume it."
+      elif [ "$bootstrap_status" -eq 3 ]; then
+        warn "Executor migration rollback is pending; the old provider remains quiesced and no executor was started. Restore the channel delivery owner, then rerun this installer."
       else
-        warn "Executor migration did not commit; exact-base package/runtime state was restored when rollback was possible."
+        warn "Executor migration did not commit; the exact-base package and runtime were restored."
       fi
       return "$bootstrap_status"
     fi
-    find "$bootstrap_backup" -depth -delete
+    node "$bootstrap_backup/target-release/scripts/cleanup-bootstrap-staging.js" \
+      --zylos-dir "$zylos_dir" || return $?
   else
     local install_url="${ZYLOS_REPO}#${BRANCH}"
     info "Installing zylos from GitHub (${BRANCH})..."
