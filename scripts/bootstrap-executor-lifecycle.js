@@ -11,7 +11,11 @@ import { pathToFileURL } from 'node:url';
 import { startExecutorService } from '../cli/lib/executor-service-lifecycle.js';
 import { createInstalledExecutorUpgradeHandler } from '../runtime/migration/installed-executor-upgrade.js';
 import { createLegacyProviderQuiescence } from '../runtime/migration/legacy-provider-quiescence.js';
-import { readChannelAuthorityManifest } from '../runtime/migration/channel-authority-manifest.js';
+import {
+  CHANNEL_AUTHORITY_PROVIDER_BINDING,
+  readChannelAuthorityManifest,
+  validateChannelAuthorityManifest,
+} from '../runtime/migration/channel-authority-manifest.js';
 
 const MANIFEST_NAME = 'base-executor-bootstrap.json';
 
@@ -120,7 +124,7 @@ function prepareManifest({
   targetReleasePath,
   fromPackageTarball,
   targetPackageTarball,
-  channelAuthorityManifest,
+  channelAuthority,
   installMode,
 }) {
   let existing = null;
@@ -133,9 +137,8 @@ function prepareManifest({
       target_release_path: requireDirectory('targetReleasePath', targetReleasePath),
       from_package_tarball: requireFile('fromPackageTarball', fromPackageTarball),
       target_package_tarball: requireFile('targetPackageTarball', targetPackageTarball),
-      channel_authority_manifest: requireFile(
-        'channelAuthorityManifest', channelAuthorityManifest,
-      ),
+      channel_authority_source_path: channelAuthority.path,
+      channel_authority_sha256: channelAuthority.sha256,
       install_mode: installMode,
     };
     for (const [key, value] of Object.entries(requested)) {
@@ -153,12 +156,13 @@ function prepareManifest({
     target_release_path: requireDirectory('targetReleasePath', targetReleasePath),
     from_package_tarball: requireFile('fromPackageTarball', fromPackageTarball),
     target_package_tarball: requireFile('targetPackageTarball', targetPackageTarball),
-    channel_authority_manifest: requireFile(
-      'channelAuthorityManifest', channelAuthorityManifest,
-    ),
+    channel_authority_source_path: channelAuthority.path,
+    channel_authority: channelAuthority.document,
     from_package_sha256: sha256(fromPackageTarball),
     target_package_sha256: sha256(targetPackageTarball),
-    channel_authority_sha256: sha256(channelAuthorityManifest),
+    channel_authority_sha256: channelAuthority.sha256,
+    channel_authority_raw_sha256: channelAuthority.raw_sha256,
+    channel_authority_provider_binding: channelAuthority.provider_binding,
     install_mode: installMode,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
@@ -207,28 +211,43 @@ export async function runBaseToExecutorBootstrap({
   const managedLifecycle = fromPackageTarball !== null || resume;
   let manifest = null;
   let packageLifecycle = null;
+  let authority = null;
   let fromPath;
   let targetPath;
   if (managedLifecycle) {
-    manifest = resume
-      ? JSON.parse(fs.readFileSync(manifestFile, 'utf8'))
-      : prepareManifest({
-        manifestFile, fromReleasePath, targetReleasePath,
-        fromPackageTarball, targetPackageTarball, channelAuthorityManifest, installMode,
+    if (resume) {
+      manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+      authority = validateChannelAuthorityManifest(manifest.channel_authority);
+      if (authority.sha256 !== manifest.channel_authority_sha256
+        || manifest.channel_authority_provider_binding
+          !== CHANNEL_AUTHORITY_PROVIDER_BINDING) {
+        throw new Error('Durable bootstrap channel authority facts conflict.');
+      }
+      authority = Object.freeze({
+        ...authority,
+        path: manifest.channel_authority_source_path,
+        provider_binding: CHANNEL_AUTHORITY_PROVIDER_BINDING,
       });
+    } else {
+      authority = readChannelAuthorityManifest(channelAuthorityManifest, {
+        expectedPath: path.join(installationRoot, 'runtime', 'channel-authority.json'),
+      });
+      manifest = prepareManifest({
+        manifestFile, fromReleasePath, targetReleasePath,
+        fromPackageTarball, targetPackageTarball, channelAuthority: authority, installMode,
+      });
+    }
     fromPath = requireDirectory('fromReleasePath', manifest.from_release_path);
     targetPath = requireDirectory('targetReleasePath', manifest.target_release_path);
     packageLifecycle = createPackageLifecycle({ manifestFile, manifest, execFileSyncFn });
   } else {
     fromPath = requireDirectory('fromReleasePath', fromReleasePath);
     targetPath = requireDirectory('targetReleasePath', targetReleasePath);
-  }
-  const authority = managedLifecycle
-    ? readChannelAuthorityManifest(manifest.channel_authority_manifest)
-    : (channelAuthorityManifest === null ? null : readChannelAuthorityManifest(channelAuthorityManifest));
-  if (managedLifecycle && sha256(manifest.channel_authority_manifest)
-    !== manifest.channel_authority_sha256) {
-    throw new Error('Channel authority manifest changed after bootstrap preparation.');
+    if (channelAuthorityManifest !== null) {
+      authority = readChannelAuthorityManifest(channelAuthorityManifest, {
+        expectedPath: path.join(installationRoot, 'runtime', 'channel-authority.json'),
+      });
+    }
   }
   const DatabaseConstructor = Database ?? createRequire(path.join(
     installationRoot, '.claude', 'skills', 'comm-bridge', 'package.json',

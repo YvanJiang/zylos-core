@@ -51,6 +51,14 @@ function descendants(rows, rootPid) {
   return result;
 }
 
+function requireCompleteProcessGroup(rows, members, processGroupId, operation) {
+  const currentGroup = rows.filter(({ pgid }) => pgid === processGroupId);
+  if (currentGroup.length !== members.length
+    || currentGroup.some(({ pid }) => !members.some((member) => member.pid === pid))) {
+    throw new Error(`Legacy provider process group has unowned members before ${operation}.`);
+  }
+}
+
 function birthIdentity(execFileSyncFn, pid) {
   let value;
   try {
@@ -152,6 +160,7 @@ export function createLegacyProviderQuiescence({
     if (tree.length === 0 || tree.some(({ pgid }) => pgid !== paneRow.pgid)) {
       throw new Error('Legacy provider process tree must occupy one dedicated process group.');
     }
+    requireCompleteProcessGroup(rows, tree, paneRow.pgid, 'inspection');
     const members = tree.map((row) => ownedIdentity(execFileSyncFn, row));
     return Object.freeze({
       active: true, session, process_group_id: paneRow.pgid,
@@ -178,6 +187,7 @@ export function createLegacyProviderQuiescence({
       const rows = processRows(execFileSyncFn);
       const tree = descendants(rows, record.pane.pid);
       if (tree.length === 0) throw new Error('Legacy provider pane disappeared while suspending.');
+      requireCompleteProcessGroup(rows, tree, record.process_group_id, 'suspension');
       for (const row of tree) {
         const existing = identities.find(({ pid }) => pid === row.pid);
         if (existing) currentIdentity(existing);
@@ -210,53 +220,85 @@ export function createLegacyProviderQuiescence({
       throw new Error('Legacy provider server or pane disappeared before suspension.');
     }
     signalProcess(observed.server.pid, 'SIGSTOP');
-    signalProcess(-observed.process_group_id, 'SIGSTOP');
+    for (const member of observed.members) {
+      currentIdentity(member);
+      signalProcess(member.pid, 'SIGSTOP');
+    }
     const members = stableStoppedTree(observed);
     const suspended = Object.freeze({ ...observed, members, suspended: true });
     onPhase('suspended', suspended);
     return suspended;
   }
 
-  function resume(record, { onPhase = () => {} } = {}) {
+  function resume(record, { phase = 'suspended', onPhase = () => {} } = {}) {
     if (record?.active !== true) return Object.freeze({ resumed: false, session });
     validateRecord(record, session);
-    onPhase('resuming', record);
+    if (!['suspended', 'resuming', 'resumed'].includes(phase)) {
+      throw new Error('Legacy provider resume phase is invalid.');
+    }
     const currentServer = currentIdentity(record.server);
     const currentPane = currentIdentity(record.pane);
     if (currentServer === null || currentPane === null) {
       throw new Error('Legacy provider resume requires its exact server and pane identities.');
     }
-    if (!currentServer.state.startsWith('T') || !currentPane.state.startsWith('T')) {
-      throw new Error('Legacy provider resume requires its exact server and pane to remain stopped.');
-    }
-    for (const member of record.members) {
-      const current = currentIdentity(member);
+    const rows = processRows(execFileSyncFn);
+    const currentTree = descendants(rows, record.pane.pid);
+    const expectedMembers = phase === 'suspended' ? record.members : currentTree;
+    requireCompleteProcessGroup(rows, expectedMembers, record.process_group_id, 'resume');
+    const currentMembers = [];
+    for (const member of expectedMembers) {
+      const recorded = record.members.find(({ pid }) => pid === member.pid);
+      const current = recorded === undefined
+        ? ownedIdentity(execFileSyncFn, member) : currentIdentity(recorded);
       if (current === null) {
         throw new Error('Legacy provider resume requires every recorded process identity.');
       }
-      if (!current.state.startsWith('T')) {
-        throw new Error('Legacy provider resume requires every recorded process to remain stopped.');
+      currentMembers.push(current);
+    }
+    const resumedRecord = Object.freeze({
+      ...record,
+      members: Object.freeze(currentMembers.map((member) => Object.freeze({ ...member }))),
+    });
+    const allStopped = currentServer.state.startsWith('T')
+      && currentPane.state.startsWith('T')
+      && currentMembers.every(({ state }) => state.startsWith('T'));
+    const allRunning = !currentServer.state.startsWith('T')
+      && !currentPane.state.startsWith('T')
+      && currentMembers.every(({ state }) => !state.startsWith('T'));
+    if (phase === 'suspended' && !allStopped) {
+      throw new Error('Legacy provider suspended phase requires every exact process to remain stopped.');
+    }
+    if (phase === 'resumed') {
+      if (!allRunning) {
+        throw new Error('Legacy provider resumed phase requires every exact process to be running.');
       }
+      const alreadyResumed = inspect();
+      if (!alreadyResumed.active
+        || alreadyResumed.server.birth_identity !== record.server.birth_identity
+        || alreadyResumed.pane.birth_identity !== record.pane.birth_identity) {
+        throw new Error('Legacy provider resumed phase lost its exact recorded session.');
+      }
+      return Object.freeze({
+        resumed: true, session, process_group_id: record.process_group_id,
+        already_resumed: true,
+      });
     }
-    const currentGroup = processRows(execFileSyncFn)
-      .filter(({ pgid }) => pgid === record.process_group_id);
-    const recordedGroup = record.members.filter(({ pgid }) => pgid === record.process_group_id);
-    if (currentGroup.length !== recordedGroup.length
-      || currentGroup.some(({ pid }) => !recordedGroup.some((member) => member.pid === pid))) {
-      throw new Error('Legacy provider process group membership changed before resume.');
-    }
-    signalProcess(-record.process_group_id, 'SIGCONT');
-    for (const member of record.members.filter(({ pgid }) => pgid !== record.process_group_id)) {
+    if (phase !== 'resuming') onPhase('resuming', resumedRecord);
+    for (const member of currentMembers.filter(({ state }) => state.startsWith('T'))) {
+      currentIdentity(member);
       signalProcess(member.pid, 'SIGCONT');
     }
-    signalProcess(record.server.pid, 'SIGCONT');
+    if (currentServer.state.startsWith('T')) {
+      currentIdentity(record.server);
+      signalProcess(record.server.pid, 'SIGCONT');
+    }
     const observed = inspect();
     if (!observed.active || observed.server.birth_identity !== record.server.birth_identity
       || observed.pane.birth_identity !== record.pane.birth_identity) {
       throw new Error('Legacy provider did not resume its exact recorded session.');
     }
     const result = Object.freeze({ resumed: true, session, process_group_id: record.process_group_id });
-    onPhase('resumed', record);
+    onPhase('resumed', resumedRecord);
     return result;
   }
 

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { canonicalizeJson } from '../../contracts/public/index.js';
 
 const CHANNEL_REGIONS = Object.freeze({ feishu: 'cn', lark: 'global' });
+export const CHANNEL_AUTHORITY_PROVIDER_BINDING = 'owner_only_exact_path_authenticated_event';
 const SCOPE_KEYS = Object.freeze([
   'channel', 'region', 'tenant_id', 'bot_id', 'verified_at',
   'verification_source', 'provider_instance_id',
@@ -28,6 +29,7 @@ export function validateChannelAuthorityManifest(document) {
     throw new TypeError('Channel authority manifest contains unsupported fields.');
   }
   const scopes = new Map();
+  const providerInstances = new Set();
   for (const [index, candidate] of document.scopes.entries()) {
     if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)
       || JSON.stringify(Object.keys(candidate).sort()) !== JSON.stringify([...SCOPE_KEYS].sort())) {
@@ -48,7 +50,11 @@ export function validateChannelAuthorityManifest(document) {
     if (scopes.has(scope.channel)) {
       throw new Error(`Legacy channel ${scope.channel} has ambiguous authority scopes.`);
     }
+    if (providerInstances.has(scope.provider_instance_id)) {
+      throw new Error('Channel authority provider instance binding is ambiguous.');
+    }
     scopes.set(scope.channel, Object.freeze(scope));
+    providerInstances.add(scope.provider_instance_id);
   }
   const normalized = Object.freeze({
     schema_version: 1,
@@ -61,17 +67,38 @@ export function validateChannelAuthorityManifest(document) {
   });
 }
 
-export function readChannelAuthorityManifest(file) {
+export function readChannelAuthorityManifest(file, { expectedPath = null } = {}) {
   if (typeof file !== 'string' || !path.isAbsolute(file) || path.parse(file).root === file) {
     throw new TypeError('Channel authority manifest must be an explicit absolute non-root file.');
   }
-  const resolved = fs.realpathSync(file);
-  const stat = fs.statSync(resolved);
-  if (!stat.isFile() || (stat.mode & 0o022) !== 0
-    || (typeof process.getuid === 'function' && stat.uid !== process.getuid())) {
-    throw new Error('Channel authority manifest ownership or mode is unsafe.');
+  const resolved = path.join(fs.realpathSync(path.dirname(file)), path.basename(file));
+  const expected = expectedPath === null ? null : path.join(
+    fs.realpathSync(path.dirname(expectedPath)), path.basename(expectedPath),
+  );
+  if (expected !== null && resolved !== expected) {
+    throw new Error('Channel authority manifest is not at the provider prerequisite path.');
   }
-  return Object.freeze({ ...validateChannelAuthorityManifest(JSON.parse(fs.readFileSync(resolved, 'utf8'))), path: resolved });
+  const descriptor = fs.openSync(
+    resolved,
+    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isFile() || (stat.mode & 0o077) !== 0
+      || (typeof process.getuid === 'function' && stat.uid !== process.getuid())) {
+      throw new Error('Channel authority manifest ownership or mode is unsafe.');
+    }
+    const bytes = fs.readFileSync(descriptor);
+    const validated = validateChannelAuthorityManifest(JSON.parse(bytes.toString('utf8')));
+    return Object.freeze({
+      ...validated,
+      path: resolved,
+      raw_sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+      provider_binding: CHANNEL_AUTHORITY_PROVIDER_BINDING,
+    });
+  } finally {
+    fs.closeSync(descriptor);
+  }
 }
 
 export function authorityScopeFor(channelAuthority, channel) {

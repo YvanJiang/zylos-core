@@ -36,6 +36,11 @@ region `global`. Core copies the validated non-secret facts and their canonical 
 durable upgrade plan before fencing the old source. A missing, changed, duplicate, or mismatched
 scope fails before source mutation. Provider execution activity is a separate plan fact and never
 selects or synthesizes a user reply target.
+Core accepts the prerequisite artifact only at the exact owner-only
+`$ZYLOS_DIR/runtime/channel-authority.json` path. It opens without following a final symlink and
+derives ownership, parsed facts, raw hash, and canonical hash from the same file descriptor. The
+bootstrap copies those facts into its fsync-backed manifest, so recovery never depends on the
+external prerequisite file after preparation.
 
 External adapter effects use `upgrade_id:step_key` as their idempotency key and take a durable
 SQLite claim before invocation. The coordinator renews the claim while the adapter is live; only a

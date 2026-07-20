@@ -12,7 +12,8 @@ import {
 import { cleanupCompletedBootstrapStaging } from '../scripts/cleanup-bootstrap-staging.js';
 
 function writeChannelAuthority(root) {
-  const file = path.join(root, 'channel-authority.json');
+  const file = path.join(root, 'zylos', 'runtime', 'channel-authority.json');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, `${JSON.stringify({
     schema_version: 1,
     contract: 'zylos.channel-authority',
@@ -193,8 +194,10 @@ describe('exact-base executor lifecycle bootstrap', () => {
         path.join(zylosDir, 'runtime', 'base-executor-bootstrap.json'), 'utf8',
       ))).toMatchObject({
         state: 'supervisor_started',
-        channel_authority_manifest: fs.realpathSync(authorityManifest),
+        channel_authority_source_path: fs.realpathSync(authorityManifest),
         channel_authority_sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+        channel_authority: expect.objectContaining({ contract: 'zylos.channel-authority' }),
+        channel_authority_provider_binding: 'owner_only_exact_path_authenticated_event',
       });
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
@@ -248,7 +251,7 @@ describe('exact-base executor lifecycle bootstrap', () => {
     }
   });
 
-  test('resume rejects a changed authority manifest before reopening migration state', async () => {
+  test('resume uses copied authority facts after the prerequisite file disappears', async () => {
     const root = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-authority-resume-'));
     const zylosDir = path.join(root, 'zylos');
     const fromRelease = path.join(root, 'exact-base');
@@ -274,10 +277,17 @@ describe('exact-base executor lifecycle bootstrap', () => {
           return handler;
         },
       })).rejects.toThrow('fixture interruption');
-      fs.appendFileSync(authorityManifest, ' ');
+      fs.rmSync(authorityManifest);
       await expect(runBaseToExecutorBootstrap({
         zylosDir, resume: true, Database: DatabaseFixture,
-      })).rejects.toThrow('Channel authority manifest changed after bootstrap preparation');
+        createHandler: () => {
+          const handler = async () => ({
+            success: false, state: 'rolled_back', error: 'fixture durable rollback',
+          });
+          handler.resumeBlocking = async () => null;
+          return handler;
+        },
+      })).rejects.toThrow('rollback state is rolled_back');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

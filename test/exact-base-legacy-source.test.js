@@ -245,9 +245,17 @@ describe('exact-base durable source fencing', () => {
     };
     const signalsBeforeMissingResume = signals.length;
     expect(() => quiescence.resume(missingIdentity, phaseJournal))
-      .toThrow('every recorded process identity');
+      .toThrow('unowned members before resume');
     expect(signals).toHaveLength(signalsBeforeMissingResume);
-    expect(quiescence.resume(suspended, phaseJournal)).toMatchObject({ resumed: true });
+    phaseJournal.onPhase('resuming');
+    process.kill(suspended.members.at(-1).pid, 'SIGCONT');
+    expect(quiescence.resume(suspended, { phase: 'resuming', ...phaseJournal }))
+      .toMatchObject({ resumed: true });
+    const signalsAfterResume = signals.length;
+    expect(quiescence.resume(suspended, { phase: 'resumed', ...phaseJournal }))
+      .toMatchObject({ resumed: true, already_resumed: true });
+    expect(signals).toHaveLength(signalsAfterResume);
+    expect(signals.every(([pid]) => pid > 1)).toBe(true);
     expect(execFileSync('ps', ['-o', 'state=', '-p', String(suspended.pane.pid)], {
       encoding: 'utf8',
     }).trim()).not.toMatch(/^T/);
@@ -267,7 +275,7 @@ describe('exact-base durable source fencing', () => {
       expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
     }
     expect(phases).toEqual([
-      'suspending', 'suspended', 'resuming', 'resuming', 'resuming', 'resumed',
+      'suspending', 'suspended', 'resuming', 'resumed',
       'suspending', 'suspended', 'committing', 'removed',
     ]);
   });
@@ -332,6 +340,7 @@ describe('exact-base durable source fencing', () => {
       return execFileSync(file, args, options);
     };
     const packageCalls = [];
+    let failProviderResumeOnce = true;
     let healthShouldPass = false;
     let deliveryEnabled = false;
     let stopDeliveryOwner = false;
@@ -357,16 +366,30 @@ describe('exact-base durable source fencing', () => {
       }
     })().catch((error) => { deliveryOwnerError = error; });
     try {
+      const providerQuiescence = createLegacyProviderQuiescence({
+        provider: 'claude', execFileSyncFn: fixtureExec, tmuxArgsPrefix: ['-L', server],
+      });
       const handler = createInstalledExecutorUpgradeHandler({
         database, Database, zylosDir,
         currentReleasePath: fromRelease,
         currentReleaseRef: 'branch:exact-base-bootstrap',
         provider: 'claude', allowLegacyFromRelease: true,
-        legacyChannelAuthority: channelAuthority(),
+        legacyChannelAuthority: {
+          document: channelAuthority(),
+          provider_binding: 'owner_only_exact_path_authenticated_event',
+        },
         execFileSyncFn: fixtureExec,
-        legacyProviderQuiescence: createLegacyProviderQuiescence({
-          provider: 'claude', execFileSyncFn: fixtureExec, tmuxArgsPrefix: ['-L', server],
-        }),
+        legacyProviderQuiescence: {
+          ...providerQuiescence,
+          resume(record, journal) {
+            const result = providerQuiescence.resume(record, journal);
+            if (failProviderResumeOnce) {
+              failProviderResumeOnce = false;
+              throw new Error('fixture interruption after durable provider resume');
+            }
+            return result;
+          },
+        },
         noticeDeliveryTimeoutMs: 50,
         packageLifecycle: {
           async activate() { packageCalls.push('activate'); return { installed: true }; },
@@ -426,6 +449,18 @@ describe('exact-base durable source fencing', () => {
       expect(processes.size).toBe(0);
 
       deliveryEnabled = true;
+      const interruptedRollback = await handler.resumeBlocking();
+      expect(interruptedRollback).toMatchObject({ success: false, state: 'rollback_failed' });
+      expect(interruptedRollback.rollback?.error).toContain(
+        'fixture interruption after durable provider resume',
+      );
+      expect(database.prepare('SELECT status FROM conversations WHERE id = 1').get().status)
+        .toBe('failed');
+      expect(database.prepare('SELECT status FROM conversations WHERE id = 2').get().status)
+        .toBe('pending');
+      expect(execFileSync('ps', ['-o', 'state=', '-p', String(tmuxServers.get(server))], {
+        encoding: 'utf8',
+      }).trim()).not.toMatch(/^T/);
       const recoveredRollback = await handler.resumeBlocking();
       expect(deliveryOwnerError).toBeNull();
       expect(database.prepare(`

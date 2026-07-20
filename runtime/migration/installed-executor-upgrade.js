@@ -18,7 +18,10 @@ import {
   readLegacyBaseBatch,
   reconcileLegacyBaseRollback,
 } from './legacy-base-source.js';
-import { validateChannelAuthorityManifest } from './channel-authority-manifest.js';
+import {
+  CHANNEL_AUTHORITY_PROVIDER_BINDING,
+  validateChannelAuthorityManifest,
+} from './channel-authority-manifest.js';
 import { findResumableRuntimeUpgrade } from './upgrade-state.js';
 
 const LEGACY_SERVICE_NAMES = Object.freeze([
@@ -80,11 +83,23 @@ function requireDirectory(name, value) {
   return resolved;
 }
 
-function atomicJson(file, document) {
+export function atomicJson(file, document) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${crypto.randomUUID()}.partial`;
-  fs.writeFileSync(temporary, `${canonicalizeJson(document)}\n`, { mode: 0o600 });
-  fs.renameSync(temporary, file);
+  const descriptor = fs.openSync(temporary, 'wx', 0o600);
+  try {
+    fs.writeFileSync(descriptor, `${canonicalizeJson(document)}\n`);
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  try {
+    fs.renameSync(temporary, file);
+    const directory = fs.openSync(path.dirname(file), 'r');
+    try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
 }
 
 function deployManagedFile(source, destination) {
@@ -565,11 +580,12 @@ export function createInstalledExecutorUpgradeHandler({
     || typeof legacyProviderQuiescence.commit !== 'function')) {
     throw new TypeError('legacyProviderQuiescence is required for exact-base migration');
   }
+  if (allowLegacyFromRelease
+    && legacyChannelAuthority?.provider_binding !== CHANNEL_AUTHORITY_PROVIDER_BINDING) {
+    throw new Error('Exact-base migration requires verified channel prerequisite authority.');
+  }
   const channelAuthority = allowLegacyFromRelease
-    ? validateChannelAuthorityManifest(
-      legacyChannelAuthority?.document ?? legacyChannelAuthority,
-    )
-    : null;
+    ? validateChannelAuthorityManifest(legacyChannelAuthority.document) : null;
   if (typeof startTargetHealth !== 'function') throw new TypeError('startTargetHealth must be a function');
   if (!Number.isSafeInteger(targetHealthProofTimeoutMs) || targetHealthProofTimeoutMs <= 0) {
     throw new TypeError('targetHealthProofTimeoutMs must be a positive safe integer');
@@ -692,7 +708,10 @@ export function createInstalledExecutorUpgradeHandler({
       reconcileLegacyBaseRollback({ database, rollbackBatch: sourceQueue });
       providerQuiescence.resume(
         state.provider_execution,
-        providerPhaseJournal(legacyServiceStateFile(upgradeId), state),
+        {
+          phase: state.provider_phase,
+          ...providerPhaseJournal(legacyServiceStateFile(upgradeId), state),
+        },
       );
     }
     const ecosystem = path.join(installationRoot, 'pm2', 'ecosystem.config.cjs');
@@ -882,7 +901,12 @@ export function createInstalledExecutorUpgradeHandler({
         `Runtime upgrade ${upgradeId} is ${blocking?.state ?? 'prepared'} but cannot resume: ${error.message}`,
       );
     }
-    if (plan.from_release_kind === 'legacy_base') {
+    const rollbackReconciliationStarted = database.prepare(`
+      SELECT 1 FROM runtime_upgrade_effects
+      WHERE upgrade_id = ? AND step_key = 'legacy-dispatcher-restart'
+      LIMIT 1
+    `).get(upgradeId) !== undefined;
+    if (plan.from_release_kind === 'legacy_base' && !rollbackReconciliationStarted) {
       fenceLegacyBaseBatch({
         database,
         expectedBatch: plan.legacy_batch,

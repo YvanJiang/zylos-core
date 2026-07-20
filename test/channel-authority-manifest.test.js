@@ -38,6 +38,10 @@ describe('legacy channel authority manifest', () => {
     expect(() => validateChannelAuthorityManifest(document([
       scope({ region: 'global' }),
     ]))).toThrow('requires authoritative region cn');
+    expect(() => validateChannelAuthorityManifest(document([
+      scope(),
+      scope({ channel: 'lark', region: 'global', tenant_id: 'tenant-two', bot_id: 'app-two' }),
+    ]))).toThrow('provider instance binding is ambiguous');
   });
 
   test('reads only an explicit owner-controlled manifest file', () => {
@@ -47,7 +51,11 @@ describe('legacy channel authority manifest', () => {
       fs.writeFileSync(file, JSON.stringify(document([scope()])), { mode: 0o600 });
       expect(readChannelAuthorityManifest(file)).toMatchObject({
         path: fs.realpathSync(file), document: document([scope()]),
+        provider_binding: 'owner_only_exact_path_authenticated_event',
       });
+      expect(() => readChannelAuthorityManifest(file, {
+        expectedPath: path.join(root, 'different-authority.json'),
+      })).toThrow('provider prerequisite path');
       fs.chmodSync(file, 0o666);
       expect(() => readChannelAuthorityManifest(file)).toThrow('ownership or mode is unsafe');
     } finally {
