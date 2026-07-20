@@ -1791,6 +1791,18 @@ describe('runtime executor service', () => {
           attempt_no: 1,
           lease_epoch: 1,
         },
+        workspace: {
+          workspace_lease_id: 'workspace-lease-executor-1',
+          workspace_root: process.cwd(),
+          mode: 'writable',
+          status: 'current',
+          holder_service_instance_id: 'executor-service-A',
+          holder_conversation_id: accepted.conversation_id,
+          holder_turn_id: accepted.turn_id,
+          lease_epoch: 1,
+          acquired_at: '2026-07-19T07:01:00Z',
+          lease_expires_at: '2026-07-19T07:01:10.000Z',
+        },
       },
     ]);
     expect(service.snapshot().executors).toEqual([]);

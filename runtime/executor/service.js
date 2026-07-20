@@ -1122,8 +1122,21 @@ export function createExecutorService({
         );
         if (released) endedResidentFences.delete(context.conversation_id);
       },
-      assertWorkspaceWrite() {
-        return persist(() => store.assertWorkspaceWritable(turnContext));
+      assertWorkspaceWrite(approvalFence = undefined) {
+        if (
+          approvalFence !== undefined
+          && (
+            committedControlStatus(activeRun) !== null
+            || activeRun.durableSettled
+            || activeRuns.get(turnContext.turn_id) !== activeRun
+            || approvalFence.provider_thread_id !== activeRun.currentProviderNativeId
+          )
+        ) {
+          const error = new Error('The Codex approval no longer matches the active provider run.');
+          error.code = 'stale_attempt';
+          throw error;
+        }
+        return persist(() => store.assertWorkspaceWritable(turnContext, approvalFence));
       },
       authorizeProtectedAction(request) {
         return authorizeProtectedAction(request);
@@ -1407,6 +1420,9 @@ export function createExecutorService({
         provider_native_id: turnContext.provider_native_id,
         trace_id: turnContext.trace_id,
         executor_instance_id: turnContext.executor_instance_id,
+        workspace: turnContext.workspace === null
+          ? null
+          : Object.freeze({ ...turnContext.workspace }),
         input: turnContext.input,
         interaction: Object.freeze({
           authorized_subjects: Object.freeze(

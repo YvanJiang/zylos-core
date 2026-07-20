@@ -111,6 +111,17 @@ function executionContext(overrides = {}) {
       authorized_subjects: [{ type: 'actor', actor_id: 'user-1' }],
       allowed_sources: ['main_card_reply', 'card_action'],
     },
+    executor_instance_id: 'executor-1',
+    workspace: {
+      workspace_lease_id: 'workspace-lease-1',
+      workspace_root: '/workspace',
+      mode: 'writable',
+      holder_service_instance_id: 'service-1',
+      holder_conversation_id: 'conversation-1',
+      holder_turn_id: 'turn-1',
+      lease_epoch: 11,
+      lease_expires_at: '2026-07-19T05:10:00Z',
+    },
     attempt: { attempt_id: 'attempt-1', attempt_no: 1, lease_epoch: 3 },
     ...overrides,
   };
@@ -208,6 +219,27 @@ function sendStartedFileChange({ send, threadId, turnId }, itemId) {
   });
 }
 
+function sendStartedCommand({ send, threadId, turnId }, itemId, {
+  command = 'touch approved.txt',
+  cwd = '/workspace',
+} = {}) {
+  send({
+    method: 'item/started',
+    params: {
+      threadId,
+      turnId,
+      startedAtMs: 1,
+      item: {
+        type: 'commandExecution',
+        id: itemId,
+        command,
+        cwd,
+        status: 'inProgress',
+      },
+    },
+  });
+}
+
 describe('Codex app-server provider adapter', () => {
   test('advertises the workspace access enforced by its configured sandbox', () => {
     const spawnProcess = jest.fn();
@@ -220,7 +252,7 @@ describe('Codex app-server provider adapter', () => {
       root: '/workspace',
       mode: 'writable',
       read_only_enforced: false,
-      authority: 'provider_sandbox',
+      authority: 'core_workspace_lease',
     });
 
     expect(createCodexAppServerAdapter({
@@ -233,6 +265,24 @@ describe('Codex app-server provider adapter', () => {
       read_only_enforced: true,
       authority: 'provider_sandbox',
     });
+  });
+
+  test('rejects full access and any writable turn that would bypass synchronous approval', () => {
+    const spawnProcess = jest.fn();
+
+    expect(() => createCodexAppServerAdapter({
+      spawnProcess,
+      cwd: '/workspace',
+      sandbox: 'danger-full-access',
+      approvalPolicy: 'never',
+    })).toThrow(/danger-full-access/);
+    expect(() => createCodexAppServerAdapter({
+      spawnProcess,
+      cwd: '/workspace',
+      sandbox: 'workspace-write',
+      approvalPolicy: 'never',
+    })).toThrow(/on-request/);
+    expect(spawnProcess).not.toHaveBeenCalled();
   });
 
   test('fails closed before starting a writable turn without a current workspace fence', async () => {
@@ -390,11 +440,26 @@ describe('Codex app-server provider adapter', () => {
     expect(server.received[1]).toEqual({ method: 'initialized' });
     expect(server.received[2]).toEqual(expect.objectContaining({
       method: 'thread/start',
-      params: {
+      params: expect.objectContaining({
         cwd: '/workspace',
         approvalPolicy: 'on-request',
-        sandbox: 'workspace-write',
-      },
+        approvalsReviewer: 'user',
+        sandbox: 'read-only',
+        environments: [],
+        dynamicTools: [],
+        config: expect.objectContaining({
+          mcp_servers: {},
+          web_search: 'disabled',
+          features: expect.objectContaining({
+            apps: false,
+            hooks: false,
+            multi_agent: false,
+            code_mode: false,
+            image_generation: false,
+            request_permissions: false,
+          }),
+        }),
+      }),
     }));
     expect(context.bindProviderNativeId).toHaveBeenCalledWith('codex-thread-1');
     expect(context.reportProviderState).toHaveBeenCalledWith({
@@ -414,6 +479,11 @@ describe('Codex app-server provider adapter', () => {
       params: expect.objectContaining({
         threadId: 'codex-thread-1',
         input: [{ type: 'text', text: 'Hello Codex' }],
+        cwd: '/workspace',
+        approvalPolicy: 'on-request',
+        approvalsReviewer: 'user',
+        sandboxPolicy: { type: 'readOnly', networkAccess: false },
+        environments: [],
       }),
     }));
   });
@@ -449,6 +519,17 @@ describe('Codex app-server provider adapter', () => {
         expect.objectContaining({ params: expect.objectContaining({ threadId: 'codex-thread-A' }) }),
         expect.objectContaining({ params: expect.objectContaining({ threadId: 'codex-thread-B' }) }),
       ]));
+    for (const resume of server.received.filter(({ method }) => method === 'thread/resume')) {
+      expect(resume.params).toEqual(expect.objectContaining({
+        approvalPolicy: 'on-request',
+        approvalsReviewer: 'user',
+        sandbox: 'read-only',
+        config: expect.objectContaining({
+          mcp_servers: {},
+          web_search: 'disabled',
+        }),
+      }));
+    }
     expect(server.received.filter(({ method }) => method === 'turn/start')).toHaveLength(2);
   });
 
@@ -515,7 +596,10 @@ describe('Codex app-server provider adapter', () => {
         });
       },
     });
-    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
     const runAContext = executionContext({
       lineage: { provider_native_id: 'codex-thread-A' },
     });
@@ -745,40 +829,6 @@ describe('Codex app-server provider adapter', () => {
           },
         });
         send({
-          method: 'hook/started',
-          params: {
-            threadId,
-            turnId,
-            run: {
-              id: 'private-stop-hook-1',
-              eventName: 'stop',
-              handlerType: 'command',
-              executionMode: 'sync',
-              scope: 'turn',
-              status: 'running',
-              sourcePath: '/private/machine/hooks.json',
-              entries: [],
-            },
-          },
-        });
-        send({
-          method: 'hook/completed',
-          params: {
-            threadId,
-            turnId,
-            run: {
-              id: 'private-stop-hook-1',
-              eventName: 'stop',
-              handlerType: 'command',
-              executionMode: 'sync',
-              scope: 'turn',
-              status: 'completed',
-              sourcePath: '/private/machine/hooks.json',
-              entries: [{ kind: 'context', text: 'private hook output' }],
-            },
-          },
-        });
-        send({
           method: 'turn/completed',
           params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
         });
@@ -828,30 +878,7 @@ describe('Codex app-server provider adapter', () => {
         provider_native_id: 'codex-thread-1',
         payload: { text: 'Hello', end_offset: 5 },
       },
-      {
-        kind: 'tool_started',
-        provider_native_id: 'codex-thread-1',
-        payload: {
-          tool_use_id: 'provider-hook-1',
-          tool_name: 'provider_hook',
-          summary: 'Provider hook started.',
-          side_effect_status: 'unknown',
-        },
-      },
-      {
-        kind: 'tool_finished',
-        provider_native_id: 'codex-thread-1',
-        payload: {
-          tool_use_id: 'provider-hook-1',
-          tool_name: 'provider_hook',
-          summary: 'Provider hook completed.',
-          side_effect_status: 'unknown',
-        },
-      },
     ]);
-    expect(JSON.stringify(events)).not.toContain('/private/machine/hooks.json');
-    expect(JSON.stringify(events)).not.toContain('private hook output');
-    expect(JSON.stringify(events)).not.toContain('private-stop-hook-1');
     expect(JSON.stringify(server.received)).not.toContain('exec --json');
   });
 
@@ -1119,7 +1146,13 @@ describe('Codex app-server provider adapter', () => {
     expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
   });
 
-  test('normalizes image generation completion without interpreting its opaque status as success', async () => {
+  test.each([
+    'mcpToolCall',
+    'dynamicToolCall',
+    'collabAgentToolCall',
+    'webSearch',
+    'imageGeneration',
+  ])('fails closed if disabled %s execution appears despite the locked thread config', async (type) => {
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
         send({
@@ -1128,42 +1161,45 @@ describe('Codex app-server provider adapter', () => {
             threadId,
             turnId,
             startedAtMs: 1,
-            item: { type: 'imageGeneration', id: 'image-1', status: 'inProgress' },
+            item: { type, id: `disabled-${type}`, status: 'inProgress' },
           },
-        });
-        send({
-          method: 'item/completed',
-          params: {
-            threadId,
-            turnId,
-            completedAtMs: 2,
-            item: {
-              type: 'imageGeneration',
-              id: 'image-1',
-              status: 'completed',
-              result: 'private result',
-              revisedPrompt: null,
-            },
-          },
-        });
-        send({
-          method: 'turn/completed',
-          params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
         });
       },
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
 
-    await expect(collect(executeAdapter(adapter, executionContext()))).resolves.toEqual([
-      expect.objectContaining({
-        kind: 'tool_started',
-        payload: expect.objectContaining({ summary: 'Image generation started.' }),
-      }),
-      expect.objectContaining({
-        kind: 'tool_finished',
-        payload: expect.objectContaining({ summary: 'Image generation finished.' }),
-      }),
-    ]);
+    await expect(collect(executeAdapter(adapter, executionContext()))).rejects.toMatchObject({
+      providerError: { code: 'unsupported_capability' },
+    });
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
+  test('fails closed if a disabled provider hook appears despite the locked thread config', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'hook/started',
+          params: {
+            threadId,
+            turnId,
+            run: {
+              id: 'disabled-hook',
+              eventName: 'stop',
+              handlerType: 'command',
+              executionMode: 'sync',
+              scope: 'turn',
+              status: 'running',
+            },
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(executeAdapter(adapter, executionContext()))).rejects.toMatchObject({
+      providerError: { code: 'unsupported_capability' },
+    });
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
   });
 
   test('fails the connection closed for an unknown notification scoped to the current turn', async () => {
@@ -1331,113 +1367,6 @@ describe('Codex app-server provider adapter', () => {
       result: { decision: 'decline' },
       workspaceFenceChecks: 5,
     },
-    {
-      label: 'permission approval',
-      method: 'item/permissions/requestApproval',
-      params: {
-        itemId: 'permission-1',
-        startedAtMs: 1,
-        reason: 'Read an external directory?',
-        environmentId: null,
-        cwd: '/workspace',
-        permissions: { network: null, fileSystem: { read: ['/external'], write: [] } },
-      },
-      expected: {
-        kind: 'permission_approval',
-        prompt: expect.stringMatching(/Working directory: \/workspace[\s\S]*Requested permissions:.*"\/external"/),
-      },
-      answer: { kind: 'decision', decision: 'approve' },
-      result: {
-        permissions: { fileSystem: { read: ['/external'], write: [] } },
-        scope: 'turn',
-      },
-    },
-    {
-      label: 'filesystem write permission approval',
-      method: 'item/permissions/requestApproval',
-      params: {
-        itemId: 'permission-write-1',
-        startedAtMs: 1,
-        reason: 'Write an external directory?',
-        environmentId: null,
-        cwd: '/workspace',
-        permissions: { network: null, fileSystem: { read: [], write: ['/external'] } },
-      },
-      expected: {
-        kind: 'permission_approval',
-        prompt: expect.stringMatching(/Working directory: \/workspace[\s\S]*Requested permissions:.*"\/external"/),
-      },
-      answer: { kind: 'decision', decision: 'approve' },
-      result: {
-        permissions: { fileSystem: { read: [], write: ['/external'] } },
-        scope: 'turn',
-      },
-      workspaceFenceChecks: 5,
-    },
-    {
-      label: 'MCP elicitation',
-      method: 'mcpServer/elicitation/request',
-      params: {
-        turnId: null,
-        serverName: 'provider-private',
-        mode: 'form',
-        message: 'Which environment should the tool use?',
-        requestedSchema: {
-          type: 'object',
-          properties: {
-            environment: {
-              type: 'string',
-              enum: ['staging', 'production'],
-              enumNames: ['Staging', 'Production'],
-            },
-          },
-          required: ['environment'],
-        },
-        _meta: null,
-      },
-      expected: {
-        kind: 'choice',
-        prompt: 'Which environment should the tool use?',
-        choices: [
-          { choice_id: 'staging', label: 'Staging' },
-          { choice_id: 'production', label: 'Production' },
-        ],
-      },
-      answer: { kind: 'choice', choice_id: 'staging' },
-      result: { action: 'accept', content: { environment: 'staging' }, _meta: null },
-    },
-    {
-      label: 'MCP astral choice using JSON Schema code-point length',
-      method: 'mcpServer/elicitation/request',
-      params: {
-        turnId: null,
-        serverName: 'provider-private',
-        mode: 'form',
-        message: 'Choose the symbol.',
-        requestedSchema: {
-          type: 'object',
-          properties: {
-            symbol: {
-              type: 'string',
-              enum: ['😀'],
-              enumNames: ['Face'],
-              default: '😀',
-              minLength: 1,
-              maxLength: 1,
-            },
-          },
-          required: ['symbol'],
-        },
-        _meta: null,
-      },
-      expected: {
-        kind: 'choice',
-        prompt: 'Choose the symbol.',
-        choices: [{ choice_id: '😀', label: 'Face' }],
-      },
-      answer: { kind: 'choice', choice_id: '😀' },
-      result: { action: 'accept', content: { symbol: '😀' }, _meta: null },
-    },
   ])('maps $label through a fenced provider-neutral interaction', async ({
     method,
     params,
@@ -1499,7 +1428,10 @@ describe('Codex app-server provider adapter', () => {
       },
     });
     const controls = workspaceControls();
-    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
     const iterator = executeAdapter(
       adapter,
       executionContext(),
@@ -1529,7 +1461,7 @@ describe('Codex app-server provider adapter', () => {
     await iterator.return();
   });
 
-  test('auto-approves native protected actions only after Core returns a trusted decision', async () => {
+  test('auto-approves one native write only after Core validates its complete approval fence', async () => {
     const authorizeProtectedAction = jest.fn(() => ({
       trusted: true,
       basis_kind: 'persistent_bot',
@@ -1577,10 +1509,14 @@ describe('Codex app-server provider adapter', () => {
         });
       },
     });
-    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const assertWorkspaceWrite = jest.fn(() => ({ status: 'current' }));
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
 
     const events = await collect(adapter.execute(executionContext(), {
-      assertWorkspaceWrite: jest.fn(() => ({ status: 'current' })),
+      assertWorkspaceWrite,
       authorizeProtectedAction,
     }));
 
@@ -1594,6 +1530,289 @@ describe('Codex app-server provider adapter', () => {
     expect(server.received).toContainEqual({
       id: 'trusted-provider-request',
       result: { decision: 'accept' },
+    });
+    expect(assertWorkspaceWrite).toHaveBeenLastCalledWith({
+      action_kind: 'item/fileChange/requestApproval',
+      connection_id: 'codex-app-server-1',
+      conversation_id: 'conversation-1',
+      core_turn_id: 'turn-1',
+      cwd: '/workspace',
+      environment_id: null,
+      executor_instance_id: 'executor-1',
+      lineage_id: 'lineage-1',
+      provider_approval_id: null,
+      provider_attempt: { attempt_id: 'attempt-1', attempt_no: 1, lease_epoch: 3 },
+      provider_item_id: 'trusted-file-change',
+      provider_thread_id: 'codex-thread-1',
+      provider_turn_id: 'codex-turn-1',
+      workspace: expect.objectContaining({
+        workspace_lease_id: 'workspace-lease-1',
+        holder_conversation_id: 'conversation-1',
+        holder_turn_id: 'turn-1',
+        lease_epoch: 11,
+      }),
+      write_paths: ['/workspace/trusted-file-change.txt'],
+    });
+  });
+
+  test('chooses only one-shot accept when app-server advertises session approval alternatives', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart(details) {
+        sendStartedCommand(details, 'one-shot-command');
+        details.send({
+          id: 'one-shot-command-approval',
+          method: 'item/commandExecution/requestApproval',
+          params: {
+            threadId: details.threadId,
+            turnId: details.turnId,
+            itemId: 'one-shot-command',
+            startedAtMs: 1,
+            environmentId: null,
+            command: 'touch approved.txt',
+            cwd: '/workspace',
+            availableDecisions: ['accept', 'acceptForSession', 'decline'],
+          },
+        });
+      },
+      onClientResponse({ message, send }) {
+        send({
+          method: 'serverRequest/resolved',
+          params: { threadId: 'codex-thread-1', requestId: message.id },
+        });
+        send({
+          method: 'item/completed',
+          params: {
+            threadId: 'codex-thread-1',
+            turnId: 'codex-turn-1',
+            item: { type: 'commandExecution', id: 'one-shot-command', status: 'completed' },
+          },
+        });
+        send({
+          method: 'turn/completed',
+          params: {
+            threadId: 'codex-thread-1',
+            turn: { id: 'codex-turn-1', status: 'completed', items: [] },
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
+
+    await expect(collect(adapter.execute(executionContext(), {
+      assertWorkspaceWrite: jest.fn(() => ({ status: 'current' })),
+      authorizeProtectedAction: jest.fn(() => ({ trusted: true })),
+    }))).resolves.toEqual(expect.any(Array));
+    expect(server.received).toContainEqual({
+      id: 'one-shot-command-approval',
+      result: { decision: 'accept' },
+    });
+    const response = server.received.find(({ id, result }) => (
+      id === 'one-shot-command-approval' && result
+    ));
+    expect(JSON.stringify(response)).not.toMatch(
+      /acceptForSession|acceptWithExecpolicyAmendment|applyNetworkPolicyAmendment/,
+    );
+  });
+
+  test.each([
+    ['cwd', '/outside', null, null],
+    ['environment', '/workspace', 'remote-environment', null],
+    ['network', '/workspace', null, { host: 'example.com', protocol: 'https' }],
+  ])('declines a trusted command whose %s fence escapes the local workspace', async (
+    _label,
+    commandCwd,
+    environmentId,
+    networkApprovalContext,
+  ) => {
+    const server = createFakeAppServer({
+      afterTurnStart(details) {
+        sendStartedCommand(details, 'mismatched-command', { cwd: commandCwd });
+        details.send({
+          id: 'mismatched-command-approval',
+          method: 'item/commandExecution/requestApproval',
+          params: {
+            threadId: details.threadId,
+            turnId: details.turnId,
+            itemId: 'mismatched-command',
+            startedAtMs: 1,
+            environmentId,
+            command: 'touch approved.txt',
+            cwd: commandCwd,
+            networkApprovalContext,
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
+
+    await expect(collect(adapter.execute(executionContext(), {
+      assertWorkspaceWrite: jest.fn(() => ({ status: 'current' })),
+      authorizeProtectedAction: jest.fn(() => ({ trusted: true })),
+    }))).rejects.toMatchObject({
+      providerError: { code: 'side_effect_unknown' },
+    });
+    expect(server.received).toContainEqual({
+      id: 'mismatched-command-approval',
+      result: { decision: 'decline' },
+    });
+    expect(server.received).not.toContainEqual({
+      id: 'mismatched-command-approval',
+      result: { decision: 'accept' },
+    });
+  });
+
+  test('declines a protected write when its durable lease epoch becomes stale before approval', async () => {
+    const staleLease = Object.assign(new Error('stale workspace lease'), {
+      code: 'stale_workspace_lease',
+    });
+    const assertWorkspaceWrite = jest.fn((fence) => {
+      if (fence?.provider_item_id === 'stale-file-change') throw staleLease;
+      return { status: 'current' };
+    });
+    const server = createFakeAppServer({
+      afterTurnStart(details) {
+        sendStartedFileChange(details, 'stale-file-change');
+        details.send({
+          id: 'stale-auto-approval',
+          method: 'item/fileChange/requestApproval',
+          params: {
+            threadId: details.threadId,
+            turnId: details.turnId,
+            itemId: 'stale-file-change',
+            startedAtMs: 1,
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
+
+    await expect(collect(adapter.execute(executionContext(), {
+      assertWorkspaceWrite,
+      authorizeProtectedAction: jest.fn(() => ({ trusted: true })),
+    }))).rejects.toMatchObject({
+      code: 'provider_connection_lost',
+      cause: staleLease,
+      providerError: { side_effect_status: 'unknown' },
+    });
+    expect(server.received).toContainEqual({
+      id: 'stale-auto-approval',
+      result: { decision: 'decline' },
+    });
+    expect(server.received).not.toContainEqual({
+      id: 'stale-auto-approval',
+      result: { decision: 'accept' },
+    });
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
+  test('never returns session, persistent-policy, network-amendment, or permission grants', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          id: 'permission-grant-request',
+          method: 'item/permissions/requestApproval',
+          params: {
+            threadId,
+            turnId,
+            itemId: 'permission-grant-item',
+            startedAtMs: 1,
+            environmentId: null,
+            cwd: '/workspace',
+            reason: 'Request a broad grant.',
+            permissions: {
+              network: { enabled: true },
+              fileSystem: { read: [], write: ['/workspace'] },
+            },
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
+
+    await expect(collect(adapter.execute(executionContext(), {
+      assertWorkspaceWrite: jest.fn(() => ({ status: 'current' })),
+      authorizeProtectedAction: jest.fn(() => ({ trusted: true })),
+    }))).rejects.toMatchObject({
+      providerError: { code: 'unsupported_capability' },
+    });
+    expect(server.received).toContainEqual({
+      id: 'permission-grant-request',
+      result: { permissions: {}, scope: 'turn' },
+    });
+    expect(JSON.stringify(server.received)).not.toMatch(
+      /acceptForSession|acceptWithExecpolicyAmendment|applyNetworkPolicyAmendment|"scope":"session"/,
+    );
+  });
+
+  test('declines a well-formed MCP elicitation instead of exposing an external side-effect path', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          id: 'disabled-mcp-elicitation',
+          method: 'mcpServer/elicitation/request',
+          params: {
+            threadId,
+            turnId,
+            serverName: 'private-server',
+            mode: 'form',
+            message: 'Choose an environment.',
+            requestedSchema: {
+              type: 'object',
+              properties: { environment: { type: 'string', minLength: 1 } },
+              required: ['environment'],
+            },
+            _meta: null,
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(executeAdapter(adapter, executionContext()))).rejects.toMatchObject({
+      providerError: { code: 'unsupported_capability' },
+    });
+    expect(server.received).toContainEqual({
+      id: 'disabled-mcp-elicitation',
+      result: { action: 'decline', content: null, _meta: null },
+    });
+  });
+
+  test('rejects an app-server initiated dynamic tool call before it can execute', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          id: 'disabled-dynamic-tool-call',
+          method: 'item/tool/call',
+          params: {
+            threadId,
+            turnId,
+            callId: 'dynamic-call-1',
+            tool: 'writeFile',
+            arguments: { path: '/workspace/unapproved.txt' },
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(executeAdapter(adapter, executionContext()))).rejects.toMatchObject({
+      providerError: { code: 'unsupported_capability' },
+    });
+    expect(server.received).toContainEqual({
+      id: 'disabled-dynamic-tool-call',
+      error: { code: -32601, message: 'Unsupported or stale app-server request.' },
     });
   });
 
@@ -2734,7 +2953,11 @@ describe('Codex app-server provider adapter', () => {
       providerError: { side_effect_status: 'unknown' },
     });
     expect(controls.assertWorkspaceWrite).toHaveBeenCalledTimes(6);
-    expect(server.received).toHaveLength(before);
+    expect(server.received).toHaveLength(before + 1);
+    expect(server.received).toContainEqual({
+      id: 'stale-workspace-approval',
+      result: { decision: 'decline' },
+    });
     expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
     await iterator.return();
   });

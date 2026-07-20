@@ -1,3 +1,5 @@
+import path from 'node:path';
+
 import {
   admitNormalizedEvent,
   canonicalizeJson,
@@ -31,7 +33,10 @@ import {
 } from './inbound-acceptance.js';
 import { initializeMainProjection, stageMainProjection } from './main-projection.js';
 import { initializeRuntimePersistence } from './schema.js';
-import { createWorkspaceLeaseCoordinator } from '../workspace/lease-coordinator.js';
+import {
+  createWorkspaceLeaseCoordinator,
+  normalizeWorkspaceRoot,
+} from '../workspace/lease-coordinator.js';
 
 const CANONICAL_TRANSITIONS = Object.freeze({
   queued: Object.freeze(['starting']),
@@ -4870,13 +4875,128 @@ export function createExecutorStore({
     return recoveries;
   }
 
-  function assertWorkspaceWritable(turnContext) {
+  function assertWorkspaceWritable(turnContext, approvalFence = undefined) {
     const turn = loadTurn(database, turnContext.turn_id);
     assertTurnContextFence(turn, turnContext);
     if (!turnContext.workspace) {
       conflict('stale_workspace_lease', 'The turn has no workspace lease fence.');
     }
-    return workspaceLeases.assertWritable(turnContext.workspace);
+    const workspace = workspaceLeases.assertWritable(turnContext.workspace);
+    if (approvalFence === undefined) return workspace;
+    if (!approvalFence || typeof approvalFence !== 'object' || Array.isArray(approvalFence)) {
+      conflict('provider_context_invalid', 'A Codex write approval requires a complete fence.');
+    }
+    const approvalWorkspace = approvalFence.workspace;
+    const providerAttempt = approvalFence.provider_attempt;
+    if (
+      !['item/commandExecution/requestApproval', 'item/fileChange/requestApproval']
+        .includes(approvalFence.action_kind)
+      || typeof approvalFence.connection_id !== 'string'
+      || approvalFence.connection_id.length === 0
+      || approvalFence.conversation_id !== turn.conversation_id
+      || approvalFence.core_turn_id !== turn.turn_id
+      || approvalFence.lineage_id !== turn.lineage_id
+      || approvalFence.executor_instance_id !== turnContext.executor_instance_id
+      || approvalFence.provider_thread_id !== turn.provider_native_id
+      || typeof approvalFence.provider_turn_id !== 'string'
+      || approvalFence.provider_turn_id.length === 0
+      || typeof approvalFence.provider_item_id !== 'string'
+      || approvalFence.provider_item_id.length === 0
+      || approvalFence.provider_approval_id !== null
+        && (typeof approvalFence.provider_approval_id !== 'string'
+          || approvalFence.provider_approval_id.length === 0)
+      || approvalFence.environment_id !== null
+      || !providerAttempt
+      || !sameFence(providerAttempt, turnContext.attempt)
+      || !approvalWorkspace
+      || approvalWorkspace.workspace_lease_id !== workspace.workspace_lease_id
+      || approvalWorkspace.workspace_root !== workspace.workspace_root
+      || approvalWorkspace.mode !== 'writable'
+      || approvalWorkspace.holder_service_instance_id !== serviceInstanceId
+      || approvalWorkspace.holder_conversation_id !== turn.conversation_id
+      || approvalWorkspace.holder_turn_id !== turn.turn_id
+      || approvalWorkspace.lease_epoch !== workspace.lease_epoch
+    ) {
+      conflict(
+        'provider_context_invalid',
+        'The Codex write approval does not match its durable turn, owner, or workspace fence.',
+      );
+    }
+    let canonicalCwd;
+    try {
+      canonicalCwd = normalizeWorkspaceRoot(approvalFence.cwd, {
+        base: workspace.workspace_root,
+      });
+    } catch {
+      conflict('provider_context_invalid', 'The Codex write approval has an invalid working directory.');
+    }
+    if (canonicalCwd !== workspace.workspace_root) {
+      conflict('provider_context_invalid', 'The Codex write approval changed its workspace cwd.');
+    }
+    if (!Array.isArray(approvalFence.write_paths) || approvalFence.write_paths.length === 0) {
+      conflict('provider_context_invalid', 'The Codex write approval has no bounded write path.');
+    }
+    for (const writePath of approvalFence.write_paths) {
+      let canonicalWritePath;
+      try {
+        canonicalWritePath = normalizeWorkspaceRoot(writePath, { base: workspace.workspace_root });
+      } catch {
+        conflict('provider_context_invalid', 'The Codex write approval has an invalid write path.');
+      }
+      if (
+        canonicalWritePath !== workspace.workspace_root
+        && !canonicalWritePath.startsWith(`${workspace.workspace_root}${path.sep}`)
+      ) {
+        conflict('provider_context_invalid', 'The Codex write approval escaped its workspace root.');
+      }
+    }
+    const checkedAt = now();
+    const writer = database.prepare(`
+      SELECT lease_expires_at
+      FROM runtime_executor_leases
+      WHERE conversation_id = ? AND lease_owner = ? AND turn_id = ?
+        AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+    `).get(
+      turn.conversation_id,
+      serviceInstanceId,
+      turn.turn_id,
+      turnContext.attempt.attempt_id,
+      turnContext.attempt.attempt_no,
+      turnContext.attempt.lease_epoch,
+    );
+    const attempt = database.prepare(`
+      SELECT state
+      FROM runtime_provider_attempts
+      WHERE attempt_id = ? AND turn_id = ? AND attempt_no = ? AND lease_epoch = ?
+        AND service_instance_id = ? AND executor_instance_id = ?
+    `).get(
+      turnContext.attempt.attempt_id,
+      turn.turn_id,
+      turnContext.attempt.attempt_no,
+      turnContext.attempt.lease_epoch,
+      serviceInstanceId,
+      turnContext.executor_instance_id,
+    );
+    if (
+      !writer
+      || writer.lease_expires_at <= checkedAt
+      || !attempt
+      || !['starting', 'running', 'waiting_user'].includes(attempt.state)
+    ) {
+      conflict('stale_attempt', 'The Codex write approval lost its current writer ownership.');
+    }
+    return Object.freeze({
+      status: 'current',
+      conversation_id: turn.conversation_id,
+      turn_id: turn.turn_id,
+      executor_instance_id: turnContext.executor_instance_id,
+      provider_native_id: turn.provider_native_id,
+      provider_turn_id: approvalFence.provider_turn_id,
+      provider_item_id: approvalFence.provider_item_id,
+      workspace_lease_id: workspace.workspace_lease_id,
+      workspace_lease_epoch: workspace.lease_epoch,
+      checked_at: checkedAt,
+    });
   }
 
   function recordProviderEventActivityInTransaction(turnContext, observedAt) {

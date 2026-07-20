@@ -1,6 +1,7 @@
 # Codex app-server adapter evidence
 
-This document records the provider-specific boundary implemented for runtime migration issue 10.
+This document records the provider-specific boundary implemented for runtime migration issues 10
+and 14.
 It does not change the provider-neutral Core contracts or the migration consensus.
 
 ## Transport boundary
@@ -40,16 +41,18 @@ Private app-server method and item names remain inside the adapter:
 |---|---|
 | fenced `turn/started` | provider-neutral started signal; Core atomically authors `starting -> running` with `provider_started` |
 | `item/agentMessage/delta` and completed agent message | `text_delta` and `text_snapshot` |
-| command, file, MCP, dynamic, collaboration, web, image, and turn-scoped provider-hook lifecycle | `tool_started`, `tool_progress`, `tool_finished`; item/hook IDs, progress methods, and fixed-version statuses are fenced by type; hook paths/output remain private |
+| command and file lifecycle | `tool_started`, `tool_progress`, `tool_finished`; item IDs, progress methods, and fixed-version statuses are fenced by type |
+| MCP, dynamic, collaboration, web, image, or provider-hook lifecycle | capability failure; these paths are disabled because their fixed execution surface lacks the required synchronous Core fence |
 | completed turn | adapter iterator completion; Core authors the canonical completed state |
 | failed/interrupted turn, error notification, or lost connection | typed provider failure; Core authors the canonical failure or recovery state |
 | fenced token-usage and moderation telemetry | intentionally omitted because the public normalized-event contract has no usage/score event and private provider scores must not escape the adapter |
-| command/file approval | durable `tool_approval` interaction with bounded command/cwd or path/diff/grant details |
-| permissions approval | durable `permission_approval` interaction with bounded cwd/environment/permission scope |
+| command/file approval | one-shot `accept` only after the current durable permission and workspace fences; otherwise a durable `tool_approval` interaction, with the same workspace fence repeated before an approved handoff is sent |
+| permissions approval | empty turn-scoped denial followed by capability failure; the adapter never creates a turn/session filesystem or network grant |
 | single-question `requestUserInput` | durable `question` or fixed `choice` interaction with answer constraints preserved |
-| single-field required MCP typed string/enum form | durable `question` or `choice` interaction; accepted content is reconstructed as the schema-keyed object; free text is accepted only for the provider-neutral contract's exact non-empty/unbounded shape |
+| MCP elicitation or tool execution | disabled and declined because the fixed protocol has no Core-controlled synchronous gate before an MCP tool's external side effects |
 
-Answers are accepted only through Core's durable interaction-answer and handoff records. The
+User-supplied answers are accepted only through Core's durable interaction-answer and handoff
+records. The
 adapter verifies the current connection, provider request, thread, turn, Core turn, attempt, lease,
 and handoff claim before writing a response. Preparation is side-effect free. Core persists the
 exact handoff send-start fence before invoking the prepared one-shot send. A handoff is acknowledged
@@ -61,20 +64,25 @@ acceptance from connection or in-memory request state and does not resend the an
 
 ## Workspace access and write fencing
 
-The adapter advertises the access that its own app-server configuration enforces. `read-only`
-maps to provider-sandbox-authoritative read-only access at the configured working directory;
-`workspace-write` maps to writable access at that directory. `danger-full-access` is conservatively
-reported as writable access at the filesystem root so it cannot run concurrently merely because
-two configured working directories do not overlap. A request cannot self-report read-only access.
+`sandbox: "workspace-write"` is a trusted adapter-construction declaration of the logical access
+that Core must serialize; it is not forwarded as the provider sandbox. Core therefore acquires a
+writable workspace lease at the normalized configured cwd, while every new, resumed, and started
+Codex turn is forced to `read-only` plus `on-request`, with the user reviewer. The turn override is
+repeated even after a persisted thread is resumed. `danger-full-access` is rejected at construction,
+as is any writable configuration whose approval policy is not `on-request`. A request cannot
+self-report read-only access.
 
-Writable execution fails closed unless Core supplies `assertWorkspaceWrite`. The adapter checks
-that durable holder/epoch fence before it contacts app-server, again after thread load/binding and
-immediately before `turn/start`, when `turn/started` is observed, at every observed command or
-file-change start that can write, and immediately before accepting a command/file approval or a
-filesystem-write permission grant. A file-change start is fenced even under `read-only`, because it
-would contradict the provider sandbox authority that allowed overlapping execution. If a fence is
-stale at a running boundary, the shared connection is retired and the turn follows the existing
-side-effect-unknown recovery path; no approval response is written.
+Writable execution fails closed unless Core supplies `assertWorkspaceWrite`. Before a one-shot
+command/file approval, the adapter passes the exact connection, conversation, Core turn, lineage,
+executor instance, provider attempt, durable workspace lease, provider thread/turn/item/approval,
+environment, cwd, and bounded write paths back to Core. Core reopens those facts from SQLite and
+requires the current executor owner, unexpired executor and workspace leases, matching holder and
+epochs, the durably bound provider thread, a null environment, the canonical workspace cwd, and
+write paths contained by the workspace root. Only then may the official client return
+`{"decision":"accept"}` for that request. It never returns `acceptForSession`, an exec-policy or
+network amendment, a session scope, or a filesystem/network permission profile. A stale or
+mismatched approval receives `decline` before the shared connection is retired into the existing
+uncertain-recovery boundary.
 
 The run is registered with the shared-connection failure latch before thread load or durable
 binding. If the failing fence came from Core persistence, the adapter preserves that failure marker
@@ -83,24 +91,27 @@ the expired workspace uncertain, persists the recovery notification, and waits f
 before isolation and ownership release. Other runs affected by retiring the shared connection still
 receive the normal provider-loss recovery signal.
 
-App-server provides a blocking pre-action boundary for requested approvals, but it does not expose
-a Claude-style synchronous pre-tool callback for every action already permitted by the configured
-sandbox. For those actions the item-start notification is the earliest protocol boundary available;
-the provider sandbox remains the enforcement mechanism and a stale observation retires the
-connection rather than claiming that a now-uncertain write was prevented.
+App-server provides a blocking pre-action boundary for built-in command and file-change approvals.
+The read-only OS sandbox is the enforcement layer that prevents the built-in shell and apply-patch
+paths from writing before that response. The adapter also locks each new/resumed thread with empty
+MCP and dynamic-tool configuration and disables apps/connectors, plugins, hooks, code mode, browser,
+computer use, image generation, web search, collaboration/subagents, JS REPL, tool search, and the
+permission-request tools. An unexpected hook, MCP/dynamic/collaboration/web/image item, dynamic tool
+server request, permission-profile request, or MCP elicitation is refused and retires the
+connection; its item-start notification is only contradiction evidence, never claimed as the
+pre-action fence.
+
+The remaining app-server RPCs with independent side effects (`thread/shellCommand`, `command/exec`,
+`process/spawn`, `fs/writeFile`, configuration/plugin mutation, direct MCP calls, and their control
+methods) are client-initiated APIs. They are unreachable because Zylos exposes no raw RPC surface
+and its private sender has an explicit call-site allowlist limited to initialize, thread
+start/resume, turn start/interrupt, and the exact server-request responses above.
 
 Multi-question, secret, provider-auto-resolving, and fixed-choice-plus-Other `requestUserInput`
-requests,
-multi-field/non-string/optional/formatted
-MCP typed forms, tighter free-text length constraints, `openai/form`, URL elicitation, unknown server requests, duplicate request IDs,
+requests, MCP execution and elicitation, unknown server requests, duplicate request IDs,
 unsupported item or notification types, incomplete fixed-version request shapes, duplicate or
 unfinished tool lifecycles, cross-tool progress, unrenderable approval details, and stale or
-mismatched traffic fail closed. Image-generation status is opaque in the fixed-version protocol;
-the adapter maps only the notification-proven lifecycle and reports `finished` without inventing a
-success outcome. Formatted MCP strings and unrecognized MCP schema constraints are rejected because
-the provider-neutral answer contract cannot preserve or validate the fixed-version
-`email|uri|date|date-time` constraint. URL elicitation is rejected because its URL can contain
-credentials and the public interaction contract has no safe reference field.
+mismatched traffic fail closed.
 Connection loss before an answer cancels still-pending interactions; a committed handoff whose send
 has not started is atomically cancelled with its interaction, audit, projection, and outbox state.
 Both paths move the turn to `recovering`. Loss after a response may have been sent is recorded as

@@ -261,31 +261,44 @@ const IGNORED_SCOPED_NOTIFICATIONS = Object.freeze(new Set([
   'turn/plan/updated',
 ]));
 
-const HOOK_EVENT_NAMES = Object.freeze(new Set([
-  'preToolUse',
-  'permissionRequest',
-  'postToolUse',
-  'preCompact',
-  'postCompact',
-  'sessionStart',
-  'userPromptSubmit',
-  'subagentStart',
-  'subagentStop',
-  'stop',
-]));
-const HOOK_HANDLER_TYPES = Object.freeze(new Set(['command', 'prompt', 'agent']));
-const HOOK_EXECUTION_MODES = Object.freeze(new Set(['sync', 'async']));
-const PROTECTED_APPROVAL_METHODS = Object.freeze(new Set([
+const ONE_SHOT_WRITE_APPROVAL_METHODS = Object.freeze(new Set([
   'item/commandExecution/requestApproval',
   'item/fileChange/requestApproval',
-  'item/permissions/requestApproval',
 ]));
-const HOOK_TERMINAL_STATUSES = Object.freeze(new Set([
-  'completed',
-  'failed',
-  'blocked',
-  'stopped',
+const DISABLED_SIDE_EFFECT_TOOL_TYPES = Object.freeze(new Set([
+  'mcpToolCall',
+  'dynamicToolCall',
+  'collabAgentToolCall',
+  'webSearch',
+  'imageGeneration',
 ]));
+const APP_SERVER_LOCKDOWN_CONFIG = Object.freeze({
+  mcp_servers: Object.freeze({}),
+  web_search: 'disabled',
+  features: Object.freeze({
+    apps: false,
+    browser_use: false,
+    code_mode: false,
+    computer_use: false,
+    enable_mcp_apps: false,
+    exec_permission_approvals: false,
+    hooks: false,
+    image_generation: false,
+    in_app_browser: false,
+    js_repl: false,
+    js_repl_tools_only: false,
+    multi_agent: false,
+    plugin_hooks: false,
+    plugin_sharing: false,
+    plugins: false,
+    remote_control: false,
+    remote_plugin: false,
+    request_permissions: false,
+    request_permissions_tool: false,
+    tool_call_mcp_elicitation: false,
+    tool_search: false,
+  }),
+});
 
 function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -398,19 +411,6 @@ function toolDescriptor(run, itemId, specification, kind, verb) {
       tool_name: specification.name,
       summary: `${specification.label} ${verb}.`,
       side_effect_status: specification.sideEffect,
-    },
-  };
-}
-
-function hookDescriptor(run, toolUseId, kind, verb) {
-  return {
-    kind,
-    provider_native_id: run.thread_id,
-    payload: {
-      tool_use_id: toolUseId,
-      tool_name: 'provider_hook',
-      summary: `Provider hook ${verb}.`,
-      side_effect_status: 'unknown',
     },
   };
 }
@@ -547,6 +547,12 @@ export function createCodexAppServerAdapter({
   if (!['read-only', 'workspace-write', 'danger-full-access'].includes(sandbox)) {
     throw new TypeError('sandbox must be read-only, workspace-write, or danger-full-access');
   }
+  if (sandbox === 'danger-full-access') {
+    throw new TypeError('danger-full-access is prohibited for the Codex app-server adapter');
+  }
+  if (sandbox === 'workspace-write' && approvalPolicy !== 'on-request') {
+    throw new TypeError('Writable Codex app-server execution requires approvalPolicy on-request');
+  }
   if (
     !Number.isSafeInteger(interruptConfirmationTimeoutMs)
     || interruptConfirmationTimeoutMs <= 0
@@ -570,11 +576,15 @@ export function createCodexAppServerAdapter({
   const childEnvironment = selectEnvironment(env, envAllowlist);
   const effectiveCwd = cwd ?? process.cwd();
   const workspaceAccess = Object.freeze({
-    root: sandbox === 'danger-full-access' ? path.parse(effectiveCwd).root : effectiveCwd,
+    root: effectiveCwd,
     mode: sandbox === 'read-only' ? 'read_only' : 'writable',
     read_only_enforced: sandbox === 'read-only',
-    authority: 'provider_sandbox',
+    authority: sandbox === 'read-only' ? 'provider_sandbox' : 'core_workspace_lease',
   });
+  const providerApprovalPolicy = workspaceAccess.mode === 'writable'
+    ? 'on-request'
+    : approvalPolicy;
+  const providerSandbox = 'read-only';
   const loadedThreads = new Set();
   const activeRuns = new Map();
   const startingRuns = new Map();
@@ -585,21 +595,20 @@ export function createCodexAppServerAdapter({
   let connection = null;
   let connecting = null;
   let nextConnectionNo = 0;
-  let nextHookNo = 0;
   let nextInteractionNo = 0;
 
   function getWorkspaceAccess() {
     return workspaceAccess;
   }
 
-  function assertWorkspaceWrite(controls) {
+  function assertWorkspaceWrite(controls, approvalFence = undefined) {
     if (typeof controls?.assertWorkspaceWrite !== 'function') {
       throw new CodexAppServerAdapterError(
         'unsupported_capability',
         'Writable Codex app-server execution requires the Core workspace write fence.',
       );
     }
-    return controls.assertWorkspaceWrite();
+    return controls.assertWorkspaceWrite(approvalFence);
   }
 
   function failCoreBoundary(target, cause, message, run) {
@@ -615,9 +624,14 @@ export function createCodexAppServerAdapter({
     return failure;
   }
 
-  function assertWorkspaceWriteOrFail(target, controls, run = null) {
+  function assertWorkspaceWriteOrFail(
+    target,
+    controls,
+    run = null,
+    approvalFence = undefined,
+  ) {
     try {
-      return assertWorkspaceWrite(controls);
+      return assertWorkspaceWrite(controls, approvalFence);
     } catch (cause) {
       throw failCoreBoundary(
         target,
@@ -870,55 +884,11 @@ export function createCodexAppServerAdapter({
       return;
     }
     if (IGNORED_SCOPED_NOTIFICATIONS.has(method)) return;
-    if (method === 'hook/started') {
-      const hook = params.run;
-      if (
-        !isRecord(hook)
-        || typeof hook.id !== 'string'
-        || hook.id.length === 0
-        || hook.scope !== 'turn'
-        || hook.status !== 'running'
-        || !HOOK_EVENT_NAMES.has(hook.eventName)
-        || !HOOK_HANDLER_TYPES.has(hook.handlerType)
-        || !HOOK_EXECUTION_MODES.has(hook.executionMode)
-        || run.hook_runs.has(hook.id)
-      ) {
-        failConnection(target, new CodexAppServerAdapterError(
-          'provider_protocol_invalid',
-          'Codex app-server emitted an invalid or duplicate turn hook start.',
-        ));
-        return;
-      }
-      nextHookNo += 1;
-      const started = {
-        event_name: hook.eventName,
-        execution_mode: hook.executionMode,
-        handler_type: hook.handlerType,
-        tool_use_id: `provider-hook-${nextHookNo}`,
-      };
-      run.hook_runs.set(hook.id, started);
-      run.queue.push(hookDescriptor(run, started.tool_use_id, 'tool_started', 'started'));
-      return;
-    }
-    if (method === 'hook/completed') {
-      const hook = params.run;
-      const started = isRecord(hook) ? run.hook_runs.get(hook.id) : null;
-      if (
-        !started
-        || hook.scope !== 'turn'
-        || !HOOK_TERMINAL_STATUSES.has(hook.status)
-        || hook.eventName !== started.event_name
-        || hook.handlerType !== started.handler_type
-        || hook.executionMode !== started.execution_mode
-      ) {
-        failConnection(target, new CodexAppServerAdapterError(
-          'provider_protocol_invalid',
-          'Codex app-server emitted a mismatched turn hook completion.',
-        ));
-        return;
-      }
-      run.hook_runs.delete(hook.id);
-      run.queue.push(hookDescriptor(run, started.tool_use_id, 'tool_finished', hook.status));
+    if (method === 'hook/started' || method === 'hook/completed') {
+      failConnection(target, new CodexAppServerAdapterError(
+        'unsupported_capability',
+        'Codex app-server hooks are disabled because they have no synchronous Core fence.',
+      ));
       return;
     }
     if (method === 'item/agentMessage/delta') {
@@ -955,6 +925,13 @@ export function createCodexAppServerAdapter({
       const item = params.item;
       const specification = TOOL_ITEMS[item?.type];
       if (specification) {
+        if (DISABLED_SIDE_EFFECT_TOOL_TYPES.has(item.type)) {
+          failConnection(target, new CodexAppServerAdapterError(
+            'unsupported_capability',
+            `Codex app-server ${item.type} is disabled because it has no synchronous Core fence.`,
+          ));
+          return;
+        }
         const invalidStartStatus = specification.statusMode === 'enum'
           ? item.status !== 'inProgress'
           : specification.statusMode === 'absent'
@@ -1088,7 +1065,7 @@ export function createCodexAppServerAdapter({
         ));
         return;
       }
-      if (status === 'completed' && (run.tool_items.size > 0 || run.hook_runs.size > 0)) {
+      if (status === 'completed' && run.tool_items.size > 0) {
         failConnection(target, new CodexAppServerAdapterError(
           'provider_protocol_invalid',
           'Codex app-server completed a turn with unfinished tools or hooks.',
@@ -1554,6 +1531,99 @@ export function createCodexAppServerAdapter({
     return null;
   }
 
+  function providerWritePaths(group) {
+    if (group.method === 'item/fileChange/requestApproval') {
+      const item = requireStartedTool(group.run, group.params.itemId, 'fileChange');
+      const paths = [];
+      for (const change of item.changes) {
+        paths.push(path.resolve(effectiveCwd, change.path));
+        if (typeof change.kind.move_path === 'string') {
+          paths.push(path.resolve(effectiveCwd, change.kind.move_path));
+        }
+      }
+      if (group.params.grantRoot !== undefined && group.params.grantRoot !== null) {
+        rejectProtocol(
+          'Codex app-server requested a session-style file grant root.',
+          'unsupported_capability',
+        );
+      }
+      return [...new Set(paths)].sort();
+    }
+    const item = requireStartedTool(group.run, group.params.itemId, 'commandExecution');
+    if (
+      !path.isAbsolute(item.cwd)
+      || path.resolve(item.cwd) !== path.resolve(effectiveCwd)
+      || group.params.environmentId !== null
+      || (group.params.networkApprovalContext !== undefined
+        && group.params.networkApprovalContext !== null)
+      || group.params.additionalPermissions?.network?.enabled === true
+    ) {
+      rejectProtocol(
+        'Codex app-server requested a command outside the fenced local workspace environment.',
+        'unsupported_capability',
+      );
+    }
+    const paths = [effectiveCwd];
+    const additionalFileSystem = group.params.additionalPermissions?.fileSystem;
+    for (const requestedPath of additionalFileSystem?.write ?? []) {
+      paths.push(path.resolve(effectiveCwd, requestedPath));
+    }
+    for (const entry of additionalFileSystem?.entries ?? []) {
+      if (entry.access !== 'write') continue;
+      if (typeof entry.path !== 'string') {
+        rejectProtocol(
+          'Codex app-server requested a non-path filesystem write capability.',
+          'unsupported_capability',
+        );
+      }
+      paths.push(path.resolve(effectiveCwd, entry.path));
+    }
+    return [...new Set(paths)].sort();
+  }
+
+  function providerWriteApprovalFence(group) {
+    const { context } = group.run;
+    if (
+      workspaceAccess.mode !== 'writable'
+      || !context.workspace
+      || typeof context.executor_instance_id !== 'string'
+      || context.executor_instance_id.length === 0
+    ) {
+      rejectProtocol(
+        'Codex app-server cannot approve a write without a complete Core workspace owner fence.',
+        'unsupported_capability',
+      );
+    }
+    return Object.freeze({
+      action_kind: group.method,
+      connection_id: group.connection_id,
+      conversation_id: context.conversation_id,
+      core_turn_id: context.turn_id,
+      cwd: effectiveCwd,
+      environment_id: group.params.environmentId ?? null,
+      executor_instance_id: context.executor_instance_id,
+      lineage_id: context.lineage_id,
+      provider_approval_id: group.params.approvalId ?? null,
+      provider_attempt: Object.freeze({ ...context.attempt }),
+      provider_item_id: group.params.itemId,
+      provider_thread_id: group.thread_id,
+      provider_turn_id: group.turn_id,
+      workspace: Object.freeze({ ...context.workspace }),
+      write_paths: Object.freeze(providerWritePaths(group)),
+    });
+  }
+
+  function failStaleProviderApproval(target, group, cause) {
+    group.response_sent = true;
+    sendServerResponse(target, group.request_id, { decision: 'decline' });
+    return failCoreBoundary(
+      target,
+      cause,
+      'Codex app-server write approval lost its durable Core workspace fence.',
+      group.run,
+    );
+  }
+
   function sendServerResponse(target, id, result) {
     if (target.failed || connection !== target) {
       rejectProtocol('Codex app-server connection is not current.');
@@ -1670,7 +1740,6 @@ export function createCodexAppServerAdapter({
       answer_constraints: new Map(components.map((component) => (
         [component.component_key, component.answer_constraint ?? null]
       ))),
-      mcp_form: components[0]?.mcp_form ?? null,
       response_sent: false,
       auto_approved: false,
       resolved,
@@ -1678,8 +1747,26 @@ export function createCodexAppServerAdapter({
       rejectResolved,
     };
     providerRequests.set(requestKey, group);
+    if (message.method === 'item/permissions/requestApproval') {
+      group.response_sent = true;
+      sendServerResponse(target, message.id, { permissions: {}, scope: 'turn' });
+      failConnection(target, new CodexAppServerAdapterError(
+        'unsupported_capability',
+        'Codex permission profiles are disabled because they create turn or session grants.',
+      ));
+      return;
+    }
+    if (message.method === 'mcpServer/elicitation/request') {
+      group.response_sent = true;
+      sendServerResponse(target, message.id, { action: 'decline', content: null, _meta: null });
+      failConnection(target, new CodexAppServerAdapterError(
+        'unsupported_capability',
+        'Codex MCP execution is disabled because its tool calls lack a synchronous Core fence.',
+      ));
+      return;
+    }
     if (
-      PROTECTED_APPROVAL_METHODS.has(message.method)
+      ONE_SHOT_WRITE_APPROVAL_METHODS.has(message.method)
       && typeof run.controls?.authorizeProtectedAction === 'function'
     ) {
       const permission = run.controls.authorizeProtectedAction({
@@ -1691,6 +1778,12 @@ export function createCodexAppServerAdapter({
           componentKey,
           { kind: 'decision', decision: 'approve' },
         ]));
+        try {
+          assertWorkspaceWrite(run.controls, providerWriteApprovalFence(group));
+        } catch (cause) {
+          failStaleProviderApproval(target, group, cause);
+          return;
+        }
         group.response_sent = true;
         group.auto_approved = true;
         sendServerResponse(target, message.id, buildProviderResponse(group, answers));
@@ -1912,9 +2005,11 @@ export function createCodexAppServerAdapter({
     if (!loadedThreads.has(threadId)) {
       await sendRequest(target, 'thread/resume', {
         threadId,
-        cwd,
-        approvalPolicy,
-        sandbox,
+        cwd: effectiveCwd,
+        approvalPolicy: providerApprovalPolicy,
+        approvalsReviewer: 'user',
+        sandbox: providerSandbox,
+        config: structuredClone(APP_SERVER_LOCKDOWN_CONFIG),
       }, {
         onResult: (response) => {
           requireThreadResult(response, threadId);
@@ -1936,9 +2031,13 @@ export function createCodexAppServerAdapter({
     const persistedThreadId = context.lineage.provider_native_id;
     if (persistedThreadId === null) {
       const result = await sendRequest(target, 'thread/start', {
-        cwd,
-        approvalPolicy,
-        sandbox,
+        cwd: effectiveCwd,
+        approvalPolicy: providerApprovalPolicy,
+        approvalsReviewer: 'user',
+        sandbox: providerSandbox,
+        environments: [],
+        dynamicTools: [],
+        config: structuredClone(APP_SERVER_LOCKDOWN_CONFIG),
       });
       const threadId = requireThreadResult(result);
       if (workspaceAccess.mode === 'writable') {
@@ -2030,7 +2129,6 @@ export function createCodexAppServerAdapter({
       text_by_item: new Map(),
       text_item_order: [],
       tool_items: new Map(),
-      hook_runs: new Map(),
       turn_id: null,
       terminal_status: null,
     };
@@ -2044,6 +2142,11 @@ export function createCodexAppServerAdapter({
       const result = await sendRequest(target, 'turn/start', {
         threadId,
         input: [{ type: 'text', text: context.input.text }],
+        cwd: effectiveCwd,
+        approvalPolicy: providerApprovalPolicy,
+        approvalsReviewer: 'user',
+        sandboxPolicy: { type: 'readOnly', networkAccess: false },
+        environments: [],
       }, {
         onResult: (response) => {
           run.turn_id = requireTurnResult(response);
@@ -2143,36 +2246,11 @@ export function createCodexAppServerAdapter({
     return Object.freeze({ status: 'interrupt_requested', reason });
   }
 
-  function answerText(value) {
-    if (value?.kind === 'text' && typeof value.text === 'string' && value.text.length > 0) {
-      return value.text;
-    }
-    if (
-      value?.kind === 'choice'
-      && typeof value.choice_id === 'string'
-      && value.choice_id.length > 0
-    ) {
-      return value.choice_id;
-    }
-    rejectProtocol('The persisted interaction answer is incompatible with the provider request.');
-  }
-
   function answerDecision(value) {
     if (value?.kind !== 'decision' || !['approve', 'deny'].includes(value.decision)) {
       rejectProtocol('The persisted interaction answer must be an approval decision.');
     }
     return value.decision;
-  }
-
-  function grantedPermissions(requested) {
-    const permissions = {};
-    if (requested?.network !== null && requested?.network !== undefined) {
-      permissions.network = structuredClone(requested.network);
-    }
-    if (requested?.fileSystem !== null && requested?.fileSystem !== undefined) {
-      permissions.fileSystem = structuredClone(requested.fileSystem);
-    }
-    return permissions;
   }
 
   function requestUserInputAnswer(value, constraint) {
@@ -2211,40 +2289,6 @@ export function createCodexAppServerAdapter({
     ) {
       return { decision: answerDecision(value) === 'approve' ? 'accept' : 'decline' };
     }
-    if (group.method === 'item/permissions/requestApproval') {
-      const approved = answerDecision(value) === 'approve';
-      return {
-        permissions: approved ? grantedPermissions(group.params.permissions) : {},
-        scope: 'turn',
-      };
-    }
-    if (group.method === 'mcpServer/elicitation/request') {
-      if (!group.mcp_form) {
-        rejectProtocol('The MCP elicitation has no safe provider-neutral form mapping.');
-      }
-      if (
-        (group.mcp_form.allowed_values === null && value?.kind !== 'text')
-        || (group.mcp_form.allowed_values !== null && value?.kind !== 'choice')
-      ) {
-        rejectProtocol('The persisted answer kind does not match the MCP form schema.');
-      }
-      const answer = answerText(value);
-      if (
-        (group.mcp_form.allowed_values !== null
-          && !group.mcp_form.allowed_values.includes(answer))
-        || (group.mcp_form.min_length !== null
-          && jsonSchemaStringLength(answer) < group.mcp_form.min_length)
-        || (group.mcp_form.max_length !== null
-          && jsonSchemaStringLength(answer) > group.mcp_form.max_length)
-      ) {
-        rejectProtocol('The persisted answer does not satisfy the MCP form schema.');
-      }
-      return {
-        action: 'accept',
-        content: { [group.mcp_form.property_name]: answer },
-        _meta: null,
-      };
-    }
     rejectProtocol('The provider request cannot accept an interaction answer.');
   }
 
@@ -2255,11 +2299,7 @@ export function createCodexAppServerAdapter({
     if (group.method === 'item/commandExecution/requestApproval') {
       return workspaceAccess.mode === 'writable';
     }
-    if (group.method !== 'item/permissions/requestApproval') return false;
-    const fileSystem = group.params.permissions.fileSystem;
-    return (Array.isArray(fileSystem?.write) && fileSystem.write.length > 0)
-      || (Array.isArray(fileSystem?.entries)
-        && fileSystem.entries.some((entry) => entry.access === 'write'));
+    return false;
   }
 
   function acknowledgementFor(delivery) {
@@ -2345,7 +2385,14 @@ export function createCodexAppServerAdapter({
           rejectProtocol('The prepared interaction answer lost its provider handoff fence.');
         }
         if (providerResponseAllowsWorkspaceWrite(group, candidateAnswers)) {
-          assertWorkspaceWriteOrFail(currentTarget, currentRun.controls, currentRun);
+          try {
+            assertWorkspaceWrite(
+              currentRun.controls,
+              providerWriteApprovalFence(group),
+            );
+          } catch (cause) {
+            throw failStaleProviderApproval(currentTarget, group, cause);
+          }
         }
         sent = true;
         group.answers.set(entry.component_key, structuredClone(expected.answer_value));

@@ -244,6 +244,93 @@ describe('durable workspace lease coordinator', () => {
     database.close();
   });
 
+  test('rebuilds and validates the complete Codex pre-action write fence from SQLite', () => {
+    const { database, directory, workspace } = createFixture();
+    const turn = acceptQueuedTurn(database, 'codex-pre-action', 'chat-codex-pre-action');
+    let clock = '2026-07-19T13:19:10.000Z';
+    const store = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'workspace-codex-pre-action',
+      now: () => clock,
+      generateId: deterministicIds('workspace-codex-pre-action'),
+      leaseDurationMs: 30_000,
+      workspaceLeaseDurationMs: 30_000,
+    });
+    const context = store.claimNextQueuedTurn({
+      workspaceAccess: { workspace_root: workspace, mode: 'writable' },
+    });
+    store.bindProviderNativeId(context, 'codex-thread-pre-action');
+    const approvalFence = {
+      action_kind: 'item/fileChange/requestApproval',
+      connection_id: 'codex-app-server-1',
+      conversation_id: turn.conversation_id,
+      core_turn_id: turn.turn_id,
+      cwd: workspace,
+      environment_id: null,
+      executor_instance_id: context.executor_instance_id,
+      lineage_id: context.lineage_id,
+      provider_approval_id: null,
+      provider_attempt: { ...context.attempt },
+      provider_item_id: 'file-change-1',
+      provider_thread_id: 'codex-thread-pre-action',
+      provider_turn_id: 'codex-turn-pre-action',
+      workspace: { ...context.workspace },
+      write_paths: [path.join(workspace, 'file.txt')],
+    };
+
+    expect(store.assertWorkspaceWritable(context, approvalFence)).toMatchObject({
+      status: 'current',
+      conversation_id: turn.conversation_id,
+      turn_id: turn.turn_id,
+      executor_instance_id: context.executor_instance_id,
+      provider_native_id: 'codex-thread-pre-action',
+      workspace_lease_id: context.workspace.workspace_lease_id,
+      workspace_lease_epoch: context.workspace.lease_epoch,
+      provider_item_id: 'file-change-1',
+    });
+
+    database.close();
+    const restartedDatabase = new Database(path.join(directory, 'c4.db'));
+    const restartedStore = createExecutorStore({
+      database: restartedDatabase,
+      provider: 'codex',
+      serviceInstanceId: 'workspace-codex-pre-action',
+      now: () => clock,
+      generateId: deterministicIds('workspace-codex-pre-action-restart'),
+      leaseDurationMs: 30_000,
+      workspaceLeaseDurationMs: 30_000,
+    });
+    expect(restartedStore.assertWorkspaceWritable(context, approvalFence)).toMatchObject({
+      status: 'current',
+      provider_turn_id: 'codex-turn-pre-action',
+    });
+
+    for (const mismatch of [
+      { conversation_id: 'conversation-stale' },
+      { executor_instance_id: 'executor-stale' },
+      { cwd: path.dirname(workspace) },
+      { environment_id: 'remote-environment' },
+      { provider_thread_id: 'codex-thread-stale' },
+      { provider_turn_id: '' },
+      { provider_item_id: '' },
+      { workspace: { ...context.workspace, lease_epoch: context.workspace.lease_epoch + 1 } },
+      { provider_attempt: { ...context.attempt, lease_epoch: context.attempt.lease_epoch + 1 } },
+      { write_paths: [path.join(path.dirname(workspace), 'outside.txt')] },
+    ]) {
+      expect(() => restartedStore.assertWorkspaceWritable(context, {
+        ...approvalFence,
+        ...mismatch,
+      })).toThrow(expect.objectContaining({ code: expect.stringMatching(/stale|provider_context/) }));
+    }
+
+    clock = '2026-07-19T13:19:41.000Z';
+    expect(() => restartedStore.assertWorkspaceWritable(context, approvalFence)).toThrow(
+      expect.objectContaining({ code: 'stale_workspace_lease' }),
+    );
+    restartedDatabase.close();
+  });
+
   test('normalizes roots and fences an expired holder from write, renew, or release', () => {
     const { alias, database, workspace } = createFixture();
     const firstTurn = acceptQueuedTurn(database, 'first', 'chat-workspace-first');
