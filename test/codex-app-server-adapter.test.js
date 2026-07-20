@@ -106,6 +106,7 @@ function executionContext(overrides = {}) {
     lineage: { provider_native_id: null },
     bindProviderNativeId: jest.fn(async () => {}),
     reportProviderState: jest.fn(),
+    reportRuntimeEvidence: jest.fn(),
     interaction: {
       authorized_subjects: [{ type: 'actor', actor_id: 'user-1' }],
       allowed_sources: ['main_card_reply', 'card_action'],
@@ -178,6 +179,12 @@ function handoffDelivery(providerInteractionRef, value, {
       lease_epoch: 3,
     },
   };
+}
+
+async function deliverPreparedInteractionAnswer(adapter, delivery) {
+  const prepared = await adapter.prepareInteractionAnswer(delivery);
+  delivery.handoff.last_send_started_at ??= '2026-07-19T05:04:03Z';
+  return prepared.send(delivery);
 }
 
 function sendStartedFileChange({ send, threadId, turnId }, itemId) {
@@ -351,7 +358,11 @@ describe('Codex app-server provider adapter', () => {
     context.bindProviderNativeId = jest.fn(async (threadId) => {
       server.received.push({ method: 'core/thread-bound', params: { threadId } });
     });
-    const adapter = createCodexAppServerAdapter({ spawnProcess, cwd: '/workspace' });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess,
+      cwd: '/workspace',
+      now: () => '2026-07-19T05:00:00Z',
+    });
 
     await expect(collect(executeAdapter(adapter, context))).resolves.toEqual([]);
 
@@ -389,6 +400,11 @@ describe('Codex app-server provider adapter', () => {
     expect(context.reportProviderState).toHaveBeenCalledWith({
       state: 'started',
       provider_native_id: 'codex-thread-1',
+    });
+    expect(context.reportRuntimeEvidence).toHaveBeenCalledWith({
+      runtime_instance_id: 'codex-app-server-1',
+      handle_kind: 'codex_app_server_connection',
+      controllable: true,
     });
     const turnStartIndex = server.received.findIndex(({ method }) => method === 'turn/start');
     expect(turnStartIndex).toBeGreaterThan(2);
@@ -436,6 +452,44 @@ describe('Codex app-server provider adapter', () => {
     expect(server.received.filter(({ method }) => method === 'turn/start')).toHaveLength(2);
   });
 
+  test('recovers one persisted lineage through app-server thread/resume without starting work', async () => {
+    const server = createFakeAppServer();
+    const spawnProcess = jest.fn(() => server.child);
+    const adapter = createCodexAppServerAdapter({ spawnProcess });
+    const request = {
+      recovery_id: 'mapping-recovery-codex-A',
+      turn_id: 'turn-recovery-codex-A',
+      reason: 'mapping_missing',
+      native_recovery_attempt_id: 'native-recovery-attempt-codex-A',
+      native_recovery_attempt_no: 1,
+      candidate: {
+        lineage_id: 'lineage-codex-A',
+        provider: 'codex',
+        provider_native_id: 'codex-thread-recovery-A',
+      },
+    };
+
+    await expect(adapter.recoverLineage(request)).resolves.toEqual({
+      status: 'recovered',
+      recovery_id: request.recovery_id,
+      lineage_id: request.candidate.lineage_id,
+      provider: 'codex',
+      provider_native_id: request.candidate.provider_native_id,
+      native_recovery_attempt_id: request.native_recovery_attempt_id,
+      native_recovery_attempt_no: request.native_recovery_attempt_no,
+      side_effect_status: 'none',
+    });
+    expect(server.received.filter(({ method }) => method === 'thread/resume'))
+      .toEqual([expect.objectContaining({
+        params: expect.objectContaining({
+          threadId: request.candidate.provider_native_id,
+        }),
+      })]);
+    expect(server.received.filter(({ method }) => method === 'turn/start')).toHaveLength(0);
+    await expect(adapter.recoverLineage(request)).resolves.toMatchObject({ status: 'recovered' });
+    expect(server.received.filter(({ method }) => method === 'thread/resume')).toHaveLength(1);
+  });
+
   test('ignores tombstoned late traffic without changing another run on the current connection', async () => {
     const reportRunBFailure = jest.fn();
     const server = createFakeAppServer({
@@ -467,7 +521,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const runA = executeAdapter(adapter, runAContext)[Symbol.asyncIterator]();
     const interaction = await nextInteraction(runA);
-    await adapter.handleInteractionAnswer(handoffDelivery(
+    await deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
       { kind: 'decision', decision: 'approve' },
     ));
@@ -1215,10 +1269,22 @@ describe('Codex app-server provider adapter', () => {
     });
     expect(JSON.stringify(interaction.value)).not.toContain('requestUserInput');
 
-    await expect(adapter.handleInteractionAnswer(handoffDelivery(
+    const delivery = handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
       { kind: 'text', text: 'Alice' },
-    ))).resolves.toEqual({
+    );
+    await expect(adapter.queryInteractionHandoffAcceptance(delivery)).resolves.toMatchObject({
+      status: 'unknown',
+      read_only: true,
+      idempotent: true,
+      handoff_id: delivery.handoff.handoff_id,
+      handoff_attempt_id: delivery.handoff.handoff_attempt_id,
+      reason_code: 'provider_acceptance_query_unavailable',
+    });
+    const prepared = await adapter.prepareInteractionAnswer(delivery);
+    expect(server.received).not.toContainEqual(expect.objectContaining({ id: 71 }));
+    delivery.handoff.last_send_started_at = '2026-07-19T05:04:03Z';
+    await expect(prepared.send(delivery)).resolves.toEqual({
       handoff_id: 'handoff-1',
       status: 'accepted',
       provider_attempt_id: 'attempt-1',
@@ -1451,7 +1517,7 @@ describe('Codex app-server provider adapter', () => {
       }),
     });
     expect(JSON.stringify(interaction.value)).not.toMatch(/requestApproval|requestUserInput/);
-    await expect(adapter.handleInteractionAnswer(handoffDelivery(
+    await expect(deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
       answer,
     ))).resolves.toEqual(expect.objectContaining({
@@ -1461,6 +1527,74 @@ describe('Codex app-server provider adapter', () => {
     expect(server.received).toContainEqual({ id: 'provider-request-1', result });
     expect(controls.assertWorkspaceWrite).toHaveBeenCalledTimes(workspaceFenceChecks);
     await iterator.return();
+  });
+
+  test('auto-approves native protected actions only after Core returns a trusted decision', async () => {
+    const authorizeProtectedAction = jest.fn(() => ({
+      trusted: true,
+      basis_kind: 'persistent_bot',
+      checked_policy_revision: 7,
+    }));
+    const server = createFakeAppServer({
+      afterTurnStart(details) {
+        sendStartedFileChange(details, 'trusted-file-change');
+        details.send({
+          id: 'trusted-provider-request',
+          method: 'item/fileChange/requestApproval',
+          params: {
+            threadId: details.threadId,
+            turnId: details.turnId,
+            itemId: 'trusted-file-change',
+            startedAtMs: 1,
+            reason: 'Trusted policy recheck.',
+          },
+        });
+      },
+      onClientResponse({ message, send }) {
+        send({
+          method: 'serverRequest/resolved',
+          params: { threadId: 'codex-thread-1', requestId: message.id },
+        });
+        send({
+          method: 'item/completed',
+          params: {
+            threadId: 'codex-thread-1',
+            turnId: 'codex-turn-1',
+            item: {
+              type: 'fileChange',
+              id: 'trusted-file-change',
+              status: 'completed',
+              changes: [],
+            },
+          },
+        });
+        send({
+          method: 'turn/completed',
+          params: {
+            threadId: 'codex-thread-1',
+            turn: { id: 'codex-turn-1', status: 'completed', items: [] },
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    const events = await collect(adapter.execute(executionContext(), {
+      assertWorkspaceWrite: jest.fn(() => ({ status: 'current' })),
+      authorizeProtectedAction,
+    }));
+
+    expect(authorizeProtectedAction).toHaveBeenCalledWith({
+      action_ref: expect.stringMatching(
+        /^codex:codex-app-server-1:s:trusted-provider-request:/,
+      ),
+      action_kind: 'item/fileChange/requestApproval',
+    });
+    expect(events).not.toContainEqual(expect.objectContaining({ kind: 'interaction_requested' }));
+    expect(server.received).toContainEqual({
+      id: 'trusted-provider-request',
+      result: { decision: 'accept' },
+    });
   });
 
   test('fails closed when one provider request contains multiple questions', async () => {
@@ -1769,7 +1903,7 @@ describe('Codex app-server provider adapter', () => {
     const iterator = executeAdapter(adapter, executionContext())[Symbol.asyncIterator]();
     const interaction = await iterator.next();
 
-    await expect(adapter.handleInteractionAnswer(handoffDelivery(
+    await expect(deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
       answer,
     ))).rejects.toMatchObject({ providerError: { code: 'side_effect_unknown' } });
@@ -1963,7 +2097,7 @@ describe('Codex app-server provider adapter', () => {
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     const iterator = executeAdapter(adapter, executionContext({ reportProviderFailure }))[Symbol.asyncIterator]();
     const interaction = await nextInteraction(iterator);
-    await adapter.handleInteractionAnswer(handoffDelivery(
+    await deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
       { kind: 'decision', decision: 'approve' },
     ));
@@ -2011,7 +2145,7 @@ describe('Codex app-server provider adapter', () => {
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     const iterator = executeAdapter(adapter, executionContext())[Symbol.asyncIterator]();
     const first = await nextInteraction(iterator);
-    await adapter.handleInteractionAnswer(handoffDelivery(
+    await deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       first.value.payload.provider_interaction_ref,
       { kind: 'decision', decision: 'approve' },
       { handoffId: 'handoff-numeric', handoffAttemptId: 'attempt-numeric' },
@@ -2046,7 +2180,7 @@ describe('Codex app-server provider adapter', () => {
     });
 
     const second = await nextInteraction(iterator);
-    await adapter.handleInteractionAnswer(handoffDelivery(
+    await deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       second.value.payload.provider_interaction_ref,
       { kind: 'decision', decision: 'deny' },
       { handoffId: 'handoff-string', handoffAttemptId: 'attempt-string' },
@@ -2273,16 +2407,18 @@ describe('Codex app-server provider adapter', () => {
     expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
   });
 
-  test('maps service cancellation to the current fenced app-server turn interrupt', async () => {
+  test.each(['stop', 'steer'])(
+    'maps service %s cancellation to the current fenced app-server turn interrupt',
+    async (reason) => {
     const server = createFakeAppServer({ afterTurnStart() {} });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     const context = executionContext({ lineage: { provider_native_id: 'codex-thread-1' } });
     const waiting = executeAdapter(adapter, context)[Symbol.asyncIterator]().next();
     await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
 
-    await expect(adapter.cancel(context)).resolves.toEqual({
+    await expect(adapter.cancel(context, { reason })).resolves.toEqual({
       status: 'interrupt_requested',
-      reason: 'stop',
+      reason,
     });
     expect(server.received).toContainEqual(expect.objectContaining({
       method: 'turn/interrupt',
@@ -2300,7 +2436,8 @@ describe('Codex app-server provider adapter', () => {
     await expect(waiting).rejects.toMatchObject({
       providerError: { code: 'side_effect_unknown' },
     });
-  });
+    },
+  );
 
   test('proves abort isolation only after the exact provider turn reaches terminal', async () => {
     const server = createFakeAppServer({ afterTurnStart() {} });
@@ -2542,7 +2679,7 @@ describe('Codex app-server provider adapter', () => {
     delivery.handoff.lease_epoch = 4;
     const before = server.received.length;
 
-    await expect(adapter.handleInteractionAnswer(delivery)).rejects.toThrow(/runtime fence/);
+    await expect(deliverPreparedInteractionAnswer(adapter, delivery)).rejects.toThrow(/runtime fence/);
     expect(server.received).toHaveLength(before);
     await iterator.return();
   });
@@ -2588,7 +2725,7 @@ describe('Codex app-server provider adapter', () => {
     current = false;
     const before = server.received.length;
 
-    await expect(adapter.handleInteractionAnswer(handoffDelivery(
+    await expect(deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
       { kind: 'decision', decision: 'approve' },
     ))).rejects.toMatchObject({
@@ -2672,7 +2809,7 @@ describe('Codex app-server provider adapter', () => {
       throw new Error('forced synchronous EPIPE');
     });
 
-    await expect(adapter.handleInteractionAnswer(handoffDelivery(
+    await expect(deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
       { kind: 'decision', decision: 'approve' },
     ))).rejects.toMatchObject({
@@ -2701,7 +2838,7 @@ describe('Codex app-server provider adapter', () => {
     server.child.emit('close', 1, null);
 
     expect(reportProviderFailure).toHaveBeenCalledTimes(1);
-    await expect(adapter.handleInteractionAnswer(handoffDelivery(
+    await expect(deliverPreparedInteractionAnswer(adapter, handoffDelivery(
       interaction.value.payload.provider_interaction_ref,
       { kind: 'decision', decision: 'approve' },
     ))).rejects.toThrow(/current provider request/);

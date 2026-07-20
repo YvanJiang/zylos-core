@@ -66,6 +66,13 @@ function acceptQueuedTurn(database, suffix = 'canonical') {
   });
 }
 
+function stopActiveConversation(service, accepted, suffix = accepted.turn_id) {
+  return service.stop({
+    conversation_id: accepted.conversation_id,
+    stop_id: `stop-${suffix}`,
+  });
+}
+
 function malformedTurnStartAppServer() {
   const child = new EventEmitter();
   child.stdin = new PassThrough();
@@ -166,6 +173,769 @@ afterEach(() => {
 });
 
 describe('runtime executor service', () => {
+  test('renews the current executor turn lease every ten seconds under its exact fence', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'turn-lease-renewal');
+    let finishProvider;
+    const providerFinished = new Promise((resolve) => { finishProvider = resolve; });
+    let renewalTick;
+    let nonterminalSweep;
+    const adapter = {
+      async *execute(context) {
+        context.reportRuntimeEvidence({
+          runtime_instance_id: 'codex-app-server-turn-lease-renewal',
+          handle_kind: 'codex_app_server_connection',
+          controllable: true,
+        });
+        context.reportProviderState({ state: 'started', provider_native_id: null });
+        await providerFinished;
+      },
+    };
+    const clock = { now: '2026-07-19T07:01:00Z' };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-turn-lease-renewal',
+      now: () => clock.now,
+      generateId: deterministicIds('turn-lease-renewal'),
+      workspaceLeaseDurationMs: 60_000,
+      scheduleTurnLeaseRenewal(callback, intervalMs) {
+        expect(intervalMs).toBe(10_000);
+        renewalTick = callback;
+        return { unref() {} };
+      },
+      cancelTurnLeaseRenewal() {},
+      scheduleNonterminalSweep(callback, intervalMs) {
+        expect(intervalMs).toBe(30_000);
+        nonterminalSweep = callback;
+        return { unref() {} };
+      },
+      cancelNonterminalSweep() {},
+    });
+
+    service.start();
+    const running = service.runNext();
+    await new Promise((resolve) => setImmediate(resolve));
+    const before = database.prepare(`
+      SELECT lease_owner, attempt_id, attempt_no, lease_epoch, lease_expires_at, updated_at
+      FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id);
+    expect(before).toMatchObject({
+      lease_owner: 'executor-service-turn-lease-renewal',
+      attempt_id: 'attempt-turn-lease-renewal-1',
+      attempt_no: 1,
+      lease_epoch: 1,
+      lease_expires_at: '2026-07-19T07:01:30.000Z',
+      updated_at: '2026-07-19T07:01:00Z',
+    });
+
+    expect(renewalTick).toEqual(expect.any(Function));
+    clock.now = '2026-07-19T07:01:10Z';
+    renewalTick();
+    clock.now = '2026-07-19T07:01:20Z';
+    renewalTick();
+    clock.now = '2026-07-19T07:01:30Z';
+    expect(nonterminalSweep).toEqual(expect.any(Function));
+    nonterminalSweep();
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'running' });
+    renewalTick();
+    expect(database.prepare(`
+      SELECT lease_owner, attempt_id, attempt_no, lease_epoch, lease_expires_at, updated_at
+      FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({
+      lease_owner: 'executor-service-turn-lease-renewal',
+      attempt_id: 'attempt-turn-lease-renewal-1',
+      attempt_no: 1,
+      lease_epoch: 1,
+      lease_expires_at: '2026-07-19T07:02:00.000Z',
+      updated_at: '2026-07-19T07:01:30Z',
+    });
+
+    finishProvider();
+    await expect(running).resolves.toMatchObject({ status: 'completed' });
+    await service.close();
+    database.close();
+  });
+
+  test('rejects a renewal cadence without lease-expiry headroom', () => {
+    const database = openTestDatabase();
+    expect(() => createExecutorService({
+      database,
+      adapter: { async *execute() {} },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-invalid-renewal-headroom',
+      leaseDurationMs: 10_000,
+      turnLeaseRenewalIntervalMs: 10_000,
+    })).toThrow(/renewal interval must be below the turn lease duration/);
+    database.close();
+  });
+
+  test('persists provider attempt identity and controllable runtime evidence without PID authority', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'runtime-evidence');
+    let finishProvider;
+    const providerFinished = new Promise((resolve) => { finishProvider = resolve; });
+    const clock = { now: '2026-07-19T07:01:00Z' };
+    const adapter = {
+      async *execute(context) {
+        expect(context.reportRuntimeEvidence({
+          runtime_instance_id: 'codex-connection-runtime-evidence',
+          handle_kind: 'codex_app_server_connection',
+          controllable: true,
+          process: {
+            pid: 4142,
+            pgid: 4142,
+            started_at: '2026-07-19T07:00:59Z',
+            diagnostic_only: true,
+          },
+        })).toMatchObject({ status: 'recorded' });
+        context.reportProviderState({ state: 'started', provider_native_id: null });
+        clock.now = '2026-07-19T07:01:01Z';
+        expect(context.reportProviderState({
+          state: 'started',
+          provider_native_id: null,
+        })).toMatchObject({ status: 'already_started' });
+        await providerFinished;
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-runtime-evidence',
+      now: () => clock.now,
+      generateId: deterministicIds('runtime-evidence'),
+    });
+
+    const running = service.runNext();
+    await new Promise((resolve) => setImmediate(resolve));
+    const attempt = database.prepare(`
+      SELECT turn_id, conversation_id, attempt_id, attempt_no, lease_epoch,
+        provider, service_instance_id, executor_instance_id, state,
+        runtime_instance_id, runtime_evidence_json, last_provider_event_at
+      FROM runtime_provider_attempts WHERE turn_id = ?
+    `).get(accepted.turn_id);
+    expect(attempt).toMatchObject({
+      turn_id: accepted.turn_id,
+      conversation_id: accepted.conversation_id,
+      attempt_id: 'attempt-runtime-evidence-1',
+      attempt_no: 1,
+      lease_epoch: 1,
+      provider: 'codex',
+      service_instance_id: 'executor-service-runtime-evidence',
+      executor_instance_id: 'executor-runtime-evidence-1',
+      state: 'running',
+      runtime_instance_id: 'codex-connection-runtime-evidence',
+      last_provider_event_at: '2026-07-19T07:01:01Z',
+    });
+    expect(JSON.parse(attempt.runtime_evidence_json)).toEqual({
+      runtime_instance_id: 'codex-connection-runtime-evidence',
+      handle_kind: 'codex_app_server_connection',
+      controllable: true,
+      process: {
+        pid: 4142,
+        pgid: 4142,
+        started_at: '2026-07-19T07:00:59Z',
+        diagnostic_only: true,
+      },
+    });
+
+    finishProvider();
+    await expect(running).resolves.toMatchObject({ status: 'completed' });
+    database.close();
+  });
+
+  test('startup reconciles an unproven nonterminal attempt without trusting PID evidence', async () => {
+    const firstDatabase = openTestDatabase();
+    const accepted = acceptQueuedTurn(firstDatabase, 'startup-reconciliation-pid');
+    const firstStore = createExecutorStore({
+      database: firstDatabase,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-startup-reconciliation-old',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('startup-reconciliation-old'),
+    });
+    const oldContext = firstStore.claimNextQueuedTurn();
+    firstStore.transitionTurn(oldContext, 'starting', 'running');
+    firstDatabase.prepare(`
+      UPDATE runtime_provider_attempts
+      SET runtime_evidence_json = ?, runtime_instance_id = NULL
+      WHERE turn_id = ?
+    `).run(JSON.stringify({ pid: process.pid, pgid: process.pid }), accepted.turn_id);
+    const databasePath = firstDatabase.name;
+    firstDatabase.close();
+
+    const restartedDatabase = new Database(databasePath);
+    let executions = 0;
+    const restartedService = createExecutorService({
+      database: restartedDatabase,
+      adapter: { async *execute() { executions += 1; } },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-startup-reconciliation-new',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('startup-reconciliation-new'),
+    });
+
+    restartedService.start();
+    expect(restartedDatabase.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    expect(restartedDatabase.prepare(`
+      SELECT lease_owner, turn_id, attempt_id, attempt_no, lease_epoch
+      FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({
+      lease_owner: 'executor-service-startup-reconciliation-old',
+      turn_id: accepted.turn_id,
+      attempt_id: oldContext.attempt.attempt_id,
+      attempt_no: 1,
+      lease_epoch: 1,
+    });
+    expect(restartedDatabase.prepare(`
+      SELECT recovery_kind, state, side_effect_status
+      FROM runtime_execution_recoveries WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({
+      recovery_kind: 'startup_reconciliation',
+      state: 'waiting_decision',
+      side_effect_status: 'unknown',
+    });
+    expect(restartedDatabase.prepare(`
+      SELECT parent_type, state FROM runtime_interactions WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ parent_type: 'recovery_control', state: 'pending' });
+    expect(restartedDatabase.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_outbox WHERE turn_id = ? AND status = 'pending'
+    `).get(accepted.turn_id).count).toBeGreaterThan(0);
+    await expect(restartedService.runNext()).resolves.toMatchObject({ status: 'idle' });
+    expect(executions).toBe(0);
+
+    await restartedService.close();
+    restartedDatabase.close();
+  });
+
+  test('runs a thirty-second sweep and fences newly orphaned nonterminal work', async () => {
+    const database = openTestDatabase();
+    let sweep;
+    let scheduledInterval;
+    const service = createExecutorService({
+      database,
+      adapter: { async *execute() {} },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-nonterminal-sweep',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('nonterminal-sweep'),
+      scheduleNonterminalSweep(callback, intervalMs) {
+        sweep = callback;
+        scheduledInterval = intervalMs;
+        return { unref() {} };
+      },
+      cancelNonterminalSweep() {},
+    });
+    service.start();
+    expect(scheduledInterval).toBe(30_000);
+
+    const accepted = acceptQueuedTurn(database, 'nonterminal-sweep-orphan');
+    const foreignStore = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-nonterminal-sweep-orphan',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('nonterminal-sweep-orphan'),
+    });
+    const foreignContext = foreignStore.claimNextQueuedTurn();
+    foreignStore.transitionTurn(foreignContext, 'starting', 'running');
+    sweep();
+
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    expect(database.prepare(`
+      SELECT recovery_kind, state FROM runtime_execution_recoveries WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({
+      recovery_kind: 'sweep_reconciliation',
+      state: 'waiting_decision',
+    });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({
+      lease_owner: 'executor-service-nonterminal-sweep-orphan',
+      turn_id: accepted.turn_id,
+    });
+
+    await service.close();
+    database.close();
+  });
+
+  test('sweep accepts only an exact active fence with durable controllable runtime evidence', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'healthy-nonterminal-sweep');
+    let sweep;
+    let releaseProvider;
+    const providerCanFinish = new Promise((resolve) => { releaseProvider = resolve; });
+    let markEvidenceRecorded;
+    const evidenceRecorded = new Promise((resolve) => { markEvidenceRecorded = resolve; });
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute(context) {
+          context.reportRuntimeEvidence({
+            runtime_instance_id: 'codex-app-server-runtime-healthy',
+            handle_kind: 'codex_app_server_connection',
+            controllable: true,
+          });
+          context.reportProviderState({ state: 'started', provider_native_id: null });
+          markEvidenceRecorded();
+          await providerCanFinish;
+        },
+      },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-healthy-nonterminal-sweep',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('healthy-nonterminal-sweep'),
+      scheduleNonterminalSweep(callback) {
+        sweep = callback;
+        return { unref() {} };
+      },
+      cancelNonterminalSweep() {},
+    });
+
+    const running = service.runNext();
+    await evidenceRecorded;
+    sweep();
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'running' });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_execution_recoveries WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ count: 0 });
+    releaseProvider();
+    await expect(running).resolves.toMatchObject({ status: 'completed' });
+
+    await service.close();
+    database.close();
+  });
+
+  test('runtime evidence alone is not accepted as provider-event freshness', () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'runtime-evidence-without-provider-event');
+    const store = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-runtime-evidence-without-provider-event',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('runtime-evidence-without-provider-event'),
+    });
+    const context = store.claimNextQueuedTurn();
+    store.recordProviderRuntimeEvidence(context, {
+      runtime_instance_id: 'codex-app-server-runtime-evidence-only',
+      handle_kind: 'codex_app_server_connection',
+      controllable: true,
+    });
+
+    expect(store.reconcileNonterminalTurns([context], 'sweep_reconciliation'))
+      .toMatchObject({
+        inspected: 1,
+        healthy: 0,
+        waiting_decision: 1,
+        results: [{ turn_id: accepted.turn_id, status: 'waiting_decision' }],
+      });
+    expect(database.prepare(`
+      SELECT last_provider_event_at FROM runtime_provider_attempts WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ last_provider_event_at: null });
+    database.close();
+  });
+
+  test('retains a foreign exact lease only until expiry even with persisted controllable evidence', () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'foreign-lease-reconciliation');
+    const foreignStore = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-foreign-lease-owner',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('foreign-lease-owner'),
+    });
+    const foreignContext = foreignStore.claimNextQueuedTurn();
+    foreignStore.recordProviderRuntimeEvidence(foreignContext, {
+      runtime_instance_id: 'foreign-codex-app-server-runtime',
+      handle_kind: 'codex_app_server_connection',
+      controllable: true,
+    });
+    foreignStore.transitionTurn(foreignContext, 'starting', 'running');
+
+    let currentTime = '2026-07-19T07:01:05Z';
+    const reconcilingStore = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-reconciler',
+      now: () => currentTime,
+      generateId: deterministicIds('foreign-lease-reconciler'),
+    });
+
+    expect(reconcilingStore.reconcileNonterminalTurns([], 'sweep_reconciliation'))
+      .toMatchObject({
+        inspected: 1,
+        healthy: 0,
+        waiting_decision: 0,
+        results: [{ turn_id: accepted.turn_id, status: 'foreign_lease_retained' }],
+      });
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'running' });
+
+    currentTime = '2026-07-19T07:01:11Z';
+    expect(reconcilingStore.reconcileNonterminalTurns([], 'sweep_reconciliation'))
+      .toMatchObject({
+        inspected: 1,
+        healthy: 0,
+        waiting_decision: 1,
+        results: [{ turn_id: accepted.turn_id, status: 'waiting_decision' }],
+      });
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    database.close();
+  });
+
+  test('safely retries one turn at most three times with new attempts and lease epochs', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'safe-provider-retry');
+    const observedAttempts = [];
+    const backoffs = [];
+    let currentTimeMs = Date.parse('2026-07-19T07:01:00Z');
+    const adapter = {
+      async *execute(context) {
+        observedAttempts.push({
+          turn_id: context.turn_id,
+          ...context.attempt,
+        });
+        if (context.attempt.attempt_no < 4) {
+          const error = new Error('private transient provider failure');
+          error.providerError = {
+            code: 'delivery_transient',
+            category: 'provider',
+            retryable: true,
+            side_effect_status: 'none',
+            user_message: 'The provider is temporarily unavailable.',
+          };
+          throw error;
+        }
+        context.reportProviderState({ state: 'started', provider_native_id: null });
+        yield {
+          kind: 'text_snapshot',
+          provider_native_id: null,
+          payload: { text: 'completed after safe retries', end_offset: 28 },
+        };
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-safe-provider-retry',
+      now: () => new Date(currentTimeMs).toISOString(),
+      generateId: deterministicIds('safe-provider-retry'),
+      providerRetryBaseDelayMs: 1_000,
+      providerRetryJitterRatio: 0,
+    });
+
+    for (const expectedBackoff of [1_000, 2_000, 4_000]) {
+      const scheduled = await service.runNext();
+      expect(scheduled).toMatchObject({
+        status: 'retry_scheduled',
+        turn_id: accepted.turn_id,
+        retry: { backoff_ms: expectedBackoff },
+      });
+      backoffs.push(scheduled.retry.backoff_ms);
+      currentTimeMs += scheduled.retry.backoff_ms;
+    }
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: accepted.turn_id,
+      attempt_id: 'attempt-safe-provider-retry-4',
+      attempt_no: 4,
+      lease_epoch: 4,
+    });
+    expect(backoffs).toEqual([1_000, 2_000, 4_000]);
+    expect(observedAttempts).toEqual([1, 2, 3, 4].map((attemptNo) => ({
+      turn_id: accepted.turn_id,
+      attempt_id: `attempt-safe-provider-retry-${attemptNo}`,
+      attempt_no: attemptNo,
+      lease_epoch: attemptNo,
+    })));
+    expect(database.prepare(`
+      SELECT attempt_no, lease_epoch, state, side_effect_status
+      FROM runtime_provider_attempts WHERE turn_id = ? ORDER BY attempt_no
+    `).all(accepted.turn_id)).toEqual([
+      { attempt_no: 1, lease_epoch: 1, state: 'retry_wait', side_effect_status: 'none' },
+      { attempt_no: 2, lease_epoch: 2, state: 'retry_wait', side_effect_status: 'none' },
+      { attempt_no: 3, lease_epoch: 3, state: 'retry_wait', side_effect_status: 'none' },
+      { attempt_no: 4, lease_epoch: 4, state: 'completed', side_effect_status: 'none' },
+    ]);
+    expect(readEvents(database, accepted.turn_id).filter(({ kind }) => (
+      kind.startsWith('retry_')
+    )).map(({ kind, attempt_no: attemptNo, lease_epoch: leaseEpoch, payload }) => ({
+      kind,
+      attemptNo,
+      leaseEpoch,
+      retryNo: payload.retry_no,
+      payloadAttemptNo: payload.attempt_no,
+      backoffMs: payload.backoff_ms,
+    }))).toEqual([
+      { kind: 'retry_scheduled', attemptNo: 1, leaseEpoch: 1, retryNo: 1,
+        payloadAttemptNo: 2, backoffMs: 1_000 },
+      { kind: 'retry_attempt_started', attemptNo: 2, leaseEpoch: 2, retryNo: 1,
+        payloadAttemptNo: 2, backoffMs: 1_000 },
+      { kind: 'retry_scheduled', attemptNo: 2, leaseEpoch: 2, retryNo: 2,
+        payloadAttemptNo: 3, backoffMs: 2_000 },
+      { kind: 'retry_attempt_started', attemptNo: 3, leaseEpoch: 3, retryNo: 2,
+        payloadAttemptNo: 3, backoffMs: 2_000 },
+      { kind: 'retry_scheduled', attemptNo: 3, leaseEpoch: 3, retryNo: 3,
+        payloadAttemptNo: 4, backoffMs: 4_000 },
+      { kind: 'retry_attempt_started', attemptNo: 4, leaseEpoch: 4, retryNo: 3,
+        payloadAttemptNo: 4, backoffMs: 4_000 },
+    ]);
+    database.close();
+  });
+
+  test('emits retry exhaustion after the third retry and never creates a fifth attempt', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'provider-retry-exhausted');
+    let currentTimeMs = Date.parse('2026-07-19T07:01:00Z');
+    let executions = 0;
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute() {
+          executions += 1;
+          const error = new Error('private transient provider failure');
+          error.providerError = {
+            code: 'delivery_transient',
+            category: 'provider',
+            retryable: true,
+            side_effect_status: 'none',
+            user_message: 'The provider is temporarily unavailable.',
+          };
+          throw error;
+        },
+      },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-provider-retry-exhausted',
+      now: () => new Date(currentTimeMs).toISOString(),
+      generateId: deterministicIds('provider-retry-exhausted'),
+      providerRetryJitterRatio: 0,
+    });
+
+    for (const expectedBackoff of [1_000, 2_000, 4_000]) {
+      const scheduled = await service.runNext();
+      expect(scheduled).toMatchObject({
+        status: 'retry_scheduled',
+        turn_id: accepted.turn_id,
+        retry: { backoff_ms: expectedBackoff },
+      });
+      currentTimeMs += scheduled.retry.backoff_ms;
+    }
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'failed',
+      turn_id: accepted.turn_id,
+      attempt_no: 4,
+      lease_epoch: 4,
+    });
+    expect(executions).toBe(4);
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_provider_attempts WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ count: 4 });
+    expect(readEvents(database, accepted.turn_id).filter(
+      ({ kind }) => kind === 'retry_exhausted',
+    )).toEqual([
+      expect.objectContaining({
+        attempt_no: 4,
+        lease_epoch: 4,
+        payload: expect.objectContaining({ retry_no: 3, attempt_no: 4, backoff_ms: 0 }),
+        error: expect.objectContaining({ code: 'delivery_transient', retryable: true }),
+      }),
+    ]);
+    database.close();
+  });
+
+  test('returns a turn-bound retry schedule before another service claims the retry', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'provider-retry-handoff');
+    let currentTimeMs = Date.parse('2026-07-19T07:01:00Z');
+    const firstService = createExecutorService({
+      database,
+      adapter: {
+        async *execute() {
+          const error = new Error('private transient provider failure');
+          error.providerError = {
+            code: 'delivery_transient',
+            category: 'provider',
+            retryable: true,
+            side_effect_status: 'none',
+            user_message: 'The provider is temporarily unavailable.',
+          };
+          throw error;
+        },
+      },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-provider-retry-handoff-first',
+      now: () => new Date(currentTimeMs).toISOString(),
+      generateId: deterministicIds('provider-retry-handoff-first'),
+      providerRetryJitterRatio: 0,
+    });
+    const secondService = createExecutorService({
+      database,
+      adapter: { async *execute() {} },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-provider-retry-handoff-second',
+      now: () => new Date(currentTimeMs).toISOString(),
+      generateId: deterministicIds('provider-retry-handoff-second'),
+      providerRetryJitterRatio: 0,
+    });
+
+    const scheduled = await firstService.runNext();
+    expect(scheduled).toMatchObject({
+      status: 'retry_scheduled',
+      turn_id: accepted.turn_id,
+      attempt_no: 1,
+      lease_epoch: 1,
+      retry: { backoff_ms: 1_000 },
+    });
+    currentTimeMs += scheduled.retry.backoff_ms;
+    await expect(secondService.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: accepted.turn_id,
+      attempt_no: 2,
+      lease_epoch: 2,
+    });
+    await expect(firstService.runNext()).resolves.toMatchObject({ status: 'idle' });
+    database.close();
+  });
+
+  test('records callbacks from a superseded provider attempt as diagnostics only', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'stale-provider-attempt-diagnostics');
+    let currentTimeMs = Date.parse('2026-07-19T07:01:00Z');
+    let staleCallbacks;
+    const staleResults = [];
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute(context) {
+          if (context.attempt.attempt_no === 1) {
+            staleCallbacks = context;
+            const error = new Error('private transient provider failure');
+            error.providerError = {
+              code: 'delivery_transient',
+              category: 'provider',
+              retryable: true,
+              side_effect_status: 'none',
+              user_message: 'The provider is temporarily unavailable.',
+            };
+            throw error;
+          }
+          context.reportProviderState({ state: 'started', provider_native_id: null });
+        },
+      },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-stale-provider-attempt-diagnostics',
+      now: () => new Date(currentTimeMs).toISOString(),
+      generateId: deterministicIds('stale-provider-attempt-diagnostics'),
+      providerRetryJitterRatio: 0,
+    });
+
+    const scheduled = await service.runNext();
+    expect(scheduled).toMatchObject({
+      status: 'retry_scheduled',
+      turn_id: accepted.turn_id,
+      retry: { backoff_ms: 1_000 },
+    });
+    staleResults.push(staleCallbacks.bindProviderNativeId('stale-native-id'));
+    staleResults.push(staleCallbacks.reportProviderState({
+      state: 'started',
+      provider_native_id: null,
+    }));
+    staleResults.push(staleCallbacks.reportRuntimeEvidence({
+      runtime_instance_id: 'stale-runtime',
+      handle_kind: 'stale_handle',
+      controllable: true,
+    }));
+    staleResults.push(staleCallbacks.reportProviderFailure({
+      providerError: {
+        code: 'side_effect_unknown',
+        category: 'provider',
+        retryable: false,
+        side_effect_status: 'unknown',
+        user_message: 'This stale failure is diagnostic only.',
+      },
+    }));
+    currentTimeMs += scheduled.retry.backoff_ms;
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: accepted.turn_id,
+      attempt_no: 2,
+    });
+    expect(staleResults).toEqual(Array(4).fill({ status: 'stale_attempt' }));
+    expect(database.prepare(`
+      SELECT event_kind, reason_code FROM runtime_provider_event_diagnostics
+      WHERE turn_id = ? ORDER BY observed_at, rowid
+    `).all(accepted.turn_id)).toEqual([
+      { event_kind: 'provider_native_id', reason_code: 'stale_attempt' },
+      { event_kind: 'provider_state', reason_code: 'stale_attempt' },
+      { event_kind: 'runtime_evidence', reason_code: 'stale_attempt' },
+      { event_kind: 'provider_failure', reason_code: 'stale_attempt' },
+    ]);
+    expect(database.prepare(`
+      SELECT provider_native_id FROM runtime_lineages WHERE lineage_id = ?
+    `).get(accepted.lineage_id)).toEqual({ provider_native_id: null });
+    database.close();
+  });
+
+  test.each([
+    ['authentication', 'provider_auth_failed', 'none'],
+    ['authorization', 'forbidden', 'none'],
+    ['provider', 'provider_context_invalid', 'none'],
+    ['conflict', 'turn_interrupted', 'none'],
+    ['provider', 'side_effect_unknown', 'unknown'],
+  ])('never retries %s/%s provider failures', async (category, code, sideEffectStatus) => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, `nonretry-${code}`);
+    let executions = 0;
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute() {
+          executions += 1;
+          const error = new Error('private ineligible provider failure');
+          error.providerError = {
+            code,
+            category,
+            retryable: true,
+            side_effect_status: sideEffectStatus,
+            user_message: 'This failure must not be retried.',
+          };
+          throw error;
+        },
+      },
+      provider: 'codex',
+      serviceInstanceId: `executor-service-nonretry-${code}`,
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds(`nonretry-${code}`),
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: code === 'side_effect_unknown' ? 'recovering' : 'failed',
+      turn_id: accepted.turn_id,
+      attempt_no: 1,
+    });
+    expect(executions).toBe(1);
+    expect(readEvents(database, accepted.turn_id).filter(
+      ({ kind }) => kind.startsWith('retry_'),
+    )).toEqual([]);
+    database.close();
+  });
+
   test('atomically binds a provider-native lineage before persisting provider output', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'native-lineage');
@@ -309,11 +1079,12 @@ describe('runtime executor service', () => {
     expect(database.prepare(`
       SELECT state FROM runtime_turns WHERE turn_id = ?
     `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
-    expect(readEvents(database, accepted.turn_id).slice(-3).map(({ kind, phase }) => ({ kind, phase })))
+    expect(readEvents(database, accepted.turn_id).slice(-4).map(({ kind, phase }) => ({ kind, phase })))
       .toEqual([
         { kind: 'interaction_cancelled', phase: 'waiting_user' },
         { kind: 'turn_state_changed', phase: 'recovering' },
         { kind: 'recovery_started', phase: 'recovering' },
+        { kind: 'recovery_waiting_decision', phase: 'recovering' },
       ]);
 
     database.close();
@@ -375,8 +1146,8 @@ describe('runtime executor service', () => {
       turn_id: accepted.turn_id,
     });
     expect(database.prepare(`
-      SELECT COUNT(*) AS count FROM runtime_interactions WHERE turn_id = ?
-    `).get(accepted.turn_id)).toEqual({ count: 0 });
+      SELECT parent_type, state FROM runtime_interactions WHERE turn_id = ?
+    `).all(accepted.turn_id)).toEqual([{ parent_type: 'recovery_control', state: 'pending' }]);
     expect(database.prepare(`
       SELECT state FROM runtime_turns WHERE turn_id = ?
     `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
@@ -441,7 +1212,7 @@ describe('runtime executor service', () => {
       turn_id: accepted.turn_id,
       attempt_id: expect.any(String),
     }));
-    expect(readEvents(database, accepted.turn_id).slice(-2)).toEqual([
+    expect(readEvents(database, accepted.turn_id).slice(-3)).toEqual([
       expect.objectContaining({
         kind: 'turn_state_changed',
         phase: 'recovering',
@@ -449,6 +1220,11 @@ describe('runtime executor service', () => {
       }),
       expect.objectContaining({
         kind: 'recovery_started',
+        phase: 'recovering',
+        error: expect.objectContaining({ side_effect_status: 'unknown' }),
+      }),
+      expect.objectContaining({
+        kind: 'recovery_waiting_decision',
         phase: 'recovering',
         error: expect.objectContaining({ side_effect_status: 'unknown' }),
       }),
@@ -597,9 +1373,9 @@ describe('runtime executor service', () => {
     });
 
     await expect(service.runNext()).resolves.toMatchObject({ status: 'waiting_user' });
-    await expect(service.cancel(accepted.conversation_id)).resolves.toMatchObject({
-      status: 'cancellation_requested',
-      execution: { status: 'stopped', turn_id: accepted.turn_id },
+    await expect(stopActiveConversation(service, accepted)).resolves.toMatchObject({
+      status: 'stopped',
+      active_turn: { turn_id: accepted.turn_id },
     });
     expect(database.prepare(`
       SELECT state FROM runtime_turns WHERE turn_id = ?
@@ -700,7 +1476,7 @@ describe('runtime executor service', () => {
     database.close();
   });
 
-  test('normalizes provider failure into a fenced terminal state and public error', async () => {
+  test('normalizes uncertain provider failure into fenced recovery and a durable decision', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'provider-failure');
     const adapter = {
@@ -726,33 +1502,28 @@ describe('runtime executor service', () => {
     });
 
     await expect(service.runNext()).resolves.toMatchObject({
-      status: 'failed',
+      status: 'recovering',
       turn_id: accepted.turn_id,
     });
 
     expect(database.prepare(`
       SELECT state FROM runtime_turns WHERE turn_id = ?
-    `).get(accepted.turn_id)).toEqual({ state: 'failed' });
+    `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
     expect(database.prepare(`
       SELECT status FROM runtime_turn_queue WHERE turn_id = ?
-    `).get(accepted.turn_id)).toEqual({ status: 'failed' });
+    `).get(accepted.turn_id)).toEqual({ status: 'claimed' });
     expect(database.prepare(`
       SELECT lease_owner, turn_id, attempt_id
       FROM runtime_executor_leases WHERE conversation_id = ?
-    `).get(accepted.conversation_id)).toEqual({
-      lease_owner: null,
-      turn_id: null,
-      attempt_id: null,
-    });
+    `).get(accepted.conversation_id)).toEqual(expect.objectContaining({
+      lease_owner: 'executor-service-provider-failure',
+      turn_id: accepted.turn_id,
+      attempt_id: expect.any(String),
+    }));
     const terminalEvent = readEvents(database, accepted.turn_id).at(-1);
     expect(terminalEvent).toMatchObject({
-      kind: 'turn_state_changed',
-      phase: 'failed',
-      payload: {
-        from_state: 'starting',
-        to_state: 'failed',
-        reason_code: 'executor_failed',
-      },
+      kind: 'recovery_waiting_decision',
+      phase: 'recovering',
       error: {
         code: 'side_effect_unknown',
         category: 'provider',
@@ -772,13 +1543,85 @@ describe('runtime executor service', () => {
     `).get(accepted.turn_id);
     expect(failureProjection).toMatchObject({
       critical: 1,
-      terminal: 1,
+      terminal: 0,
       status: 'staged',
     });
     expect(JSON.parse(failureProjection.render_model_json)).toMatchObject({
-      phase: 'failed',
-      terminal: true,
+      phase: 'recovering',
+      terminal: false,
       error: terminalEvent.error,
+      interactions: [expect.objectContaining({ kind: 'recovery_decision' })],
+    });
+    const recoveryRequest = JSON.parse(database.prepare(`
+      SELECT request_json FROM runtime_interactions
+      WHERE turn_id = ? AND parent_type = 'recovery_control'
+    `).get(accepted.turn_id).request_json);
+    const sourceEventId = 'recovery-decision-provider-failure';
+    const answer = {
+      contract: 'zylos.interaction-answer',
+      contract_version: '1.0',
+      trace_id: 'trace-recovery-decision-provider-failure',
+      interaction_id: recoveryRequest.interaction_id,
+      interaction_version: recoveryRequest.version,
+      answer_id: 'answer-recovery-decision-provider-failure',
+      source_event_or_action_id: sourceEventId,
+      actor: { type: 'user', actor_id: 'user-A', authenticated: true, roles: ['member'] },
+      source_context: {
+        region: 'cn',
+        tenant_id: 'tenant-A',
+        channel: 'feishu',
+        bot_id: 'bot-A',
+        chat_id: 'chat-dm-A',
+        native_thread_or_topic_id: null,
+        platform_message_or_action_id: sourceEventId,
+      },
+      source: 'card_action',
+      value: { kind: 'decision', decision: 'approve' },
+      answered_at: '2026-07-19T07:05:00Z',
+      idempotency_key: createIdempotencyKey('interaction', {
+        interaction_id: recoveryRequest.interaction_id,
+        source_event_or_action_id: sourceEventId,
+      }),
+    };
+    expect(service.submitInteractionAnswer(answer, {})).toMatchObject({
+      status: 'rejected',
+      error: expect.objectContaining({ code: 'side_effect_unknown' }),
+    });
+    const deliveryService = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-service-provider-failure-recovery',
+      now: () => '2026-07-19T07:05:01Z',
+      generateId: deterministicIds('delivery-provider-failure-recovery'),
+      throttleMs: 0,
+    });
+    for (let command = deliveryService.claimNext(); command; command = deliveryService.claimNext()) {
+      deliveryService.recordResult(deliveredResult(command, '2026-07-19T07:05:01Z'));
+    }
+    const committedDecision = service.submitInteractionAnswer(answer, {});
+    expect(committedDecision).toMatchObject({
+      status: 'accepted',
+      interaction_id: recoveryRequest.interaction_id,
+    });
+    await expect(service.deliverInteractionAnswer(committedDecision.handoff_id)).resolves
+      .toMatchObject({
+        acknowledgement: { status: 'accepted' },
+        recovery_resolution: {
+          status: 'authorized',
+          automatic_replay: false,
+          lease_released: false,
+        },
+      });
+    expect(database.prepare(`
+      SELECT state FROM runtime_execution_recoveries WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'authorized' });
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({
+      lease_owner: 'executor-service-provider-failure',
+      turn_id: accepted.turn_id,
     });
 
     database.close();
@@ -932,6 +1775,7 @@ describe('runtime executor service', () => {
         lineage_id: accepted.lineage_id,
         provider_native_id: null,
         trace_id: 'trace-canonical',
+        executor_instance_id: 'executor-executor-1',
         input: normalEnvelope().content,
         interaction: {
           authorized_subjects: [{ type: 'actor', actor_id: 'user-A' }],
@@ -941,6 +1785,7 @@ describe('runtime executor service', () => {
         bindProviderNativeId: expect.any(Function),
         reportProviderFailure: expect.any(Function),
         reportProviderState: expect.any(Function),
+        reportRuntimeEvidence: expect.any(Function),
         attempt: {
           attempt_id: 'attempt-executor-1',
           attempt_no: 1,
@@ -1081,6 +1926,12 @@ describe('runtime executor service', () => {
       async *execute(context) {
         adapterCalls.push(context.turn_id);
         if (context.turn_id === first.turn_id) {
+          context.reportRuntimeEvidence({
+            runtime_instance_id: 'claude-runtime-capacity-first',
+            handle_kind: 'claude_sdk_query',
+            controllable: true,
+          });
+          context.reportProviderState({ state: 'started', provider_native_id: null });
           markFirstStarted();
           await firstCanFinish;
         }
@@ -1348,7 +2199,6 @@ describe('runtime executor service', () => {
       now: () => '2026-07-19T07:06:00Z',
       generateId: deterministicIds('resident-crash-A'),
       maxResidentExecutorsPerBot: 1,
-      leaseDurationMs: 10_000,
       residentLeaseDurationMs: 10_000,
       residentHeartbeatIntervalMs: 3_000,
     });
@@ -1367,7 +2217,6 @@ describe('runtime executor service', () => {
       now: () => '2026-07-19T07:06:11Z',
       generateId: deterministicIds('resident-crash-B'),
       maxResidentExecutorsPerBot: 1,
-      leaseDurationMs: 10_000,
       residentLeaseDurationMs: 10_000,
       residentHeartbeatIntervalMs: 3_000,
     });
@@ -1544,6 +2393,14 @@ describe('runtime executor service', () => {
         lineage_id, conversation_id, lineage_kind, is_default, created_at
       ) VALUES (?, ?, 'normal', 0, ?)
     `).run(alternateLineageId, first.conversation_id, first.committed_at);
+    const historical = acceptNormalInbound(database, normalEnvelope('fifo-historical'), {
+      now: () => '2026-07-19T07:10:00.500Z',
+      generateId: deterministicIds('inbound-fifo-historical'),
+    });
+    database.prepare(`
+      UPDATE runtime_turns SET lineage_id = ?, state = 'completed' WHERE turn_id = ?
+    `).run(alternateLineageId, historical.turn_id);
+    database.prepare('DELETE FROM runtime_turn_queue WHERE turn_id = ?').run(historical.turn_id);
     database.prepare(`
       INSERT INTO runtime_message_mappings (
         region, tenant_id, channel, bot_id, platform_message_id,
@@ -1557,7 +2414,7 @@ describe('runtime executor service', () => {
       firstEnvelope.bot_id,
       'model-message-fifo-alternate',
       first.conversation_id,
-      first.turn_id,
+      historical.turn_id,
       alternateLineageId,
       'mapping-fifo-alternate',
       first.committed_at,
@@ -1589,6 +2446,12 @@ describe('runtime executor service', () => {
           lineage_id: context.lineage_id,
         });
         if (context.turn_id === first.turn_id) {
+          context.reportRuntimeEvidence({
+            runtime_instance_id: 'claude-runtime-fifo-first',
+            handle_kind: 'claude_sdk_query',
+            controllable: true,
+          });
+          context.reportProviderState({ state: 'started', provider_native_id: null });
           markFirstStarted();
           await firstCanFinish;
         }

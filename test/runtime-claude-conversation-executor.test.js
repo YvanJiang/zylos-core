@@ -63,6 +63,13 @@ function acceptQueuedTurn(database, suffix) {
   });
 }
 
+function stopActiveConversation(service, accepted, suffix = accepted.turn_id) {
+  return service.stop({
+    conversation_id: accepted.conversation_id,
+    stop_id: `stop-${suffix}`,
+  });
+}
+
 function permissionAnswer(request, suffix, decision = 'approve') {
   const sourceEventId = `permission-action-${suffix}`;
   return {
@@ -191,10 +198,12 @@ function createInterruptibleQuery({ sessionId }) {
     queryCalls += 1;
     const drainedInputs = [];
     const inputWaiters = [];
+    let closed = false;
     let drainFinished;
     const drainDone = new Promise((resolve) => { drainFinished = resolve; });
     const takeInput = () => {
       if (drainedInputs.length > 0) return Promise.resolve(drainedInputs.shift());
+      if (closed) return Promise.resolve(null);
       return new Promise((resolve) => inputWaiters.push(resolve));
     };
     (async () => {
@@ -207,7 +216,7 @@ function createInterruptibleQuery({ sessionId }) {
       drainFinished();
     })();
     const stream = (async function* generateSdkMessages() {
-      await takeInput();
+      if (await takeInput() === null) return;
       yield { type: 'system', subtype: 'init', session_id: sessionId };
       firstTurnStarted.resolve();
       await interrupted.promise;
@@ -225,7 +234,7 @@ function createInterruptibleQuery({ sessionId }) {
         parent_tool_use_id: null,
       };
       yield idleSession(sessionId);
-      await takeInput();
+      if (await takeInput() === null) return;
       yield {
         type: 'assistant',
         session_id: sessionId,
@@ -246,7 +255,12 @@ function createInterruptibleQuery({ sessionId }) {
       interrupted.resolve();
       return { still_queued: [] };
     };
-    stream.close = () => {};
+    stream.close = () => {
+      closed = true;
+      interrupted.resolve();
+      lateOutputRelease.resolve();
+      for (const waiter of inputWaiters.splice(0)) waiter(null);
+    };
     return stream;
   }
 
@@ -1093,6 +1107,31 @@ describe('Claude conversation executor', () => {
     expect(activeTurn.resultSeen).toBe(true);
   });
 
+  test('reports that Claude has no read-only same-handoff acceptance query', async () => {
+    const adapter = createClaudeConversationAdapter({ query: () => {} });
+    await expect(adapter.queryInteractionHandoffAcceptance({
+      handoff: {
+        handoff_id: 'handoff-query-claude',
+        provider_attempt_id: 'provider-attempt-query-claude',
+        handoff_attempt_id: 'handoff-attempt-query-claude',
+        handoff_attempt_no: 2,
+        lease_epoch: 7,
+      },
+    })).resolves.toEqual({
+      status: 'unknown',
+      read_only: true,
+      idempotent: true,
+      handoff_id: 'handoff-query-claude',
+      provider_attempt_id: 'provider-attempt-query-claude',
+      handoff_attempt_id: 'handoff-attempt-query-claude',
+      handoff_attempt_no: 2,
+      lease_epoch: 7,
+      accepted_at: null,
+      evidence_ref: null,
+      reason_code: 'provider_acceptance_query_unavailable',
+    });
+  });
+
   test('removes static tokens when native credentials are detected', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'native-auth-env');
@@ -1225,6 +1264,18 @@ describe('Claude conversation executor', () => {
       PATH: '/test/bin',
     });
     expect(fake.inputs).toEqual(['turn first', 'turn second']);
+    expect(database.prepare(`
+      SELECT runtime_evidence_json FROM runtime_provider_attempts WHERE turn_id = ?
+    `).get(first.turn_id)).toEqual({
+      runtime_evidence_json: expect.any(String),
+    });
+    expect(JSON.parse(database.prepare(`
+      SELECT runtime_evidence_json FROM runtime_provider_attempts WHERE turn_id = ?
+    `).get(first.turn_id).runtime_evidence_json)).toMatchObject({
+      runtime_instance_id: expect.any(String),
+      handle_kind: 'claude_sdk_query',
+      controllable: true,
+    });
     expect(readEvents(database, first.turn_id).at(-2)).toMatchObject({
       kind: 'text_snapshot',
       provider: 'claude',
@@ -1261,6 +1312,19 @@ describe('Claude conversation executor', () => {
         lineage_id, conversation_id, lineage_kind, is_default, created_at
       ) VALUES (?, ?, 'normal', 0, ?)
     `).run(alternateLineageId, first.conversation_id, first.committed_at);
+    const historical = acceptNormalInbound(
+      database,
+      normalEnvelope('claude-lineage-historical'),
+      {
+        now: () => '2026-07-19T09:01:30.500Z',
+        generateId: deterministicIds('inbound-claude-lineage-historical'),
+      },
+    );
+    database.prepare(`
+      UPDATE runtime_turns SET lineage_id = ?, state = 'completed' WHERE turn_id = ?
+    `).run(alternateLineageId, historical.turn_id);
+    database.prepare('DELETE FROM runtime_turn_queue WHERE turn_id = ?')
+      .run(historical.turn_id);
     database.prepare(`
       INSERT INTO runtime_message_mappings (
         region, tenant_id, channel, bot_id, platform_message_id,
@@ -1274,7 +1338,7 @@ describe('Claude conversation executor', () => {
       firstEnvelope.bot_id,
       'model-message-claude-alternate',
       first.conversation_id,
-      first.turn_id,
+      historical.turn_id,
       alternateLineageId,
       'mapping-claude-alternate',
       first.committed_at,
@@ -1323,7 +1387,7 @@ describe('Claude conversation executor', () => {
     database.close();
   });
 
-  test('cancels only the current fenced turn and keeps the resident query resumable', async () => {
+  test('stops the current fenced turn and cancels queued work through the cutoff', async () => {
     const database = openTestDatabase();
     const first = acceptQueuedTurn(database, 'cancel-first');
     const second = acceptQueuedTurn(database, 'cancel-second');
@@ -1340,9 +1404,9 @@ describe('Claude conversation executor', () => {
     const firstRun = service.runNext();
     await fake.firstTurnStarted.promise;
     await expect(service.runNext()).resolves.toEqual({ status: 'idle' });
-    await expect(service.cancel(first.conversation_id)).resolves.toMatchObject({
-      status: 'cancellation_requested',
-      turn_id: first.turn_id,
+    await expect(stopActiveConversation(service, first)).resolves.toMatchObject({
+      status: 'stopped',
+      active_turn: { turn_id: first.turn_id },
     });
     await expect(firstRun).resolves.toMatchObject({
       status: 'stopped',
@@ -1357,18 +1421,13 @@ describe('Claude conversation executor', () => {
       SELECT status FROM runtime_turn_queue WHERE turn_id = ?
     `).get(first.turn_id)).toEqual({ status: 'stopped' });
 
-    const secondRun = service.runNext();
-    await Promise.resolve();
-    expect(fake.inputs).toEqual(['turn cancel-first']);
     fake.lateOutputRelease.resolve();
-    await expect(secondRun).resolves.toMatchObject({
-      status: 'completed',
-      turn_id: second.turn_id,
-    });
+    await expect(service.runNext()).resolves.toEqual({ status: 'idle' });
     expect(fake.queryCalls).toBe(1);
-    expect(fake.inputs).toEqual(['turn cancel-first', 'turn cancel-second']);
-    expect(readEvents(database, second.turn_id).map((event) => event.payload.text).filter(Boolean))
-      .toEqual(['second turn answer']);
+    expect(fake.inputs).toEqual(['turn cancel-first']);
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(second.turn_id)).toEqual({ state: 'cancelled' });
 
     await service.close();
     database.close();
@@ -1419,7 +1478,7 @@ describe('Claude conversation executor', () => {
     database.close();
   });
 
-  test('keeps a sent SDK answer in delivering state when durable acknowledgement fails', async () => {
+  test('persists delivery_unknown when provider ack cannot be durably committed', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'permission-ack-failure');
     const fake = createPermissionQuery({ sessionId: 'claude-session-permission-ack-failure' });
@@ -1439,13 +1498,16 @@ describe('Claude conversation executor', () => {
     database.exec(`
       CREATE TRIGGER fail_permission_ack_audit
       BEFORE INSERT ON runtime_interaction_audit
+      WHEN NEW.outcome = 'accepted'
       BEGIN
         SELECT RAISE(ABORT, 'forced permission acknowledgement failure');
       END;
     `);
-    await expect(service.deliverInteractionAnswer(answer.handoff_id)).rejects.toThrow(
-      /forced permission acknowledgement failure/,
-    );
+    await expect(service.deliverInteractionAnswer(answer.handoff_id)).rejects.toMatchObject({
+      name: 'SqliteError',
+      code: 'SQLITE_CONSTRAINT_TRIGGER',
+      message: 'forced permission acknowledgement failure',
+    });
     expect(fake.permissionResults).toEqual([{
       behavior: 'allow',
       updatedInput: { command: 'pwd' },
@@ -1453,8 +1515,8 @@ describe('Claude conversation executor', () => {
     expect(database.prepare(`
       SELECT state, handoff_state FROM runtime_interactions WHERE interaction_id = ?
     `).get(waiting.request.interaction_id)).toEqual({
-      state: 'answer_delivering',
-      handoff_state: 'delivering',
+      state: 'delivery_unknown',
+      handoff_state: 'delivery_unknown',
     });
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
       .get(accepted.turn_id)).toEqual({ state: 'recovering' });
@@ -1464,7 +1526,7 @@ describe('Claude conversation executor', () => {
     database.close();
   });
 
-  test('marks answer delivery unknown when the SDK query ended before handler acknowledgement', async () => {
+  test('cancels without retry when the SDK query ended before answer send', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'permission-ended-before-answer');
     const fake = createEndingPermissionQuery({
@@ -1487,9 +1549,12 @@ describe('Claude conversation executor', () => {
       permissionAnswer(waiting.request, 'ended-before-answer'),
     );
 
-    await expect(service.deliverInteractionAnswer(answer.handoff_id)).rejects.toThrow(
-      /active provider attempt fence|pending SDK permission/,
-    );
+    await expect(service.deliverInteractionAnswer(answer.handoff_id)).resolves.toMatchObject({
+      status: 'recovering',
+      interaction_state: 'cancelled',
+      handoff_state: 'cancelled',
+      turn_state: 'recovering',
+    });
     expect(database.prepare(`
       SELECT interaction.state, interaction.handoff_state,
         handoff.state AS durable_handoff_state, turn.state AS turn_state
@@ -1499,9 +1564,9 @@ describe('Claude conversation executor', () => {
       JOIN runtime_turns AS turn ON turn.turn_id = interaction.turn_id
       WHERE interaction.interaction_id = ?
     `).get(waiting.request.interaction_id)).toEqual({
-      state: 'delivery_unknown',
-      handoff_state: 'delivery_unknown',
-      durable_handoff_state: 'delivery_unknown',
+      state: 'cancelled',
+      handoff_state: 'cancelled',
+      durable_handoff_state: 'cancelled',
       turn_state: 'recovering',
     });
     const latestEvent = JSON.parse(database.prepare(`
@@ -1509,7 +1574,7 @@ describe('Claude conversation executor', () => {
       WHERE turn_id = ? ORDER BY event_sequence DESC LIMIT 1
     `).get(accepted.turn_id).event_json);
     expect(latestEvent).toMatchObject({
-      kind: 'interaction_answer_delivery_unknown',
+      kind: 'recovery_started',
       phase: 'recovering',
     });
 
@@ -1610,9 +1675,9 @@ describe('Claude conversation executor', () => {
 
     const waiting = await service.runNext();
     expect(waiting).toMatchObject({ status: 'waiting_user' });
-    await expect(service.cancel(accepted.conversation_id)).resolves.toMatchObject({
-      status: 'cancellation_requested',
-      execution: { status: 'stopped' },
+    await expect(stopActiveConversation(service, accepted)).resolves.toMatchObject({
+      status: 'stopped',
+      active_turn: { turn_id: accepted.turn_id },
     });
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
       .get(accepted.turn_id)).toEqual({ state: 'stopped' });
@@ -1641,9 +1706,9 @@ describe('Claude conversation executor', () => {
 
     const waiting = await service.runNext();
     expect(waiting).toMatchObject({ status: 'waiting_user' });
-    await expect(service.cancel(accepted.conversation_id)).resolves.toMatchObject({
-      status: 'cancellation_requested',
-      execution: { status: 'stopped' },
+    await expect(stopActiveConversation(service, accepted)).resolves.toMatchObject({
+      status: 'stopped',
+      active_turn: { turn_id: accepted.turn_id },
     });
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
       .get(accepted.turn_id)).toEqual({ state: 'stopped' });
@@ -1706,9 +1771,9 @@ describe('Claude conversation executor', () => {
       SELECT COUNT(*) AS count FROM runtime_interactions WHERE turn_id = ? AND state = 'pending'
     `).get(accepted.turn_id)).toEqual({ count: 2 });
 
-    await expect(service.cancel(accepted.conversation_id)).resolves.toMatchObject({
-      status: 'cancellation_requested',
-      execution: { status: 'stopped' },
+    await expect(stopActiveConversation(service, accepted)).resolves.toMatchObject({
+      status: 'stopped',
+      active_turn: { turn_id: accepted.turn_id },
     });
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
       .get(accepted.turn_id)).toEqual({ state: 'stopped' });
@@ -1723,7 +1788,7 @@ describe('Claude conversation executor', () => {
     database.close();
   });
 
-  test('cleans a durably stopped cancellation despite timer projection failure', async () => {
+  test('isolates a durable stop despite timer projection failure', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'permission-cancel-timer-failure');
     const fake = createPermissionQuery({
@@ -1745,17 +1810,20 @@ describe('Claude conversation executor', () => {
 
     await expect(service.runNext()).resolves.toMatchObject({ status: 'waiting_user' });
     failTimerProjection = true;
-    await expect(service.cancel(accepted.conversation_id)).rejects.toThrow(
-      /forced timer projection failure/,
-    );
+    await expect(stopActiveConversation(service, accepted)).resolves.toMatchObject({
+      status: 'stopped',
+      provider_stop_status: 'isolated',
+      lease_released: true,
+    });
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
       .get(accepted.turn_id)).toEqual({ state: 'stopped' });
-    await expect(service.cancel(accepted.conversation_id)).resolves.toEqual({
-      status: 'idle',
+    failTimerProjection = false;
+    await expect(stopActiveConversation(service, accepted)).resolves.toMatchObject({
+      status: 'stopped',
       conversation_id: accepted.conversation_id,
+      deduplicated: true,
     });
 
-    failTimerProjection = false;
     await service.close();
     database.close();
   });
@@ -2424,8 +2492,8 @@ describe('Claude conversation executor', () => {
 
     const run = service.runNext();
     await fake.queryStarted.promise;
-    await expect(service.cancel(accepted.conversation_id)).resolves.toMatchObject({
-      status: 'cancellation_requested',
+    await expect(stopActiveConversation(service, accepted)).resolves.toMatchObject({
+      status: 'stopped',
     });
     await expect(run).resolves.toMatchObject({ status: 'stopped' });
     expect(fake.interruptCalls).toBe(0);
@@ -2454,19 +2522,86 @@ describe('Claude conversation executor', () => {
     await expect(fake.inputConsumed.promise).resolves.toMatchObject({
       uuid: '00000000-0000-4000-8000-000000000009',
     });
-    await expect(service.cancel(accepted.conversation_id)).resolves.toMatchObject({
-      status: 'cancellation_requested',
+    await expect(stopActiveConversation(service, accepted)).resolves.toMatchObject({
+      status: 'stopped',
     });
     await expect(run).resolves.toMatchObject({ status: 'stopped' });
     expect(fake.cancelledMessageUuids).toEqual([
       '00000000-0000-4000-8000-000000000009',
     ]);
+    expect(database.prepare(`
+      SELECT provider_native_id FROM runtime_lineages WHERE lineage_id = ?
+    `).get(accepted.lineage_id)).toEqual({ provider_native_id: null });
+    expect(database.prepare(`
+      SELECT event_kind, reason_code FROM runtime_provider_event_diagnostics
+      WHERE turn_id = ? AND event_kind = 'provider_native_id'
+    `).get(accepted.turn_id)).toEqual({
+      event_kind: 'provider_native_id',
+      reason_code: 'stale_attempt',
+    });
 
     await service.close();
     database.close();
   });
 
-  test('recovers instead of claiming cancellation when queued-message removal is unconfirmed', async () => {
+  test('steers a UUID-stamped SDK turn through the adapter-private interrupt seam', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'steer-sdk-queued');
+    const fake = createQueuedReceiptQuery({ sessionId: 'claude-session-steer-sdk-queued' });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({
+        query: fake.query,
+        generateMessageUuid: () => '00000000-0000-4000-8000-000000000019',
+      }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-steer-sdk-queued',
+      now: () => '2026-07-19T09:12:17Z',
+      generateId: deterministicIds('steer-sdk-queued'),
+    });
+
+    const run = service.runNext();
+    await expect(fake.inputConsumed.promise).resolves.toMatchObject({
+      uuid: '00000000-0000-4000-8000-000000000019',
+    });
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      if (database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+        .get(accepted.turn_id).state === 'running') break;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'running' });
+    const envelope = normalEnvelope('steer-sdk-command');
+    envelope.content = { kind: 'text', text: '/steer revise SDK direction', attachments: [] };
+    await expect(service.steer({
+      conversation_id: accepted.conversation_id,
+      turn_id: accepted.turn_id,
+      steer_id: 'steer-sdk-control',
+      envelope,
+    })).resolves.toMatchObject({
+      status: 'completed',
+      old_turn: { turn_id: accepted.turn_id, state: 'interrupted' },
+      priority_turn: {
+        status: 'queued',
+        lineage_id: accepted.lineage_id,
+        redirected_from_turn_id: accepted.turn_id,
+      },
+      provider_stop_status: 'confirmed',
+    });
+    await expect(run).resolves.toMatchObject({ status: 'interrupted' });
+    expect(fake.cancelledMessageUuids).toEqual([
+      '00000000-0000-4000-8000-000000000019',
+    ]);
+
+    await service.stop({
+      conversation_id: accepted.conversation_id,
+      stop_id: 'stop-steer-sdk-cleanup',
+    });
+    await service.close();
+    database.close();
+  });
+
+  test('isolates a stopped turn when queued-message removal is unconfirmed', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'cancel-sdk-unconfirmed');
     const fake = createQueuedReceiptQuery({
@@ -2487,21 +2622,22 @@ describe('Claude conversation executor', () => {
 
     const run = service.runNext();
     await fake.inputConsumed.promise;
-    await expect(service.cancel(accepted.conversation_id)).rejects.toMatchObject({
-      cancellationUncertain: true,
+    await expect(stopActiveConversation(service, accepted)).resolves.toMatchObject({
+      status: 'stopped',
+      provider_stop_status: 'isolated',
     });
     await expect(run).resolves.toMatchObject({
-      status: 'recovering',
+      status: 'stopped',
       turn_id: accepted.turn_id,
     });
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
-      .get(accepted.turn_id)).toEqual({ state: 'recovering' });
+      .get(accepted.turn_id)).toEqual({ state: 'stopped' });
 
     await service.close();
     database.close();
   });
 
-  test('waits for a racing cancellation receipt before terminalizing provider output', async () => {
+  test('bounds a racing cancellation receipt and isolates the stopped provider', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'cancel-receipt-race');
     const fake = createReceiptRaceQuery({ sessionId: 'claude-session-cancel-receipt-race' });
@@ -2510,21 +2646,23 @@ describe('Claude conversation executor', () => {
       adapter: createClaudeConversationAdapter({ query: fake.query }),
       provider: 'claude',
       serviceInstanceId: 'executor-service-cancel-receipt-race',
+      providerStopTimeoutMs: 50,
       now: () => '2026-07-19T09:12:25Z',
       generateId: deterministicIds('cancel-receipt-race'),
     });
 
     const run = service.runNext();
     await fake.inputConsumed.promise;
-    await expect(service.cancel(accepted.conversation_id)).rejects.toMatchObject({
-      cancellationUncertain: true,
+    await expect(stopActiveConversation(service, accepted)).resolves.toMatchObject({
+      status: 'stopped',
+      provider_stop_status: 'isolated',
     });
     await expect(run).resolves.toMatchObject({
-      status: 'recovering',
+      status: 'stopped',
       turn_id: accepted.turn_id,
     });
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
-      .get(accepted.turn_id)).toEqual({ state: 'recovering' });
+      .get(accepted.turn_id)).toEqual({ state: 'stopped' });
 
     await service.close();
     database.close();
@@ -2621,7 +2759,7 @@ describe('Claude conversation executor', () => {
     database.close();
   });
 
-  test('moves an interrupt-rejection turn to recovering instead of reporting cancellation', async () => {
+  test('isolates a stopped turn when the interrupt receipt is rejected', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'interrupt-rejection');
     const fake = createRejectingInterruptQuery({ sessionId: 'claude-session-interrupt-rejection' });
@@ -2636,12 +2774,13 @@ describe('Claude conversation executor', () => {
 
     const run = service.runNext();
     await fake.turnStarted.promise;
-    await expect(service.cancel(accepted.conversation_id)).rejects.toThrow(
-      /interrupt receipt unavailable/,
-    );
-    await expect(run).resolves.toMatchObject({ status: 'recovering' });
+    await expect(stopActiveConversation(service, accepted)).resolves.toMatchObject({
+      status: 'stopped',
+      provider_stop_status: 'isolated',
+    });
+    await expect(run).resolves.toMatchObject({ status: 'stopped' });
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
-      .get(accepted.turn_id)).toEqual({ state: 'recovering' });
+      .get(accepted.turn_id)).toEqual({ state: 'stopped' });
     await expect(service.evictIdleExecutors()).resolves.toEqual([]);
 
     await service.close();
@@ -2800,7 +2939,11 @@ describe('Claude conversation executor', () => {
       END;
     `);
 
-    await expect(service.close()).rejects.toThrow(/forced close resident delete failure/);
+    await expect(service.close()).rejects.toMatchObject({
+      name: 'SqliteError',
+      code: 'SQLITE_CONSTRAINT_TRIGGER',
+      message: 'forced close resident delete failure',
+    });
     expect(heartbeatCancelled).toBe(false);
     database.exec('DROP TRIGGER fail_close_resident_delete');
     await expect(service.close()).resolves.toBeUndefined();

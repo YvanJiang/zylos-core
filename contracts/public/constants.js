@@ -99,6 +99,8 @@ export const PUBLIC_ERROR_CODES = Object.freeze([
   'interaction_answer_delivery_unknown',
   'permission_duration_exceeds_policy',
   'steer_precondition_failed',
+  'steer_reconciliation_required',
+  'turn_interrupted',
   'turn_terminal',
   'stale_attempt',
   'lease_conflict',

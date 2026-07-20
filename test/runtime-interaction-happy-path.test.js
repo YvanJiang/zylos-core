@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, test } from '@jest/globals';
 
 import {
+  createContractError,
   validateInteractionAnswerResult,
   validateInteractionHandoff,
   validateInteractionRequest,
   validateNormalizedEvent,
 } from '../contracts/public/index.js';
 import { createExecutorService } from '../runtime/executor/service.js';
+import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import {
   acceptQueuedInteractionTurn,
   cleanupInteractionTestDatabases,
@@ -15,6 +17,7 @@ import {
   interactionAnswer,
   openInteractionTestDatabase,
 } from './helpers/runtime-interaction-fixtures.js';
+import { deliveredResult } from './helpers/delivered-result.js';
 
 function openTestDatabase() {
   return openInteractionTestDatabase('interaction-happy-path');
@@ -88,6 +91,39 @@ function readInteractionAuthority(database, turnId) {
       WHERE turn_id = ?
     `).get(turnId).count,
   };
+}
+
+function preparedInteractionAnswer(handler) {
+  return async function prepare(delivery) {
+    return Object.freeze({
+      send(startedDelivery) {
+        return handler(startedDelivery, delivery);
+      },
+    });
+  };
+}
+
+function markLatestTurnProjectionDelivered(database, turnId) {
+  const outbox = createOutboxService({
+    database,
+    serviceInstanceId: `delivery-service-${turnId}`,
+    now: () => '2026-07-19T07:02:00Z',
+    generateId: deterministicIds(`delivery-${turnId}`),
+    throttleMs: 0,
+  });
+  for (let count = 0; count < 100; count += 1) {
+    const command = outbox.claimNext();
+    if (command === null) break;
+    expect(outbox.recordResult(deliveredResult(command, '2026-07-19T07:02:00Z')))
+      .toMatchObject({ status: 'applied', outbox_status: 'delivered' });
+  }
+  expect(database.prepare(`
+    SELECT COUNT(*) AS count
+    FROM runtime_projection_snapshots AS projection
+    JOIN runtime_outbox AS outbox
+      ON outbox.outbox_id = projection.materialized_outbox_id
+    WHERE projection.turn_id = ? AND outbox.status = 'delivered'
+  `).get(turnId).count).toBeGreaterThan(0);
 }
 
 afterEach(() => {
@@ -282,13 +318,14 @@ describe('runtime interaction happy path', () => {
       WHERE turn_id = ?
     `).get(accepted.turn_id)).toEqual({ state: 'waiting_user', turn_version: 8 });
 
+    const sendingDelivery = store.markInteractionHandoffSendStarted(delivery);
     const acknowledgement = store.acknowledgeInteractionHandoff({
       status: 'accepted',
-      handoff_id: delivery.handoff.handoff_id,
-      provider_attempt_id: delivery.handoff.provider_attempt_id,
-      handoff_attempt_id: delivery.handoff.handoff_attempt_id,
-      handoff_attempt_no: delivery.handoff.handoff_attempt_no,
-      lease_epoch: delivery.handoff.lease_epoch,
+      handoff_id: sendingDelivery.handoff.handoff_id,
+      provider_attempt_id: sendingDelivery.handoff.provider_attempt_id,
+      handoff_attempt_id: sendingDelivery.handoff.handoff_attempt_id,
+      handoff_attempt_no: sendingDelivery.handoff.handoff_attempt_no,
+      lease_epoch: sendingDelivery.handoff.lease_epoch,
     });
 
     expect(acknowledgement).toEqual({
@@ -318,7 +355,7 @@ describe('runtime interaction happy path', () => {
       state: 'answered',
       version: 4,
       handoff_state: 'accepted',
-      handoff_version: 3,
+      handoff_version: 4,
       turn_state: 'running',
       turn_version: 10,
       audit_outcome: 'accepted',
@@ -346,6 +383,123 @@ describe('runtime interaction happy path', () => {
     database.close();
   });
 
+  test('claims a handoff without send evidence and fences the later send start', () => {
+    const database = openTestDatabase();
+    const { store, turnContext } = createRunningTurn(database, 'send-start-fence');
+    const request = store.requestInteraction(turnContext, {
+      provider_interaction_ref: 'provider-question-send-start-fence',
+      tool_use_id: 'tool-use-send-start-fence',
+      kind: 'tool_approval',
+      prompt: 'Allow this fenced handoff?',
+      choices: [],
+      authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+      allowed_sources: ['main_card_reply', 'card_action'],
+    });
+    const result = store.commitInteractionAnswer(
+      interactionAnswer(request, 'send-start-fence'),
+    );
+
+    const delivery = store.claimInteractionHandoff(result.handoff_id);
+    expect(delivery.handoff).toMatchObject({
+      state: 'delivering',
+      last_send_started_at: null,
+      provider_attempt_id: request.runtime_fence.provider_attempt_id,
+      lease_epoch: request.runtime_fence.lease_epoch,
+    });
+
+    const staleDelivery = structuredClone(delivery);
+    staleDelivery.handoff.handoff_attempt_id = 'stale-handoff-attempt';
+    const beforeStaleStart = readInteractionAuthority(database, request.turn_id);
+    expect(() => store.markInteractionHandoffSendStarted(staleDelivery))
+      .toThrow(expect.objectContaining({ code: 'stale_attempt' }));
+    expect(readInteractionAuthority(database, request.turn_id)).toEqual(beforeStaleStart);
+
+    const sending = store.markInteractionHandoffSendStarted(delivery);
+    expect(sending.handoff).toMatchObject({
+      handoff_id: delivery.handoff.handoff_id,
+      handoff_attempt_id: delivery.handoff.handoff_attempt_id,
+      handoff_attempt_no: 1,
+      last_send_started_at: '2026-07-19T07:02:00Z',
+    });
+    expect(JSON.parse(database.prepare(`
+      SELECT record_json
+      FROM runtime_interaction_handoffs
+      WHERE handoff_id = ?
+    `).get(result.handoff_id).record_json)).toEqual(sending.handoff);
+
+    database.close();
+  });
+
+  test('retries only a proven pre-send failure with a new fenced handoff attempt', () => {
+    const database = openTestDatabase();
+    const { store, turnContext } = createRunningTurn(database, 'pre-send-retry');
+    const request = store.requestInteraction(turnContext, {
+      provider_interaction_ref: 'provider-question-pre-send-retry',
+      tool_use_id: 'tool-use-pre-send-retry',
+      kind: 'tool_approval',
+      prompt: 'Allow the answer retry test?',
+      choices: [],
+      authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+      allowed_sources: ['main_card_reply', 'card_action'],
+    });
+    const result = store.commitInteractionAnswer(
+      interactionAnswer(request, 'pre-send-retry'),
+    );
+    const firstDelivery = store.claimInteractionHandoff(result.handoff_id);
+    const retryWait = store.markInteractionHandoffPreSendFailure(
+      firstDelivery,
+      createContractError({
+        code: 'delivery_transient',
+        category: 'provider',
+        retryable: true,
+        sideEffectStatus: 'none',
+        userMessage: 'The provider was unavailable before the answer send began.',
+        occurredAt: '2026-07-19T07:02:00Z',
+      }),
+    );
+
+    expect(retryWait).toMatchObject({
+      status: 'retry_wait',
+      interaction_state: 'answer_committed',
+      handoff: {
+        state: 'retry_wait',
+        handoff_attempt_id: firstDelivery.handoff.handoff_attempt_id,
+        handoff_attempt_no: 1,
+        last_send_started_at: null,
+        side_effect_status: 'none',
+      },
+    });
+
+    const retryDelivery = store.claimInteractionHandoff(result.handoff_id);
+    expect(retryDelivery.handoff).toMatchObject({
+      state: 'delivering',
+      handoff_attempt_id: 'handoff-attempt-pre-send-retry-2',
+      handoff_attempt_no: 2,
+      last_send_started_at: null,
+      error: null,
+      side_effect_status: 'none',
+    });
+    expect(() => store.markInteractionHandoffSendStarted(firstDelivery))
+      .toThrow(expect.objectContaining({ code: 'stale_attempt' }));
+    const beforeLateAck = readInteractionAuthority(database, request.turn_id);
+    expect(() => store.acknowledgeInteractionHandoff({
+      status: 'accepted',
+      handoff_id: firstDelivery.handoff.handoff_id,
+      provider_attempt_id: firstDelivery.handoff.provider_attempt_id,
+      handoff_attempt_id: firstDelivery.handoff.handoff_attempt_id,
+      handoff_attempt_no: firstDelivery.handoff.handoff_attempt_no,
+      lease_epoch: firstDelivery.handoff.lease_epoch,
+    })).toThrow(expect.objectContaining({ code: 'stale_attempt' }));
+    const afterLateAck = readInteractionAuthority(database, request.turn_id);
+    expect({ ...afterLateAck, audits: afterLateAck.audits.slice(0, -1) }).toEqual(beforeLateAck);
+    expect(afterLateAck.audits.at(-1)).toMatchObject({
+      outcome: 'late_ack_ignored',
+      handoff_id: firstDelivery.handoff.handoff_id,
+    });
+
+    database.close();
+  });
+
   test('records a handler deny acknowledgement as a completed denied decision', () => {
     const database = openTestDatabase();
     const { store, turnContext } = createRunningTurn(database, 'deny');
@@ -363,13 +517,14 @@ describe('runtime interaction happy path', () => {
     const result = store.commitInteractionAnswer(answer);
     const delivery = store.claimInteractionHandoff(result.handoff_id);
 
+    const sendingDelivery = store.markInteractionHandoffSendStarted(delivery);
     const acknowledgement = store.acknowledgeInteractionHandoff({
       status: 'deny',
-      handoff_id: delivery.handoff.handoff_id,
-      provider_attempt_id: delivery.handoff.provider_attempt_id,
-      handoff_attempt_id: delivery.handoff.handoff_attempt_id,
-      handoff_attempt_no: delivery.handoff.handoff_attempt_no,
-      lease_epoch: delivery.handoff.lease_epoch,
+      handoff_id: sendingDelivery.handoff.handoff_id,
+      provider_attempt_id: sendingDelivery.handoff.provider_attempt_id,
+      handoff_attempt_id: sendingDelivery.handoff.handoff_attempt_id,
+      handoff_attempt_no: sendingDelivery.handoff.handoff_attempt_no,
+      lease_epoch: sendingDelivery.handoff.lease_epoch,
     });
 
     expect(acknowledgement).toMatchObject({
@@ -422,13 +577,14 @@ describe('runtime interaction happy path', () => {
 
     const result = store.commitInteractionAnswer(interactionAnswer(first, 'first'));
     const delivery = store.claimInteractionHandoff(result.handoff_id);
+    const sendingDelivery = store.markInteractionHandoffSendStarted(delivery);
     const acknowledgement = store.acknowledgeInteractionHandoff({
       status: 'accepted',
-      handoff_id: delivery.handoff.handoff_id,
-      provider_attempt_id: delivery.handoff.provider_attempt_id,
-      handoff_attempt_id: delivery.handoff.handoff_attempt_id,
-      handoff_attempt_no: delivery.handoff.handoff_attempt_no,
-      lease_epoch: delivery.handoff.lease_epoch,
+      handoff_id: sendingDelivery.handoff.handoff_id,
+      provider_attempt_id: sendingDelivery.handoff.provider_attempt_id,
+      handoff_attempt_id: sendingDelivery.handoff.handoff_attempt_id,
+      handoff_attempt_no: sendingDelivery.handoff.handoff_attempt_no,
+      lease_epoch: sendingDelivery.handoff.lease_epoch,
     });
 
     expect(acknowledgement).toMatchObject({
@@ -478,7 +634,7 @@ describe('runtime interaction happy path', () => {
           provider_native_id: null,
         };
       },
-      async handleInteractionAnswer(delivery) {
+      prepareInteractionAnswer: preparedInteractionAnswer(async (delivery) => {
         const durable = database.prepare(`
           SELECT result_json
           FROM runtime_interaction_answers
@@ -496,7 +652,7 @@ describe('runtime interaction happy path', () => {
           handoff_attempt_no: delivery.handoff.handoff_attempt_no,
           lease_epoch: delivery.handoff.lease_epoch,
         };
-      },
+      }),
     };
     const service = createExecutorService({
       database,
@@ -552,6 +708,733 @@ describe('runtime interaction happy path', () => {
     database.close();
   });
 
+  test('executor service retries preparation failure before durably starting the send', async () => {
+    const database = openTestDatabase();
+    acceptQueuedTurn(database, 'service-pre-send-retry');
+    let prepareCalls = 0;
+    const sent = [];
+    const adapter = {
+      async *execute() {
+        yield {
+          kind: 'interaction_requested',
+          payload: {
+            provider_interaction_ref: 'provider-service-pre-send-retry',
+            tool_use_id: 'tool-service-pre-send-retry',
+            kind: 'tool_approval',
+            prompt: 'Allow the prepared answer?',
+            choices: [],
+            authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+            allowed_sources: ['card_action'],
+          },
+        };
+      },
+      async prepareInteractionAnswer(delivery) {
+        prepareCalls += 1;
+        if (prepareCalls === 1) {
+          const error = new Error('provider unavailable before send');
+          error.providerError = {
+            code: 'delivery_transient',
+            category: 'provider',
+            retryable: true,
+            side_effect_status: 'none',
+            user_message: 'The provider was unavailable before answer delivery began.',
+          };
+          throw error;
+        }
+        return {
+          async send(startedDelivery) {
+            sent.push(startedDelivery);
+            return {
+              status: 'accepted',
+              handoff_id: startedDelivery.handoff.handoff_id,
+              provider_attempt_id: startedDelivery.handoff.provider_attempt_id,
+              handoff_attempt_id: startedDelivery.handoff.handoff_attempt_id,
+              handoff_attempt_no: startedDelivery.handoff.handoff_attempt_no,
+              lease_epoch: startedDelivery.handoff.lease_epoch,
+            };
+          },
+        };
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-pre-send-retry',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('service-pre-send-retry'),
+    });
+    const waiting = await service.runNext();
+    const committed = service.submitInteractionAnswer(
+      interactionAnswer(waiting.request, 'service-pre-send-retry'),
+    );
+
+    await expect(service.deliverInteractionAnswer(committed.handoff_id)).resolves.toMatchObject({
+      status: 'retry_wait',
+      handoff: {
+        state: 'retry_wait',
+        last_send_started_at: null,
+      },
+    });
+    expect(sent).toEqual([]);
+
+    await expect(service.deliverInteractionAnswer(committed.handoff_id)).resolves.toMatchObject({
+      acknowledgement: { status: 'accepted' },
+      execution: { status: 'completed' },
+    });
+    expect(sent).toHaveLength(1);
+    expect(sent[0].handoff).toMatchObject({
+      handoff_attempt_no: 2,
+      last_send_started_at: '2026-07-19T07:02:00Z',
+    });
+    expect(database.prepare(`
+      SELECT interaction.handoff_version, handoff.state
+      FROM runtime_interactions AS interaction
+      JOIN runtime_interaction_handoffs AS handoff
+        ON handoff.interaction_id = interaction.interaction_id
+      WHERE handoff.handoff_id = ?
+    `).get(committed.handoff_id)).toEqual({
+      handoff_version: 6,
+      state: 'accepted',
+    });
+
+    database.close();
+  });
+
+  test('does not retry when preparation cannot prove no provider side effect', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'service-pre-send-terminal');
+    let sendCalls = 0;
+    const adapter = {
+      async *execute() {
+        yield {
+          kind: 'interaction_requested',
+          payload: {
+            provider_interaction_ref: 'provider-service-pre-send-terminal',
+            tool_use_id: 'tool-service-pre-send-terminal',
+            kind: 'tool_approval',
+            prompt: 'Allow the non-retryable prepared answer?',
+            choices: [],
+            authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+            allowed_sources: ['card_action'],
+          },
+        };
+      },
+      async prepareInteractionAnswer() {
+        const error = new Error('provider rejected answer before send');
+        error.providerError = {
+          code: 'provider_context_invalid',
+          category: 'provider',
+          retryable: true,
+          side_effect_status: 'unknown',
+          user_message: 'Preparation may have crossed the provider boundary.',
+        };
+        throw error;
+      },
+      async send() {
+        sendCalls += 1;
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-pre-send-terminal',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('service-pre-send-terminal'),
+    });
+    const waiting = await service.runNext();
+    const committed = service.submitInteractionAnswer(
+      interactionAnswer(waiting.request, 'service-pre-send-terminal'),
+    );
+
+    await expect(service.deliverInteractionAnswer(committed.handoff_id)).resolves.toMatchObject({
+      status: 'recovering',
+      interaction_state: 'cancelled',
+      handoff_state: 'cancelled',
+      turn_state: 'recovering',
+    });
+    expect(sendCalls).toBe(0);
+    expect(readInteractionAuthority(database, accepted.turn_id)).toMatchObject({
+      turn: { state: 'recovering' },
+      interactions: [expect.objectContaining({
+        state: 'cancelled',
+        handoff_state: 'cancelled',
+      })],
+      handoffs: [expect.objectContaining({
+        state: 'cancelled',
+        record_json: expect.stringContaining('"side_effect_status":"unknown"'),
+      })],
+      audits: expect.arrayContaining([
+        expect.objectContaining({ outcome: 'cancelled_pre_send' }),
+      ]),
+    });
+
+    database.close();
+  });
+
+  test('startup recovers an expired sent handoff after a worker crash', () => {
+    const database = openTestDatabase();
+    const { store, turnContext } = createRunningTurn(database, 'crashed-sent-handoff');
+    const request = store.requestInteraction(turnContext, {
+      provider_interaction_ref: 'provider-question-crashed-sent-handoff',
+      tool_use_id: 'tool-use-crashed-sent-handoff',
+      kind: 'tool_approval',
+      prompt: 'Allow the action before the worker crashes?',
+      choices: [],
+      authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+      allowed_sources: ['card_action'],
+    });
+    const committed = store.commitInteractionAnswer(
+      interactionAnswer(request, 'crashed-sent-handoff'),
+    );
+    const claimed = store.claimInteractionHandoff(committed.handoff_id);
+    const sending = store.markInteractionHandoffSendStarted(claimed);
+    const restarted = createExecutorService({
+      database,
+      adapter: {
+        async *execute() {},
+        async prepareInteractionAnswer() {
+          throw new Error('The crashed answer must never be resent.');
+        },
+      },
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-crash-restart',
+      now: () => '2026-07-19T07:03:00Z',
+      generateId: deterministicIds('crash-restart'),
+    });
+
+    restarted.start();
+    expect(readInteractionAuthority(database, request.turn_id)).toMatchObject({
+      turn: { state: 'recovering' },
+      interactions: [expect.objectContaining({
+        interaction_id: request.interaction_id,
+        state: 'delivery_unknown',
+        handoff_state: 'delivery_unknown',
+      })],
+      handoffs: [expect.objectContaining({ state: 'delivery_unknown' })],
+      audits: [expect.objectContaining({
+        outcome: 'delivery_unknown',
+        acknowledgement_json: expect.stringContaining('expired_writer_lease'),
+      })],
+    });
+    expect(readEvents(database, request.turn_id).at(-1)).toMatchObject({
+      kind: 'interaction_answer_delivery_unknown',
+      phase: 'recovering',
+    });
+    expect(() => store.acknowledgeInteractionHandoff({
+      status: 'accepted',
+      handoff_id: sending.handoff.handoff_id,
+      provider_attempt_id: sending.handoff.provider_attempt_id,
+      handoff_attempt_id: sending.handoff.handoff_attempt_id,
+      handoff_attempt_no: sending.handoff.handoff_attempt_no,
+      lease_epoch: sending.handoff.lease_epoch,
+    })).toThrow(expect.objectContaining({ code: 'stale_attempt' }));
+
+    database.close();
+  });
+
+  test('completes delivery_unknown only from a read-only idempotent same-handoff proof', async () => {
+    const database = openTestDatabase();
+    const { accepted, store, turnContext } = createRunningTurn(
+      database,
+      'query-accepted',
+    );
+    const request = store.requestInteraction(turnContext, {
+      provider_interaction_ref: 'provider-question-query-accepted',
+      tool_use_id: 'tool-use-query-accepted',
+      kind: 'tool_approval',
+      prompt: 'Allow the queried answer?',
+      choices: [],
+      authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+      allowed_sources: ['card_action'],
+    });
+    const committed = store.commitInteractionAnswer(
+      interactionAnswer(request, 'query-accepted'),
+    );
+    const claimed = store.claimInteractionHandoff(committed.handoff_id);
+    const sending = store.markInteractionHandoffSendStarted(claimed);
+    store.markInteractionHandoffDeliveryUnknown(sending);
+
+    let queryCalls = 0;
+    const adapter = {
+      async *execute() {},
+      async queryInteractionHandoffAcceptance(delivery) {
+        queryCalls += 1;
+        return {
+          status: 'accepted',
+          read_only: true,
+          idempotent: true,
+          handoff_id: delivery.handoff.handoff_id,
+          provider_attempt_id: delivery.handoff.provider_attempt_id,
+          handoff_attempt_id: delivery.handoff.handoff_attempt_id,
+          handoff_attempt_no: delivery.handoff.handoff_attempt_no,
+          lease_epoch: delivery.handoff.lease_epoch,
+          accepted_at: '2026-07-19T07:02:00Z',
+          evidence_ref: 'provider-ack-query-query-accepted',
+          reason_code: null,
+        };
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-query-accepted',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('query-accepted-recovery'),
+    });
+
+    await expect(service.reconcileInteractionHandoff(committed.handoff_id))
+      .rejects.toMatchObject({ code: 'notification_pending' });
+    expect(queryCalls).toBe(0);
+    markLatestTurnProjectionDelivered(database, request.turn_id);
+    await expect(service.reconcileInteractionHandoff(committed.handoff_id)).resolves.toMatchObject({
+      status: 'accepted',
+      acknowledgement_source: 'read_only_idempotent_query',
+      handoff_id: committed.handoff_id,
+      turn_state: 'recovering',
+    });
+    expect(database.prepare(`
+      SELECT interaction.state, interaction.handoff_state,
+        handoff.state AS durable_handoff_state, turn.state AS turn_state,
+        audit.outcome
+      FROM runtime_interactions AS interaction
+      JOIN runtime_interaction_handoffs AS handoff
+        ON handoff.interaction_id = interaction.interaction_id
+      JOIN runtime_turns AS turn ON turn.turn_id = interaction.turn_id
+      JOIN runtime_interaction_audit AS audit ON audit.audit_id = (
+        SELECT audit_id FROM runtime_interaction_audit
+        WHERE handoff_id = handoff.handoff_id
+        ORDER BY created_at DESC, audit_id DESC LIMIT 1
+      )
+      WHERE handoff.handoff_id = ?
+    `).get(committed.handoff_id)).toEqual({
+      state: 'answered',
+      handoff_state: 'accepted',
+      durable_handoff_state: 'accepted',
+      turn_state: 'recovering',
+      outcome: 'accepted_via_query',
+    });
+    expect(readEvents(database, accepted.turn_id).at(-1)).toMatchObject({
+      kind: 'interaction_answered',
+      phase: 'recovering',
+    });
+
+    database.close();
+  });
+
+  test('keeps delivery_unknown without resending when the provider query cannot prove acceptance', async () => {
+    const database = openTestDatabase();
+    const { store, turnContext } = createRunningTurn(database, 'query-unproven');
+    const request = store.requestInteraction(turnContext, {
+      provider_interaction_ref: 'provider-question-query-unproven',
+      tool_use_id: 'tool-use-query-unproven',
+      kind: 'tool_approval',
+      prompt: 'Allow the unproven answer?',
+      choices: [],
+      authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+      allowed_sources: ['card_action'],
+    });
+    const committed = store.commitInteractionAnswer(
+      interactionAnswer(request, 'query-unproven'),
+    );
+    const claimed = store.claimInteractionHandoff(committed.handoff_id);
+    const sending = store.markInteractionHandoffSendStarted(claimed);
+    store.markInteractionHandoffDeliveryUnknown(sending);
+    let sendPreparations = 0;
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute() {},
+        async prepareInteractionAnswer() {
+          sendPreparations += 1;
+          throw new Error('reconciliation must not prepare another send');
+        },
+        async queryInteractionHandoffAcceptance(delivery) {
+          return {
+            status: 'unknown',
+            read_only: true,
+            idempotent: true,
+            handoff_id: delivery.handoff.handoff_id,
+            provider_attempt_id: delivery.handoff.provider_attempt_id,
+            handoff_attempt_id: delivery.handoff.handoff_attempt_id,
+            handoff_attempt_no: delivery.handoff.handoff_attempt_no,
+            lease_epoch: delivery.handoff.lease_epoch,
+            accepted_at: null,
+            evidence_ref: null,
+            reason_code: 'provider_acceptance_query_unavailable',
+          };
+        },
+      },
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-query-unproven',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('query-unproven-recovery'),
+    });
+
+    markLatestTurnProjectionDelivered(database, request.turn_id);
+    await expect(service.reconcileInteractionHandoff(committed.handoff_id)).resolves.toMatchObject({
+      status: 'unknown',
+      handoff_id: committed.handoff_id,
+      turn_state: 'recovering',
+    });
+    expect(sendPreparations).toBe(0);
+    expect(readInteractionAuthority(database, request.turn_id)).toMatchObject({
+      turn: { state: 'recovering' },
+      interactions: [expect.objectContaining({ state: 'delivery_unknown' })],
+      handoffs: [expect.objectContaining({ state: 'delivery_unknown' })],
+      audits: expect.arrayContaining([
+        expect.objectContaining({ outcome: 'query_unproven' }),
+      ]),
+    });
+
+    database.close();
+  });
+
+  test('requires a trusted authorization decision to terminate delivery_unknown', async () => {
+    const database = openTestDatabase();
+    const { store, turnContext } = createRunningTurn(database, 'authorized-termination');
+    const request = store.requestInteraction(turnContext, {
+      provider_interaction_ref: 'provider-question-authorized-termination',
+      tool_use_id: 'tool-use-authorized-termination',
+      kind: 'tool_approval',
+      prompt: 'Allow the answer that may need recovery?',
+      choices: [],
+      authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+      allowed_sources: ['card_action'],
+    });
+    const committed = store.commitInteractionAnswer(
+      interactionAnswer(request, 'authorized-termination'),
+    );
+    const claimed = store.claimInteractionHandoff(committed.handoff_id);
+    const sending = store.markInteractionHandoffSendStarted(claimed);
+    store.markInteractionHandoffDeliveryUnknown(sending);
+
+    let authorized = false;
+    let authorizationCalls = 0;
+    const service = createExecutorService({
+      database,
+      adapter: { async *execute() {} },
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-authorized-termination',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('authorized-termination-disposition'),
+      async interactionHandoffDispositionAuthorizer(decision) {
+        authorizationCalls += 1;
+        if (!authorized) return null;
+        return {
+          decision_id: 'disposition-decision-authorized-termination',
+          authorized: true,
+          actor_id: 'operations-user-123',
+          capability: decision.capability,
+          scope: decision.scope,
+          policy_id: 'recovery-policy-1',
+          policy_version: 1,
+          authorized_at: '2026-07-19T07:02:00Z',
+        };
+      },
+    });
+
+    await expect(service.resolveInteractionHandoff(committed.handoff_id, {
+      action: 'terminate',
+      replacement_interaction: null,
+    })).rejects.toMatchObject({ code: 'notification_pending' });
+    expect(authorizationCalls).toBe(0);
+    markLatestTurnProjectionDelivered(database, request.turn_id);
+    await expect(service.resolveInteractionHandoff(committed.handoff_id, {
+      action: 'terminate',
+      replacement_interaction: null,
+    })).rejects.toMatchObject({ code: 'authorization_denied' });
+    expect(readInteractionAuthority(database, request.turn_id)).toMatchObject({
+      turn: { state: 'recovering' },
+      interactions: [expect.objectContaining({ state: 'delivery_unknown' })],
+    });
+
+    authorized = true;
+    await expect(service.resolveInteractionHandoff(committed.handoff_id, {
+      action: 'terminate',
+      replacement_interaction: null,
+    })).resolves.toMatchObject({
+      status: 'terminated',
+      interaction_id: request.interaction_id,
+      handoff_id: committed.handoff_id,
+      turn_state: 'recovering',
+    });
+    const authority = readInteractionAuthority(database, request.turn_id);
+    const cancelledHandoff = JSON.parse(authority.handoffs[0].record_json);
+    expect(authority).toMatchObject({
+      turn: { state: 'recovering' },
+      interactions: [expect.objectContaining({
+        state: 'cancelled',
+        handoff_state: 'cancelled',
+      })],
+      handoffs: [expect.objectContaining({ state: 'cancelled' })],
+      audits: expect.arrayContaining([
+        expect.objectContaining({ outcome: 'authorized_termination' }),
+      ]),
+    });
+    expect(cancelledHandoff).toMatchObject({
+      state: 'cancelled',
+      last_send_started_at: sending.handoff.last_send_started_at,
+      provider_acked_at: null,
+      side_effect_status: 'unknown',
+      reason_code: 'authorized_delivery_unknown_termination',
+    });
+    expect(JSON.parse(authority.audits.at(-1).acknowledgement_json)).toMatchObject({
+      disposition: { action: 'terminate', replacement_interaction: null },
+      authorization: {
+        decision_id: 'disposition-decision-authorized-termination',
+        capability: 'interaction.handoff.resolve',
+      },
+      previous_handoff: {
+        state: 'delivery_unknown',
+        handoff_attempt_id: sending.handoff.handoff_attempt_id,
+      },
+    });
+    expect(() => store.acknowledgeInteractionHandoff({
+      status: 'accepted',
+      handoff_id: sending.handoff.handoff_id,
+      provider_attempt_id: sending.handoff.provider_attempt_id,
+      handoff_attempt_id: sending.handoff.handoff_attempt_id,
+      handoff_attempt_no: sending.handoff.handoff_attempt_no,
+      lease_epoch: sending.handoff.lease_epoch,
+    })).toThrow(expect.objectContaining({ code: 'stale_attempt' }));
+    expect(readInteractionAuthority(database, request.turn_id).audits).toEqual(
+      expect.arrayContaining([expect.objectContaining({
+        outcome: 'late_ack_ignored',
+        handoff_id: sending.handoff.handoff_id,
+      })]),
+    );
+
+    database.close();
+  });
+
+  test('authorized recovery establishes an answerable Core-owned interaction', async () => {
+    const database = openTestDatabase();
+    const { store, turnContext } = createRunningTurn(database, 'authorized-supersession');
+    const first = store.requestInteraction(turnContext, {
+      provider_interaction_ref: 'provider-question-authorized-supersession-old',
+      tool_use_id: 'tool-use-authorized-supersession-old',
+      kind: 'tool_approval',
+      prompt: 'Allow the original answer?',
+      choices: [],
+      authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+      allowed_sources: ['card_action'],
+    });
+    const committed = store.commitInteractionAnswer(
+      interactionAnswer(first, 'authorized-supersession'),
+    );
+    const claimed = store.claimInteractionHandoff(committed.handoff_id);
+    const sending = store.markInteractionHandoffSendStarted(claimed);
+    store.markInteractionHandoffDeliveryUnknown(sending);
+    markLatestTurnProjectionDelivered(database, first.turn_id);
+    store.releaseRecoveringExecutorOwnership(turnContext);
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute() {},
+        async prepareInteractionAnswer() {
+          throw new Error('Core recovery control must not call the provider adapter.');
+        },
+      },
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-authorized-supersession',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('authorized-supersession-disposition'),
+      async interactionHandoffDispositionAuthorizer(decision) {
+        return {
+          decision_id: 'disposition-decision-authorized-supersession',
+          authorized: true,
+          actor_id: 'operations-user-123',
+          capability: decision.capability,
+          scope: decision.scope,
+          policy_id: 'recovery-policy-1',
+          policy_version: 1,
+          authorized_at: '2026-07-19T07:02:00Z',
+        };
+      },
+    });
+
+    const resolution = await service.resolveInteractionHandoff(committed.handoff_id, {
+      action: 'establish_interaction',
+      replacement_interaction: {
+        kind: 'recovery_decision',
+        prompt: 'Choose how to continue after uncertain delivery.',
+        choices: [],
+        authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+        allowed_sources: ['card_action'],
+      },
+    });
+    expect(resolution).toMatchObject({
+      status: 'interaction_established',
+      replacement_interaction_id: expect.any(String),
+      turn_state: 'recovering',
+    });
+    expect(readInteractionAuthority(database, first.turn_id)).toMatchObject({
+      turn: { state: 'recovering' },
+      interactions: expect.arrayContaining([
+        expect.objectContaining({ interaction_id: first.interaction_id, state: 'cancelled' }),
+        expect.objectContaining({
+          interaction_id: resolution.replacement_interaction_id,
+          state: 'pending',
+          handoff_state: 'not_started',
+        }),
+      ]),
+    });
+    const replacementRow = readInteractionAuthority(database, first.turn_id).interactions
+      .find(({ interaction_id: interactionId }) => (
+        interactionId === resolution.replacement_interaction_id
+      ));
+    const replacementRequest = JSON.parse(replacementRow.request_json);
+    expect(replacementRequest).toMatchObject({
+      interaction_id: resolution.replacement_interaction_id,
+      parent_type: 'recovery_control',
+      control_id: expect.any(String),
+      ordinal: 1,
+      kind: 'recovery_decision',
+      prompt: 'Choose how to continue after uncertain delivery.',
+      state: 'pending',
+      handoff_state: 'not_started',
+      runtime_fence: null,
+    });
+    const recoveryAnswer = service.submitInteractionAnswer(
+      interactionAnswer(replacementRequest, 'authorized-recovery-control'),
+    );
+    expect(recoveryAnswer).toMatchObject({
+      status: 'accepted',
+      control_id: replacementRequest.control_id,
+      handoff_state: 'pending',
+    });
+    await expect(service.deliverInteractionAnswer(recoveryAnswer.handoff_id)).resolves.toMatchObject({
+      acknowledgement: {
+        status: 'accepted',
+        resumed: false,
+        turn_state: 'recovering',
+      },
+      execution: null,
+    });
+    expect(JSON.parse(database.prepare(`
+      SELECT request_json FROM runtime_interactions WHERE interaction_id = ?
+    `).get(replacementRequest.interaction_id).request_json)).toMatchObject({
+      state: 'answered',
+      handoff_state: 'accepted',
+    });
+
+    database.close();
+  });
+
+  test('rolls back a Core-owned recovery claim when its acknowledgement cannot commit', async () => {
+    const database = openTestDatabase();
+    const { store, turnContext } = createRunningTurn(database, 'recovery-control-rollback');
+    const original = store.requestInteraction(turnContext, {
+      provider_interaction_ref: 'provider-recovery-control-rollback',
+      tool_use_id: 'tool-recovery-control-rollback',
+      kind: 'tool_approval',
+      prompt: 'Allow the original answer?',
+      choices: [],
+      authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+      allowed_sources: ['card_action'],
+    });
+    const committed = store.commitInteractionAnswer(
+      interactionAnswer(original, 'recovery-control-rollback-original'),
+    );
+    const claimed = store.claimInteractionHandoff(committed.handoff_id);
+    const sending = store.markInteractionHandoffSendStarted(claimed);
+    store.markInteractionHandoffDeliveryUnknown(sending);
+    const unknown = store.getInteractionHandoffForRecovery(committed.handoff_id);
+    store.releaseRecoveringExecutorOwnership(turnContext);
+    const replacementInteraction = {
+      kind: 'recovery_decision',
+      prompt: 'Choose how to continue after uncertain delivery.',
+      choices: [],
+      authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+      allowed_sources: ['card_action'],
+    };
+    const disposition = {
+      action: 'establish_interaction',
+      replacement_interaction: replacementInteraction,
+    };
+    const resolution = store.resolveInteractionHandoffDisposition(
+      unknown,
+      disposition,
+      {
+        decision_id: 'decision-recovery-control-rollback',
+        authorized: true,
+        actor_id: 'operations-user-123',
+        capability: 'interaction.handoff.resolve',
+        scope: {
+          conversation_id: original.conversation_id,
+          turn_id: original.turn_id,
+          handoff_id: committed.handoff_id,
+          action: disposition.action,
+          replacement_interaction: replacementInteraction,
+        },
+        policy_id: 'recovery-policy-1',
+        policy_version: 1,
+        authorized_at: '2026-07-19T07:02:00Z',
+      },
+    );
+    const replacementRequest = JSON.parse(database.prepare(`
+      SELECT request_json FROM runtime_interactions WHERE interaction_id = ?
+    `).get(resolution.replacement_interaction_id).request_json);
+    const answer = store.commitInteractionAnswer(
+      interactionAnswer(replacementRequest, 'recovery-control-rollback'),
+    );
+    const before = readInteractionAuthority(database, original.turn_id);
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute() {},
+        async prepareInteractionAnswer() {
+          throw new Error('Core recovery control must not call the provider adapter.');
+        },
+      },
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-recovery-control-rollback',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('recovery-control-rollback-service'),
+    });
+    database.exec(`
+      CREATE TRIGGER force_recovery_control_audit_failure
+      BEFORE INSERT ON runtime_interaction_audit
+      WHEN NEW.interaction_id = '${replacementRequest.interaction_id}'
+      BEGIN
+        SELECT RAISE(ABORT, 'forced recovery control audit failure');
+      END;
+    `);
+
+    await expect(service.deliverInteractionAnswer(answer.handoff_id))
+      .rejects.toThrow(/forced recovery control audit failure/);
+    expect(readInteractionAuthority(database, original.turn_id)).toEqual(before);
+    const persistedHandoff = JSON.parse(database.prepare(`
+      SELECT record_json FROM runtime_interaction_handoffs WHERE handoff_id = ?
+    `).get(answer.handoff_id).record_json);
+    expect(persistedHandoff).toMatchObject({
+      state: 'pending',
+      last_send_started_at: null,
+      provider_acked_at: null,
+      side_effect_status: 'none',
+    });
+    database.exec('DROP TRIGGER force_recovery_control_audit_failure;');
+    await expect(service.deliverInteractionAnswer(answer.handoff_id)).resolves.toMatchObject({
+      acknowledgement: {
+        status: 'accepted',
+        resumed: false,
+        turn_state: 'recovering',
+      },
+      execution: null,
+    });
+    expect(JSON.parse(database.prepare(`
+      SELECT request_json FROM runtime_interactions WHERE interaction_id = ?
+    `).get(replacementRequest.interaction_id).request_json)).toMatchObject({
+      state: 'answered',
+      handoff_state: 'accepted',
+    });
+
+    database.close();
+  });
+
   test('uses iterator return to prove isolation when a failed handler has no abort primitive', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'service-handler-no-abort');
@@ -575,9 +1458,9 @@ describe('runtime interaction happy path', () => {
           iteratorReturnCalls += 1;
         }
       },
-      async handleInteractionAnswer() {
+      prepareInteractionAnswer: preparedInteractionAnswer(async () => {
         throw new Error('uncertain handler send');
-      },
+      }),
     };
     const service = createExecutorService({
       database,
@@ -626,9 +1509,9 @@ describe('runtime interaction happy path', () => {
           },
         };
       },
-      async handleInteractionAnswer() {
+      prepareInteractionAnswer: preparedInteractionAnswer(async () => {
         throw new Error('uncertain retrying send');
-      },
+      }),
       async abort() {
         abortCalls += 1;
         throw new Error('forced recovery abort failure');
@@ -720,11 +1603,11 @@ describe('runtime interaction happy path', () => {
           },
         };
       },
-      async handleInteractionAnswer() {
+      prepareInteractionAnswer: preparedInteractionAnswer(async () => {
         handlerStarted();
         await handlerReleasePromise;
         throw new Error('deferred uncertain handler send');
-      },
+      }),
       async abort() {},
       async close() { return [accepted.conversation_id]; },
     };
@@ -804,7 +1687,7 @@ describe('runtime interaction happy path', () => {
           provider_native_id: null,
         };
       },
-      async handleInteractionAnswer(delivery) {
+      prepareInteractionAnswer: preparedInteractionAnswer(async (delivery) => {
         return {
           status: 'accepted',
           handoff_id: delivery.handoff.handoff_id,
@@ -813,7 +1696,7 @@ describe('runtime interaction happy path', () => {
           handoff_attempt_no: delivery.handoff.handoff_attempt_no,
           lease_epoch: delivery.handoff.lease_epoch,
         };
-      },
+      }),
       async close() {
         closeCalls += 1;
         releaseResumedExecution();
@@ -987,7 +1870,7 @@ describe('runtime interaction happy path', () => {
         };
         await permissionResult;
       },
-      async handleInteractionAnswer(delivery) {
+      prepareInteractionAnswer: preparedInteractionAnswer(async (delivery) => {
         return {
           status: 'accepted',
           handoff_id: delivery.handoff.handoff_id,
@@ -996,7 +1879,7 @@ describe('runtime interaction happy path', () => {
           handoff_attempt_no: delivery.handoff.handoff_attempt_no,
           lease_epoch: delivery.handoff.lease_epoch,
         };
-      },
+      }),
     };
     const service = createExecutorService({
       database,
@@ -1044,7 +1927,7 @@ describe('runtime interaction happy path', () => {
           },
         };
       },
-      async handleInteractionAnswer() {
+      prepareInteractionAnswer: preparedInteractionAnswer(async () => {
         const error = new Error('connection closed after response write');
         error.providerError = {
           code: 'side_effect_unknown',
@@ -1054,7 +1937,7 @@ describe('runtime interaction happy path', () => {
           user_message: 'The provider may have received the answer.',
         };
         throw error;
-      },
+      }),
     };
     const service = createExecutorService({
       database,
@@ -1123,10 +2006,10 @@ describe('runtime interaction happy path', () => {
           },
         };
       },
-      async handleInteractionAnswer(delivery) {
+      prepareInteractionAnswer: preparedInteractionAnswer(async (delivery) => {
         handlerCalls.push(delivery);
         throw new Error('cancelled handoff must never reach the provider');
-      },
+      }),
     };
     const service = createExecutorService({
       database,
@@ -1190,11 +2073,12 @@ describe('runtime interaction happy path', () => {
     expect(database.prepare(`
       SELECT state FROM runtime_turns WHERE turn_id = ?
     `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
-    expect(readEvents(database, accepted.turn_id).slice(-3).map(({ kind, phase }) => ({ kind, phase })))
+    expect(readEvents(database, accepted.turn_id).slice(-4).map(({ kind, phase }) => ({ kind, phase })))
       .toEqual([
         { kind: 'interaction_cancelled', phase: 'waiting_user' },
         { kind: 'turn_state_changed', phase: 'recovering' },
         { kind: 'recovery_started', phase: 'recovering' },
+        { kind: 'recovery_waiting_decision', phase: 'recovering' },
       ]);
     const recoveryProjection = database.prepare(`
       SELECT status, render_model_json
@@ -1366,6 +2250,7 @@ describe('runtime interaction happy path', () => {
     });
     const result = store.commitInteractionAnswer(interactionAnswer(request, 'ack-rollback'));
     const delivery = store.claimInteractionHandoff(result.handoff_id);
+    const sendingDelivery = store.markInteractionHandoffSendStarted(delivery);
     const before = readInteractionAuthority(database, accepted.turn_id);
     database.exec(`
       CREATE TRIGGER force_interaction_audit_failure
@@ -1377,11 +2262,11 @@ describe('runtime interaction happy path', () => {
 
     expect(() => store.acknowledgeInteractionHandoff({
       status: 'accepted',
-      handoff_id: delivery.handoff.handoff_id,
-      provider_attempt_id: delivery.handoff.provider_attempt_id,
-      handoff_attempt_id: delivery.handoff.handoff_attempt_id,
-      handoff_attempt_no: delivery.handoff.handoff_attempt_no,
-      lease_epoch: delivery.handoff.lease_epoch,
+      handoff_id: sendingDelivery.handoff.handoff_id,
+      provider_attempt_id: sendingDelivery.handoff.provider_attempt_id,
+      handoff_attempt_id: sendingDelivery.handoff.handoff_attempt_id,
+      handoff_attempt_no: sendingDelivery.handoff.handoff_attempt_no,
+      lease_epoch: sendingDelivery.handoff.lease_epoch,
     })).toThrow(/forced interaction audit failure/);
     expect(readInteractionAuthority(database, accepted.turn_id)).toEqual(before);
 
@@ -1412,7 +2297,12 @@ describe('runtime interaction happy path', () => {
       handoff_attempt_no: delivery.handoff.handoff_attempt_no,
       lease_epoch: delivery.handoff.lease_epoch + 1,
     })).toThrow(expect.objectContaining({ code: 'stale_attempt' }));
-    expect(readInteractionAuthority(database, accepted.turn_id)).toEqual(before);
+    const after = readInteractionAuthority(database, accepted.turn_id);
+    expect({ ...after, audits: after.audits.slice(0, -1) }).toEqual(before);
+    expect(after.audits.at(-1)).toMatchObject({
+      outcome: 'late_ack_ignored',
+      handoff_id: delivery.handoff.handoff_id,
+    });
 
     database.close();
   });

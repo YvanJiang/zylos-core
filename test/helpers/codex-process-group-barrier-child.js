@@ -69,6 +69,7 @@ const context = {
   lineage: { provider_native_id: null },
   async bindProviderNativeId() {},
   reportProviderState() {},
+  reportRuntimeEvidence() {},
   interaction: {
     authorized_subjects: [{ type: 'actor', actor_id: 'barrier-user' }],
     allowed_sources: ['operations_control'],

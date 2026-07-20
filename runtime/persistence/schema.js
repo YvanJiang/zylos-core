@@ -57,6 +57,9 @@ const RUNTIME_SCHEMA = `
     provider TEXT CHECK (provider IS NULL OR provider IN ('claude', 'codex')),
     provider_native_id TEXT,
     provider_native_id_bound_at TEXT,
+    provider_native_state TEXT NOT NULL DEFAULT 'unknown'
+      CHECK (provider_native_state IN ('unknown', 'valid', 'invalid')),
+    recovery_of_lineage_id TEXT REFERENCES runtime_lineages(lineage_id),
     CHECK (
       (provider IS NULL AND provider_native_id IS NULL AND provider_native_id_bound_at IS NULL)
       OR (provider IS NOT NULL AND provider_native_id IS NOT NULL
@@ -90,6 +93,8 @@ const RUNTIME_SCHEMA = `
     attempt_no INTEGER CHECK (attempt_no IS NULL OR attempt_no > 0),
     lease_epoch INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0),
     queue_sequence INTEGER NOT NULL CHECK (queue_sequence > 0),
+    provider_input_json TEXT,
+    redirected_from_turn_id TEXT UNIQUE REFERENCES runtime_turns(turn_id),
     created_at TEXT NOT NULL,
     committed_at TEXT NOT NULL,
     CHECK (
@@ -104,6 +109,7 @@ const RUNTIME_SCHEMA = `
     queue_sequence INTEGER NOT NULL CHECK (queue_sequence > 0),
     turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
     status TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1)),
     wait_reason TEXT,
     wait_detail_json TEXT,
     enqueued_at TEXT NOT NULL,
@@ -113,6 +119,204 @@ const RUNTIME_SCHEMA = `
   CREATE UNIQUE INDEX IF NOT EXISTS runtime_turns_one_active_per_conversation
     ON runtime_turns(conversation_id)
     WHERE state IN ('starting', 'running', 'waiting_user', 'redirecting', 'recovering');
+
+  CREATE TABLE IF NOT EXISTS runtime_permission_revision_sequence (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    current_revision INTEGER NOT NULL CHECK (current_revision >= 0)
+  );
+
+  INSERT OR IGNORE INTO runtime_permission_revision_sequence (singleton_id, current_revision)
+    VALUES (1, 0);
+
+  CREATE TABLE IF NOT EXISTS runtime_permission_grants (
+    grant_id TEXT PRIMARY KEY,
+    grant_kind TEXT NOT NULL CHECK (
+      grant_kind IN ('next_turn', 'timed_conversation', 'persistent_bot')
+    ),
+    state TEXT NOT NULL CHECK (state IN ('active', 'consumed', 'revoked', 'expired')),
+    region TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    bot_id TEXT NOT NULL,
+    conversation_id TEXT REFERENCES runtime_conversations(conversation_id),
+    issued_by_actor_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    policy_revision INTEGER NOT NULL UNIQUE CHECK (policy_revision > 0),
+    issued_at TEXT NOT NULL,
+    expires_at TEXT,
+    consumed_by_turn_id TEXT UNIQUE REFERENCES runtime_turns(turn_id),
+    consumed_at TEXT,
+    revoked_at TEXT,
+    expired_at TEXT,
+    notice_target_json TEXT NOT NULL,
+    CHECK (
+      (grant_kind = 'next_turn' AND conversation_id IS NOT NULL AND expires_at IS NULL)
+      OR (grant_kind = 'timed_conversation' AND conversation_id IS NOT NULL
+          AND expires_at IS NOT NULL)
+      OR (grant_kind = 'persistent_bot' AND conversation_id IS NULL AND expires_at IS NULL)
+    ),
+    CHECK (
+      (state = 'consumed' AND consumed_by_turn_id IS NOT NULL AND consumed_at IS NOT NULL)
+      OR (state != 'consumed' AND consumed_by_turn_id IS NULL AND consumed_at IS NULL)
+    )
+  );
+
+  CREATE INDEX IF NOT EXISTS runtime_permission_grants_conversation
+    ON runtime_permission_grants(conversation_id, grant_kind, state, policy_revision);
+  CREATE INDEX IF NOT EXISTS runtime_permission_grants_bot
+    ON runtime_permission_grants(region, tenant_id, bot_id, grant_kind, state, policy_revision);
+  CREATE UNIQUE INDEX IF NOT EXISTS runtime_permission_one_active_bot_grant
+    ON runtime_permission_grants(region, tenant_id, bot_id)
+    WHERE grant_kind = 'persistent_bot' AND state = 'active';
+
+  CREATE TABLE IF NOT EXISTS runtime_permission_revocations (
+    revocation_id TEXT PRIMARY KEY,
+    scope_kind TEXT NOT NULL CHECK (scope_kind IN ('conversation', 'bot')),
+    region TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    bot_id TEXT NOT NULL,
+    conversation_id TEXT REFERENCES runtime_conversations(conversation_id),
+    actor_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    policy_revision INTEGER NOT NULL UNIQUE CHECK (policy_revision > 0),
+    reason TEXT NOT NULL,
+    committed_at TEXT NOT NULL,
+    CHECK (
+      (scope_kind = 'conversation' AND conversation_id IS NOT NULL)
+      OR (scope_kind = 'bot' AND conversation_id IS NULL)
+    )
+  );
+
+  CREATE INDEX IF NOT EXISTS runtime_permission_revocations_scope
+    ON runtime_permission_revocations(
+      region, tenant_id, bot_id, conversation_id, scope_kind, policy_revision
+    );
+
+  CREATE TABLE IF NOT EXISTS runtime_turn_permissions (
+    turn_id TEXT PRIMARY KEY REFERENCES runtime_turns(turn_id),
+    actor_id TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK (mode IN ('safe', 'trusted')),
+    basis_kind TEXT NOT NULL CHECK (
+      basis_kind IN ('default_safe', 'next_turn', 'timed_conversation', 'persistent_bot')
+    ),
+    grant_id TEXT REFERENCES runtime_permission_grants(grant_id),
+    grant_policy_revision INTEGER,
+    accepted_policy_revision INTEGER NOT NULL CHECK (accepted_policy_revision >= 0),
+    accepted_at TEXT NOT NULL,
+    CHECK (
+      (basis_kind = 'default_safe' AND mode = 'safe' AND grant_id IS NULL
+        AND grant_policy_revision IS NULL)
+      OR (basis_kind != 'default_safe' AND mode = 'trusted' AND grant_id IS NOT NULL
+        AND grant_policy_revision IS NOT NULL)
+    )
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_permission_controls (
+    control_id TEXT PRIMARY KEY,
+    inbound_event_id TEXT NOT NULL UNIQUE REFERENCES runtime_inbound_events(inbound_event_id),
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    command_kind TEXT NOT NULL CHECK (
+      command_kind IN ('next_turn', 'timed_conversation', 'persistent_bot', 'safe')
+    ),
+    command_text TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('completed', 'pending_confirmation', 'rejected')),
+    policy_revision INTEGER CHECK (policy_revision IS NULL OR policy_revision > 0),
+    grant_id TEXT REFERENCES runtime_permission_grants(grant_id),
+    interaction_id TEXT UNIQUE REFERENCES runtime_interactions(interaction_id),
+    result_json TEXT NOT NULL,
+    final_result_json TEXT,
+    committed_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_permission_confirmations (
+    control_id TEXT PRIMARY KEY REFERENCES runtime_permission_controls(control_id),
+    interaction_id TEXT NOT NULL UNIQUE REFERENCES runtime_interactions(interaction_id),
+    action_kind TEXT NOT NULL CHECK (
+      action_kind IN ('grant_persistent_bot', 'revoke_persistent_bot')
+    ),
+    expected_command TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    region TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    bot_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    target_grant_id TEXT REFERENCES runtime_permission_grants(grant_id),
+    requested_policy_revision INTEGER NOT NULL CHECK (requested_policy_revision >= 0),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'denied', 'expired')),
+    expires_at TEXT NOT NULL,
+    resolved_at TEXT,
+    effect_policy_revision INTEGER CHECK (effect_policy_revision IS NULL OR effect_policy_revision > 0),
+    CHECK (
+      (action_kind = 'grant_persistent_bot' AND target_grant_id IS NULL)
+      OR (action_kind = 'revoke_persistent_bot' AND target_grant_id IS NOT NULL)
+    )
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_permission_audit (
+    audit_id TEXT PRIMARY KEY,
+    action TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    scope_json TEXT NOT NULL,
+    policy_revision INTEGER NOT NULL CHECK (policy_revision >= 0),
+    reason TEXT NOT NULL,
+    redacted_context_json TEXT NOT NULL,
+    turn_id TEXT REFERENCES runtime_turns(turn_id),
+    grant_id TEXT REFERENCES runtime_permission_grants(grant_id),
+    control_id TEXT REFERENCES runtime_permission_controls(control_id),
+    action_ref TEXT,
+    committed_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS runtime_permission_audit_policy
+    ON runtime_permission_audit(policy_revision, committed_at);
+
+  CREATE TABLE IF NOT EXISTS runtime_permission_action_decisions (
+    decision_id TEXT PRIMARY KEY,
+    turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),
+    action_ref TEXT NOT NULL,
+    action_kind TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('trusted', 'requires_approval')),
+    basis_kind TEXT NOT NULL,
+    grant_id TEXT REFERENCES runtime_permission_grants(grant_id),
+    checked_policy_revision INTEGER NOT NULL CHECK (checked_policy_revision >= 0),
+    checked_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_stop_controls (
+    stop_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    stop_cutoff_queue_sequence INTEGER NOT NULL CHECK (stop_cutoff_queue_sequence >= 0),
+    active_turn_id TEXT REFERENCES runtime_turns(turn_id),
+    result_json TEXT NOT NULL,
+    committed_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_steer_controls (
+    steer_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    target_turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
+    inbound_event_id TEXT UNIQUE REFERENCES runtime_inbound_events(inbound_event_id),
+    priority_turn_id TEXT UNIQUE REFERENCES runtime_turns(turn_id),
+    stop_barrier_id TEXT UNIQUE REFERENCES runtime_stop_controls(stop_id),
+    request_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    committed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_steer_requests (
+    steer_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    target_turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),
+    inbound_event_id TEXT NOT NULL UNIQUE REFERENCES runtime_inbound_events(inbound_event_id),
+    winner_control_id TEXT UNIQUE REFERENCES runtime_steer_controls(steer_id),
+    request_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    committed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
 
   CREATE TABLE IF NOT EXISTS runtime_executor_residents (
     conversation_id TEXT PRIMARY KEY REFERENCES runtime_conversations(conversation_id),
@@ -201,6 +405,65 @@ const RUNTIME_SCHEMA = `
     )
   );
 
+  CREATE TABLE IF NOT EXISTS runtime_provider_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+    lease_epoch INTEGER NOT NULL CHECK (lease_epoch > 0),
+    provider TEXT NOT NULL CHECK (provider IN ('claude', 'codex')),
+    service_instance_id TEXT NOT NULL,
+    executor_instance_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+      state IN (
+        'starting', 'running', 'waiting_user', 'redirecting',
+        'retry_wait', 'retrying', 'recovering',
+        'completed', 'stopped', 'cancelled', 'interrupted', 'failed', 'timed_out'
+      )
+    ),
+    runtime_instance_id TEXT,
+    runtime_evidence_json TEXT,
+    last_provider_event_at TEXT,
+    last_lease_renewed_at TEXT NOT NULL,
+    retry_backoff_ms INTEGER CHECK (retry_backoff_ms IS NULL OR retry_backoff_ms >= 0),
+    next_retry_at TEXT,
+    side_effect_status TEXT NOT NULL DEFAULT 'none'
+      CHECK (side_effect_status IN ('none', 'known', 'unknown')),
+    error_json TEXT,
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (turn_id, attempt_no),
+    UNIQUE (turn_id, lease_epoch)
+  );
+
+  CREATE INDEX IF NOT EXISTS runtime_provider_attempts_active
+    ON runtime_provider_attempts(turn_id, state, service_instance_id);
+
+  CREATE TABLE IF NOT EXISTS runtime_execution_recoveries (
+    recovery_id TEXT PRIMARY KEY,
+    turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
+    attempt_id TEXT NOT NULL,
+    attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+    lease_epoch INTEGER NOT NULL CHECK (lease_epoch > 0),
+    provider TEXT NOT NULL CHECK (provider IN ('claude', 'codex')),
+    prior_service_instance_id TEXT,
+    prior_executor_instance_id TEXT,
+    prior_runtime_instance_id TEXT,
+    recovery_kind TEXT NOT NULL CHECK (
+      recovery_kind IN ('provider_failure', 'startup_reconciliation', 'sweep_reconciliation')
+    ),
+    state TEXT NOT NULL CHECK (state IN ('waiting_decision', 'authorized', 'stopped')),
+    side_effect_status TEXT NOT NULL CHECK (side_effect_status = 'unknown'),
+    notice_event_sequence INTEGER NOT NULL CHECK (notice_event_sequence > 0),
+    interaction_id TEXT NOT NULL UNIQUE REFERENCES runtime_interactions(interaction_id),
+    error_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS runtime_execution_recovery_state
+    ON runtime_execution_recoveries(state, created_at);
+
   CREATE TABLE IF NOT EXISTS runtime_provider_stop_incidents (
     incident_id TEXT PRIMARY KEY,
     turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
@@ -213,6 +476,21 @@ const RUNTIME_SCHEMA = `
     error_json TEXT NOT NULL,
     outbox_id TEXT NOT NULL UNIQUE,
     created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_provider_event_diagnostics (
+    diagnostic_id TEXT PRIMARY KEY,
+    turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    provider TEXT NOT NULL CHECK (provider IN ('claude', 'codex')),
+    attempt_id TEXT,
+    attempt_no INTEGER CHECK (attempt_no IS NULL OR attempt_no > 0),
+    lease_epoch INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0),
+    current_turn_state TEXT NOT NULL,
+    event_kind TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    descriptor_json TEXT NOT NULL,
+    observed_at TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS runtime_normalized_events (
@@ -229,8 +507,12 @@ const RUNTIME_SCHEMA = `
   CREATE TABLE IF NOT EXISTS runtime_interactions (
     interaction_id TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
-    turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),
-    lineage_id TEXT NOT NULL REFERENCES runtime_lineages(lineage_id),
+    turn_id TEXT REFERENCES runtime_turns(turn_id),
+    lineage_id TEXT REFERENCES runtime_lineages(lineage_id),
+    parent_type TEXT NOT NULL CHECK (
+      parent_type IN ('provider_turn', 'security_control', 'recovery_control')
+    ),
+    parent_id TEXT NOT NULL,
     ordinal INTEGER NOT NULL CHECK (ordinal > 0),
     state TEXT NOT NULL,
     version INTEGER NOT NULL CHECK (version > 0),
@@ -239,7 +521,11 @@ const RUNTIME_SCHEMA = `
     request_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    UNIQUE (turn_id, ordinal)
+    UNIQUE (parent_type, parent_id, ordinal),
+    CHECK (
+      (parent_type = 'security_control' AND turn_id IS NULL AND lineage_id IS NULL)
+      OR (parent_type != 'security_control' AND turn_id IS NOT NULL)
+    )
   );
 
   CREATE TABLE IF NOT EXISTS runtime_interaction_answers (
@@ -257,15 +543,22 @@ const RUNTIME_SCHEMA = `
     interaction_id TEXT NOT NULL UNIQUE REFERENCES runtime_interactions(interaction_id),
     answer_id TEXT NOT NULL UNIQUE,
     state TEXT NOT NULL,
-    provider_attempt_id TEXT NOT NULL,
+    parent_type TEXT NOT NULL CHECK (
+      parent_type IN ('provider_turn', 'security_control', 'recovery_control')
+    ),
+    provider_attempt_id TEXT,
     handoff_attempt_id TEXT,
     handoff_attempt_no INTEGER CHECK (
       handoff_attempt_no IS NULL OR handoff_attempt_no > 0
     ),
-    lease_epoch INTEGER NOT NULL CHECK (lease_epoch > 0),
+    lease_epoch INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0),
     record_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    CHECK (
+      (parent_type = 'provider_turn' AND provider_attempt_id IS NOT NULL AND lease_epoch IS NOT NULL)
+      OR (parent_type != 'provider_turn' AND provider_attempt_id IS NULL AND lease_epoch IS NULL)
+    )
   );
 
   CREATE TABLE IF NOT EXISTS runtime_interaction_audit (
@@ -273,8 +566,8 @@ const RUNTIME_SCHEMA = `
     interaction_id TEXT NOT NULL REFERENCES runtime_interactions(interaction_id),
     handoff_id TEXT NOT NULL REFERENCES runtime_interaction_handoffs(handoff_id),
     outcome TEXT NOT NULL,
-    provider_attempt_id TEXT NOT NULL,
-    lease_epoch INTEGER NOT NULL CHECK (lease_epoch > 0),
+    provider_attempt_id TEXT,
+    lease_epoch INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0),
     acknowledgement_json TEXT NOT NULL,
     created_at TEXT NOT NULL
   );
@@ -339,6 +632,49 @@ const RUNTIME_SCHEMA = `
     created_at TEXT NOT NULL,
     PRIMARY KEY (region, tenant_id, channel, bot_id, platform_message_id)
   );
+
+  CREATE TABLE IF NOT EXISTS runtime_reply_mapping_recoveries (
+    recovery_id TEXT PRIMARY KEY,
+    turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
+    mapping_id TEXT NOT NULL UNIQUE,
+    source_platform_message_id TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK (
+      reason IN (
+        'mapping_missing',
+        'mapping_corrupt',
+        'mapping_unbound',
+        'provider_lineage_invalid'
+      )
+    ),
+    candidate_lineage_id TEXT REFERENCES runtime_lineages(lineage_id),
+    side_effect_status TEXT NOT NULL
+      CHECK (side_effect_status IN ('none', 'known', 'unknown')),
+    state TEXT NOT NULL CHECK (
+      state IN (
+        'queued',
+        'notice_pending',
+        'native_recovery_claimed',
+        'native_recovery_not_applicable',
+        'waiting_decision',
+        'bound',
+        'rejected',
+        'failed'
+      )
+    ),
+    notice_event_sequence INTEGER CHECK (
+      notice_event_sequence IS NULL OR notice_event_sequence > 0
+    ),
+    native_recovery_attempt_count INTEGER NOT NULL DEFAULT 0
+      CHECK (native_recovery_attempt_count IN (0, 1)),
+    native_recovery_attempt_id TEXT,
+    native_recovery_status TEXT,
+    native_recovery_result_json TEXT,
+    native_recovery_owner_service_instance_id TEXT,
+    native_recovery_claim_expires_at TEXT,
+    bound_lineage_id TEXT REFERENCES runtime_lineages(lineage_id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
 `;
 
 const OUTBOX_V2_SCHEMA = `CREATE TABLE runtime_outbox ${OUTBOX_TABLE_SCHEMA};`;
@@ -376,6 +712,244 @@ function addColumnIfMissing(database, tableName, columnName, definition) {
   const columns = database.prepare(`PRAGMA table_info(${tableName})`).all();
   if (columns.some(({ name }) => name === columnName)) return;
   database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+}
+
+function migrateInteractionControlStorage(database) {
+  const columns = database.prepare("PRAGMA table_info('runtime_interactions')").all();
+  if (columns.some(({ name }) => name === 'parent_type')) return;
+
+  database.pragma('foreign_keys = OFF');
+  database.pragma('legacy_alter_table = ON');
+  try {
+    const migrate = database.transaction(() => {
+      database.exec(`
+        ALTER TABLE runtime_interactions RENAME TO runtime_interactions_issue16;
+        ALTER TABLE runtime_interaction_answers RENAME TO runtime_interaction_answers_issue16;
+        ALTER TABLE runtime_interaction_handoffs RENAME TO runtime_interaction_handoffs_issue16;
+        ALTER TABLE runtime_interaction_audit RENAME TO runtime_interaction_audit_issue16;
+
+        CREATE TABLE runtime_interactions (
+          interaction_id TEXT PRIMARY KEY,
+          conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+          turn_id TEXT REFERENCES runtime_turns(turn_id),
+          lineage_id TEXT REFERENCES runtime_lineages(lineage_id),
+          parent_type TEXT NOT NULL CHECK (
+            parent_type IN ('provider_turn', 'security_control', 'recovery_control')
+          ),
+          parent_id TEXT NOT NULL,
+          ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+          state TEXT NOT NULL,
+          version INTEGER NOT NULL CHECK (version > 0),
+          handoff_state TEXT NOT NULL,
+          handoff_version INTEGER CHECK (handoff_version IS NULL OR handoff_version > 0),
+          request_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE (parent_type, parent_id, ordinal),
+          CHECK (
+            (parent_type = 'security_control' AND turn_id IS NULL AND lineage_id IS NULL)
+            OR (parent_type != 'security_control' AND turn_id IS NOT NULL)
+          )
+        );
+        INSERT INTO runtime_interactions (
+          interaction_id, conversation_id, turn_id, lineage_id, parent_type, parent_id,
+          ordinal, state, version, handoff_state, handoff_version, request_json,
+          created_at, updated_at
+        )
+        SELECT interaction_id, conversation_id, turn_id, lineage_id, 'provider_turn', turn_id,
+          ordinal, state, version, handoff_state, handoff_version, request_json,
+          created_at, updated_at
+        FROM runtime_interactions_issue16;
+
+        CREATE TABLE runtime_interaction_answers (
+          answer_id TEXT PRIMARY KEY,
+          interaction_id TEXT NOT NULL UNIQUE REFERENCES runtime_interactions(interaction_id),
+          idempotency_key TEXT NOT NULL UNIQUE,
+          payload_hash TEXT NOT NULL,
+          answer_json TEXT NOT NULL,
+          result_json TEXT NOT NULL,
+          committed_at TEXT NOT NULL
+        );
+        INSERT INTO runtime_interaction_answers
+        SELECT * FROM runtime_interaction_answers_issue16;
+
+        CREATE TABLE runtime_interaction_handoffs (
+          handoff_id TEXT PRIMARY KEY,
+          interaction_id TEXT NOT NULL UNIQUE REFERENCES runtime_interactions(interaction_id),
+          answer_id TEXT NOT NULL UNIQUE,
+          state TEXT NOT NULL,
+          parent_type TEXT NOT NULL CHECK (
+            parent_type IN ('provider_turn', 'security_control', 'recovery_control')
+          ),
+          provider_attempt_id TEXT,
+          handoff_attempt_id TEXT,
+          handoff_attempt_no INTEGER CHECK (
+            handoff_attempt_no IS NULL OR handoff_attempt_no > 0
+          ),
+          lease_epoch INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0),
+          record_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          CHECK (
+            (parent_type = 'provider_turn' AND provider_attempt_id IS NOT NULL
+              AND lease_epoch IS NOT NULL)
+            OR (parent_type != 'provider_turn' AND provider_attempt_id IS NULL
+              AND lease_epoch IS NULL)
+          )
+        );
+        INSERT INTO runtime_interaction_handoffs (
+          handoff_id, interaction_id, answer_id, state, parent_type, provider_attempt_id,
+          handoff_attempt_id, handoff_attempt_no, lease_epoch, record_json, created_at, updated_at
+        )
+        SELECT handoff_id, interaction_id, answer_id, state, 'provider_turn', provider_attempt_id,
+          handoff_attempt_id, handoff_attempt_no, lease_epoch, record_json, created_at, updated_at
+        FROM runtime_interaction_handoffs_issue16;
+
+        CREATE TABLE runtime_interaction_audit (
+          audit_id TEXT PRIMARY KEY,
+          interaction_id TEXT NOT NULL REFERENCES runtime_interactions(interaction_id),
+          handoff_id TEXT NOT NULL REFERENCES runtime_interaction_handoffs(handoff_id),
+          outcome TEXT NOT NULL,
+          provider_attempt_id TEXT,
+          lease_epoch INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0),
+          acknowledgement_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        INSERT INTO runtime_interaction_audit
+        SELECT * FROM runtime_interaction_audit_issue16;
+
+        DROP TABLE runtime_interaction_audit_issue16;
+        DROP TABLE runtime_interaction_handoffs_issue16;
+        DROP TABLE runtime_interaction_answers_issue16;
+        DROP TABLE runtime_interactions_issue16;
+      `);
+      const violations = database.prepare('PRAGMA foreign_key_check').all();
+      if (violations.length > 0) {
+        throw new Error('Interaction control storage migration violated foreign keys.');
+      }
+    });
+    migrate.immediate();
+  } finally {
+    database.pragma('legacy_alter_table = OFF');
+    database.pragma('foreign_keys = ON');
+  }
+}
+
+function migrateNullableSecurityControlInteractions(database) {
+  const columns = database.prepare("PRAGMA table_info('runtime_interactions')").all();
+  const turnId = columns.find(({ name }) => name === 'turn_id');
+  if (!turnId || turnId.notnull === 0) return;
+
+  database.pragma('foreign_keys = OFF');
+  database.pragma('legacy_alter_table = ON');
+  try {
+    const migrate = database.transaction(() => {
+      database.exec(`
+        ALTER TABLE runtime_interactions RENAME TO runtime_interactions_issue18;
+        ALTER TABLE runtime_interaction_answers RENAME TO runtime_interaction_answers_issue18;
+        ALTER TABLE runtime_interaction_handoffs RENAME TO runtime_interaction_handoffs_issue18;
+        ALTER TABLE runtime_interaction_audit RENAME TO runtime_interaction_audit_issue18;
+
+        CREATE TABLE runtime_interactions (
+          interaction_id TEXT PRIMARY KEY,
+          conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+          turn_id TEXT REFERENCES runtime_turns(turn_id),
+          lineage_id TEXT REFERENCES runtime_lineages(lineage_id),
+          parent_type TEXT NOT NULL CHECK (
+            parent_type IN ('provider_turn', 'security_control', 'recovery_control')
+          ),
+          parent_id TEXT NOT NULL,
+          ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+          state TEXT NOT NULL,
+          version INTEGER NOT NULL CHECK (version > 0),
+          handoff_state TEXT NOT NULL,
+          handoff_version INTEGER CHECK (handoff_version IS NULL OR handoff_version > 0),
+          request_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE (parent_type, parent_id, ordinal),
+          CHECK (
+            (parent_type = 'security_control' AND turn_id IS NULL AND lineage_id IS NULL)
+            OR (parent_type != 'security_control' AND turn_id IS NOT NULL)
+          )
+        );
+        INSERT INTO runtime_interactions (
+          interaction_id, conversation_id, turn_id, lineage_id, parent_type, parent_id,
+          ordinal, state, version, handoff_state, handoff_version, request_json,
+          created_at, updated_at
+        )
+        SELECT interaction_id, conversation_id, turn_id, lineage_id, parent_type, parent_id,
+          ordinal, state, version, handoff_state, handoff_version, request_json,
+          created_at, updated_at
+        FROM runtime_interactions_issue18;
+
+        CREATE TABLE runtime_interaction_answers (
+          answer_id TEXT PRIMARY KEY,
+          interaction_id TEXT NOT NULL UNIQUE REFERENCES runtime_interactions(interaction_id),
+          idempotency_key TEXT NOT NULL UNIQUE,
+          payload_hash TEXT NOT NULL,
+          answer_json TEXT NOT NULL,
+          result_json TEXT NOT NULL,
+          committed_at TEXT NOT NULL
+        );
+        INSERT INTO runtime_interaction_answers
+        SELECT * FROM runtime_interaction_answers_issue18;
+
+        CREATE TABLE runtime_interaction_handoffs (
+          handoff_id TEXT PRIMARY KEY,
+          interaction_id TEXT NOT NULL UNIQUE REFERENCES runtime_interactions(interaction_id),
+          answer_id TEXT NOT NULL UNIQUE,
+          state TEXT NOT NULL,
+          parent_type TEXT NOT NULL CHECK (
+            parent_type IN ('provider_turn', 'security_control', 'recovery_control')
+          ),
+          provider_attempt_id TEXT,
+          handoff_attempt_id TEXT,
+          handoff_attempt_no INTEGER CHECK (
+            handoff_attempt_no IS NULL OR handoff_attempt_no > 0
+          ),
+          lease_epoch INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0),
+          record_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          CHECK (
+            (parent_type = 'provider_turn' AND provider_attempt_id IS NOT NULL
+              AND lease_epoch IS NOT NULL)
+            OR (parent_type != 'provider_turn' AND provider_attempt_id IS NULL
+              AND lease_epoch IS NULL)
+          )
+        );
+        INSERT INTO runtime_interaction_handoffs
+        SELECT * FROM runtime_interaction_handoffs_issue18;
+
+        CREATE TABLE runtime_interaction_audit (
+          audit_id TEXT PRIMARY KEY,
+          interaction_id TEXT NOT NULL REFERENCES runtime_interactions(interaction_id),
+          handoff_id TEXT NOT NULL REFERENCES runtime_interaction_handoffs(handoff_id),
+          outcome TEXT NOT NULL,
+          provider_attempt_id TEXT,
+          lease_epoch INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0),
+          acknowledgement_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        INSERT INTO runtime_interaction_audit
+        SELECT * FROM runtime_interaction_audit_issue18;
+
+        DROP TABLE runtime_interaction_audit_issue18;
+        DROP TABLE runtime_interaction_handoffs_issue18;
+        DROP TABLE runtime_interaction_answers_issue18;
+        DROP TABLE runtime_interactions_issue18;
+      `);
+      const violations = database.prepare('PRAGMA foreign_key_check').all();
+      if (violations.length > 0) {
+        throw new Error('Nullable security-control interaction migration violated foreign keys.');
+      }
+    });
+    migrate.immediate();
+  } finally {
+    database.pragma('legacy_alter_table = OFF');
+    database.pragma('foreign_keys = ON');
+  }
 }
 
 function hasLegacyAggregateVersionConstraint(database) {
@@ -537,12 +1111,73 @@ export function initializeRuntimePersistence(database) {
   );
   addColumnIfMissing(
     database,
+    'runtime_lineages',
+    'recovery_of_lineage_id',
+    'TEXT REFERENCES runtime_lineages(lineage_id)',
+  );
+  addColumnIfMissing(
+    database,
     'runtime_turns',
     'lease_epoch',
     'INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0)',
   );
+  addColumnIfMissing(database, 'runtime_turns', 'provider_input_json', 'TEXT');
+  addColumnIfMissing(
+    database,
+    'runtime_turns',
+    'redirected_from_turn_id',
+    'TEXT REFERENCES runtime_turns(turn_id)',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_turn_queue',
+    'priority',
+    'INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1))',
+  );
   addColumnIfMissing(database, 'runtime_turn_queue', 'wait_reason', 'TEXT');
   addColumnIfMissing(database, 'runtime_turn_queue', 'wait_detail_json', 'TEXT');
+  addColumnIfMissing(
+    database,
+    'runtime_reply_mapping_recoveries',
+    'notice_event_sequence',
+    'INTEGER CHECK (notice_event_sequence IS NULL OR notice_event_sequence > 0)',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_reply_mapping_recoveries',
+    'native_recovery_attempt_id',
+    'TEXT',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_reply_mapping_recoveries',
+    'native_recovery_status',
+    'TEXT',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_reply_mapping_recoveries',
+    'native_recovery_result_json',
+    'TEXT',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_reply_mapping_recoveries',
+    'native_recovery_owner_service_instance_id',
+    'TEXT',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_reply_mapping_recoveries',
+    'native_recovery_claim_expires_at',
+    'TEXT',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_reply_mapping_recoveries',
+    'bound_lineage_id',
+    'TEXT REFERENCES runtime_lineages(lineage_id)',
+  );
   addColumnIfMissing(database, 'runtime_executor_residents', 'owner_service_instance_id', 'TEXT');
   addColumnIfMissing(
     database,
@@ -552,6 +1187,10 @@ export function initializeRuntimePersistence(database) {
   );
   addColumnIfMissing(database, 'runtime_executor_residents', 'owner_expires_at', 'TEXT');
   addColumnIfMissing(database, 'runtime_interaction_answers', 'payload_hash', 'TEXT');
+  migrateInteractionControlStorage(database);
+  migrateNullableSecurityControlInteractions(database);
+  addColumnIfMissing(database, 'runtime_permission_controls', 'final_result_json', 'TEXT');
+  addColumnIfMissing(database, 'runtime_permission_confirmations', 'target_grant_id', 'TEXT');
   addColumnIfMissing(
     database,
     'runtime_lineages',
@@ -560,6 +1199,12 @@ export function initializeRuntimePersistence(database) {
   );
   addColumnIfMissing(database, 'runtime_lineages', 'provider_native_id', 'TEXT');
   addColumnIfMissing(database, 'runtime_lineages', 'provider_native_id_bound_at', 'TEXT');
+  addColumnIfMissing(
+    database,
+    'runtime_lineages',
+    'provider_native_state',
+    "TEXT NOT NULL DEFAULT 'unknown' CHECK (provider_native_state IN ('unknown', 'valid', 'invalid'))",
+  );
   addColumnIfMissing(
     database,
     'runtime_delivery_lanes',
@@ -630,5 +1275,101 @@ export function initializeRuntimePersistence(database) {
       ON runtime_outbox(status, next_attempt_at, priority, created_at);
     CREATE INDEX IF NOT EXISTS runtime_outbox_lane
       ON runtime_outbox(lane_key, aggregate_version, status);
+    CREATE INDEX IF NOT EXISTS runtime_reply_mapping_recovery_dispatch
+      ON runtime_reply_mapping_recoveries(state, created_at);
+    CREATE INDEX IF NOT EXISTS runtime_reply_mapping_recovery_source
+      ON runtime_reply_mapping_recoveries(source_platform_message_id, state);
+
+    DROP TRIGGER IF EXISTS runtime_bound_message_mapping_immutable;
+    CREATE TRIGGER runtime_bound_message_mapping_immutable
+    BEFORE UPDATE ON runtime_message_mappings
+    WHEN OLD.binding_state = 'bound'
+    BEGIN
+      SELECT RAISE(ABORT, 'bound reply mapping is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_bound_message_mapping_delete_immutable
+    BEFORE DELETE ON runtime_message_mappings
+    WHEN OLD.binding_state = 'bound'
+    BEGIN
+      SELECT RAISE(ABORT, 'bound reply mapping cannot be deleted');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_bound_recovery_turn_lineage_immutable
+    BEFORE UPDATE OF lineage_id ON runtime_turns
+    WHEN NEW.lineage_id IS NOT OLD.lineage_id AND EXISTS (
+      SELECT 1 FROM runtime_reply_mapping_recoveries AS recovery
+      WHERE recovery.turn_id = OLD.turn_id AND recovery.state = 'bound'
+        AND recovery.bound_lineage_id = OLD.lineage_id
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'bound recovery turn lineage is immutable');
+    END;
+
+    DROP TRIGGER IF EXISTS runtime_bound_delivery_lane_mapping_immutable;
+    CREATE TRIGGER runtime_bound_delivery_lane_mapping_immutable
+    BEFORE UPDATE OF mapping_json ON runtime_delivery_lanes
+    WHEN json_extract(OLD.mapping_json, '$.binding_state') = 'bound' AND (
+      json_extract(NEW.mapping_json, '$.conversation_id')
+        IS NOT json_extract(OLD.mapping_json, '$.conversation_id')
+      OR json_extract(NEW.mapping_json, '$.turn_id')
+        IS NOT json_extract(OLD.mapping_json, '$.turn_id')
+      OR json_extract(NEW.mapping_json, '$.lineage_id')
+        IS NOT json_extract(OLD.mapping_json, '$.lineage_id')
+      OR json_extract(NEW.mapping_json, '$.binding_state')
+        IS NOT json_extract(OLD.mapping_json, '$.binding_state')
+      OR json_extract(NEW.mapping_json, '$.reason')
+        IS NOT json_extract(OLD.mapping_json, '$.reason')
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'bound delivery lane mapping is immutable');
+    END;
+
+    DROP TRIGGER IF EXISTS runtime_bound_outbox_mapping_immutable;
+    CREATE TRIGGER runtime_bound_outbox_mapping_immutable
+    BEFORE UPDATE OF command_json ON runtime_outbox
+    WHEN json_extract(OLD.command_json, '$.mapping.binding_state') = 'bound' AND (
+      json_extract(NEW.command_json, '$.mapping.mapping_id')
+        IS NOT json_extract(OLD.command_json, '$.mapping.mapping_id')
+      OR json_extract(NEW.command_json, '$.mapping.lineage_id')
+        IS NOT json_extract(OLD.command_json, '$.mapping.lineage_id')
+      OR json_extract(NEW.command_json, '$.mapping.binding_state')
+        IS NOT json_extract(OLD.command_json, '$.mapping.binding_state')
+      OR json_extract(NEW.command_json, '$.mapping.mapping_version')
+        IS NOT json_extract(OLD.command_json, '$.mapping.mapping_version')
+      OR json_extract(NEW.command_json, '$.mapping.conversation_id')
+        IS NOT json_extract(OLD.command_json, '$.mapping.conversation_id')
+      OR json_extract(NEW.command_json, '$.mapping.turn_id')
+        IS NOT json_extract(OLD.command_json, '$.mapping.turn_id')
+      OR json_extract(NEW.command_json, '$.mapping.reason')
+        IS NOT json_extract(OLD.command_json, '$.mapping.reason')
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'bound outbox mapping is immutable');
+    END;
+
+    DROP TRIGGER IF EXISTS runtime_bound_reply_recovery_immutable;
+    CREATE TRIGGER runtime_bound_reply_recovery_immutable
+    BEFORE UPDATE ON runtime_reply_mapping_recoveries
+    WHEN OLD.state = 'bound'
+    BEGIN
+      SELECT RAISE(ABORT, 'bound reply recovery is immutable');
+    END;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS runtime_turns_one_redirect_per_turn
+      ON runtime_turns(redirected_from_turn_id)
+      WHERE redirected_from_turn_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS runtime_steer_controls_one_winner_per_turn
+      ON runtime_steer_controls(target_turn_id);
+    CREATE INDEX IF NOT EXISTS runtime_turn_queue_priority
+      ON runtime_turn_queue(conversation_id, priority DESC, queue_sequence ASC, status);
+    INSERT OR IGNORE INTO runtime_steer_requests (
+      steer_id, conversation_id, target_turn_id, inbound_event_id,
+      winner_control_id, request_json, result_json, committed_at, updated_at
+    )
+    SELECT steer_id, conversation_id, target_turn_id, inbound_event_id,
+      steer_id, request_json, result_json, committed_at, updated_at
+    FROM runtime_steer_controls
+    WHERE inbound_event_id IS NOT NULL;
   `);
 }

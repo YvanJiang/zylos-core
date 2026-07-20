@@ -1,11 +1,23 @@
 import crypto from 'node:crypto';
 
-import { createContractError } from '../../contracts/public/index.js';
+import {
+  canonicalizeJson,
+  createContractError,
+} from '../../contracts/public/index.js';
+import { createPermissionService } from '../permissions/permission-service.js';
 import { createExecutorStore } from '../persistence/executor-store.js';
 import { resolveProviderWorkspaceAccess } from '../workspace/lease-coordinator.js';
 
 function defaultGenerateId(kind) {
   return `${kind}-${crypto.randomUUID()}`;
+}
+
+function deepFreeze(value) {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
 }
 
 function normalizeProviderError(error, occurredAt) {
@@ -34,11 +46,68 @@ function normalizeProviderError(error, occurredAt) {
   });
 }
 
+function normalizePreSendProviderError(error, occurredAt) {
+  const descriptor = error?.providerError;
+  if (descriptor && typeof descriptor === 'object') {
+    try {
+      return createContractError({
+        code: descriptor.code,
+        category: descriptor.category,
+        retryable: descriptor.retryable === true
+          && descriptor.side_effect_status === 'none',
+        sideEffectStatus: descriptor.side_effect_status,
+        userMessage: descriptor.user_message,
+        occurredAt,
+      });
+    } catch {
+      // Invalid adapter metadata is replaced with the safe non-retryable failure below.
+    }
+  }
+  return createContractError({
+    code: 'provider_context_invalid',
+    category: 'provider',
+    retryable: false,
+    sideEffectStatus: 'unknown',
+    userMessage: 'Provider preparation failed without proving that no side effect occurred.',
+    occurredAt,
+  });
+}
+
 function isExplicitProviderError(error) {
   return error !== null
     && typeof error === 'object'
     && error.providerError !== null
     && typeof error.providerError === 'object';
+}
+
+const NEVER_RETRY_PROVIDER_CODES = new Set([
+  'authentication_failed',
+  'authorization_failed',
+  'cancelled',
+  'permission_denied',
+  'provider_context_invalid',
+  'provider_stop_failed',
+  'side_effect_unknown',
+  'stopped',
+  'turn_interrupted',
+  'turn_terminal',
+  'unauthenticated',
+  'unauthorized',
+]);
+
+function isSafeProviderRetry(error) {
+  return error.retryable === true
+    && error.side_effect_status === 'none'
+    && !['authentication', 'authorization', 'validation'].includes(error.category)
+    && !NEVER_RETRY_PROVIDER_CODES.has(error.code)
+    && !error.code.includes('permission')
+    && !error.code.includes('context')
+    && !error.code.includes('stop');
+}
+
+function isProviderTerminalRecord(record) {
+  return record?.type === 'turn_result'
+    && ['cancelled', 'completed', 'failed'].includes(record.outcome);
 }
 
 export function createExecutorService({
@@ -48,7 +117,7 @@ export function createExecutorService({
   serviceInstanceId,
   now = () => new Date().toISOString(),
   generateId = defaultGenerateId,
-  leaseDurationMs,
+  leaseDurationMs = 30_000,
   residentLeaseDurationMs = 60_000,
   residentHeartbeatIntervalMs = 20_000,
   workspaceRoot = process.cwd(),
@@ -59,8 +128,22 @@ export function createExecutorService({
   scheduleWorkspaceHeartbeat = setInterval,
   cancelWorkspaceHeartbeat = clearInterval,
   isolateOrphanedWorkspace = null,
+  turnLeaseRenewalIntervalMs = Math.min(10_000, leaseDurationMs / 3),
+  scheduleTurnLeaseRenewal = setInterval,
+  cancelTurnLeaseRenewal = clearInterval,
+  nonterminalSweepIntervalMs = 30_000,
+  scheduleNonterminalSweep = setInterval,
+  cancelNonterminalSweep = clearInterval,
+  permissionSweepIntervalMs = 1_000,
+  schedulePermissionSweep = setInterval,
+  cancelPermissionSweep = clearInterval,
   permissionHandler = null,
+  interactionHandoffDispositionAuthorizer = null,
   interactionTimeoutMs,
+  providerStopTimeoutMs = 10_000,
+  providerRetryBaseDelayMs = 1_000,
+  providerRetryJitterRatio = 0.2,
+  providerRetryRandom = Math.random,
   maxResidentExecutorsPerBot = 20,
   setTimeoutFn = setTimeout,
   clearTimeoutFn = clearTimeout,
@@ -84,6 +167,28 @@ export function createExecutorService({
   if (permissionHandler !== null && typeof permissionHandler !== 'function') {
     throw new TypeError('permissionHandler must be a function or null');
   }
+  if (
+    interactionHandoffDispositionAuthorizer !== null
+    && typeof interactionHandoffDispositionAuthorizer !== 'function'
+  ) {
+    throw new TypeError('interactionHandoffDispositionAuthorizer must be a function or null');
+  }
+  if (!Number.isFinite(providerStopTimeoutMs) || providerStopTimeoutMs <= 0) {
+    throw new TypeError('providerStopTimeoutMs must be a positive finite number');
+  }
+  if (!Number.isSafeInteger(providerRetryBaseDelayMs) || providerRetryBaseDelayMs <= 0) {
+    throw new TypeError('providerRetryBaseDelayMs must be a positive safe integer');
+  }
+  if (
+    !Number.isFinite(providerRetryJitterRatio)
+    || providerRetryJitterRatio < 0
+    || providerRetryJitterRatio > 1
+  ) {
+    throw new TypeError('providerRetryJitterRatio must be between zero and one');
+  }
+  if (typeof providerRetryRandom !== 'function') {
+    throw new TypeError('providerRetryRandom must be a function');
+  }
   if (!Number.isFinite(residentLeaseDurationMs) || residentLeaseDurationMs <= 0) {
     throw new TypeError('residentLeaseDurationMs must be a positive finite number');
   }
@@ -99,6 +204,39 @@ export function createExecutorService({
   }
   if (typeof cancelResidentHeartbeat !== 'function') {
     throw new TypeError('cancelResidentHeartbeat must be a function');
+  }
+  if (!Number.isFinite(turnLeaseRenewalIntervalMs) || turnLeaseRenewalIntervalMs <= 0) {
+    throw new TypeError('turnLeaseRenewalIntervalMs must be a positive finite number');
+  }
+  if (!Number.isFinite(leaseDurationMs) || leaseDurationMs <= 0) {
+    throw new TypeError('leaseDurationMs must be a positive finite number');
+  }
+  if (turnLeaseRenewalIntervalMs >= leaseDurationMs) {
+    throw new TypeError('turn lease renewal interval must be below the turn lease duration');
+  }
+  if (typeof scheduleTurnLeaseRenewal !== 'function') {
+    throw new TypeError('scheduleTurnLeaseRenewal must be a function');
+  }
+  if (typeof cancelTurnLeaseRenewal !== 'function') {
+    throw new TypeError('cancelTurnLeaseRenewal must be a function');
+  }
+  if (!Number.isFinite(nonterminalSweepIntervalMs) || nonterminalSweepIntervalMs <= 0) {
+    throw new TypeError('nonterminalSweepIntervalMs must be a positive finite number');
+  }
+  if (typeof scheduleNonterminalSweep !== 'function') {
+    throw new TypeError('scheduleNonterminalSweep must be a function');
+  }
+  if (typeof cancelNonterminalSweep !== 'function') {
+    throw new TypeError('cancelNonterminalSweep must be a function');
+  }
+  if (!Number.isFinite(permissionSweepIntervalMs) || permissionSweepIntervalMs <= 0) {
+    throw new TypeError('permissionSweepIntervalMs must be a positive finite number');
+  }
+  if (typeof schedulePermissionSweep !== 'function') {
+    throw new TypeError('schedulePermissionSweep must be a function');
+  }
+  if (typeof cancelPermissionSweep !== 'function') {
+    throw new TypeError('cancelPermissionSweep must be a function');
   }
   if (
     !Number.isFinite(workspaceLeaseDurationMs)
@@ -142,27 +280,32 @@ export function createExecutorService({
     workspaceLeaseDurationMs,
     interactionTimeoutMs,
   });
+  const permissionPolicy = createPermissionService({ database, now, generateId });
   let executors = [];
   let started = false;
   const activeRuns = new Map();
   const activeTurns = new Map();
-  const cancelledTurnIds = new Set();
   const closingPermissionTurnIds = new Set();
   const permissionControllers = new Map();
   const activeRunSettlements = new Set();
   const interactionDeliverySettlements = new Set();
-  const cancellationSettlements = new Map();
+  const replyMappingRecoverySettlements = new Set();
   const endedResidentFences = new Map();
   const pendingInteractionRecoveries = new Map();
   const pendingRecoveryIsolations = new Map();
   const orphanedWorkspaceRecoveryTurnIds = new Set();
   const recoveringOwnershipReleases = new Map();
+  const releasedRecoveringOwnershipTurnIds = new Set();
   const timedOutLeaseReleases = new Map();
-  const uncertainTurnIds = new Set();
+  const stopSettlements = new Map();
+  const steerSettlements = new Map();
   let lifecycle = 'open';
   let closePromise = null;
   let residentHeartbeat = null;
   let workspaceHeartbeat = null;
+  let turnLeaseRenewal = null;
+  let nonterminalSweep = null;
+  let permissionSweep = null;
   let residentHeartbeatFailure = null;
   let workspaceHeartbeatFailure = null;
   let workspaceRecoveryFlight = null;
@@ -170,6 +313,7 @@ export function createExecutorService({
   function persistenceFailure(cause) {
     const error = new Error(`Runtime persistence failed: ${cause.message}`, { cause });
     error.persistenceFailure = true;
+    if (typeof cause?.code === 'string') error.code = cause.code;
     return error;
   }
 
@@ -252,8 +396,57 @@ export function createExecutorService({
       throw new Error(`Executor service is ${lifecycle}; it cannot be started.`);
     }
     if (started) return snapshot();
+    permissionPolicy.expireDue();
+    if (permissionSweep === null) {
+      permissionSweep = schedulePermissionSweep(() => {
+        try {
+          permissionPolicy.expireDue();
+        } catch (error) {
+          onDeadlineError(error, Object.freeze({
+            kind: 'permission_expiry_sweep',
+            expires_at: now(),
+          }));
+        }
+      }, permissionSweepIntervalMs);
+      permissionSweep?.unref?.();
+    }
     store.reconcileExpiredResidents();
     adoptOrphanedWorkspaceRecoveries();
+    store.reconcileExpiredStartedInteractionHandoffs();
+    store.reconcileNonterminalTurns([], 'startup_reconciliation');
+    if (nonterminalSweep === null) {
+      nonterminalSweep = scheduleNonterminalSweep(() => {
+        try {
+          store.reconcileNonterminalTurns(
+            [...activeRuns.values()].map(({ turnContext }) => turnContext),
+            'sweep_reconciliation',
+          );
+          refresh();
+          reschedulePendingInteractionDeadlines();
+        } catch (error) {
+          onDeadlineError(error, Object.freeze({
+            kind: 'executor_nonterminal_reconciliation',
+            expires_at: now(),
+          }));
+        }
+      }, nonterminalSweepIntervalMs);
+      nonterminalSweep?.unref?.();
+    }
+    if (turnLeaseRenewal === null) {
+      turnLeaseRenewal = scheduleTurnLeaseRenewal(() => {
+        try {
+          store.renewOwnedTurnLeases(
+            [...activeRuns.values()].map(({ turnContext }) => turnContext),
+          );
+        } catch (error) {
+          onDeadlineError(error, Object.freeze({
+            kind: 'executor_turn_lease_renewal',
+            expires_at: now(),
+          }));
+        }
+      }, turnLeaseRenewalIntervalMs);
+      turnLeaseRenewal?.unref?.();
+    }
     if (residentHeartbeat === null) {
       residentHeartbeat = scheduleResidentHeartbeat(() => {
         try {
@@ -330,6 +523,13 @@ export function createExecutorService({
     };
   }
 
+  function committedControlStatus(activeRun) {
+    if (activeRun.steerCommitted) return 'interrupted';
+    if (activeRun.stopCommitted) return 'stopped';
+    if (activeRun.recoveryCommitted) return 'recovering';
+    return null;
+  }
+
   function cleanupActiveRun(activeRun) {
     const { turnContext } = activeRun;
     if (activeRuns.get(turnContext.turn_id) === activeRun) {
@@ -338,9 +538,6 @@ export function createExecutorService({
     if (activeTurns.get(turnContext.conversation_id) === turnContext) {
       activeTurns.delete(turnContext.conversation_id);
     }
-    cancelledTurnIds.delete(turnContext.turn_id);
-    uncertainTurnIds.delete(turnContext.turn_id);
-    cancellationSettlements.delete(turnContext.turn_id);
     const controllers = permissionControllers.get(turnContext.turn_id);
     if (!controllers || controllers.size === 0) {
       permissionControllers.delete(turnContext.turn_id);
@@ -349,7 +546,7 @@ export function createExecutorService({
     if (!activeRun.settled) {
       activeRun.settled = true;
       activeRunSettlements.delete(activeRun.settlement);
-      activeRun.resolveSettlement();
+      activeRun.resolveSettlement(activeRun.providerTerminalObserved);
     }
   }
 
@@ -366,8 +563,12 @@ export function createExecutorService({
   }
 
   function releaseRecoveringOwnership(turnContext) {
+    if (releasedRecoveringOwnershipTurnIds.has(turnContext.turn_id)) {
+      return { lease_released: true, already_released: true };
+    }
     recoveringOwnershipReleases.set(turnContext.turn_id, turnContext);
     const result = store.releaseRecoveringExecutorOwnership(turnContext);
+    releasedRecoveringOwnershipTurnIds.add(turnContext.turn_id);
     recoveringOwnershipReleases.delete(turnContext.turn_id);
     pendingRecoveryIsolations.delete(turnContext.turn_id);
     orphanedWorkspaceRecoveryTurnIds.delete(turnContext.turn_id);
@@ -399,11 +600,57 @@ export function createExecutorService({
     return false;
   }
 
-  async function awaitCancellationSettlement(turnId) {
-    const settlement = cancellationSettlements.get(turnId);
-    if (settlement) await settlement.promise;
+  async function recoverUnknownInteractionDelivery(
+    activeRun,
+    delivery,
+    cause,
+    providerError = null,
+  ) {
+    const recovery = {
+      activeRun,
+      delivery,
+      providerError,
+      deliveryUnknown: null,
+      isolationProven: false,
+      marked: false,
+    };
+    pendingInteractionRecoveries.set(delivery.request.turn_id, recovery);
+    try {
+      recovery.deliveryUnknown = persist(
+        () => store.markInteractionHandoffDeliveryUnknown(delivery, providerError),
+      );
+      recovery.marked = true;
+    } catch (markFailure) {
+      lifecycle = 'close_failed';
+      cause.markFailure = markFailure;
+    }
+    if (activeRun && !activeRun.durableSettled) {
+      try {
+        recovery.isolationProven = await isolateInteractionRecovery(activeRun);
+      } catch (isolationFailure) {
+        lifecycle = 'close_failed';
+        cause.isolationFailure = isolationFailure;
+      }
+    }
+    if (!recovery.isolationProven) lifecycle = 'close_failed';
+    if (recovery.marked && activeRun && !activeRun.durableSettled) {
+      activeRun.durableSettled = true;
+      refresh();
+      cleanupActiveRun(activeRun);
+    }
+    if (recovery.marked && recovery.isolationProven) {
+      try {
+        releaseRecoveringOwnership(activeRun.turnContext);
+      } catch (ownershipFailure) {
+        lifecycle = 'close_failed';
+        cause.ownershipFailure = ownershipFailure;
+      }
+      pendingInteractionRecoveries.delete(delivery.request.turn_id);
+    }
+    reschedulePendingInteractionDeadlines();
+    if (recovery.deliveryUnknown) cause.deliveryUnknown = recovery.deliveryUnknown;
+    return recovery;
   }
-
   function transitionToRecovery(
     activeRun,
     reasonCode = 'provider_execution_uncertain',
@@ -553,6 +800,13 @@ export function createExecutorService({
 
   async function handleRunFailure(activeRun, error) {
     const { turnContext } = activeRun;
+    const controlStatus = committedControlStatus(activeRun);
+    if (controlStatus !== null) {
+      activeRun.durableSettled = true;
+      cleanupActiveRun(activeRun);
+      refresh();
+      return resultFor(activeRun, controlStatus);
+    }
     if (activeRun.providerFailureOutcome?.status === 'recovering') {
       return retainRecoveringRun(activeRun);
     }
@@ -593,7 +847,6 @@ export function createExecutorService({
       cleanupActiveRun(activeRun);
       throw error;
     }
-    await awaitCancellationSettlement(turnContext.turn_id);
     closingPermissionTurnIds.add(turnContext.turn_id);
     for (const controller of permissionControllers.get(turnContext.turn_id) ?? []) {
       controller.abort();
@@ -601,24 +854,44 @@ export function createExecutorService({
     if (activeRun.backgroundUncertain) {
       return beginUnknownBackgroundRecovery(activeRun);
     }
-    if (uncertainTurnIds.has(turnContext.turn_id)) {
-      const isolationProven = cancellationSettlements.get(turnContext.turn_id)?.isolationProven;
-      const recovery = transitionToRecovery(activeRun);
-      if (isolationProven) {
-        try {
-          releaseRecoveringOwnership(turnContext);
-        } catch (ownershipFailure) {
-          residentHeartbeatFailure = ownershipFailure;
-        }
+    if (isExplicitProviderError(error)) {
+      const normalizedError = normalizeProviderError(error, now());
+      const attemptNo = turnContext.attempt.attempt_no;
+      if (isSafeProviderRetry(normalizedError) && attemptNo <= 3) {
+        const baseBackoff = providerRetryBaseDelayMs * (2 ** (attemptNo - 1));
+        const jitterFactor = 1 + ((providerRetryRandom() * 2) - 1) * providerRetryJitterRatio;
+        const backoffMs = Math.max(0, Math.round(baseBackoff * jitterFactor));
+        const retry = persist(
+          () => store.scheduleProviderRetry(turnContext, normalizedError, backoffMs),
+        );
+        activeRun.durableSettled = true;
+        refresh();
+        cleanupActiveRun(activeRun);
+        reschedulePendingInteractionDeadlines();
+        return resultFor(activeRun, 'retry_scheduled', { retry });
       }
-      return recovery;
-    }
-    const cancelled = cancelledTurnIds.has(turnContext.turn_id);
-    if (isExplicitProviderError(error) && !cancelled) {
+      if (isSafeProviderRetry(normalizedError) && attemptNo === 4) {
+        persist(() => store.exhaustProviderRetries(turnContext, normalizedError));
+        activeRun.durableSettled = true;
+        refresh();
+        cleanupActiveRun(activeRun);
+        releaseAbsentResident(turnContext);
+        reschedulePendingInteractionDeadlines();
+        return resultFor(activeRun, 'failed');
+      }
+      if (normalizedError.side_effect_status === 'unknown') {
+        const recovery = persist(() => store.markProviderFailure(turnContext, normalizedError));
+        activeRun.durableSettled = true;
+        refresh();
+        cleanupActiveRun(activeRun);
+        reschedulePendingInteractionDeadlines();
+        return resultFor(activeRun, recovery.status, { recovery });
+      }
       const { state } = store.assertCurrentFence(turnContext);
       persist(() => store.transitionTurn(turnContext, state, 'failed', {
-        error: normalizeProviderError(error, now()),
+        error: normalizedError,
         reasonCode: 'executor_failed',
+        providerEventObserved: true,
       }));
       activeRun.durableSettled = true;
       refresh();
@@ -627,44 +900,47 @@ export function createExecutorService({
       reschedulePendingInteractionDeadlines();
       return resultFor(activeRun, 'failed');
     }
-    const terminalState = cancelled ? 'stopped' : 'failed';
     const { state } = store.assertCurrentFence(turnContext);
-    store.transitionTurn(turnContext, state, terminalState, {
-      error: cancelled ? null : {
+    store.transitionTurn(turnContext, state, 'failed', {
+      error: {
         code: 'provider_stream_failed',
         category: 'provider',
         retryable: false,
         side_effect_status: 'unknown',
         user_message: 'The provider stream ended before the turn completed.',
       },
+      providerEventObserved: true,
     });
     activeRun.durableSettled = true;
     refresh();
     cleanupActiveRun(activeRun);
     releaseAbsentResident(turnContext);
     reschedulePendingInteractionDeadlines();
-    return resultFor(activeRun, terminalState);
+    return resultFor(activeRun, 'failed');
   }
 
   async function finishRun(activeRun) {
     if (activeRun.durableSettled && activeRun.forcedResult) {
       return activeRun.forcedResult;
     }
-    activeRun.ensureProviderStarted();
-    await awaitCancellationSettlement(activeRun.turnContext.turn_id);
-    if (uncertainTurnIds.has(activeRun.turnContext.turn_id)) {
-      const { turnContext } = activeRun;
-      const isolationProven = cancellationSettlements.get(turnContext.turn_id)?.isolationProven;
-      const recovery = transitionToRecovery(activeRun);
-      if (isolationProven) {
+    const controlStatus = committedControlStatus(activeRun);
+    if (controlStatus !== null) {
+      const recoveringIsolationProven = controlStatus === 'recovering'
+        && activeRun.providerTerminalObserved
+        && pendingRecoveryIsolations.has(activeRun.turnContext.turn_id);
+      activeRun.durableSettled = true;
+      cleanupActiveRun(activeRun);
+      if (recoveringIsolationProven) {
         try {
-          releaseRecoveringOwnership(turnContext);
-        } catch (ownershipFailure) {
-          residentHeartbeatFailure = ownershipFailure;
+          releaseRecoveringOwnership(activeRun.turnContext);
+        } catch {
+          if (lifecycle !== 'closed') lifecycle = 'close_failed';
         }
       }
-      return recovery;
+      refresh();
+      return resultFor(activeRun, controlStatus);
     }
+    activeRun.ensureProviderStarted();
     if (activeRun.backgroundUncertain) {
       return beginUnknownBackgroundRecovery(activeRun);
     }
@@ -688,6 +964,7 @@ export function createExecutorService({
           side_effect_status: 'unknown',
           user_message: 'The provider turn did not complete successfully.',
         } : null,
+        providerEventObserved: true,
       },
     ));
     activeRun.durableSettled = true;
@@ -702,6 +979,25 @@ export function createExecutorService({
     try {
       while (true) {
         const next = await activeRun.iterator.next();
+        if (committedControlStatus(activeRun) !== null) {
+          if (next.done) return await finishRun(activeRun);
+          persist(() => store.recordProviderEventDiagnostic(
+            activeRun.turnContext,
+            next.value,
+          ));
+          if (isProviderTerminalRecord(next.value)) {
+            activeRun.providerTerminalObserved = true;
+          }
+          if (
+            next.value?.type === 'provider_native_id'
+            && typeof next.value.acknowledge === 'function'
+          ) {
+            next.value.acknowledge(new Error(
+              'Provider identity arrived after the durable control fence.',
+            ));
+          }
+          continue;
+        }
         if (activeRun.providerFailureOutcome?.status === 'recovering') {
           return retainRecoveringRun(activeRun);
         }
@@ -709,7 +1005,6 @@ export function createExecutorService({
         const record = next.value;
         if (record?.type === 'interaction_persisted') {
           reschedulePendingInteractionDeadlines();
-          if (cancelledTurnIds.has(activeRun.turnContext.turn_id)) continue;
           activeRun.pauseKind = 'interaction';
           refresh();
           return resultFor(activeRun, 'waiting_user', { request: record.request });
@@ -740,7 +1035,6 @@ export function createExecutorService({
             record.payload,
           ));
           reschedulePendingInteractionDeadlines();
-          if (cancelledTurnIds.has(activeRun.turnContext.turn_id)) continue;
           activeRun.pauseKind = 'interaction';
           refresh();
           return resultFor(activeRun, 'waiting_user', { request });
@@ -771,6 +1065,7 @@ export function createExecutorService({
           activeRun.usesManagedRecords = true;
           activeRun.ensureProviderStarted();
           activeRun.outcome = record.outcome;
+          activeRun.providerTerminalObserved = isProviderTerminalRecord(record);
           continue;
         }
         activeRun.ensureProviderStarted();
@@ -793,6 +1088,19 @@ export function createExecutorService({
 
   function createPermissionControls(activeRun, adapterContext) {
     const { turnContext } = activeRun;
+    function authorizeProtectedAction(request) {
+      const actionRef = typeof request?.action_ref === 'string'
+        ? request.action_ref
+        : generateId('protected-action');
+      const actionKind = typeof request?.action_kind === 'string'
+        ? request.action_kind
+        : (typeof request?.tool_name === 'string' ? request.tool_name : 'provider_action');
+      return persist(() => permissionPolicy.authorizeProtectedAction({
+        turn_id: turnContext.turn_id,
+        action_ref: actionRef,
+        action_kind: actionKind,
+      }));
+    }
     return Object.freeze({
       interactionPolicy: Object.freeze({
         allowed_sources: Object.freeze(['main_card_reply', 'card_action']),
@@ -817,7 +1125,17 @@ export function createExecutorService({
       assertWorkspaceWrite() {
         return persist(() => store.assertWorkspaceWritable(turnContext));
       },
+      authorizeProtectedAction(request) {
+        return authorizeProtectedAction(request);
+      },
       async requestPermission(request, { signal } = {}) {
+        const policyDecision = authorizeProtectedAction(request);
+        if (policyDecision.trusted) {
+          return Object.freeze({
+            behavior: 'allow',
+            permission_basis: policyDecision.basis_kind,
+          });
+        }
         if (permissionHandler === null) {
           return Object.freeze({
             behavior: 'deny',
@@ -857,10 +1175,7 @@ export function createExecutorService({
           controllers.delete(controller);
           if (controllers.size === 0) {
             permissionControllers.delete(turnContext.turn_id);
-            if (
-              !cancelledTurnIds.has(turnContext.turn_id)
-              && !closingPermissionTurnIds.has(turnContext.turn_id)
-            ) {
+            if (!closingPermissionTurnIds.has(turnContext.turn_id)) {
               const resumed = persist(() => store.resumeTurnAfterPermission(turnContext));
               if (resumed.resumed && activeRun.pauseKind === 'interaction') {
                 activeRun.pauseKind = null;
@@ -906,6 +1221,85 @@ export function createExecutorService({
     if (!started) start();
     if (residentHeartbeatFailure) throw persistenceFailure(residentHeartbeatFailure);
     if (workspaceHeartbeatFailure) throw persistenceFailure(workspaceHeartbeatFailure);
+    const replyMappingRecovery = store.claimNextReplyMappingRecoveryNotice();
+    if (replyMappingRecovery !== null) {
+      if (!replyMappingRecovery.notice_delivered) {
+        refresh();
+        return replyMappingRecovery;
+      }
+      const recoveryClaim = persist(() => store.beginReplyMappingRecovery(
+        replyMappingRecovery.turn_id,
+        { allowNativeRecovery: typeof adapter.recoverLineage === 'function' },
+      ));
+      if (recoveryClaim.status === 'waiting_decision') {
+        refresh();
+        return recoveryClaim;
+      }
+      if (recoveryClaim.status === 'native_recovery_in_flight') {
+        refresh();
+        return replyMappingRecovery;
+      }
+      let nativeResult = {
+        status: 'not_applicable',
+        recovery_id: recoveryClaim.recovery_id,
+        side_effect_status: 'none',
+      };
+      let finishRecoverySettlement = null;
+      if (recoveryClaim.status === 'native_recovery_claimed') {
+        const recoverySettlement = new Promise((resolve) => {
+          finishRecoverySettlement = resolve;
+        });
+        replyMappingRecoverySettlements.add(recoverySettlement);
+        recoverySettlement.finally(() => {
+          replyMappingRecoverySettlements.delete(recoverySettlement);
+        }).catch(() => {});
+      }
+      let recoveryCompletion;
+      try {
+        if (recoveryClaim.status === 'native_recovery_claimed') {
+          try {
+            nativeResult = await adapter.recoverLineage(deepFreeze({
+              recovery_id: recoveryClaim.recovery_id,
+              turn_id: recoveryClaim.turn_id,
+              reason: recoveryClaim.reason,
+              candidate: Object.freeze({ ...recoveryClaim.candidate }),
+              native_recovery_attempt_id: recoveryClaim.native_recovery_attempt_id,
+              native_recovery_attempt_no: recoveryClaim.native_recovery_attempt_no,
+            }));
+          } catch (error) {
+            nativeResult = {
+              status: 'failed',
+              recovery_id: recoveryClaim.recovery_id,
+              native_recovery_attempt_id: recoveryClaim.native_recovery_attempt_id,
+              native_recovery_attempt_no: recoveryClaim.native_recovery_attempt_no,
+              side_effect_status: error?.providerError?.side_effect_status ?? 'unknown',
+            };
+          }
+        } else if (recoveryClaim.status === 'native_recovery_lost') {
+          nativeResult = {
+            status: 'lost',
+            recovery_id: recoveryClaim.recovery_id,
+            native_recovery_attempt_id: recoveryClaim.native_recovery_attempt_id,
+            native_recovery_attempt_no: recoveryClaim.native_recovery_attempt_no,
+            side_effect_status: 'unknown',
+          };
+        }
+        recoveryCompletion = persist(
+          () => store.completeReplyMappingRecovery(recoveryClaim, nativeResult),
+        );
+        refresh();
+      } finally {
+        finishRecoverySettlement?.();
+      }
+      if (recoveryCompletion.status === 'stopped') return recoveryCompletion;
+      if (lifecycle !== 'open') {
+        return {
+          status: 'service_closing',
+          turn_id: recoveryCompletion.turn_id,
+          recovery_status: recoveryCompletion.status,
+        };
+      }
+    }
     let reserved = reserveWithWorkspace({ markCapacityWait: false });
     let { reservation } = reserved;
     if (reservation.status === 'idle') return reservation;
@@ -980,12 +1374,16 @@ export function createExecutorService({
       providerFailureOutcome: null,
       providerFailurePersistenceError: null,
       providerStarted: false,
+      providerTerminalObserved: false,
       resolveSettlement,
       settled: false,
       settlement,
       timedOutExpiration: null,
       turnContext,
       usesManagedRecords: false,
+      stopCommitted: false,
+      steerCommitted: false,
+      recoveryCommitted: false,
     };
     activeRunSettlements.add(settlement);
     activeRuns.set(turnContext.turn_id, activeRun);
@@ -994,6 +1392,7 @@ export function createExecutorService({
       if (activeRun.providerStarted) return { status: 'already_started' };
       persist(() => store.transitionTurn(turnContext, 'starting', 'running', {
         reasonCode: 'provider_started',
+        providerEventObserved: true,
       }));
       activeRun.providerStarted = true;
       refresh();
@@ -1007,6 +1406,7 @@ export function createExecutorService({
         lineage_id: turnContext.lineage_id,
         provider_native_id: turnContext.provider_native_id,
         trace_id: turnContext.trace_id,
+        executor_instance_id: turnContext.executor_instance_id,
         input: turnContext.input,
         interaction: Object.freeze({
           authorized_subjects: Object.freeze(
@@ -1018,6 +1418,20 @@ export function createExecutorService({
         }),
         lineage: Object.freeze({ ...turnContext.lineage }),
         bindProviderNativeId(providerNativeId) {
+          if (
+            committedControlStatus(activeRun) !== null
+            || activeRun.durableSettled
+            || activeRuns.get(turnContext.turn_id) !== activeRun
+          ) {
+            persist(() => store.recordProviderEventDiagnostic(
+              turnContext,
+              {
+                kind: 'provider_native_id',
+                payload: { provider_native_id: providerNativeId },
+              },
+            ));
+            return { status: 'stale_attempt' };
+          }
           const binding = persist(() => store.bindProviderNativeId(
             turnContext,
             providerNativeId,
@@ -1027,6 +1441,20 @@ export function createExecutorService({
         },
         reportProviderState(providerState) {
           if (
+            committedControlStatus(activeRun) !== null
+            || activeRun.durableSettled
+            || activeRuns.get(turnContext.turn_id) !== activeRun
+          ) {
+            persist(() => store.recordProviderEventDiagnostic(
+              turnContext,
+              {
+                kind: 'provider_state',
+                payload: { state: providerState?.state ?? 'unknown' },
+              },
+            ));
+            return { status: 'stale_attempt' };
+          }
+          if (
             !providerState
             || providerState.state !== 'started'
             || !Object.hasOwn(providerState, 'provider_native_id')
@@ -1034,11 +1462,46 @@ export function createExecutorService({
           ) {
             throw new TypeError('provider state must match the current started lineage');
           }
+          if (activeRun.providerStarted) {
+            persist(() => store.recordProviderEventActivity(turnContext));
+            return { status: 'already_started' };
+          }
           return activeRun.ensureProviderStarted();
         },
+        reportRuntimeEvidence(runtimeEvidence) {
+          if (
+            committedControlStatus(activeRun) !== null
+            || activeRun.durableSettled
+            || activeRuns.get(turnContext.turn_id) !== activeRun
+          ) {
+            persist(() => store.recordProviderEventDiagnostic(
+              turnContext,
+              {
+                kind: 'runtime_evidence',
+                payload: { status: 'arrived_after_control' },
+              },
+            ));
+            return { status: 'stale_attempt' };
+          }
+          return persist(() => store.recordProviderRuntimeEvidence(
+            turnContext,
+            runtimeEvidence,
+          ));
+        },
         reportProviderFailure(providerFailure) {
-          if (activeRun.durableSettled) {
-            throw new Error('Provider failure arrived after the executor run settled.');
+          if (
+            committedControlStatus(activeRun) !== null
+            || activeRun.durableSettled
+            || activeRuns.get(turnContext.turn_id) !== activeRun
+          ) {
+            persist(() => store.recordProviderEventDiagnostic(
+              turnContext,
+              {
+                kind: 'provider_failure',
+                payload: { status: 'arrived_after_control' },
+              },
+            ));
+            return { status: 'stale_attempt' };
           }
           const normalizedFailure = normalizeProviderError(providerFailure, now());
           let outcome;
@@ -1078,68 +1541,353 @@ export function createExecutorService({
     return advanceRun(activeRun);
   }
 
-  async function cancel(conversationId) {
-    if (typeof conversationId !== 'string' || conversationId.length === 0) {
-      throw new TypeError('conversationId must be a non-empty string');
+  async function performStop(request) {
+    // Commit the provider-neutral terminal winner before asking an adapter to
+    // terminate private provider work; subsequent provider output is fenced.
+    const result = persist(() => store.stopConversation(request));
+    const activeRun = result.active_turn
+      ? activeRuns.get(result.active_turn.turn_id)
+      : null;
+    const turnContext = result.active_turn ? (activeRun?.turnContext ?? {
+      conversation_id: result.conversation_id,
+      turn_id: result.active_turn.turn_id,
+      attempt: result.active_turn.attempt,
+    }) : null;
+    if (activeRun) {
+      activeRun.stopCommitted = true;
+      if (activeRun.recoveryCommitted) {
+        pendingRecoveryIsolations.delete(activeRun.turnContext.turn_id);
+        recoveringOwnershipReleases.delete(activeRun.turnContext.turn_id);
+      }
     }
-    const turnContext = activeTurns.get(conversationId);
-    if (!turnContext) return { status: 'idle', conversation_id: conversationId };
-    store.assertCurrentFence(turnContext);
-    if (typeof adapter.cancel !== 'function') {
-      throw new TypeError('adapter.cancel must be a function to cancel an active turn');
+    if (turnContext) {
+      closingPermissionTurnIds.add(turnContext.turn_id);
+      for (const controller of permissionControllers.get(turnContext.turn_id) ?? []) {
+        controller.abort();
+      }
     }
-    if (cancellationSettlements.has(turnContext.turn_id)) {
-      throw new Error('Cancellation is already pending for the active turn.');
+    // These are rebuildable local projections. A failure must not reopen the
+    // durable stop fence or prevent provider isolation.
+    try { refresh(); } catch {}
+    try { reschedulePendingInteractionDeadlines(); } catch {}
+    const durableProviderStopStatus = result.provider_stop_status
+      ?? (result.active_turn ? 'pending' : 'not_applicable');
+    if (result.active_turn === null || durableProviderStopStatus !== 'pending') {
+      if (activeRun?.recoveryCommitted && result.lease_released === true) {
+        releasedRecoveringOwnershipTurnIds.add(activeRun.turnContext.turn_id);
+      }
+      return result;
     }
-    let resolveCancellation;
-    const cancellation = {
-      isolationProven: false,
-      promise: new Promise((resolve) => { resolveCancellation = resolve; }),
-      resolve: () => resolveCancellation(),
-      status: 'pending',
+
+    async function requestProviderIsolation() {
+      if (typeof adapter.abort !== 'function') return false;
+      let isolationTimeoutHandle;
+      const isolation = Promise.resolve()
+        .then(() => adapter.abort(turnContext))
+        .then(() => true, () => false);
+      const isolated = await Promise.race([
+        isolation,
+        new Promise((resolve) => {
+          isolationTimeoutHandle = setTimeoutFn(
+            () => resolve(false),
+            providerStopTimeoutMs,
+          );
+        }),
+      ]);
+      clearProviderStopTimeout(isolationTimeoutHandle);
+      return isolated;
+    }
+    function clearProviderStopTimeout(timeoutHandle) {
+      if (timeoutHandle === undefined) return;
+      try { clearTimeoutFn(timeoutHandle); } catch {}
+    }
+    let providerStopStatus;
+    let isolationProven = false;
+    let cancellationTimeoutHandle;
+    const cancellation = Promise.resolve().then(async () => {
+      if (typeof adapter.cancel !== 'function') {
+        throw new TypeError('adapter.cancel must be a function to stop an active turn');
+      }
+      await adapter.cancel(turnContext);
+      return 'confirmed';
+    }).catch(() => 'uncertain');
+    providerStopStatus = await Promise.race([
+      cancellation,
+      new Promise((resolve) => {
+        cancellationTimeoutHandle = setTimeoutFn(
+          () => resolve('terminal_unconfirmed'),
+          providerStopTimeoutMs,
+        );
+      }),
+    ]);
+    if (providerStopStatus !== 'terminal_unconfirmed') {
+      clearProviderStopTimeout(cancellationTimeoutHandle);
+    }
+    if (providerStopStatus !== 'confirmed') {
+      isolationProven = await requestProviderIsolation();
+      if (isolationProven) {
+        providerStopStatus = 'isolated';
+      }
+    }
+    if (!isolationProven && providerStopStatus === 'confirmed') {
+      if (activeRun?.pauseKind === 'interaction') {
+        activeRun.pauseKind = null;
+        advanceRun(activeRun).catch(() => {});
+      }
+      if (!activeRun) {
+        providerStopStatus = 'terminal_unconfirmed';
+        isolationProven = await requestProviderIsolation();
+        if (isolationProven) providerStopStatus = 'isolated';
+      } else {
+        let timeoutHandle;
+        const settled = await Promise.race([
+          activeRun.settlement.then((terminalObserved) => terminalObserved === true),
+          new Promise((resolve) => {
+            timeoutHandle = setTimeoutFn(() => resolve(false), providerStopTimeoutMs);
+          }),
+        ]);
+        clearProviderStopTimeout(timeoutHandle);
+        isolationProven = settled;
+        if (!settled) {
+          providerStopStatus = 'terminal_unconfirmed';
+          isolationProven = await requestProviderIsolation();
+          if (isolationProven) {
+            activeRun.durableSettled = true;
+            cleanupActiveRun(activeRun);
+            providerStopStatus = 'isolated';
+          }
+        }
+      }
+    }
+    if (isolationProven && providerStopStatus === 'isolated' && activeRun && !activeRun.settled) {
+      activeRun.durableSettled = true;
+      cleanupActiveRun(activeRun);
+    }
+    if (!isolationProven) {
+      const persistedIncident = persist(() => store.markProviderStopUnknown(
+        {
+          turn_id: result.active_turn.turn_id,
+          attempt: result.active_turn.attempt,
+        },
+        providerStopStatus,
+        result,
+      ));
+      const { stop_result: stoppedResult, ...incident } = persistedIncident;
+      if (activeRun?.recoveryCommitted && stoppedResult.lease_released === true) {
+        releasedRecoveringOwnershipTurnIds.add(activeRun.turnContext.turn_id);
+      }
+      try { refresh(); } catch {}
+      return {
+        ...stoppedResult,
+        incident,
+      };
+    }
+    const stoppedResult = persist(() => store.recordStopProviderOutcome(
+      result,
+      providerStopStatus,
+    ));
+    if (activeRun?.recoveryCommitted && stoppedResult.lease_released === true) {
+      releasedRecoveringOwnershipTurnIds.add(activeRun.turnContext.turn_id);
+    }
+    if (activeRun) releaseAbsentResident(activeRun.turnContext);
+    try { refresh(); } catch {}
+    return stoppedResult;
+  }
+
+  function stop(request) {
+    const conversationId = request?.conversation_id;
+    const stopId = request?.stop_id;
+    if (
+      typeof conversationId !== 'string'
+      || conversationId.length === 0
+      || typeof stopId !== 'string'
+      || stopId.length === 0
+    ) {
+      return performStop(request);
+    }
+    const settlementKey = `${stopId}\u0000${conversationId}`;
+    const existing = stopSettlements.get(settlementKey);
+    if (existing) {
+      return existing.then((settledResult) => ({
+        ...settledResult,
+        deduplicated: true,
+      }));
+    }
+    const settlement = performStop(request);
+    stopSettlements.set(settlementKey, settlement);
+    settlement.finally(() => {
+      if (stopSettlements.get(settlementKey) === settlement) {
+        stopSettlements.delete(settlementKey);
+      }
+    }).catch(() => {});
+    return settlement;
+  }
+
+  async function performSteer(request) {
+    // The durable running -> redirecting CAS selects the steer winner before
+    // any provider-private cancellation is requested.
+    const result = persist(() => store.beginSteer(request));
+    if (result.reconciliation_required === true) {
+      if (result.reconciliation) return result;
+      const activeRun = activeRuns.get(result.old_turn?.turn_id);
+      let providerIsolated = false;
+      if (activeRun && !activeRun.durableSettled) {
+        activeRun.recoveryCommitted = true;
+        pendingRecoveryIsolations.set(
+          activeRun.turnContext.turn_id,
+          activeRun.turnContext,
+        );
+        try {
+          providerIsolated = await isolateInteractionRecovery(activeRun);
+        } catch {
+          providerIsolated = false;
+        }
+        if (activeRun.stopCommitted) {
+          try { refresh(); } catch {}
+          return persist(() => store.recordSteerReconciliationOutcome(
+            result,
+            providerIsolated,
+          ));
+        }
+        if (
+          activeRun.providerTerminalObserved
+          || releasedRecoveringOwnershipTurnIds.has(activeRun.turnContext.turn_id)
+        ) {
+          providerIsolated = true;
+        }
+        if (providerIsolated) {
+          activeRun.durableSettled = true;
+          cleanupActiveRun(activeRun);
+          if (!releasedRecoveringOwnershipTurnIds.has(activeRun.turnContext.turn_id)) {
+            try {
+              releaseRecoveringOwnership(activeRun.turnContext);
+            } catch {
+              if (lifecycle !== 'closed') lifecycle = 'close_failed';
+            }
+          }
+        } else {
+          lifecycle = 'close_failed';
+        }
+      }
+      try { refresh(); } catch {}
+      return persist(() => store.recordSteerReconciliationOutcome(
+        result,
+        providerIsolated,
+      ));
+    }
+    if (result.status !== 'redirecting') return result;
+    const activeRun = activeRuns.get(result.old_turn.turn_id);
+    const turnContext = activeRun?.turnContext ?? {
+      conversation_id: result.conversation_id,
+      turn_id: result.old_turn.turn_id,
+      attempt: result.old_turn.attempt,
     };
-    cancellationSettlements.set(turnContext.turn_id, cancellation);
-    cancelledTurnIds.add(turnContext.turn_id);
+    if (activeRun) activeRun.steerCommitted = true;
+    closingPermissionTurnIds.add(turnContext.turn_id);
     for (const controller of permissionControllers.get(turnContext.turn_id) ?? []) {
       controller.abort();
     }
-    try {
-      await adapter.cancel(turnContext);
-    } catch (error) {
-      cancelledTurnIds.delete(turnContext.turn_id);
-      if (error.cancellationUncertain) {
-        uncertainTurnIds.add(turnContext.turn_id);
-        cancellation.status = 'uncertain';
-        if (typeof adapter.abort === 'function') {
-          try {
-            await adapter.abort(turnContext);
-            cancellation.isolationProven = true;
-          } catch (abortFailure) {
-            error.abortFailure = abortFailure;
-          }
+    try { refresh(); } catch {}
+    try { reschedulePendingInteractionDeadlines(); } catch {}
+
+    function clearProviderStopTimeout(timeoutHandle) {
+      if (timeoutHandle === undefined) return;
+      try { clearTimeoutFn(timeoutHandle); } catch {}
+    }
+    async function requestProviderIsolation() {
+      if (typeof adapter.abort !== 'function') return false;
+      let timeoutHandle;
+      const isolated = await Promise.race([
+        Promise.resolve().then(() => adapter.abort(turnContext)).then(() => true, () => false),
+        new Promise((resolve) => {
+          timeoutHandle = setTimeoutFn(() => resolve(false), providerStopTimeoutMs);
+        }),
+      ]);
+      clearProviderStopTimeout(timeoutHandle);
+      return isolated;
+    }
+
+    let cancellationTimeoutHandle;
+    let providerStopStatus = await Promise.race([
+      Promise.resolve().then(async () => {
+        if (typeof adapter.cancel !== 'function') {
+          throw new TypeError('adapter.cancel must be a function to steer an active turn');
         }
-        cancellation.resolve();
-      } else {
-        cancellation.status = 'failed';
-        cancellation.resolve();
+        await adapter.cancel(turnContext, { reason: 'steer' });
+        return 'confirmed';
+      }).catch(() => 'uncertain'),
+      new Promise((resolve) => {
+        cancellationTimeoutHandle = setTimeoutFn(
+          () => resolve('terminal_unconfirmed'),
+          providerStopTimeoutMs,
+        );
+      }),
+    ]);
+    if (providerStopStatus !== 'terminal_unconfirmed') {
+      clearProviderStopTimeout(cancellationTimeoutHandle);
+    }
+
+    let isolationProven = false;
+    if (providerStopStatus === 'confirmed' && activeRun) {
+      let settlementTimeoutHandle;
+      isolationProven = await Promise.race([
+        activeRun.settlement.then((terminalObserved) => terminalObserved === true),
+        new Promise((resolve) => {
+          settlementTimeoutHandle = setTimeoutFn(() => resolve(false), providerStopTimeoutMs);
+        }),
+      ]);
+      clearProviderStopTimeout(settlementTimeoutHandle);
+      if (!isolationProven) providerStopStatus = 'terminal_unconfirmed';
+    }
+    if (!isolationProven) {
+      isolationProven = await requestProviderIsolation();
+      if (isolationProven) providerStopStatus = 'isolated';
+    }
+    if (isolationProven && activeRun && !activeRun.settled) {
+      activeRun.durableSettled = true;
+      cleanupActiveRun(activeRun);
+    }
+    if (!isolationProven) {
+      const failed = persist(() => store.failSteer(result, providerStopStatus));
+      try { refresh(); } catch {}
+      return failed;
+    }
+
+    const completed = persist(() => store.completeSteer(result, providerStopStatus));
+    try { refresh(); } catch {}
+    return completed;
+  }
+
+  function steer(request) {
+    const conversationId = request?.conversation_id;
+    const steerId = request?.steer_id;
+    if (
+      typeof conversationId !== 'string'
+      || conversationId.length === 0
+      || typeof steerId !== 'string'
+      || steerId.length === 0
+    ) {
+      return performSteer(request);
+    }
+    const settlementKey = `${steerId}\u0000${conversationId}`;
+    const requestIdentity = canonicalizeJson(request);
+    const existing = steerSettlements.get(settlementKey);
+    if (existing && existing.requestIdentity === requestIdentity) {
+      return existing.settlement.then((settledResult) => ({
+        ...settledResult,
+        deduplicated: true,
+      }));
+    }
+    const settlement = performSteer(request);
+    if (existing) return settlement;
+    const entry = { requestIdentity, settlement };
+    steerSettlements.set(settlementKey, entry);
+    settlement.finally(() => {
+      if (steerSettlements.get(settlementKey) === entry) {
+        steerSettlements.delete(settlementKey);
       }
-      throw error;
-    }
-    cancellation.status = 'confirmed';
-    cancellation.resolve();
-    const activeRun = activeRuns.get(turnContext.turn_id);
-    let execution = null;
-    if (activeRun?.pauseKind === 'interaction') {
-      activeRun.pauseKind = null;
-      execution = await advanceRun(activeRun);
-    }
-    return {
-      status: 'cancellation_requested',
-      conversation_id: turnContext.conversation_id,
-      turn_id: turnContext.turn_id,
-      ...turnContext.attempt,
-      ...(execution ? { execution } : {}),
-    };
+    }).catch(() => {});
+    return settlement;
   }
 
   async function evictIdleExecutors() {
@@ -1156,6 +1904,17 @@ export function createExecutorService({
   }
 
   function submitInteractionAnswer(answer, sourceEvidence) {
+    if (permissionPolicy.handlesInteraction(answer?.interaction_id)) {
+      const result = permissionPolicy.submitConfirmation(answer);
+      if (
+        ['accepted', 'duplicate'].includes(result.status)
+        || (result.interaction_state !== null && result.interaction_state !== 'pending')
+      ) {
+        clearInteractionDeadline(result.interaction_id);
+      }
+      reschedulePendingInteractionDeadlines();
+      return result;
+    }
     const result = store.commitInteractionAnswer(answer, sourceEvidence);
     if (
       ['accepted', 'duplicate'].includes(result.status)
@@ -1168,6 +1927,15 @@ export function createExecutorService({
   }
 
   async function expireInteraction(expiration) {
+    if (permissionPolicy.handlesInteraction(expiration?.interaction_id)) {
+      const result = permissionPolicy.expireDue();
+      clearInteractionDeadline(expiration.interaction_id);
+      reschedulePendingInteractionDeadlines();
+      return {
+        status: result.confirmations_expired > 0 ? 'expired' : 'not_pending',
+        interaction_id: expiration.interaction_id,
+      };
+    }
     const result = store.expireInteraction(expiration);
     if (result.status !== 'expired' || result.turn_state !== 'timed_out') {
       if (result.status === 'not_pending') clearInteractionDeadline(result.interaction_id);
@@ -1179,7 +1947,10 @@ export function createExecutorService({
     const timedOutRun = activeRuns.get(result.turn_id);
     if (timedOutRun) timedOutRun.timedOutExpiration = result;
     if (!timedOutRun || typeof timedOutRun.iterator.return !== 'function') {
-      store.markTimedOutProviderStopUnknown(result, 'not_current');
+      store.markProviderStopUnknown({
+        turn_id: result.turn_id,
+        attempt: result.attempt,
+      }, 'not_current');
       reschedulePendingInteractionDeadlines();
       return {
         ...result,
@@ -1196,12 +1967,18 @@ export function createExecutorService({
           reason: 'timeout',
         });
       } catch {
-        store.markTimedOutProviderStopUnknown(result, 'uncertain');
+        store.markProviderStopUnknown({
+          turn_id: result.turn_id,
+          attempt: result.attempt,
+        }, 'uncertain');
         reschedulePendingInteractionDeadlines();
         return { ...result, lease_released: false, provider_stop_status: 'uncertain' };
       }
       if (interruption?.status !== 'provider_stopped') {
-        store.markTimedOutProviderStopUnknown(result, interruption?.status ?? 'uncertain');
+        store.markProviderStopUnknown({
+          turn_id: result.turn_id,
+          attempt: result.attempt,
+        }, interruption?.status ?? 'uncertain');
         reschedulePendingInteractionDeadlines();
         return {
           ...result,
@@ -1250,76 +2027,102 @@ export function createExecutorService({
     return { ...result, lease_released: leaseReleased };
   }
 
+  function recordLateInteractionAcknowledgement(activeRun, delivery, status) {
+    persist(() => store.recordProviderEventDiagnostic(
+      activeRun.turnContext,
+      {
+        kind: 'interaction_handoff_acknowledgement',
+        payload: {
+          handoff_id: delivery.handoff.handoff_id,
+          status,
+        },
+      },
+    ));
+    return {
+      status: 'stale_acknowledgement',
+      turn_id: delivery.request.turn_id,
+      turn_state: 'stopped',
+    };
+  }
+
   async function executeInteractionDelivery(handoffId) {
-    if (typeof adapter.handleInteractionAnswer !== 'function') {
-      throw new TypeError('adapter.handleInteractionAnswer must be a function');
+    const beginning = persist(() => store.beginInteractionHandoff(handoffId));
+    if (beginning.acknowledgement !== null) {
+      reschedulePendingInteractionDeadlines();
+      refresh();
+      return {
+        acknowledgement: beginning.acknowledgement,
+        execution: null,
+        recovery_resolution: beginning.recovery_resolution ?? null,
+      };
     }
-    const delivery = store.claimInteractionHandoff(handoffId);
+    if (typeof adapter.prepareInteractionAnswer !== 'function') {
+      throw new TypeError('adapter.prepareInteractionAnswer must be a function');
+    }
+    const { delivery } = beginning;
     const activeRun = activeRuns.get(delivery.request.turn_id);
+    let prepared;
+    try {
+      prepared = await adapter.prepareInteractionAnswer(deepFreeze(delivery));
+      if (!prepared || typeof prepared.send !== 'function') {
+        throw new TypeError('adapter.prepareInteractionAnswer must return a send function');
+      }
+    } catch (error) {
+      const providerError = normalizePreSendProviderError(error, now());
+      const resolution = persist(
+        () => store.markInteractionHandoffPreSendFailure(delivery, providerError),
+      );
+      if (resolution.status === 'recovering' && activeRun && !activeRun.durableSettled) {
+        const isolationProven = await isolateInteractionRecovery(activeRun);
+        if (!isolationProven) {
+          lifecycle = 'close_failed';
+          throw new Error('The non-retryable pre-send failure could not isolate its provider run.');
+        }
+        activeRun.durableSettled = true;
+        cleanupActiveRun(activeRun);
+        releaseRecoveringOwnership(activeRun.turnContext);
+      }
+      reschedulePendingInteractionDeadlines();
+      refresh();
+      return resolution;
+    }
+    const sendingDelivery = persist(
+      () => store.markInteractionHandoffSendStarted(delivery),
+    );
     let handlerAcknowledgement;
     try {
-      handlerAcknowledgement = await adapter.handleInteractionAnswer(
-        Object.freeze(delivery),
+      handlerAcknowledgement = await prepared.send(
+        deepFreeze(sendingDelivery),
       );
     } catch (error) {
+      if (activeRun && committedControlStatus(activeRun) !== null) {
+        return recordLateInteractionAcknowledgement(
+          activeRun,
+          delivery,
+          'handler_failed_after_stop',
+        );
+      }
       if (provider === 'codex' && isExplicitProviderError(error)) {
         const providerError = normalizeProviderError(error, now());
         if (providerError.side_effect_status === 'unknown') {
-          const deliveryUnknown = persist(
-            () => store.markInteractionHandoffDeliveryUnknown(delivery, providerError),
+          const recovery = await recoverUnknownInteractionDelivery(
+            activeRun,
+            sendingDelivery,
+            error,
+            providerError,
           );
-          if (activeRun && !activeRun.durableSettled) {
-            activeRun.durableSettled = true;
-            cleanupActiveRun(activeRun);
-          }
-          reschedulePendingInteractionDeadlines();
-          refresh();
-          return deliveryUnknown;
+          if (recovery.deliveryUnknown) return recovery.deliveryUnknown;
         }
       }
-      const recovery = {
+      await recoverUnknownInteractionDelivery(activeRun, sendingDelivery, error);
+      throw error;
+    }
+    if (activeRun && committedControlStatus(activeRun) !== null) {
+      return recordLateInteractionAcknowledgement(
         activeRun,
         delivery,
-        deliveryUnknown: null,
-        isolationProven: false,
-        marked: false,
-      };
-      pendingInteractionRecoveries.set(delivery.request.turn_id, recovery);
-      try {
-        recovery.deliveryUnknown = persist(
-          () => store.markInteractionHandoffDeliveryUnknown(delivery),
-        );
-        recovery.marked = true;
-      } catch (markFailure) {
-        lifecycle = 'close_failed';
-        error.markFailure = markFailure;
-      }
-      if (activeRun && !activeRun.durableSettled) {
-        try {
-          recovery.isolationProven = await isolateInteractionRecovery(activeRun);
-        } catch (isolationFailure) {
-          lifecycle = 'close_failed';
-          error.isolationFailure = isolationFailure;
-        }
-      }
-      if (!recovery.isolationProven) lifecycle = 'close_failed';
-      if (recovery.marked && activeRun && !activeRun.durableSettled) {
-        activeRun.durableSettled = true;
-        refresh();
-        cleanupActiveRun(activeRun);
-      }
-      if (recovery.marked && recovery.isolationProven) {
-        try {
-          releaseRecoveringOwnership(activeRun.turnContext);
-        } catch (ownershipFailure) {
-          lifecycle = 'close_failed';
-          error.ownershipFailure = ownershipFailure;
-        }
-        pendingInteractionRecoveries.delete(delivery.request.turn_id);
-      }
-      reschedulePendingInteractionDeadlines();
-      if (recovery.deliveryUnknown) error.deliveryUnknown = recovery.deliveryUnknown;
-      throw error;
+        handlerAcknowledgement?.status ?? 'unknown',
+      );
     }
     const managedPermissions = permissionControllers.get(delivery.request.turn_id)?.size ?? 0;
     let acknowledgement;
@@ -1329,26 +2132,7 @@ export function createExecutorService({
           || handlerAcknowledgement.blocking_interactions_remaining === true,
       });
     } catch (error) {
-      if (activeRun && !activeRun.durableSettled) {
-        let recoveryPersisted = false;
-        try {
-          transitionToRecovery(activeRun, 'interaction_ack_persistence_failed');
-          recoveryPersisted = true;
-        } catch (recoveryFailure) {
-          lifecycle = 'close_failed';
-          error.recoveryFailure = recoveryFailure;
-        }
-        try {
-          const isolationProven = await isolateInteractionRecovery(activeRun);
-          if (recoveryPersisted && isolationProven) {
-            releaseRecoveringOwnership(activeRun.turnContext);
-          }
-          if (!isolationProven) lifecycle = 'close_failed';
-        } catch (isolationFailure) {
-          lifecycle = 'close_failed';
-          error.isolationFailure = isolationFailure;
-        }
-      }
+      await recoverUnknownInteractionDelivery(activeRun, sendingDelivery, error);
       throw error;
     }
     reschedulePendingInteractionDeadlines();
@@ -1371,6 +2155,63 @@ export function createExecutorService({
       interactionDeliverySettlements.delete(delivery);
     }).catch(() => {});
     return delivery;
+  }
+
+  async function reconcileInteractionHandoff(handoffId) {
+    if (lifecycle !== 'open') {
+      throw new Error(
+        `Executor service is ${lifecycle}; it cannot reconcile an interaction handoff.`,
+      );
+    }
+    if (typeof adapter.queryInteractionHandoffAcceptance !== 'function') {
+      throw new TypeError('adapter.queryInteractionHandoffAcceptance must be a function');
+    }
+    const delivery = store.getInteractionHandoffForRecovery(handoffId);
+    store.assertInteractionHandoffRecoveryNoticeDelivered(delivery);
+    const proof = await adapter.queryInteractionHandoffAcceptance(deepFreeze(delivery));
+    if (proof?.status === 'accepted') {
+      const acknowledgement = persist(
+        () => store.acknowledgeInteractionHandoffFromQuery(delivery, proof),
+      );
+      refresh();
+      return acknowledgement;
+    }
+    return persist(() => store.recordInteractionHandoffQueryUnproven(delivery, proof));
+  }
+
+  async function resolveInteractionHandoff(handoffId, disposition) {
+    if (lifecycle !== 'open') {
+      throw new Error(
+        `Executor service is ${lifecycle}; it cannot resolve an interaction handoff.`,
+      );
+    }
+    if (interactionHandoffDispositionAuthorizer === null) {
+      throw new TypeError('No interaction handoff disposition authorizer is configured.');
+    }
+    const delivery = store.getInteractionHandoffForRecovery(handoffId);
+    store.assertInteractionHandoffRecoveryNoticeDelivered(delivery);
+    const decision = Object.freeze({
+      capability: 'interaction.handoff.resolve',
+      scope: Object.freeze({
+        conversation_id: delivery.request.conversation_id,
+        turn_id: delivery.request.turn_id,
+        handoff_id: delivery.handoff.handoff_id,
+        action: disposition?.action,
+        replacement_interaction: disposition?.replacement_interaction,
+      }),
+    });
+    const authorization = await interactionHandoffDispositionAuthorizer(
+      decision,
+      deepFreeze(delivery),
+    );
+    const result = persist(() => store.resolveInteractionHandoffDisposition(
+      delivery,
+      disposition,
+      authorization,
+    ));
+    reschedulePendingInteractionDeadlines();
+    refresh();
+    return result;
   }
 
   async function close() {
@@ -1400,6 +2241,7 @@ export function createExecutorService({
         );
         await Promise.allSettled([...interactionDeliverySettlements]);
         const providerCloseResult = await providerClosing;
+        await Promise.allSettled([...replyMappingRecoverySettlements]);
         const { closedConversationIds } = providerCloseResult;
         if (providerCloseResult.error) shutdownFailures.push(providerCloseResult.error);
         const closedConversationIdSet = new Set(closedConversationIds);
@@ -1426,6 +2268,7 @@ export function createExecutorService({
             try {
               recovery.deliveryUnknown = store.markInteractionHandoffDeliveryUnknown(
                 recovery.delivery,
+                recovery.providerError,
               );
               recovery.marked = true;
             } catch (error) {
@@ -1453,6 +2296,7 @@ export function createExecutorService({
         }
         for (const activeRun of activeRuns.values()) {
           if (pendingRecoveryTurnIds.has(activeRun.turnContext.turn_id)) continue;
+          if (pendingRecoveryIsolations.has(activeRun.turnContext.turn_id)) continue;
           if (activeRun.timedOutExpiration) {
             if (closedConversationIdSet.has(activeRun.turnContext.conversation_id)) {
               const expiration = activeRun.timedOutExpiration;
@@ -1497,9 +2341,25 @@ export function createExecutorService({
           }
         }
         for (const [turnId, turnContext] of pendingRecoveryIsolations) {
-          if (closedConversationIdSet.has(turnContext.conversation_id)) {
+          const activeRun = activeRuns.get(turnId);
+          let isolationProven = closedConversationIdSet.has(turnContext.conversation_id);
+          if (!isolationProven && activeRun) {
+            try {
+              isolationProven = await isolateInteractionRecovery(activeRun);
+            } catch (error) {
+              shutdownFailures.push(error);
+            }
+          }
+          if (isolationProven) {
+            if (activeRun && !activeRun.durableSettled) {
+              activeRun.durableSettled = true;
+              cleanupActiveRun(activeRun);
+            }
             recordRecoveringIsolation(turnContext);
           } else {
+            if (activeRun && !activeRun.settled) {
+              skippedSettlements.add(activeRun.settlement);
+            }
             shutdownFailures.push(new Error(
               `Provider close did not prove isolation for recovering turn ${turnId}.`,
             ));
@@ -1557,6 +2417,18 @@ export function createExecutorService({
           cancelWorkspaceHeartbeat(workspaceHeartbeat);
           workspaceHeartbeat = null;
         }
+        if (permissionSweep !== null) {
+          cancelPermissionSweep(permissionSweep);
+          permissionSweep = null;
+        }
+        if (turnLeaseRenewal !== null) {
+          cancelTurnLeaseRenewal(turnLeaseRenewal);
+          turnLeaseRenewal = null;
+        }
+        if (nonterminalSweep !== null) {
+          cancelNonterminalSweep(nonterminalSweep);
+          nonterminalSweep = null;
+        }
         if (lifecycle === 'close_failed' && closePromise === closing) {
           closePromise = null;
         }
@@ -1567,15 +2439,18 @@ export function createExecutorService({
   }
 
   return Object.freeze({
-    cancel,
     close,
     deliverInteractionAnswer,
     evictIdleExecutors,
     expireInteraction,
     reconcileWorkspaceRecoveries,
+    reconcileInteractionHandoff,
+    resolveInteractionHandoff,
     runNext,
     snapshot,
     start,
+    steer,
+    stop,
     submitInteractionAnswer,
   });
 }

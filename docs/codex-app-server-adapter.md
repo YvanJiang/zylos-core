@@ -51,9 +51,13 @@ Private app-server method and item names remain inside the adapter:
 
 Answers are accepted only through Core's durable interaction-answer and handoff records. The
 adapter verifies the current connection, provider request, thread, turn, Core turn, attempt, lease,
-and handoff claim before writing a response. A handoff is acknowledged only after its answer was
-written and the matching `serverRequest/resolved` notification arrives. Server request IDs are
-never reusable within one connection, including after acknowledgement.
+and handoff claim before writing a response. Preparation is side-effect free. Core persists the
+exact handoff send-start fence before invoking the prepared one-shot send. A handoff is acknowledged
+only after its answer was written and the matching `serverRequest/resolved` notification arrives.
+Server request IDs are never reusable within one connection, including after acknowledgement.
+The fixed app-server protocol exposes no read-only, idempotent lookup that can prove acceptance for
+one prior handoff attempt, so its recovery query truthfully returns `unknown`; Core does not infer
+acceptance from connection or in-memory request state and does not resend the answer.
 
 ## Workspace access and write fencing
 

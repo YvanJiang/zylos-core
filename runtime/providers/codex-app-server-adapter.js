@@ -131,6 +131,9 @@ function requireExecutionContext(context) {
   if (typeof context.reportProviderState !== 'function') {
     throw new TypeError('reportProviderState must be a function');
   }
+  if (typeof context.reportRuntimeEvidence !== 'function') {
+    throw new TypeError('reportRuntimeEvidence must be a function');
+  }
   if (
     context.reportProviderFailure !== undefined
     && typeof context.reportProviderFailure !== 'function'
@@ -272,6 +275,11 @@ const HOOK_EVENT_NAMES = Object.freeze(new Set([
 ]));
 const HOOK_HANDLER_TYPES = Object.freeze(new Set(['command', 'prompt', 'agent']));
 const HOOK_EXECUTION_MODES = Object.freeze(new Set(['sync', 'async']));
+const PROTECTED_APPROVAL_METHODS = Object.freeze(new Set([
+  'item/commandExecution/requestApproval',
+  'item/fileChange/requestApproval',
+  'item/permissions/requestApproval',
+]));
 const HOOK_TERMINAL_STATUSES = Object.freeze(new Set([
   'completed',
   'failed',
@@ -521,6 +529,7 @@ export function createCodexAppServerAdapter({
   isProcessGroupAlive = supervisedProcessGroupIsAlive,
   setTimeoutFn = setTimeout,
   clearTimeoutFn = clearTimeout,
+  now = () => new Date().toISOString(),
 } = {}) {
   if (typeof codexExecutable !== 'string' || codexExecutable.length === 0) {
     throw new TypeError('codexExecutable must be a non-empty string');
@@ -556,6 +565,7 @@ export function createCodexAppServerAdapter({
   if (typeof setTimeoutFn !== 'function' || typeof clearTimeoutFn !== 'function') {
     throw new TypeError('timeout functions must be callable');
   }
+  if (typeof now !== 'function') throw new TypeError('now must be a function');
 
   const childEnvironment = selectEnvironment(env, envAllowlist);
   const effectiveCwd = cwd ?? process.cwd();
@@ -815,6 +825,7 @@ export function createCodexAppServerAdapter({
         ));
         return;
       }
+      if (group.auto_approved === true) providerRequests.delete(group.request_key);
       rememberConnectionFence(
         target,
         target.retired_server_requests,
@@ -1661,11 +1672,34 @@ export function createCodexAppServerAdapter({
       ))),
       mcp_form: components[0]?.mcp_form ?? null,
       response_sent: false,
+      auto_approved: false,
       resolved,
       resolveResolved,
       rejectResolved,
     };
     providerRequests.set(requestKey, group);
+    if (
+      PROTECTED_APPROVAL_METHODS.has(message.method)
+      && typeof run.controls?.authorizeProtectedAction === 'function'
+    ) {
+      const permission = run.controls.authorizeProtectedAction({
+        action_ref: `codex:${target.connection_id}:${requestId}:${message.method}`,
+        action_kind: message.method,
+      });
+      if (permission.trusted) {
+        const answers = new Map(components.map(({ component_key: componentKey }) => [
+          componentKey,
+          { kind: 'decision', decision: 'approve' },
+        ]));
+        group.response_sent = true;
+        group.auto_approved = true;
+        sendServerResponse(target, message.id, buildProviderResponse(group, answers));
+        group.resolved.then(() => {
+          providerRequests.delete(group.request_key);
+        }).catch((error) => failConnection(target, error));
+        return;
+      }
+    }
     const descriptors = components.map((component) => {
       nextInteractionNo += 1;
       const providerInteractionRef = `codex-app-server-interaction-${nextInteractionNo}`;
@@ -1796,6 +1830,7 @@ export function createCodexAppServerAdapter({
       termination_requested: false,
       termination_timer: null,
       next_request_no: 1,
+      started_at: now(),
       pending: new Map(),
       process_group_id: detachedProcessGroup
         && Number.isSafeInteger(child.pid)
@@ -1873,6 +1908,30 @@ export function createCodexAppServerAdapter({
     return connecting;
   }
 
+  async function resumePersistedThread(target, threadId) {
+    if (!loadedThreads.has(threadId)) {
+      await sendRequest(target, 'thread/resume', {
+        threadId,
+        cwd,
+        approvalPolicy,
+        sandbox,
+      }, {
+        onResult: (response) => {
+          requireThreadResult(response, threadId);
+          for (const turnId of requireThreadHistory(response)) {
+            rememberConnectionFence(
+              target,
+              target.retired_run_keys,
+              activeRunKey(threadId, turnId),
+            );
+          }
+        },
+      });
+      loadedThreads.add(threadId);
+    }
+    return threadId;
+  }
+
   async function loadThread(target, context, controls, run) {
     const persistedThreadId = context.lineage.provider_native_id;
     if (persistedThreadId === null) {
@@ -1898,33 +1957,60 @@ export function createCodexAppServerAdapter({
       loadedThreads.add(threadId);
       return threadId;
     }
-    if (!loadedThreads.has(persistedThreadId)) {
-      await sendRequest(target, 'thread/resume', {
-        threadId: persistedThreadId,
-        cwd,
-        approvalPolicy,
-        sandbox,
-      }, {
-        onResult: (response) => {
-          requireThreadResult(response, persistedThreadId);
-          for (const turnId of requireThreadHistory(response)) {
-            rememberConnectionFence(
-              target,
-              target.retired_run_keys,
-              activeRunKey(persistedThreadId, turnId),
-            );
-          }
-        },
-      });
-      loadedThreads.add(persistedThreadId);
-    }
+    await resumePersistedThread(target, persistedThreadId);
     return persistedThreadId;
   }
 
-  async function* execute(context, controls) {
+  async function recoverLineage(request) {
+    const candidate = request?.candidate;
+    if (
+      typeof request?.recovery_id !== 'string'
+      || request.recovery_id.length === 0
+      || typeof request?.turn_id !== 'string'
+      || request.turn_id.length === 0
+      || typeof request?.native_recovery_attempt_id !== 'string'
+      || request.native_recovery_attempt_id.length === 0
+      || request?.native_recovery_attempt_no !== 1
+      || typeof candidate?.lineage_id !== 'string'
+      || candidate.lineage_id.length === 0
+      || candidate.provider !== 'codex'
+      || typeof candidate.provider_native_id !== 'string'
+      || candidate.provider_native_id.length === 0
+    ) {
+      throw new TypeError('Codex lineage recovery requires one complete persisted candidate fence');
+    }
+    const target = await ensureConnection();
+    await resumePersistedThread(target, candidate.provider_native_id);
+    return Object.freeze({
+      status: 'recovered',
+      recovery_id: request.recovery_id,
+      lineage_id: candidate.lineage_id,
+      provider: 'codex',
+      provider_native_id: candidate.provider_native_id,
+      native_recovery_attempt_id: request.native_recovery_attempt_id,
+      native_recovery_attempt_no: request.native_recovery_attempt_no,
+      side_effect_status: 'none',
+    });
+  }
+
+  async function* execute(context, controls = null) {
     requireExecutionContext(context);
     if (workspaceAccess.mode === 'writable') assertWorkspaceWrite(controls);
     const target = await ensureConnection();
+    const processEvidence = Number.isSafeInteger(target.child.pid) && target.child.pid > 0
+      ? {
+        pid: target.child.pid,
+        pgid: target.process_group_id,
+        started_at: target.started_at,
+        diagnostic_only: true,
+      }
+      : null;
+    context.reportRuntimeEvidence({
+      runtime_instance_id: target.connection_id,
+      handle_kind: 'codex_app_server_connection',
+      controllable: target.failed !== true,
+      ...(processEvidence === null ? {} : { process: processEvidence }),
+    });
     let resolveTerminal;
     let rejectTerminal;
     const terminal = new Promise((resolve, reject) => {
@@ -2187,7 +2273,7 @@ export function createCodexAppServerAdapter({
     };
   }
 
-  async function handleInteractionAnswer(delivery) {
+  async function prepareInteractionAnswer(delivery) {
     const providerInteractionRef = delivery?.request?.runtime_fence?.provider_interaction_ref;
     const entry = pendingInteractions.get(providerInteractionRef);
     const target = connection;
@@ -2217,27 +2303,90 @@ export function createCodexAppServerAdapter({
     const candidateAnswers = new Map(group.answers);
     candidateAnswers.set(entry.component_key, structuredClone(delivery.answer.value));
     const providerResponse = buildProviderResponse(group, candidateAnswers);
-    if (providerResponseAllowsWorkspaceWrite(group, candidateAnswers)) {
-      assertWorkspaceWriteOrFail(target, run.controls, run);
-    }
-    group.answers.set(entry.component_key, structuredClone(delivery.answer.value));
-    group.response_sent = true;
-    sendServerResponse(target, group.request_id, providerResponse);
-    await group.resolved;
-    providerRequests.delete(group.request_key);
-    for (const [reference, component] of pendingInteractions) {
-      if (component.group === group) pendingInteractions.delete(reference);
-    }
-    return acknowledgementFor(delivery);
+    const expected = {
+      interaction_id: delivery.request.interaction_id,
+      request_version: delivery.request.version,
+      provider_attempt_id: delivery.handoff.provider_attempt_id,
+      lease_epoch: delivery.handoff.lease_epoch,
+      handoff_id: delivery.handoff.handoff_id,
+      handoff_attempt_id: delivery.handoff.handoff_attempt_id,
+      handoff_attempt_no: delivery.handoff.handoff_attempt_no,
+      answer_value: structuredClone(delivery.answer.value),
+    };
+    let sent = false;
+    return Object.freeze({
+      async send(startedDelivery) {
+        const currentEntry = pendingInteractions.get(providerInteractionRef);
+        const currentTarget = connection;
+        const currentRun = activeRuns.get(activeRunKey(group.thread_id, group.turn_id));
+        if (
+          sent
+          || currentEntry !== entry
+          || !currentTarget
+          || currentTarget !== target
+          || currentTarget.failed
+          || currentRun !== group.run
+          || currentRun.connection_id !== currentTarget.connection_id
+          || startedDelivery?.request?.interaction_id !== expected.interaction_id
+          || startedDelivery?.request?.version !== expected.request_version
+          || startedDelivery?.request?.runtime_fence?.provider_attempt_id
+            !== expected.provider_attempt_id
+          || startedDelivery?.request?.runtime_fence?.lease_epoch !== expected.lease_epoch
+          || startedDelivery?.handoff?.handoff_id !== expected.handoff_id
+          || startedDelivery?.handoff?.provider_attempt_id !== expected.provider_attempt_id
+          || startedDelivery?.handoff?.lease_epoch !== expected.lease_epoch
+          || startedDelivery?.handoff?.handoff_attempt_id !== expected.handoff_attempt_id
+          || startedDelivery?.handoff?.handoff_attempt_no !== expected.handoff_attempt_no
+          || typeof startedDelivery?.handoff?.last_send_started_at !== 'string'
+          || JSON.stringify(startedDelivery?.answer?.value) !== JSON.stringify(expected.answer_value)
+          || group.answers.has(entry.component_key)
+          || group.response_sent
+        ) {
+          rejectProtocol('The prepared interaction answer lost its provider handoff fence.');
+        }
+        if (providerResponseAllowsWorkspaceWrite(group, candidateAnswers)) {
+          assertWorkspaceWriteOrFail(currentTarget, currentRun.controls, currentRun);
+        }
+        sent = true;
+        group.answers.set(entry.component_key, structuredClone(expected.answer_value));
+        group.response_sent = true;
+        sendServerResponse(currentTarget, group.request_id, providerResponse);
+        await group.resolved;
+        providerRequests.delete(group.request_key);
+        for (const [reference, component] of pendingInteractions) {
+          if (component.group === group) pendingInteractions.delete(reference);
+        }
+        return acknowledgementFor(startedDelivery);
+      },
+    });
   }
 
-  async function cancel(context) {
+  async function queryInteractionHandoffAcceptance(delivery) {
+    return Object.freeze({
+      status: 'unknown',
+      read_only: true,
+      idempotent: true,
+      handoff_id: delivery?.handoff?.handoff_id,
+      provider_attempt_id: delivery?.handoff?.provider_attempt_id,
+      handoff_attempt_id: delivery?.handoff?.handoff_attempt_id,
+      handoff_attempt_no: delivery?.handoff?.handoff_attempt_no,
+      lease_epoch: delivery?.handoff?.lease_epoch,
+      accepted_at: null,
+      evidence_ref: null,
+      reason_code: 'provider_acceptance_query_unavailable',
+    });
+  }
+
+  async function cancel(context, { reason = 'stop' } = {}) {
+    if (!['stop', 'steer'].includes(reason)) {
+      throw new TypeError('Codex cancellation reason must be stop or steer.');
+    }
     let result;
     try {
       result = await interrupt({
         turn_id: context?.turn_id,
         attempt: context?.attempt,
-        reason: 'stop',
+        reason,
       });
     } catch (cause) {
       const error = cause instanceof Error
@@ -2366,7 +2515,9 @@ export function createCodexAppServerAdapter({
     close,
     execute,
     getWorkspaceAccess,
-    handleInteractionAnswer,
     interrupt,
+    prepareInteractionAnswer,
+    queryInteractionHandoffAcceptance,
+    recoverLineage,
   });
 }
