@@ -13,6 +13,7 @@ import {
 import { createExecutorService } from '../runtime/executor/service.js';
 import { createRuntimeSnapshotPublisher } from '../runtime/observability/snapshot-publisher.js';
 import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { acceptScheduledOccurrence } from '../runtime/scheduler/scheduler-queue.js';
 
 const inboundFixture = JSON.parse(fs.readFileSync(
   new URL('../contracts/public/fixtures/inbound-envelope-v1.json', import.meta.url),
@@ -380,6 +381,48 @@ describe('Core runtime observability snapshot publisher', () => {
     });
 
     await service.close();
+    database.close();
+  });
+
+  test('projects durable scheduler queue facts through the provider-neutral snapshot', () => {
+    const { database } = openDatabase();
+    const accepted = acceptScheduledOccurrence(database, {
+      schedule_id: 'schedule-observability',
+      task_id: 'task-observability',
+      occurrence_id: 'occurrence-observability',
+      prompt: 'Run the scheduled observability check.',
+      notification_text: 'Scheduled observability check queued.',
+      occurred_at: '2026-07-20T07:59:55Z',
+      received_at: '2026-07-20T07:59:56Z',
+      region: 'global',
+      tenant_id: 'tenant-observability',
+      bot_id: 'bot-observability',
+      bound_conversation: null,
+    }, {
+      now: () => '2026-07-20T07:59:57Z',
+      generateId: deterministicIds('scheduler-observability'),
+    });
+
+    const snapshot = createPublisher(database).publish();
+    expect(validateObservabilitySnapshot(snapshot).known).toEqual(snapshot);
+    expect(snapshot.executors).toMatchObject({ complete: true, items: [] });
+    expect(snapshot.turns.items).toContainEqual(expect.objectContaining({
+      turn_id: accepted.turn_id,
+      conversation_id: accepted.conversation_id,
+      state: 'queued',
+      phase: 'queued',
+    }));
+    expect(snapshot.outbox.items).toContainEqual({
+      channel: 'scheduler',
+      status: 'pending',
+      count: 1,
+      oldest_age_seconds: 8,
+    });
+    expect(snapshot.audit_summary.items).toContainEqual({
+      category: 'scheduler',
+      count: 1,
+      last_committed_at: '2026-07-20T07:59:57Z',
+    });
     database.close();
   });
 

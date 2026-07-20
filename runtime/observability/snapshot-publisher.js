@@ -527,6 +527,8 @@ function collectAuditSummary(database) {
       SELECT 'runtime_control', committed_at FROM runtime_steer_controls
       UNION ALL
       SELECT 'provider_diagnostic', observed_at FROM runtime_provider_event_diagnostics
+      UNION ALL
+      SELECT 'scheduler', committed_at FROM runtime_scheduler_occurrences
     )
     GROUP BY category
     ORDER BY category
