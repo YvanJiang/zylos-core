@@ -1323,6 +1323,10 @@ describe('durable workspace lease coordinator', () => {
     );
     const recovery = service.reconcileWorkspaceRecoveries();
     await abortStarted.promise;
+    expect(service.publishObservabilitySnapshot().service).toMatchObject({
+      health: 'degraded',
+      reconciling: true,
+    });
     const closing = service.close();
     await Promise.resolve();
     expect(closeCalls).toBe(0);

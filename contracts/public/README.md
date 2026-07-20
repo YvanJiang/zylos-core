@@ -234,6 +234,15 @@ contracts do not maintain a second compatibility path around the public kernel.
   `diagnostic_only=true`. The full snapshot, including audit summaries, errors, and extensions,
   is rejected if it contains credential-shaped values, secret fields, or channel/provider-private
   payloads.
+  Core publishes this contract from the real runtime store through
+  `createRuntimeSnapshotPublisher` (`runtime/observability/snapshot-publisher.js`) and the executor
+  service's `publishObservabilitySnapshot()` surface. Durable aggregates are batch-projected from
+  one optimistic WAL transaction that allocates the next version only after collection, without
+  holding a writer reservation during the reads. If another connection commits first, SQLite
+  rejects the stale read-to-write upgrade instead of publishing older state at a newer version.
+  Reopening the same service instance continues its persisted sequence. A failed collection is
+  replaced by `complete=false` plus the same top-level degraded error, never by an apparently
+  successful empty collection.
 - `validateControlRequest`, `validateControlResult`, and the two control schema descriptors
   define the registered caller namespace, transport-injected actor/auth context, versioned
   capability grants and scopes, discriminated action targets, mutation CAS, and asynchronous

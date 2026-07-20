@@ -4,6 +4,7 @@ import {
   canonicalizeJson,
   createContractError,
 } from '../../contracts/public/index.js';
+import { createRuntimeSnapshotPublisher } from '../observability/snapshot-publisher.js';
 import { createPermissionService } from '../permissions/permission-service.js';
 import { createExecutorStore } from '../persistence/executor-store.js';
 import { resolveProviderWorkspaceAccess } from '../workspace/lease-coordinator.js';
@@ -115,6 +116,8 @@ export function createExecutorService({
   adapter,
   provider,
   serviceInstanceId,
+  hostId = serviceInstanceId,
+  serviceStartedAt = null,
   now = () => new Date().toISOString(),
   generateId = defaultGenerateId,
   leaseDurationMs = 30_000,
@@ -309,6 +312,24 @@ export function createExecutorService({
   let residentHeartbeatFailure = null;
   let workspaceHeartbeatFailure = null;
   let workspaceRecoveryFlight = null;
+  const observabilityPublisher = createRuntimeSnapshotPublisher({
+    database,
+    serviceInstanceId,
+    hostId,
+    startedAt: serviceStartedAt ?? now(),
+    now,
+    generateId,
+    getServiceState: () => ({
+      degraded: residentHeartbeatFailure !== null
+        || workspaceHeartbeatFailure !== null
+        || workspaceRecoveryFlight !== null
+        || lifecycle === 'close_failed',
+      offline: !started || lifecycle === 'closed',
+      maintenance: false,
+      draining: lifecycle === 'closing',
+      reconciling: workspaceRecoveryFlight !== null,
+    }),
+  });
 
   function persistenceFailure(cause) {
     const error = new Error(`Runtime persistence failed: ${cause.message}`, { cause });
@@ -414,6 +435,7 @@ export function createExecutorService({
     adoptOrphanedWorkspaceRecoveries();
     store.reconcileExpiredStartedInteractionHandoffs();
     store.reconcileNonterminalTurns([], 'startup_reconciliation');
+    observabilityPublisher.recordReconciliation();
     if (nonterminalSweep === null) {
       nonterminalSweep = scheduleNonterminalSweep(() => {
         try {
@@ -421,6 +443,7 @@ export function createExecutorService({
             [...activeRuns.values()].map(({ turnContext }) => turnContext),
             'sweep_reconciliation',
           );
+          observabilityPublisher.recordReconciliation();
           refresh();
           reschedulePendingInteractionDeadlines();
         } catch (error) {
@@ -2459,6 +2482,7 @@ export function createExecutorService({
     deliverInteractionAnswer,
     evictIdleExecutors,
     expireInteraction,
+    publishObservabilitySnapshot: observabilityPublisher.publish,
     reconcileWorkspaceRecoveries,
     reconcileInteractionHandoff,
     resolveInteractionHandoff,
