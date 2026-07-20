@@ -61,11 +61,9 @@ class ZylosConsole {
     this.messagesContainer.addEventListener('drop', (e) => this.handleDrop(e));
     document.addEventListener('paste', (e) => this.handlePaste(e));
 
-    // Load initial conversations via HTTP (for history)
-    this.loadConversations();
-
-    // Connect WebSocket for real-time updates
-    this.connectWebSocket();
+    // Establish the live subscription only after its per-client durable cursor
+    // has been initialized from Core history.
+    this.loadConversations().finally(() => this.connectWebSocket());
   }
 
   connectWebSocket() {
@@ -78,6 +76,9 @@ class ZylosConsole {
       this.ws.onopen = () => {
         console.log('WebSocket connected');
         this.reconnectAttempts = 0;
+        if (this.pollInterval) clearInterval(this.pollInterval);
+        if (this.statusInterval) clearInterval(this.statusInterval);
+        this.ws.send(JSON.stringify({ type: 'subscribe', since_id: this.lastMessageId }));
         this.updateConnectionStatus(true);
       };
 
@@ -135,7 +136,7 @@ class ZylosConsole {
           this.clearEmptyState();
           msg.data.forEach((m) => this.addMessage(m, true));
           if (msg.data.length > 0) {
-            this.lastMessageId = Math.max(...msg.data.map((m) => m.id));
+            this.lastMessageId = Math.max(this.lastMessageId, ...msg.data.map((m) => m.id));
           }
         }
         break;
@@ -202,7 +203,7 @@ class ZylosConsole {
       conversations.forEach((msg) => this.addMessage(msg, false));
 
       if (conversations.length > 0) {
-        this.lastMessageId = Math.max(...conversations.map((m) => m.id));
+        this.lastMessageId = Math.max(this.lastMessageId, ...conversations.map((m) => m.id));
       }
 
       this.scrollToBottom();
@@ -220,7 +221,7 @@ class ZylosConsole {
       if (messages.length > 0) {
         this.clearEmptyState();
         messages.forEach((msg) => this.addMessage(msg, true));
-        this.lastMessageId = Math.max(...messages.map((m) => m.id));
+        this.lastMessageId = Math.max(this.lastMessageId, ...messages.map((m) => m.id));
       }
     } catch (err) {
       console.error('Failed to poll messages:', err);

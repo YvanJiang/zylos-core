@@ -30,6 +30,17 @@ const normalRuntimeFiles = [
   'README.md',
 ];
 
+let cachedPackedFiles = null;
+function packedFiles() {
+  if (cachedPackedFiles === null) {
+    const packed = JSON.parse(execFileSync('npm', [
+      'pack', '--dry-run', '--json', '--ignore-scripts',
+    ], { cwd: path.resolve('.'), encoding: 'utf8', timeout: 30_000 }));
+    cachedPackedFiles = packed[0].files.map(({ path: file }) => file);
+  }
+  return cachedPackedFiles;
+}
+
 describe('normal product paths have no retired runtime authority', () => {
   test('normal callers contain no terminal or host-file execution authority', () => {
     for (const file of normalRuntimeFiles) {
@@ -57,10 +68,7 @@ describe('normal product paths have no retired runtime authority', () => {
   });
 
   test('the package payload excludes every repository-only executable legacy path', () => {
-    const packed = JSON.parse(execFileSync('npm', [
-      'pack', '--dry-run', '--json', '--ignore-scripts',
-    ], { cwd: path.resolve('.'), encoding: 'utf8', timeout: 30_000 }));
-    const files = packed[0].files.map(({ path: file }) => file);
+    const files = packedFiles();
     for (const retired of [
       'skills/activity-monitor/',
       'skills/comm-bridge/scripts/c4-dispatcher.js',
@@ -76,5 +84,20 @@ describe('normal product paths have no retired runtime authority', () => {
     ]) {
       expect(files.some((file) => file === retired || file.startsWith(retired))).toBe(false);
     }
+  });
+
+  test('every reachable packaged caller is free of retired runtime authority', () => {
+    const migrationOnly = new Set([
+      'runtime/migration/legacy-c4-diagnostic.js',
+      'runtime/migration/legacy-lifecycle-artifacts.js',
+      'runtime/migration/legacy-provider-quiescence.js',
+      'scripts/installed-runtime-inventory.js',
+    ]);
+    const banned = /\btmux\b|capture-pane|send-keys|paste-buffer|global[ _-]session|terminal injection|agent-status\.json|input health|window health/i;
+    const violations = packedFiles()
+      .filter((file) => /\.(?:js|cjs|mjs|md|json|ya?ml|sh)$/.test(file))
+      .filter((file) => !migrationOnly.has(file))
+      .filter((file) => banned.test(fs.readFileSync(path.resolve(file), 'utf8')));
+    expect(violations).toEqual([]);
   });
 });

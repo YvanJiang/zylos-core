@@ -28,15 +28,56 @@ function deliverToSocket(socketPath, message) {
   });
 }
 
+export function createShellRuntimeIdentity({
+  randomUUID = crypto.randomUUID,
+  temporaryDirectory = os.tmpdir,
+} = {}) {
+  const birthId = randomUUID();
+  return Object.freeze({
+    birthId,
+    socketPath: path.join(temporaryDirectory(), `zylos-shell-${birthId}.sock`),
+    serviceInstanceId: `shell-${birthId}`,
+  });
+}
+
+export function createDeliveryDrain({ dispatchNext, onError = () => {} }) {
+  if (typeof dispatchNext !== 'function') throw new TypeError('dispatchNext must be a function');
+  if (typeof onError !== 'function') throw new TypeError('onError must be a function');
+  let stopped = false;
+  let inFlight = null;
+
+  function drain() {
+    if (stopped) return inFlight ?? Promise.resolve();
+    if (inFlight !== null) return inFlight;
+    inFlight = (async () => {
+      try {
+        for (let count = 0; count < 20; count += 1) {
+          const result = await dispatchNext();
+          if (result.status === 'idle') break;
+        }
+      } catch (error) {
+        onError(error);
+      } finally {
+        inFlight = null;
+      }
+    })();
+    return inFlight;
+  }
+
+  async function stop() {
+    stopped = true;
+    if (inFlight !== null) await inFlight;
+  }
+
+  return Object.freeze({ drain, stop });
+}
+
 export async function shellCommand() {
   const { default: Database } = await import(new URL(
     '../../skills/comm-bridge/node_modules/better-sqlite3/lib/index.js',
     import.meta.url,
   ));
-  const socketPath = path.join(os.tmpdir(), `zylos-shell-${process.pid}.sock`);
-
-  // Clean up stale socket files from previous sessions (e.g. kill -9)
-  cleanStaleSockets();
+  const { socketPath, serviceInstanceId } = createShellRuntimeIdentity();
 
   // Clean up own socket file if it exists
   try { fs.unlinkSync(socketPath); } catch {}
@@ -90,7 +131,7 @@ export async function shellCommand() {
     database,
     channel: 'shell',
     targetChatId: socketPath,
-    serviceInstanceId: `shell-${process.pid}`,
+    serviceInstanceId,
     renderer: createChannelNeutralTextRenderer({
       async sendText(delivery) {
         if (delivery.target.chat_id !== socketPath) {
@@ -101,36 +142,40 @@ export async function shellCommand() {
       },
     }),
   });
-  let deliveryInFlight = false;
-  async function drainDeliveries() {
-    if (deliveryInFlight) return;
-    deliveryInFlight = true;
-    try {
-      for (let count = 0; count < 20; count += 1) {
-        const result = await deliveryOwner.dispatchNext();
-        if (result.status === 'idle') break;
-      }
-    } catch (error) {
+  const deliveryDrain = createDeliveryDrain({
+    dispatchNext: () => deliveryOwner.dispatchNext(),
+    onError(error) {
       console.error(`Shell delivery owner: ${error.message}`);
-    } finally {
-      deliveryInFlight = false;
-    }
-  }
-  const deliveryTimer = setInterval(() => { drainDeliveries(); }, 250);
+    },
+  });
+  const deliveryTimer = setInterval(() => { void deliveryDrain.drain(); }, 250);
 
   // Cleanup on exit (guard against double invocation)
-  let cleaned = false;
+  let cleanupPromise = null;
   function cleanup() {
-    if (cleaned) return;
-    cleaned = true;
+    if (cleanupPromise !== null) return cleanupPromise;
     clearInterval(deliveryTimer);
-    server.close();
-    database.close();
-    try { fs.unlinkSync(socketPath); } catch {}
+    cleanupPromise = (async () => {
+      await deliveryDrain.stop();
+      if (server.listening) {
+        await new Promise((resolve) => server.close(() => resolve()));
+      }
+      database.close();
+      try { fs.unlinkSync(socketPath); } catch {}
+    })();
+    return cleanupPromise;
   }
-  process.on('SIGINT', () => { cleanup(); process.exit(0); });
-  process.on('SIGTERM', () => { cleanup(); process.exit(0); });
-  process.on('exit', cleanup);
+
+  let shutdownPromise = null;
+  function shutdown() {
+    if (shutdownPromise === null) {
+      shutdownPromise = cleanup();
+      if (!rl.closed) rl.close();
+    }
+    return shutdownPromise;
+  }
+  process.once('SIGINT', () => { void shutdown(); });
+  process.once('SIGTERM', () => { void shutdown(); });
 
   // Print banner
   console.log(bold('Zylos Shell'));
@@ -159,8 +204,8 @@ export async function shellCommand() {
     // Handle local commands
     if (input === '/quit' || input === '/exit' || input === '/q') {
       console.log(dim('Goodbye.'));
-      cleanup();
-      process.exit(0);
+      await shutdown();
+      return;
     }
 
     if (input === '/help') {
@@ -224,8 +269,7 @@ export async function shellCommand() {
   });
 
   rl.on('close', () => {
-    cleanup();
-    process.exit(0);
+    void shutdown();
   });
 
   function waitForResponse(timeoutMs) {
@@ -250,25 +294,6 @@ export async function shellCommand() {
 
 function formatResponse(text) {
   return `${bold('zylos>')} ${text}`;
-}
-
-function cleanStaleSockets() {
-  const tmpDir = os.tmpdir();
-  try {
-    const files = fs.readdirSync(tmpDir);
-    for (const file of files) {
-      const match = file.match(/^zylos-shell-(\d+)\.sock$/);
-      if (!match) continue;
-      const pid = Number(match[1]);
-      // Check if the process is still running
-      try {
-        process.kill(pid, 0);
-      } catch {
-        // Process doesn't exist — clean up stale socket
-        try { fs.unlinkSync(path.join(tmpDir, file)); } catch {}
-      }
-    }
-  } catch {}
 }
 
 function printHelp() {

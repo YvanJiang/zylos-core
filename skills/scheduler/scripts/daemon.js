@@ -177,18 +177,18 @@ async function mainLoop() {
         if (decision.status === 'skipped') {
           // Skip this task
           console.log(`[${new Date().toISOString()}] Task ${task.id} (${task.name}) missed its occurrence; avoiding catch-up replay.`);
-          if (!persistMissedTaskNotice(task)) continue;
-
-          if (task.type === 'one-time') {
-            // One-time tasks: mark as failed
-            db.prepare(`
-              UPDATE tasks
-              SET status = 'failed', last_error = 'Missed execution window', updated_at = ?
-              WHERE id = ?
-            `).run(currentTime, task.id);
-          } else {
-            // Recurring/interval tasks: schedule next run
-            updateNextRunTime(task);
+          if (persistMissedTaskNotice(task)) {
+            if (task.type === 'one-time') {
+              // One-time tasks: mark as failed
+              db.prepare(`
+                UPDATE tasks
+                SET status = 'failed', last_error = 'Missed execution window', updated_at = ?
+                WHERE id = ?
+              `).run(currentTime, task.id);
+            } else {
+              // Recurring/interval tasks: schedule next run
+              updateNextRunTime(task);
+            }
           }
         } else {
           // Within threshold: dispatch normally

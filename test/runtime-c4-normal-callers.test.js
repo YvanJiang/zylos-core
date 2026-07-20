@@ -123,10 +123,11 @@ describe('normal C4 callers use durable Core contracts', () => {
     assert.equal(fs.existsSync(path.join(zylosDir, 'comm-bridge', 'c4.db')), false);
   });
 
-  test('a channel delivery owner cannot claim another channel outbox lane', () => {
+  test('a channel delivery owner cannot claim another channel or endpoint outbox lane', () => {
     const { zylosDir, env } = fixture();
     for (const [channel, endpoint, messageId] of [
       ['web-console', 'console', 'web-owned-message'],
+      ['web-console', 'other-console', 'other-web-owned-message'],
       ['shell', '/tmp/disposable-shell.sock', 'shell-owned-message'],
       ['shell', '/tmp/other-disposable-shell.sock', 'other-shell-owned-message'],
     ]) {
@@ -146,6 +147,7 @@ describe('normal C4 callers use durable Core contracts', () => {
     const owner = createOutboxService({
       database,
       channel: 'web-console',
+      targetChatId: 'console',
       serviceInstanceId: 'web-console-owner-fixture',
       now: () => '2026-07-21T00:10:01.000Z',
     });
@@ -154,7 +156,7 @@ describe('normal C4 callers use durable Core contracts', () => {
     assert.equal(owner.claimNext(), null);
     assert.equal(database.prepare(`
       SELECT COUNT(*) AS count FROM runtime_outbox WHERE status = 'pending'
-    `).get().count, 2);
+    `).get().count, 3);
 
     const shellOwner = createOutboxService({
       database,
@@ -167,7 +169,7 @@ describe('normal C4 callers use durable Core contracts', () => {
     assert.equal(shellOwner.claimNext(), null);
     assert.equal(database.prepare(`
       SELECT COUNT(*) AS count FROM runtime_outbox WHERE status = 'pending'
-    `).get().count, 1);
+    `).get().count, 2);
     database.close();
   });
 

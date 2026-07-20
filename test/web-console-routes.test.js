@@ -6,7 +6,9 @@ import { spawn } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, test } from '@jest/globals';
 import Database from '../skills/web-console/node_modules/better-sqlite3/lib/index.js';
 import WebSocket from '../skills/web-console/node_modules/ws/wrapper.mjs';
+import { createIdempotencyKey } from '../contracts/public/index.js';
 import { acceptCompatibilityInbound } from '../runtime/compatibility/c4-channel-fallback.js';
+import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
 import { createWebConsoleOutboxOwner } from '../skills/web-console/scripts/core-outbox-owner.js';
 
 const SERVER_PATH = path.resolve('skills/web-console/scripts/server.js');
@@ -215,6 +217,7 @@ describe('web-console attachment routes', () => {
       const ws = new WebSocket(`ws://127.0.0.1:${ctx.port}/`);
       const timer = setTimeout(() => reject(new Error('timed out waiting for sent ack')), 3000);
       ws.on('open', () => {
+        ws.send(JSON.stringify({ type: 'subscribe', since_id: 0 }));
         ws.send(JSON.stringify({ type: 'send', content: '', attachments: [upload.body.id], tempId: 't1' }));
       });
       ws.on('message', (raw) => {
@@ -368,6 +371,200 @@ describe('web-console attachment routes', () => {
       { direction: 'in', content: 'canonical inbound text' },
       { direction: 'out', content: 'Message received.' },
     ]);
+  });
+
+  test('HTTP polling consumes and renders the authoritative Core outbox without WebSocket clients', async () => {
+    ctx = await startServer();
+    const db = new Database(ctx.dbPath);
+    const accepted = acceptCompatibilityInbound(db, {
+      inbound_event_id: 'web-poll-event', trace_id: 'web-poll-trace',
+      occurred_at: '2020-01-01T00:00:00.000Z', received_at: '2020-01-01T00:00:00.000Z',
+      region: 'global', tenant_id: 'web-poll-tenant', channel: 'web-console',
+      bot_id: 'zylos', chat_type: 'dm', chat_id: 'console',
+      native_thread_or_topic_id: null, message_id: 'web-poll-message',
+      actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
+      content: { kind: 'text', text: 'poll-only inbound', attachments: [] },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source_ref: 'web-poll-source',
+    }, { now: () => '2020-01-01T00:00:00.000Z' });
+    expect(db.prepare('SELECT status FROM runtime_outbox WHERE turn_id = ?')
+      .get(accepted.turn_id).status).toBe('pending');
+    db.close();
+
+    const invalidCursor = await fetch(`${ctx.baseUrl}/api/poll?since_id=-1`);
+    expect(invalidCursor.status).toBe(400);
+    const unchanged = new Database(ctx.dbPath);
+    expect(unchanged.prepare('SELECT status FROM runtime_outbox WHERE turn_id = ?')
+      .get(accepted.turn_id).status).toBe('pending');
+    unchanged.close();
+
+    const response = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    expect(response.status).toBe(200);
+    const messages = await response.json();
+
+    const reopened = new Database(ctx.dbPath);
+    const deliveryState = reopened.prepare(`
+      SELECT outbox.status, outbox.attempt_count, outbox.command_json
+      FROM runtime_outbox AS outbox WHERE outbox.turn_id = ?
+    `).get(accepted.turn_id);
+    expect(deliveryState).toMatchObject({ status: 'delivered', attempt_count: 1 });
+    reopened.close();
+    expect(messages.map(({ direction, content }) => ({ direction, content }))).toEqual([
+      { direction: 'in', content: 'poll-only inbound' },
+      { direction: 'out', content: 'Message received.' },
+    ]);
+  });
+
+  test('HTTP polling renders a durable security notice with no turn event', async () => {
+    ctx = await startServer();
+    const db = new Database(ctx.dbPath);
+    const envelope = {
+      contract: 'zylos.inbound-envelope', contract_version: '1.0',
+      inbound_event_id: 'web-security-event', trace_id: 'web-security-trace',
+      occurred_at: '2020-01-01T00:00:00.000Z', received_at: '2020-01-01T00:00:00.000Z',
+      region: 'global', tenant_id: 'web-security-tenant', channel: 'web-console',
+      bot_id: 'zylos', chat_type: 'dm', chat_id: 'console',
+      native_thread_or_topic_id: null, message_id: 'web-security-message',
+      actor: { type: 'user', actor_id: 'web-owner', authenticated: true, roles: ['bot_owner'] },
+      content: { kind: 'text', text: '/permission safe', attachments: [] },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source: { kind: 'platform_original', source_ref: 'web-security-source' },
+    };
+    envelope.idempotency_key = createIdempotencyKey('inbound', {
+      region: envelope.region, tenant_id: envelope.tenant_id, channel: envelope.channel,
+      bot_id: envelope.bot_id, inbound_event_id: envelope.inbound_event_id,
+    });
+    const accepted = acceptNormalInbound(db, envelope, {
+      now: () => '2020-01-01T00:00:00.000Z',
+    });
+    const row = db.prepare(`
+      SELECT outbox_id, command_json FROM runtime_outbox WHERE control_id = ?
+    `).get(accepted.control_id);
+    const command = JSON.parse(row.command_json);
+    expect(command.mapping.turn_id).toBeNull();
+    expect(command.event_sequence_through).toBeNull();
+    db.close();
+
+    const response = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    expect(response.status).toBe(200);
+    expect((await response.json()).map(({ direction, content }) => ({ direction, content }))).toEqual([
+      { direction: 'out', content: command.render_model.text },
+    ]);
+
+    const reopened = new Database(ctx.dbPath);
+    expect(reopened.prepare('SELECT status FROM runtime_outbox WHERE outbox_id = ?')
+      .get(row.outbox_id).status).toBe('delivered');
+    reopened.close();
+  });
+
+  test('WebSocket delivery projects the durable inbound before its outbox reply', async () => {
+    ctx = await startServer();
+    const messages = [];
+    const ws = new WebSocket(`ws://127.0.0.1:${ctx.port}/`);
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timed out opening WebSocket')), 3000);
+      ws.once('open', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      ws.once('error', reject);
+    });
+    ws.on('message', (raw) => {
+      const event = JSON.parse(raw.toString());
+      if (event.type === 'messages') messages.push(...event.data);
+    });
+    ws.send(JSON.stringify({ type: 'subscribe', since_id: 0 }));
+
+    const db = new Database(ctx.dbPath);
+    acceptCompatibilityInbound(db, {
+      inbound_event_id: 'web-ws-order-event', trace_id: 'web-ws-order-trace',
+      occurred_at: '2020-01-01T00:00:00.000Z', received_at: '2020-01-01T00:00:00.000Z',
+      region: 'global', tenant_id: 'web-ws-order-tenant', channel: 'web-console',
+      bot_id: 'zylos', chat_type: 'dm', chat_id: 'console',
+      native_thread_or_topic_id: null, message_id: 'web-ws-order-message',
+      actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
+      content: { kind: 'text', text: 'ordered inbound', attachments: [] },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source_ref: 'web-ws-order-source',
+    }, { now: () => '2020-01-01T00:00:00.000Z' });
+    db.close();
+
+    const deadline = Date.now() + 5000;
+    while ((!messages.some(({ direction }) => direction === 'in')
+      || !messages.some(({ direction }) => direction === 'out'))
+      && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    ws.close();
+    expect(messages[0]).toMatchObject({ direction: 'in', content: 'ordered inbound' });
+    expect(messages.slice(1).some(({ direction }) => direction === 'out')).toBe(true);
+  });
+
+  test('WebSocket clients advance independent durable projection cursors', async () => {
+    ctx = await startServer();
+    const seedDb = new Database(ctx.dbPath);
+    acceptCompatibilityInbound(seedDb, {
+      inbound_event_id: 'web-cursor-seed', trace_id: 'web-cursor-seed-trace',
+      occurred_at: '2020-01-01T00:00:00.000Z', received_at: '2020-01-01T00:00:00.000Z',
+      region: 'global', tenant_id: 'web-cursor-tenant', channel: 'web-console',
+      bot_id: 'zylos', chat_type: 'dm', chat_id: 'console', native_thread_or_topic_id: null,
+      message_id: 'web-cursor-seed-message',
+      actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
+      content: { kind: 'text', text: 'cursor history only', attachments: [] },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source_ref: 'web-cursor-seed-source',
+    }, { now: () => '2020-01-01T00:00:00.000Z' });
+    seedDb.close();
+    await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    const history = await (await fetch(`${ctx.baseUrl}/api/conversations/recent?limit=100`)).json();
+    const historyCursor = Math.max(...history.map(({ id }) => id));
+
+    async function subscribedClient(sinceId) {
+      const received = [];
+      const ws = new WebSocket(`ws://127.0.0.1:${ctx.port}/`);
+      await new Promise((resolve, reject) => {
+        ws.once('open', resolve);
+        ws.once('error', reject);
+      });
+      ws.on('message', (raw) => {
+        const event = JSON.parse(raw.toString());
+        if (event.type === 'messages') received.push(...event.data);
+      });
+      ws.send(JSON.stringify({ type: 'subscribe', since_id: sinceId }));
+      return { ws, received };
+    }
+
+    const fromBeginning = await subscribedClient(0);
+    const fromCurrent = await subscribedClient(historyCursor);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const nextDb = new Database(ctx.dbPath);
+    acceptCompatibilityInbound(nextDb, {
+      inbound_event_id: 'web-cursor-next', trace_id: 'web-cursor-next-trace',
+      occurred_at: '2020-01-01T00:00:01.000Z', received_at: '2020-01-01T00:00:01.000Z',
+      region: 'global', tenant_id: 'web-cursor-tenant', channel: 'web-console',
+      bot_id: 'zylos', chat_type: 'dm', chat_id: 'console', native_thread_or_topic_id: null,
+      message_id: 'web-cursor-next-message',
+      actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
+      content: { kind: 'text', text: 'cursor visible to both', attachments: [] },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source_ref: 'web-cursor-next-source',
+    }, { now: () => '2020-01-01T00:00:01.000Z' });
+    nextDb.close();
+
+    const deadline = Date.now() + 5000;
+    while ((!fromBeginning.received.some(({ content }) => content === 'cursor visible to both')
+      || !fromCurrent.received.some(({ content }) => content === 'cursor visible to both'))
+      && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    fromBeginning.ws.close();
+    fromCurrent.ws.close();
+
+    expect(fromBeginning.received.some(({ content }) => content === 'cursor history only')).toBe(true);
+    expect(fromCurrent.received.some(({ content }) => content === 'cursor history only')).toBe(false);
+    expect(fromBeginning.received.some(({ content }) => content === 'cursor visible to both')).toBe(true);
+    expect(fromCurrent.received.some(({ content }) => content === 'cursor visible to both')).toBe(true);
   });
 
   test('GET /api/conversations/recent does not project retired inbound rows', async () => {

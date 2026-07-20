@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { describe, it } from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -192,5 +193,59 @@ describe('processCompletedTasks', () => {
       assert.equal(b.status, 'completed');  // one-time stays completed
       assert.equal(c.status, 'pending');
     });
+  });
+});
+
+describe('scheduler daemon failure backoff', () => {
+  it('keeps a missed occurrence pending but sleeps after persistent Core notice failure', async () => {
+    const originalZylosDir = process.env.ZYLOS_DIR;
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scheduler-loop-'));
+    let child;
+    try {
+      process.env.ZYLOS_DIR = tmpDir;
+      const cacheBuster = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const { getDb } = await import(new URL(`../database.js?${cacheBuster}`, import.meta.url));
+      const database = getDb();
+      insertTask(database, {
+        id: 'persistent-notice-failure',
+        type: 'recurring',
+        cron_expression: '0 9 * * *',
+        next_run_at: now() - 600,
+        miss_threshold: 1,
+      });
+      database.close();
+
+      child = spawn(process.execPath, [path.resolve('skills/scheduler/scripts/daemon.js')], {
+        cwd: path.resolve('.'),
+        env: { ...process.env, ZYLOS_DIR: tmpDir, TZ: 'UTC' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let output = '';
+      child.stdout.on('data', (chunk) => { output += chunk.toString(); });
+      child.stderr.on('data', (chunk) => { output += chunk.toString(); });
+      await new Promise((resolve) => setTimeout(resolve, 750));
+
+      assert.equal(child.exitCode, null, output);
+      const failures = output.match(/Failed to persist missed-task notice/g) ?? [];
+      assert.equal(failures.length, 1, output);
+
+      const reopened = new (await import('better-sqlite3')).default(
+        path.join(tmpDir, 'scheduler', 'scheduler.db'),
+      );
+      assert.equal(reopened.prepare('SELECT status FROM tasks WHERE id = ?')
+        .get('persistent-notice-failure').status, 'pending');
+      reopened.close();
+    } finally {
+      if (child && child.exitCode === null) {
+        child.kill('SIGKILL');
+        await new Promise((resolve) => child.once('close', resolve));
+      }
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      if (originalZylosDir === undefined) {
+        delete process.env.ZYLOS_DIR;
+      } else {
+        process.env.ZYLOS_DIR = originalZylosDir;
+      }
+    }
   });
 });

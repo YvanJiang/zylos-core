@@ -1,3 +1,5 @@
+import crypto from 'node:crypto';
+
 import { createChannelNeutralTextRenderer } from '../../../runtime/compatibility/c4-channel-fallback.js';
 import { createOutboxService } from '../../../runtime/delivery/outbox-service.js';
 
@@ -6,7 +8,7 @@ export function createWebConsoleOutboxOwner({
   clients,
   broadcast,
   onDeliveredMessage = () => {},
-  serviceInstanceId = `web-console-${process.pid}`,
+  serviceInstanceId = `web-console-${crypto.randomUUID()}`,
   now = () => new Date().toISOString(),
 }) {
   if (!(clients instanceof Set)) throw new TypeError('clients must be a Set');
@@ -18,20 +20,16 @@ export function createWebConsoleOutboxOwner({
   const owner = createOutboxService({
     database,
     channel: 'web-console',
+    targetChatId: 'console',
     serviceInstanceId,
     now,
     renderer: createChannelNeutralTextRenderer({
       now,
       async sendText(delivery) {
         const outboxRow = database.prepare(`
-          SELECT event.rowid * 2 + 1 AS id
-          FROM runtime_outbox AS outbox
-          JOIN runtime_normalized_events AS event
-            ON event.turn_id = outbox.turn_id
-           AND event.event_sequence = CAST(
-             json_extract(outbox.command_json, '$.event_sequence_through') AS INTEGER
-           )
-          WHERE outbox.delivery_id = ?
+          SELECT rowid * 2 + 1 AS id
+          FROM runtime_outbox
+          WHERE delivery_id = ?
         `
         ).get(delivery.delivery_id);
         if (!outboxRow) throw new Error('Web Console outbox row is unavailable.');

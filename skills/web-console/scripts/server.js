@@ -41,6 +41,7 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 const PORT = process.env.WEB_CONSOLE_PORT || 3456;
+const SERVICE_BIRTH_ID = crypto.randomUUID();
 
 // Paths
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
@@ -146,10 +147,10 @@ try {
 
 // Track connected WebSocket clients
 const clients = new Set();
+const clientCursors = new WeakMap();
 
 // Last known state for change detection
 let lastStatus = null;
-let lastMessageId = 0;
 
 /**
  * Read provider-neutral Core runtime health.
@@ -197,8 +198,19 @@ function getCoreMessages({
   if (channel !== 'web-console') return [];
   const ordering = latest ? 'DESC' : 'ASC';
   const rows = db.prepare(`
-    WITH displayed AS (
-      SELECT event.rowid * 2 AS id, 'in' AS direction,
+    WITH channel_outbox AS (
+      SELECT rowid AS outbox_rowid, turn_id, status, command_json,
+        result_json, updated_at, created_at
+      FROM runtime_outbox
+      WHERE json_extract(command_json, '$.target.channel') = 'web-console'
+        AND json_extract(command_json, '$.target.chat_id') = 'console'
+    ), turn_anchor AS (
+      SELECT turn_id, MIN(outbox_rowid) AS outbox_rowid
+      FROM channel_outbox
+      WHERE turn_id IS NOT NULL
+      GROUP BY turn_id
+    ), displayed AS (
+      SELECT anchor.outbox_rowid * 2 AS id, 'in' AS direction,
         json_extract(inbound.envelope_json, '$.channel') AS channel,
         conversation.chat_id AS endpoint_id,
         json_extract(inbound.envelope_json, '$.content.text') AS content,
@@ -207,11 +219,11 @@ function getCoreMessages({
       JOIN runtime_turns AS turn ON turn.inbound_event_id = inbound.inbound_event_id
       JOIN runtime_conversations AS conversation
         ON conversation.conversation_id = turn.conversation_id
-      JOIN runtime_normalized_events AS event
-        ON event.turn_id = turn.turn_id AND event.event_sequence = 1
+      JOIN turn_anchor AS anchor ON anchor.turn_id = turn.turn_id
       WHERE json_extract(inbound.envelope_json, '$.channel') = 'web-console'
+        AND conversation.chat_id = 'console'
       UNION ALL
-      SELECT event.rowid * 2 + 1 AS id, 'out' AS direction,
+      SELECT outbox.outbox_rowid * 2 + 1 AS id, 'out' AS direction,
         'web-console' AS channel,
         json_extract(outbox.command_json, '$.target.chat_id') AS endpoint_id,
         json_extract(outbox.command_json, '$.render_model.text') AS content,
@@ -220,14 +232,8 @@ function getCoreMessages({
           outbox.updated_at,
           outbox.created_at
         ) AS timestamp
-      FROM runtime_outbox AS outbox
-      JOIN runtime_normalized_events AS event
-        ON event.turn_id = outbox.turn_id
-       AND event.event_sequence = CAST(
-         json_extract(outbox.command_json, '$.event_sequence_through') AS INTEGER
-       )
+      FROM channel_outbox AS outbox
       WHERE outbox.status = 'delivered'
-        AND json_extract(outbox.command_json, '$.target.channel') = 'web-console'
     )
     SELECT id, direction, channel, endpoint_id, content, timestamp
     FROM displayed
@@ -242,6 +248,17 @@ function getNewMessages(sinceId) {
   return getCoreMessages({ sinceId, limit: 100 });
 }
 
+function parseProjectionCursor(value) {
+  if (value === undefined) return 0;
+  const cursor = Number(value);
+  if (!Number.isSafeInteger(cursor) || cursor < 0) {
+    const error = new TypeError('since_id must be a non-negative safe integer');
+    error.status = 400;
+    throw error;
+  }
+  return cursor;
+}
+
 /**
  * Broadcast message to all connected clients
  */
@@ -252,6 +269,9 @@ function broadcast(type, data) {
     if (client.readyState === 1) { // WebSocket.OPEN
       try {
         client.send(message);
+        if (type === 'messages' && Array.isArray(data) && data.length > 0) {
+          clientCursors.set(client, Math.max(...data.map(({ id }) => id)));
+        }
         delivered += 1;
       } catch {
         clients.delete(client);
@@ -264,15 +284,25 @@ function broadcast(type, data) {
 const deliveryOwner = createWebConsoleOutboxOwner({
   database: db,
   clients,
-  serviceInstanceId: `web-console-${process.pid}`,
+  serviceInstanceId: `web-console-${SERVICE_BIRTH_ID}`,
   broadcast,
-  onDeliveredMessage(message) {
-    lastMessageId = Math.max(lastMessageId, message.id);
-  },
 });
 
 async function drainWebOutbox() {
   await deliveryOwner.drain();
+}
+
+async function drainWebOutboxForHttpPoll() {
+  const pollConsumer = Object.freeze({ transport: 'http-poll' });
+  const pollOwner = createWebConsoleOutboxOwner({
+    database: db,
+    clients: new Set([pollConsumer]),
+    serviceInstanceId: `web-console-http-${SERVICE_BIRTH_ID}`,
+    broadcast(type, data) {
+      return type === 'messages' && Array.isArray(data) ? 1 : 0;
+    },
+  });
+  return pollOwner.drain();
 }
 
 function normalizeAttachmentIds(value) {
@@ -409,42 +439,32 @@ async function checkUpdates() {
     broadcast('status', currentStatus);
   }
 
-  await drainWebOutbox();
-
-  // Check for new messages
-  const newMessages = getNewMessages(lastMessageId);
-  if (newMessages.length > 0) {
-    lastMessageId = Math.max(...newMessages.map(m => m.id));
-    broadcast('messages', newMessages);
+  // Each subscribed client advances only its own durable projection cursor.
+  // Project inbound before rendering its outbox so an owner cannot skip the
+  // user's immediately preceding message by advancing to an outbound id.
+  for (const client of clients) {
+    const newMessages = getNewMessages(clientCursors.get(client) ?? 0);
+    if (newMessages.length > 0 && client.readyState === 1) {
+      try {
+        client.send(JSON.stringify({ type: 'messages', data: newMessages }));
+        clientCursors.set(client, Math.max(...newMessages.map(({ id }) => id)));
+      } catch {
+        clients.delete(client);
+      }
+    }
   }
+
+  await drainWebOutbox();
 }
 
-// Poll only while there are consumers. This bounds snapshot work and avoids
-// advancing durable observability snapshots for an unused console.
+// Poll only while there are subscribed consumers. This bounds snapshot work
+// and avoids advancing durable observability snapshots for an unused console.
 let updateInFlight = false;
 setInterval(() => {
   if (clients.size === 0 || updateInFlight) return;
   updateInFlight = true;
   checkUpdates().catch(() => {}).finally(() => { updateInFlight = false; });
 }, 2000);
-
-// Initialize lastMessageId
-try {
-  const result = db.prepare(`
-    SELECT MAX(event.rowid * 2 + 1) AS maxId
-    FROM runtime_outbox AS outbox
-    JOIN runtime_normalized_events AS event
-      ON event.turn_id = outbox.turn_id
-     AND event.event_sequence = CAST(
-       json_extract(outbox.command_json, '$.event_sequence_through') AS INTEGER
-     )
-    WHERE outbox.status = 'delivered'
-      AND json_extract(outbox.command_json, '$.target.channel') = 'web-console'
-  `).get();
-  lastMessageId = result?.maxId ?? 0;
-} catch (err) {
-  // Ignore
-}
 
 /**
  * WebSocket connection handler
@@ -460,8 +480,7 @@ wss.on('connection', (ws, req) => {
     sessionStore.touch(cookies.wc_session);
   }
 
-  clients.add(ws);
-  console.log(`WebSocket client connected (${clients.size} total)`);
+  console.log('WebSocket client connected');
 
   // Send current status immediately
   readStatus().then((status) => {
@@ -474,7 +493,16 @@ wss.on('connection', (ws, req) => {
     try {
       const msg = JSON.parse(data);
 
-      if (msg.type === 'send') {
+      if (msg.type === 'subscribe') {
+        const sinceId = Number(msg.since_id);
+        if (!Number.isSafeInteger(sinceId) || sinceId < 0) {
+          ws.close(1008, 'Invalid durable projection cursor');
+          return;
+        }
+        clientCursors.set(ws, sinceId);
+        clients.add(ws);
+        checkUpdates().catch(() => {});
+      } else if (msg.type === 'send') {
         const tempId = msg.tempId; // Track client's temp ID
         try {
           await sendConsoleMessage({
@@ -648,12 +676,13 @@ app.get('/api/inbound-media/:filename', (req, res) => {
 /**
  * Poll for new messages since given ID (HTTP fallback)
  */
-app.get('/api/poll', (req, res) => {
+app.get('/api/poll', async (req, res) => {
   try {
-    const sinceId = parseInt(req.query.since_id) || 0;
+    const sinceId = parseProjectionCursor(req.query.since_id);
+    await drainWebOutboxForHttpPoll();
     res.json(getNewMessages(sinceId));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 
