@@ -219,19 +219,45 @@ function startTargetHealthProcess({ releasePath, zylosDir, provider, request }) 
     let settled = false;
     let exitState = null;
     const exitWaiters = [];
+    let closePromise = null;
     const settleClose = ({ code, signal }, closeResolve, closeReject) => {
       if (code === 0 || (code === null && signal === 'SIGTERM')) closeResolve();
       else closeReject(new Error(
         `Target health probe exited ${code ?? signal}: ${stderr.trim()}`,
       ));
     };
+    const closeTarget = () => {
+      if (closePromise !== null) return closePromise;
+      closePromise = new Promise((closeResolve, closeReject) => {
+        if (exitState !== null) {
+          settleClose(exitState, closeResolve, closeReject);
+          return;
+        }
+        const timer = setTimeout(() => child.kill('SIGKILL'), 5_000);
+        exitWaiters.push((state) => {
+          clearTimeout(timer);
+          settleClose(state, closeResolve, closeReject);
+        });
+        child.kill('SIGTERM');
+      });
+      return closePromise;
+    };
     const fail = (error) => {
       if (settled) return;
       settled = true;
-      child.kill('SIGTERM');
-      reject(error);
+      closeTarget().then(
+        () => reject(error),
+        (cleanupError) => reject(new AggregateError(
+          [error, cleanupError],
+          `Target health proof failed and cleanup failed: ${error.message}`,
+        )),
+      );
     };
-    child.once('error', fail);
+    child.once('error', (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk) => { stderr += chunk; });
     child.stdout.setEncoding('utf8');
@@ -248,27 +274,13 @@ function startTargetHealthProcess({ releasePath, zylosDir, provider, request }) 
         settled = true;
         resolve(Object.freeze({
           proof,
-          close: () => {
-            if (exitState !== null) {
-              return new Promise((closeResolve, closeReject) => {
-                settleClose(exitState, closeResolve, closeReject);
-              });
-            }
-            return new Promise((closeResolve, closeReject) => {
-              const timer = setTimeout(() => child.kill('SIGKILL'), 5_000);
-              exitWaiters.push((state) => {
-                clearTimeout(timer);
-                settleClose(state, closeResolve, closeReject);
-              });
-              child.kill('SIGTERM');
-            });
-          },
+          close: closeTarget,
         }));
       } catch (error) {
         fail(error);
       }
     });
-    child.once('exit', (code, signal) => {
+    child.once('close', (code, signal) => {
       exitState = { code, signal };
       for (const waiter of exitWaiters.splice(0)) waiter(exitState);
       if (!settled) fail(new Error(`Target health probe exited ${code ?? signal}: ${stderr.trim()}`));

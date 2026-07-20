@@ -159,6 +159,7 @@ export function createExecutorServiceHost({
   let closePromise = null;
   let resolveClosed;
   const closed = new Promise((resolve) => { resolveClosed = resolve; });
+  const controlSockets = new Set();
 
   async function poll() {
     if (lifecycle !== 'open' || pollActive) return;
@@ -171,6 +172,8 @@ export function createExecutorServiceHost({
   }
 
   const server = net.createServer((socket) => {
+    controlSockets.add(socket);
+    socket.once('close', () => controlSockets.delete(socket));
     socket.setEncoding('utf8');
     let data = '';
     let handled = false;
@@ -199,9 +202,7 @@ export function createExecutorServiceHost({
           };
         }
         if (request.action === 'shutdown') {
-          const result = { status: 'completed', service_instance_id: serviceInstanceId };
-          setImmediate(() => close().catch(() => {}));
-          return result;
+          return { status: 'completed', service_instance_id: serviceInstanceId };
         }
         if (request.action === 'upgrade') {
           if (onUpgrade === null) throw new Error('installed_runtime_upgrade_unavailable');
@@ -210,10 +211,12 @@ export function createExecutorServiceHost({
         throw new Error('unsupported_action');
       }).then(
         (result) => {
-          writeResponse(socket, { ok: true, result });
-          if (request.action === 'upgrade' && result?.state === 'committed') {
-            setTimeout(() => close().catch(() => {}), 25);
+          const closeAfterResponse = request.action === 'shutdown'
+            || (request.action === 'upgrade' && result?.state === 'committed');
+          if (closeAfterResponse) {
+            socket.once('finish', () => setImmediate(() => close().catch(() => {})));
           }
+          writeResponse(socket, { ok: true, result });
         },
         (error) => writeResponse(socket, { ok: false, error: error.message }),
       );
@@ -249,7 +252,11 @@ export function createExecutorServiceHost({
       lifecycle = 'closing';
       const failures = [];
       try { await service.close(); } catch (error) { failures.push(error); }
-      try { await closeServer(server); } catch (error) { failures.push(error); }
+      try {
+        const serverClosed = closeServer(server);
+        for (const socket of controlSockets) socket.destroy();
+        await serverClosed;
+      } catch (error) { failures.push(error); }
       try { removeOwnedSocket(socketPath); } catch (error) { failures.push(error); }
       if (onClose !== null) {
         try { await onClose(); } catch (error) { failures.push(error); }

@@ -19,6 +19,22 @@ const require = createRequire(new URL('../skills/comm-bridge/package.json', impo
 const Database = require('better-sqlite3');
 const directories = [];
 
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+async function waitForProcessExit(pid, timeoutMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (processIsAlive(pid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 afterEach(() => {
   for (const directory of directories.splice(0)) {
     fs.rmSync(directory, { recursive: true, force: true });
@@ -257,6 +273,63 @@ describe('installed executor production upgrade owner', () => {
     ))).toMatchObject({ release_ref: 'release-B', upgrade_id: expect.stringMatching(/^upgrade-/) });
     database.close();
   });
+
+  test('reaps a malformed target health process before rollback completes', async () => {
+    const directory = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-health-reap-'));
+    directories.push(directory);
+    const currentRelease = path.join(directory, 'release-A');
+    const downloadedSource = path.join(directory, 'downloaded-B');
+    const zylosDir = path.join(directory, 'installation');
+    const pidFile = path.join(directory, 'health-probe.pid');
+    for (const [release, version] of [[currentRelease, 'release-A'], [downloadedSource, 'release-B']]) {
+      fs.mkdirSync(path.join(release, 'runtime', 'executor'), { recursive: true });
+      fs.mkdirSync(path.join(release, 'cli'), { recursive: true });
+      fs.writeFileSync(path.join(release, 'package.json'), JSON.stringify({ name: 'zylos', version }));
+      fs.writeFileSync(path.join(release, 'runtime', 'executor', 'daemon.js'), 'export {};\n');
+      fs.writeFileSync(path.join(release, 'runtime', 'executor', 'launcher.js'), 'export {};\n');
+      fs.writeFileSync(path.join(release, 'cli', 'launcher.js'), 'export {};\n');
+      fs.writeFileSync(path.join(release, 'cli', 'zylos.js'), 'export {};\n');
+      fs.writeFileSync(
+        path.join(release, 'runtime', 'executor', 'health-probe.js'),
+        release === currentRelease
+          ? 'export {};\n'
+          : `import fs from 'node:fs';\nfs.writeFileSync(process.env.ZYLOS_TEST_HEALTH_PID_FILE, String(process.pid));\nprocess.on('SIGTERM', () => {});\nprocess.stdout.write('not-json\\n');\nsetInterval(() => {}, 1_000);\n`,
+      );
+    }
+    fs.mkdirSync(path.join(zylosDir, 'comm-bridge'), { recursive: true });
+    const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
+    const previousPidFile = process.env.ZYLOS_TEST_HEALTH_PID_FILE;
+    process.env.ZYLOS_TEST_HEALTH_PID_FILE = pidFile;
+    let childPid = null;
+    try {
+      const handler = createInstalledExecutorUpgradeHandler({
+        database,
+        Database,
+        zylosDir,
+        currentReleasePath: currentRelease,
+        currentReleaseRef: 'release-A',
+        provider: 'codex',
+        execFileSyncFn: (file) => (file === 'pm2' ? '[]' : ''),
+      });
+
+      await expect(handler({
+        action: 'upgrade',
+        target: { release: 'release-B', downloaded_source: downloadedSource },
+      })).resolves.toMatchObject({ success: false, state: 'rolled_back' });
+
+      childPid = Number(fs.readFileSync(pidFile, 'utf8'));
+      await waitForProcessExit(childPid);
+      expect(processIsAlive(childPid)).toBe(false);
+    } finally {
+      if (Number.isSafeInteger(childPid) && processIsAlive(childPid)) {
+        process.kill(childPid, 'SIGKILL');
+        await waitForProcessExit(childPid);
+      }
+      database.close();
+      if (previousPidFile === undefined) delete process.env.ZYLOS_TEST_HEALTH_PID_FILE;
+      else process.env.ZYLOS_TEST_HEALTH_PID_FILE = previousPidFile;
+    }
+  }, 10_000);
 
   test('reconstructs the same durable plan and resumes from maintenance after restart', async () => {
     const directory = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-upgrade-resume-'));

@@ -135,6 +135,40 @@ describe('executor service lifecycle host', () => {
     fs.rmSync(state.socketPath, { force: true });
   });
 
+  test('an idle control client cannot block executor shutdown', async () => {
+    const state = fixture();
+    const host = createExecutorServiceHost({
+      database: state.database,
+      adapter: inertAdapter(),
+      provider: 'claude',
+      serviceInstanceId: 'service-fixture-idle-client',
+      socketPath: state.socketPath,
+      workspaceRoot: state.directory,
+    });
+    hosts.push(host);
+    await host.start();
+    const idleClient = net.createConnection(state.socketPath);
+    await new Promise((resolve, reject) => {
+      idleClient.once('connect', resolve);
+      idleClient.once('error', reject);
+    });
+
+    try {
+      const result = await Promise.race([
+        host.close().then(() => 'closed'),
+        new Promise((resolve) => setTimeout(() => resolve('blocked'), 100)),
+      ]);
+      expect(result).toBe('closed');
+      if (!idleClient.destroyed) {
+        await new Promise((resolve) => idleClient.once('close', resolve));
+      }
+      expect(idleClient.destroyed).toBe(true);
+    } finally {
+      idleClient.destroy();
+      await host.close();
+    }
+  });
+
   test('runs the owning resource cleanup when remote shutdown completes', async () => {
     const state = fixture();
     const cleanup = [];
