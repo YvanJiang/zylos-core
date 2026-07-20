@@ -84,6 +84,11 @@ function projectRenderModel(renderModel, event) {
     text = 'Waiting for executor capacity.';
   } else if (
     event.kind === 'turn_state_changed'
+    && event.payload.reason_code === 'steer_requested'
+  ) {
+    text = 'Steering is interrupting the current work. Completed tool calls and external side effects will not be rolled back.';
+  } else if (
+    event.kind === 'turn_state_changed'
     && event.payload.to_state === 'starting'
     && renderModel.text === 'Waiting for executor capacity.'
   ) {

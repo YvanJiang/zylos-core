@@ -2166,16 +2166,18 @@ describe('Codex app-server provider adapter', () => {
     expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
   });
 
-  test('maps service cancellation to the current fenced app-server turn interrupt', async () => {
+  test.each(['stop', 'steer'])(
+    'maps service %s cancellation to the current fenced app-server turn interrupt',
+    async (reason) => {
     const server = createFakeAppServer({ afterTurnStart() {} });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
     const context = executionContext({ lineage: { provider_native_id: 'codex-thread-1' } });
     const waiting = adapter.execute(context)[Symbol.asyncIterator]().next();
     await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
 
-    await expect(adapter.cancel(context)).resolves.toEqual({
+    await expect(adapter.cancel(context, { reason })).resolves.toEqual({
       status: 'interrupt_requested',
-      reason: 'stop',
+      reason,
     });
     expect(server.received).toContainEqual(expect.objectContaining({
       method: 'turn/interrupt',
@@ -2193,7 +2195,8 @@ describe('Codex app-server provider adapter', () => {
     await expect(waiting).rejects.toMatchObject({
       providerError: { code: 'side_effect_unknown' },
     });
-  });
+    },
+  );
 
   test('proves abort isolation only after the exact provider turn reaches terminal', async () => {
     const server = createFakeAppServer({ afterTurnStart() {} });
