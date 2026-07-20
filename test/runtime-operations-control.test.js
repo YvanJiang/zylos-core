@@ -204,6 +204,45 @@ describe('capability-first operations control', () => {
     const database = openTestDatabase();
     initializeRuntimePersistence(database);
     database.exec(`
+      INSERT INTO runtime_operations_controls (
+        caller_namespace, control_id, action, target_json, request_hash,
+        normalized_request_json, control_result_version, latest_result_json,
+        audit_id, created_at, updated_at
+      ) VALUES (
+        'dashboard.prod', 'legacy-reconcile-control', 'reconcile',
+        '{"aggregate_type":"service","service_instance_id":"legacy-service"}',
+        'legacy-hash', '{}', 1, '{}', NULL,
+        '2026-07-20T08:00:00Z', '2026-07-20T08:00:00Z'
+      );
+      INSERT INTO runtime_operations_reconciliation_intents (
+        intent_id, service_instance_id, caller_namespace, expected_service_version,
+        state, control_id, created_at, updated_at
+      ) VALUES (
+        'legacy-reconcile-intent', 'legacy-service', 'dashboard.prod', 1,
+        'pending', 'legacy-reconcile-control',
+        '2026-07-20T08:00:00Z', '2026-07-20T08:00:00Z'
+      );
+      ALTER TABLE runtime_operations_reconciliation_intents
+        RENAME TO runtime_operations_reconciliation_intents_current;
+      CREATE TABLE runtime_operations_reconciliation_intents (
+        intent_id TEXT PRIMARY KEY,
+        service_instance_id TEXT NOT NULL,
+        expected_service_version INTEGER NOT NULL CHECK (expected_service_version > 0),
+        state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed')),
+        control_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (service_instance_id, control_id)
+      );
+      INSERT INTO runtime_operations_reconciliation_intents (
+        intent_id, service_instance_id, expected_service_version,
+        state, control_id, created_at, updated_at
+      )
+      SELECT intent_id, service_instance_id, expected_service_version,
+        state, control_id, created_at, updated_at
+      FROM runtime_operations_reconciliation_intents_current;
+      DROP TABLE runtime_operations_reconciliation_intents_current;
+
       DROP TRIGGER runtime_turn_queue_insert_version;
       DROP TRIGGER runtime_turn_queue_update_version;
       DROP TRIGGER runtime_turn_queue_delete_version;
@@ -224,6 +263,10 @@ describe('capability-first operations control', () => {
       .some(({ name }) => name === 'recovery_version')).toBe(true);
     expect(reopened.prepare("PRAGMA table_info('runtime_reply_mapping_recoveries')").all()
       .some(({ name }) => name === 'recovery_version')).toBe(true);
+    expect(reopened.prepare(`
+      SELECT caller_namespace FROM runtime_operations_reconciliation_intents
+      WHERE intent_id = 'legacy-reconcile-intent'
+    `).get()).toEqual({ caller_namespace: 'dashboard.prod' });
     expect(reopened.prepare(`
       SELECT COUNT(*) AS count FROM sqlite_master
       WHERE type = 'trigger' AND name IN (

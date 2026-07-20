@@ -810,6 +810,52 @@ function addColumnIfMissing(database, tableName, columnName, definition) {
   database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
 }
 
+function migrateOperationsReconciliationIntents(database) {
+  const columns = database.prepare(
+    "PRAGMA table_info('runtime_operations_reconciliation_intents')",
+  ).all();
+  if (columns.some(({ name }) => name === 'caller_namespace')) return;
+  const migrate = database.transaction(() => {
+    database.exec(`
+      CREATE TABLE runtime_operations_reconciliation_intents_v2 (
+        intent_id TEXT PRIMARY KEY,
+        service_instance_id TEXT NOT NULL,
+        caller_namespace TEXT NOT NULL,
+        expected_service_version INTEGER NOT NULL CHECK (expected_service_version > 0),
+        state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed')),
+        control_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (service_instance_id, caller_namespace, control_id)
+      );
+
+      INSERT INTO runtime_operations_reconciliation_intents_v2 (
+        intent_id, service_instance_id, caller_namespace, expected_service_version,
+        state, control_id, created_at, updated_at
+      )
+      SELECT intent.intent_id, intent.service_instance_id,
+        (
+          SELECT control.caller_namespace
+          FROM runtime_operations_controls AS control
+          WHERE control.control_id = intent.control_id
+            AND control.action = 'reconcile'
+            AND json_extract(control.target_json, '$.service_instance_id')
+              = intent.service_instance_id
+          ORDER BY control.created_at, control.caller_namespace
+          LIMIT 1
+        ),
+        intent.expected_service_version, intent.state, intent.control_id,
+        intent.created_at, intent.updated_at
+      FROM runtime_operations_reconciliation_intents AS intent;
+
+      DROP TABLE runtime_operations_reconciliation_intents;
+      ALTER TABLE runtime_operations_reconciliation_intents_v2
+        RENAME TO runtime_operations_reconciliation_intents;
+    `);
+  });
+  migrate.immediate();
+}
+
 function migrateInteractionControlStorage(database) {
   const columns = database.prepare("PRAGMA table_info('runtime_interactions')").all();
   if (columns.some(({ name }) => name === 'parent_type')) return;
@@ -1198,6 +1244,7 @@ export function initializeRuntimePersistence(database) {
   database.pragma('busy_timeout = 5000');
   database.pragma('foreign_keys = ON');
   database.exec(RUNTIME_SCHEMA);
+  migrateOperationsReconciliationIntents(database);
   addColumnIfMissing(database, 'runtime_turns', 'attempt_id', 'TEXT');
   addColumnIfMissing(
     database,

@@ -1797,8 +1797,9 @@ export function createExecutorService({
           'sweep_reconciliation',
         );
         observabilityPublisher.recordReconciliation();
-        refresh();
-        return operationsControl.completeReconciliation(request);
+        const terminal = operationsControl.completeReconciliation(request);
+        try { refresh(); } catch {}
+        return terminal;
       } catch (error) {
         return operationsControl.completeReconciliation(request, error);
       }
