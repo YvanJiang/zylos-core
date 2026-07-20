@@ -156,7 +156,10 @@ export function createExecutorServiceHost({
   let lifecycle = 'created';
   let pollTimer = null;
   let pollActive = false;
+  let resourceClosePromise = null;
   let closePromise = null;
+  let ownsSocket = false;
+  let lifecycleMutation = null;
   let resolveClosed;
   const closed = new Promise((resolve) => { resolveClosed = resolve; });
   const controlSockets = new Set();
@@ -202,11 +205,21 @@ export function createExecutorServiceHost({
           };
         }
         if (request.action === 'shutdown') {
+          await closeResources();
           return { status: 'completed', service_instance_id: serviceInstanceId };
         }
         if (request.action === 'upgrade') {
           if (onUpgrade === null) throw new Error('installed_runtime_upgrade_unavailable');
-          return onUpgrade(request);
+          if (lifecycleMutation !== null) {
+            throw new Error('executor_lifecycle_operation_in_progress');
+          }
+          const operation = Promise.resolve().then(() => onUpgrade(request));
+          lifecycleMutation = operation;
+          try {
+            return await operation;
+          } finally {
+            if (lifecycleMutation === operation) lifecycleMutation = null;
+          }
         }
         throw new Error('unsupported_action');
       }).then(
@@ -218,7 +231,12 @@ export function createExecutorServiceHost({
           }
           writeResponse(socket, { ok: true, result });
         },
-        (error) => writeResponse(socket, { ok: false, error: error.message }),
+        (error) => {
+          if (request?.action === 'shutdown') {
+            socket.once('finish', () => setImmediate(() => close().catch(() => {})));
+          }
+          writeResponse(socket, { ok: false, error: error.message });
+        },
       );
     });
   });
@@ -230,6 +248,7 @@ export function createExecutorServiceHost({
     service.start();
     try {
       await listen(server, socketPath);
+      ownsSocket = true;
     } catch (error) {
       await service.close();
       throw error;
@@ -242,27 +261,53 @@ export function createExecutorServiceHost({
     return service.publishObservabilitySnapshot();
   }
 
-  function close() {
-    if (closePromise) return closePromise;
-    closePromise = (async () => {
+  function closeResources() {
+    if (resourceClosePromise !== null) return resourceClosePromise;
+    resourceClosePromise = (async () => {
       if (pollTimer !== null) {
         clearInterval(pollTimer);
         pollTimer = null;
       }
       lifecycle = 'closing';
       const failures = [];
+      if (lifecycleMutation !== null) {
+        try { await lifecycleMutation; } catch {
+          // The control response owns reporting the upgrade failure; shutdown only joins it.
+        }
+      }
       try { await service.close(); } catch (error) { failures.push(error); }
+      if (onClose !== null) {
+        try { await onClose(); } catch (error) { failures.push(error); }
+      }
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) {
+        throw new AggregateError(failures, 'Executor host resource shutdown failed.');
+      }
+    })();
+    return resourceClosePromise;
+  }
+
+  function close() {
+    if (closePromise) return closePromise;
+    closePromise = (async () => {
+      const failures = [];
+      try { await closeResources(); } catch (error) { failures.push(error); }
       try {
         const serverClosed = closeServer(server);
         for (const socket of controlSockets) socket.destroy();
         await serverClosed;
       } catch (error) { failures.push(error); }
-      try { removeOwnedSocket(socketPath); } catch (error) { failures.push(error); }
-      if (onClose !== null) {
-        try { await onClose(); } catch (error) { failures.push(error); }
+      if (ownsSocket) {
+        try {
+          removeOwnedSocket(socketPath);
+          ownsSocket = false;
+        } catch (error) { failures.push(error); }
       }
       lifecycle = failures.length === 0 ? 'closed' : 'close_failed';
-      resolveClosed();
+      resolveClosed(Object.freeze({
+        ok: failures.length === 0,
+        error: failures.length === 0 ? null : failures[0].message,
+      }));
       if (failures.length === 1) throw failures[0];
       if (failures.length > 1) throw new AggregateError(failures, 'Executor host shutdown failed.');
     })();

@@ -36,6 +36,22 @@ function atomicJson(file, document) {
   fs.renameSync(temporary, file);
 }
 
+function deployManagedFile(source, destination) {
+  if (!fs.statSync(source).isFile()) {
+    throw new Error(`Managed runtime file is missing: ${source}`);
+  }
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  const temporary = `${destination}.${crypto.randomUUID()}.partial`;
+  try {
+    fs.copyFileSync(source, temporary, fs.constants.COPYFILE_EXCL);
+    fs.chmodSync(temporary, 0o644);
+    fs.renameSync(temporary, destination);
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
+  return destination;
+}
+
 function readUpgradePlan(planFile, expectedUpgradeId, {
   installationRoot,
   releaseRoot,
@@ -117,6 +133,7 @@ function readPackageRelease(releasePath) {
     path.join(releasePath, 'runtime', 'executor', 'daemon.js'),
     path.join(releasePath, 'runtime', 'executor', 'health-probe.js'),
     path.join(releasePath, 'runtime', 'executor', 'launcher.js'),
+    path.join(releasePath, 'templates', 'pm2', 'ecosystem.config.cjs'),
   ]) {
     if (!fs.statSync(entry).isFile()) throw new Error(`Downloaded release is missing ${entry}.`);
   }
@@ -172,7 +189,10 @@ function prepareRelease({ source, releaseRef, branch, releaseRoot, execFileSyncF
   return Object.freeze({ packageVersion, releasePath, releaseRef });
 }
 
-function decorateReleaseAdapter(adapter, activeReleaseFile, execFileSyncFn) {
+function decorateReleaseAdapter(adapter, activeReleaseFile, execFileSyncFn, {
+  ecosystemSource,
+  ecosystemDestination,
+}) {
   return Object.freeze({
     async activate(request) {
       const result = await adapter.activate(request);
@@ -193,14 +213,26 @@ function decorateReleaseAdapter(adapter, activeReleaseFile, execFileSyncFn) {
       return { ...result, upgrade_id: null };
     },
     async cleanup(request) {
+      const deployedConfig = deployManagedFile(ecosystemSource, ecosystemDestination);
       const result = await adapter.cleanup(request);
       const registrations = removeLegacyServiceRegistrations(execFileSyncFn);
-      return Object.freeze({ ...result, ...registrations });
+      return Object.freeze({
+        ...result,
+        ...registrations,
+        deployed_ecosystem_config: deployedConfig,
+      });
     },
   });
 }
 
-function startTargetHealthProcess({ releasePath, zylosDir, provider, request }) {
+function startTargetHealthProcess({
+  releasePath,
+  zylosDir,
+  provider,
+  request,
+  proofTimeoutMs,
+  terminationGraceMs,
+}) {
   const entry = path.join(releasePath, 'runtime', 'executor', 'health-probe.js');
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [entry], {
@@ -220,6 +252,13 @@ function startTargetHealthProcess({ releasePath, zylosDir, provider, request }) 
     let exitState = null;
     const exitWaiters = [];
     let closePromise = null;
+    let proofTimer = null;
+    const clearProofTimer = () => {
+      if (proofTimer !== null) {
+        clearTimeout(proofTimer);
+        proofTimer = null;
+      }
+    };
     const settleClose = ({ code, signal }, closeResolve, closeReject) => {
       if (code === 0 || (code === null && signal === 'SIGTERM')) closeResolve();
       else closeReject(new Error(
@@ -233,7 +272,7 @@ function startTargetHealthProcess({ releasePath, zylosDir, provider, request }) 
           settleClose(exitState, closeResolve, closeReject);
           return;
         }
-        const timer = setTimeout(() => child.kill('SIGKILL'), 5_000);
+        const timer = setTimeout(() => child.kill('SIGKILL'), terminationGraceMs);
         exitWaiters.push((state) => {
           clearTimeout(timer);
           settleClose(state, closeResolve, closeReject);
@@ -245,6 +284,7 @@ function startTargetHealthProcess({ releasePath, zylosDir, provider, request }) 
     const fail = (error) => {
       if (settled) return;
       settled = true;
+      clearProofTimer();
       closeTarget().then(
         () => reject(error),
         (cleanupError) => reject(new AggregateError(
@@ -256,6 +296,7 @@ function startTargetHealthProcess({ releasePath, zylosDir, provider, request }) 
     child.once('error', (error) => {
       if (settled) return;
       settled = true;
+      clearProofTimer();
       reject(error);
     });
     child.stderr.setEncoding('utf8');
@@ -272,6 +313,7 @@ function startTargetHealthProcess({ releasePath, zylosDir, provider, request }) 
       try {
         const proof = JSON.parse(stdout.slice(0, newline));
         settled = true;
+        clearProofTimer();
         resolve(Object.freeze({
           proof,
           close: closeTarget,
@@ -285,6 +327,10 @@ function startTargetHealthProcess({ releasePath, zylosDir, provider, request }) 
       for (const waiter of exitWaiters.splice(0)) waiter(exitState);
       if (!settled) fail(new Error(`Target health probe exited ${code ?? signal}: ${stderr.trim()}`));
     });
+    proofTimer = setTimeout(() => {
+      fail(new Error(`Target health proof timed out after ${proofTimeoutMs}ms.`));
+    }, proofTimeoutMs);
+    proofTimer.unref?.();
   });
 }
 
@@ -297,12 +343,20 @@ export function createInstalledExecutorUpgradeHandler({
   provider,
   execFileSyncFn = execFileSync,
   startTargetHealth = startTargetHealthProcess,
+  targetHealthProofTimeoutMs = 30_000,
+  targetHealthTerminationGraceMs = 5_000,
   now = () => new Date().toISOString(),
 }) {
   const installationRoot = requireDirectory('zylosDir', zylosDir);
   const packageRoot = requireDirectory('currentReleasePath', currentReleasePath);
   if (typeof Database !== 'function') throw new TypeError('Database must be a constructor');
   if (typeof startTargetHealth !== 'function') throw new TypeError('startTargetHealth must be a function');
+  if (!Number.isSafeInteger(targetHealthProofTimeoutMs) || targetHealthProofTimeoutMs <= 0) {
+    throw new TypeError('targetHealthProofTimeoutMs must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(targetHealthTerminationGraceMs) || targetHealthTerminationGraceMs <= 0) {
+    throw new TypeError('targetHealthTerminationGraceMs must be a positive safe integer');
+  }
   initializeRuntimePersistence(database);
   const activeReleaseFile = path.join(installationRoot, 'runtime', 'active-release.json');
   const snapshotDirectory = path.join(installationRoot, 'runtime', 'upgrade-snapshots');
@@ -324,6 +378,19 @@ export function createInstalledExecutorUpgradeHandler({
       physicalReleaseAdapter,
       activeReleaseFile,
       execFileSyncFn,
+      {
+        ecosystemSource: path.join(
+          plan.to_release_path,
+          'templates',
+          'pm2',
+          'ecosystem.config.cjs',
+        ),
+        ecosystemDestination: path.join(
+          installationRoot,
+          'pm2',
+          'ecosystem.config.cjs',
+        ),
+      },
     );
     const legacySourceAdapter = createLegacySourceQueueAdapter({
       sourceQueueFile: plan.legacy_queue_file,
@@ -344,6 +411,8 @@ export function createInstalledExecutorUpgradeHandler({
             zylosDir: installationRoot,
             provider: plan.provider,
             request: healthRequest,
+            proofTimeoutMs: targetHealthProofTimeoutMs,
+            terminationGraceMs: targetHealthTerminationGraceMs,
           });
         }
         return targetHealth.proof;

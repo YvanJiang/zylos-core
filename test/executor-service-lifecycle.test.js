@@ -22,6 +22,18 @@ import {
 const directories = [];
 const hosts = [];
 
+async function settleWithin(promise, timeoutMs, timeoutValue) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((resolve) => { timer = setTimeout(() => resolve(timeoutValue), timeoutMs); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 afterEach(async () => {
   await Promise.allSettled(hosts.splice(0).map((host) => host.close()));
   for (const directory of directories.splice(0)) {
@@ -131,6 +143,10 @@ describe('executor service lifecycle host', () => {
 
     await expect(host.start()).rejects.toThrow('already active');
     expect(existing.listening).toBe(true);
+    await host.close();
+    expect(fs.existsSync(state.socketPath)).toBe(true);
+    await expect(requestExecutorService(state.socketPath, { action: 'health' }))
+      .resolves.toEqual({ ok: true });
     await new Promise((resolve, reject) => existing.close((error) => (error ? reject(error) : resolve())));
     fs.rmSync(state.socketPath, { force: true });
   });
@@ -154,10 +170,7 @@ describe('executor service lifecycle host', () => {
     });
 
     try {
-      const result = await Promise.race([
-        host.close().then(() => 'closed'),
-        new Promise((resolve) => setTimeout(() => resolve('blocked'), 100)),
-      ]);
+      const result = await settleWithin(host.close().then(() => 'closed'), 100, 'blocked');
       expect(result).toBe('closed');
       if (!idleClient.destroyed) {
         await new Promise((resolve) => idleClient.once('close', resolve));
@@ -167,6 +180,79 @@ describe('executor service lifecycle host', () => {
       idleClient.destroy();
       await host.close();
     }
+  });
+
+  test('serializes executor upgrade control requests', async () => {
+    const state = fixture();
+    let releaseUpgrade;
+    let markStarted;
+    const upgradeGate = new Promise((resolve) => { releaseUpgrade = resolve; });
+    const upgradeStarted = new Promise((resolve) => { markStarted = resolve; });
+    let invocations = 0;
+    const host = createExecutorServiceHost({
+      database: state.database,
+      adapter: inertAdapter(),
+      provider: 'claude',
+      serviceInstanceId: 'service-fixture-serialized-upgrade',
+      socketPath: state.socketPath,
+      workspaceRoot: state.directory,
+      onUpgrade: async () => {
+        invocations += 1;
+        markStarted();
+        await upgradeGate;
+        return { state: 'rolled_back' };
+      },
+    });
+    hosts.push(host);
+    await host.start();
+    const first = requestExecutorService(state.socketPath, { action: 'upgrade', target: {} });
+    await upgradeStarted;
+    const second = requestExecutorService(state.socketPath, { action: 'upgrade', target: {} });
+
+    try {
+      const result = await settleWithin(second, 100, { blocked: true });
+      expect(result).toEqual({ ok: false, error: 'executor_lifecycle_operation_in_progress' });
+      expect(invocations).toBe(1);
+    } finally {
+      releaseUpgrade();
+      await Promise.allSettled([first, second]);
+    }
+  });
+
+  test('joins an in-flight upgrade before closing executor resources', async () => {
+    const state = fixture();
+    let releaseUpgrade;
+    let markStarted;
+    const upgradeGate = new Promise((resolve) => { releaseUpgrade = resolve; });
+    const upgradeStarted = new Promise((resolve) => { markStarted = resolve; });
+    const cleanup = [];
+    const host = createExecutorServiceHost({
+      database: state.database,
+      adapter: inertAdapter(),
+      provider: 'claude',
+      serviceInstanceId: 'service-fixture-upgrade-close-join',
+      socketPath: state.socketPath,
+      workspaceRoot: state.directory,
+      onUpgrade: async () => {
+        markStarted();
+        await upgradeGate;
+        cleanup.push('upgrade-complete');
+        return { state: 'rolled_back' };
+      },
+      onClose: async () => { cleanup.push('resources-closed'); },
+    });
+    hosts.push(host);
+    await host.start();
+    const upgrade = requestExecutorService(state.socketPath, { action: 'upgrade', target: {} });
+    await upgradeStarted;
+    const closing = host.close();
+
+    expect(await settleWithin(closing.then(() => 'closed'), 100, 'blocked')).toBe('blocked');
+    expect(cleanup).toEqual([]);
+    releaseUpgrade();
+    await expect(closing).resolves.toBeUndefined();
+    expect(cleanup).toEqual(['upgrade-complete', 'resources-closed']);
+    await Promise.allSettled([upgrade]);
   });
 
   test('runs the owning resource cleanup when remote shutdown completes', async () => {
@@ -187,6 +273,25 @@ describe('executor service lifecycle host', () => {
     await requestExecutorService(state.socketPath, { action: 'shutdown' });
     await host.closed;
     expect(cleanup).toEqual(['closed']);
+  });
+
+  test('reports shutdown cleanup failure before acknowledging completion', async () => {
+    const state = fixture();
+    const host = createExecutorServiceHost({
+      database: state.database,
+      adapter: inertAdapter(),
+      provider: 'claude',
+      serviceInstanceId: 'service-fixture-shutdown-failure',
+      socketPath: state.socketPath,
+      workspaceRoot: state.directory,
+      onClose: async () => { throw new Error('database close failed'); },
+    });
+    hosts.push(host);
+    await host.start();
+
+    await expect(requestExecutorService(state.socketPath, { action: 'shutdown' }))
+      .resolves.toEqual({ ok: false, error: 'database close failed' });
+    await expect(host.closed).resolves.toEqual({ ok: false, error: 'database close failed' });
   });
 
   test('routes upgrade requests through the installed runtime owner', async () => {

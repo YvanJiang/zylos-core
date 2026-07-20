@@ -967,7 +967,10 @@ async function startCoreServices() {
   assertLegacyServicesInactive();
 
   const result = requireHealthyExecutorStart(
-    await reconcileExecutorService({ zylosDir: ZYLOS_DIR }),
+    await reconcileExecutorService({
+      zylosDir: ZYLOS_DIR,
+      expectedProvider: getZylosConfig().runtime === 'codex' ? 'codex' : 'claude',
+    }),
   );
   console.log(`  ${success(`${bold('zylos-executor')} (${result.serviceInstanceId})`)}`);
   return 1;

@@ -35,6 +35,18 @@ async function waitForProcessExit(pid, timeoutMs = 1_000) {
   }
 }
 
+async function settleWithin(promise, timeoutMs, timeoutValue) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((resolve) => { timer = setTimeout(() => resolve(timeoutValue), timeoutMs); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 afterEach(() => {
   for (const directory of directories.splice(0)) {
     fs.rmSync(directory, { recursive: true, force: true });
@@ -192,6 +204,7 @@ describe('installed executor production upgrade owner', () => {
     for (const release of [currentRelease, downloadedSource]) {
       fs.mkdirSync(path.join(release, 'runtime', 'executor'), { recursive: true });
       fs.mkdirSync(path.join(release, 'cli'), { recursive: true });
+      fs.mkdirSync(path.join(release, 'templates', 'pm2'), { recursive: true });
       fs.writeFileSync(path.join(release, 'package.json'), JSON.stringify({
         name: 'zylos', version: release === currentRelease ? 'release-A' : 'release-B',
       }));
@@ -200,8 +213,19 @@ describe('installed executor production upgrade owner', () => {
       fs.writeFileSync(path.join(release, 'runtime', 'executor', 'launcher.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'cli', 'launcher.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'cli', 'zylos.js'), 'export {};\n');
+      fs.writeFileSync(
+        path.join(release, 'templates', 'pm2', 'ecosystem.config.cjs'),
+        release === currentRelease
+          ? 'module.exports = { apps: [{ name: "legacy-runtime" }] };\n'
+          : 'module.exports = { apps: [{ name: "zylos-executor" }] };\n',
+      );
     }
     fs.mkdirSync(path.join(zylosDir, 'comm-bridge'), { recursive: true });
+    fs.mkdirSync(path.join(zylosDir, 'pm2'), { recursive: true });
+    fs.writeFileSync(
+      path.join(zylosDir, 'pm2', 'ecosystem.config.cjs'),
+      'module.exports = { apps: [{ name: "legacy-runtime" }] };\n',
+    );
     const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
     const obsoleteArtifacts = legacyLifecycleArtifactPaths(zylosDir);
     for (const artifact of obsoleteArtifacts) {
@@ -271,6 +295,8 @@ describe('installed executor production upgrade owner', () => {
     expect(JSON.parse(fs.readFileSync(
       path.join(zylosDir, 'runtime', 'active-release.json'), 'utf8',
     ))).toMatchObject({ release_ref: 'release-B', upgrade_id: expect.stringMatching(/^upgrade-/) });
+    expect(fs.readFileSync(path.join(zylosDir, 'pm2', 'ecosystem.config.cjs'), 'utf8'))
+      .toBe('module.exports = { apps: [{ name: "zylos-executor" }] };\n');
     database.close();
   });
 
@@ -284,11 +310,16 @@ describe('installed executor production upgrade owner', () => {
     for (const [release, version] of [[currentRelease, 'release-A'], [downloadedSource, 'release-B']]) {
       fs.mkdirSync(path.join(release, 'runtime', 'executor'), { recursive: true });
       fs.mkdirSync(path.join(release, 'cli'), { recursive: true });
+      fs.mkdirSync(path.join(release, 'templates', 'pm2'), { recursive: true });
       fs.writeFileSync(path.join(release, 'package.json'), JSON.stringify({ name: 'zylos', version }));
       fs.writeFileSync(path.join(release, 'runtime', 'executor', 'daemon.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'runtime', 'executor', 'launcher.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'cli', 'launcher.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'cli', 'zylos.js'), 'export {};\n');
+      fs.writeFileSync(
+        path.join(release, 'templates', 'pm2', 'ecosystem.config.cjs'),
+        'module.exports = { apps: [{ name: "zylos-executor" }] };\n',
+      );
       fs.writeFileSync(
         path.join(release, 'runtime', 'executor', 'health-probe.js'),
         release === currentRelease
@@ -331,6 +362,74 @@ describe('installed executor production upgrade owner', () => {
     }
   }, 10_000);
 
+  test('times out and reaps a silent target health process', async () => {
+    const directory = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-health-timeout-'));
+    directories.push(directory);
+    const currentRelease = path.join(directory, 'release-A');
+    const downloadedSource = path.join(directory, 'downloaded-B');
+    const zylosDir = path.join(directory, 'installation');
+    const pidFile = path.join(directory, 'health-probe.pid');
+    for (const [release, version] of [[currentRelease, 'release-A'], [downloadedSource, 'release-B']]) {
+      fs.mkdirSync(path.join(release, 'runtime', 'executor'), { recursive: true });
+      fs.mkdirSync(path.join(release, 'cli'), { recursive: true });
+      fs.mkdirSync(path.join(release, 'templates', 'pm2'), { recursive: true });
+      fs.writeFileSync(path.join(release, 'package.json'), JSON.stringify({ name: 'zylos', version }));
+      fs.writeFileSync(path.join(release, 'runtime', 'executor', 'daemon.js'), 'export {};\n');
+      fs.writeFileSync(path.join(release, 'runtime', 'executor', 'launcher.js'), 'export {};\n');
+      fs.writeFileSync(path.join(release, 'cli', 'launcher.js'), 'export {};\n');
+      fs.writeFileSync(path.join(release, 'cli', 'zylos.js'), 'export {};\n');
+      fs.writeFileSync(
+        path.join(release, 'templates', 'pm2', 'ecosystem.config.cjs'),
+        'module.exports = { apps: [{ name: "zylos-executor" }] };\n',
+      );
+      fs.writeFileSync(
+        path.join(release, 'runtime', 'executor', 'health-probe.js'),
+        release === currentRelease
+          ? 'export {};\n'
+          : `import fs from 'node:fs';\nfs.writeFileSync(process.env.ZYLOS_TEST_HEALTH_PID_FILE, String(process.pid));\nprocess.on('SIGTERM', () => {});\nsetInterval(() => {}, 1_000);\n`,
+      );
+    }
+    fs.mkdirSync(path.join(zylosDir, 'comm-bridge'), { recursive: true });
+    const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
+    const previousPidFile = process.env.ZYLOS_TEST_HEALTH_PID_FILE;
+    process.env.ZYLOS_TEST_HEALTH_PID_FILE = pidFile;
+    let childPid = null;
+    let operation = null;
+    try {
+      const handler = createInstalledExecutorUpgradeHandler({
+        database,
+        Database,
+        zylosDir,
+        currentReleasePath: currentRelease,
+        currentReleaseRef: 'release-A',
+        provider: 'codex',
+        execFileSyncFn: (file) => (file === 'pm2' ? '[]' : ''),
+        targetHealthProofTimeoutMs: 50,
+        targetHealthTerminationGraceMs: 50,
+      });
+      operation = handler({
+        action: 'upgrade',
+        target: { release: 'release-B', downloaded_source: downloadedSource },
+      });
+
+      const result = await settleWithin(operation, 300, { blocked: true });
+      expect(result).toMatchObject({ success: false, state: 'rolled_back' });
+      childPid = Number(fs.readFileSync(pidFile, 'utf8'));
+      await waitForProcessExit(childPid);
+      expect(processIsAlive(childPid)).toBe(false);
+    } finally {
+      if (childPid === null && fs.existsSync(pidFile)) childPid = Number(fs.readFileSync(pidFile, 'utf8'));
+      if (Number.isSafeInteger(childPid) && processIsAlive(childPid)) {
+        process.kill(childPid, 'SIGKILL');
+        await waitForProcessExit(childPid);
+      }
+      if (operation !== null) await Promise.allSettled([operation]);
+      database.close();
+      if (previousPidFile === undefined) delete process.env.ZYLOS_TEST_HEALTH_PID_FILE;
+      else process.env.ZYLOS_TEST_HEALTH_PID_FILE = previousPidFile;
+    }
+  }, 10_000);
+
   test('reconstructs the same durable plan and resumes from maintenance after restart', async () => {
     const directory = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-upgrade-resume-'));
     directories.push(directory);
@@ -340,12 +439,17 @@ describe('installed executor production upgrade owner', () => {
     for (const [release, version] of [[currentRelease, 'release-A'], [targetRelease, 'release-B']]) {
       fs.mkdirSync(path.join(release, 'runtime', 'executor'), { recursive: true });
       fs.mkdirSync(path.join(release, 'cli'), { recursive: true });
+      fs.mkdirSync(path.join(release, 'templates', 'pm2'), { recursive: true });
       fs.writeFileSync(path.join(release, 'package.json'), JSON.stringify({ name: 'zylos', version }));
       fs.writeFileSync(path.join(release, 'runtime', 'executor', 'daemon.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'runtime', 'executor', 'health-probe.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'runtime', 'executor', 'launcher.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'cli', 'launcher.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'cli', 'zylos.js'), 'export {};\n');
+      fs.writeFileSync(
+        path.join(release, 'templates', 'pm2', 'ecosystem.config.cjs'),
+        'module.exports = { apps: [{ name: "zylos-executor" }] };\n',
+      );
     }
     fs.mkdirSync(path.join(zylosDir, 'comm-bridge'), { recursive: true });
     const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));

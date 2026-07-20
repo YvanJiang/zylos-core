@@ -24,11 +24,6 @@ import { fileURLToPath } from 'url';
 import { hookScriptKey, hookScriptBaseKey, getCommandHooks } from './hook-utils.js';
 import { getZylosConfig, updateZylosConfig } from './config.js';
 import { renderCodexProjectConfig, renderCodexGlobalConfig, writeCodexConfig } from './runtime-setup.js';
-import {
-  SIDE_EFFECT_NAMES,
-  buildChain,
-  loadComponentShardDeclarations,
-} from '../../skills/activity-monitor/scripts/shard-registry.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ZYLOS_DIR = path.resolve(process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos'));
@@ -60,48 +55,21 @@ export function isCoreManaged(hook, { zylosDir = ZYLOS_DIR } = {}) {
     || key === path.resolve(zylosDir, '.zylos', 'instructions', 'assembler.mjs').replaceAll('\\', '/');
 }
 
-function zylosClaudeScript(relativePath) {
-  const scriptPath = path.resolve(ZYLOS_DIR, '.claude', relativePath);
-  return `node ${scriptPath}`;
-}
-
-function commandHook(relativePath, options = {}) {
-  return {
-    type: 'command',
-    command: zylosClaudeScript(relativePath),
-    ...options,
-  };
-}
-
 /**
- * One SessionStart hook command per injection shard (plus the two
- * side-effect steps), all running the orchestrator script with distinct
- * `--shard` args. Chain membership and order come from the shard registry:
- * 7 core shards followed by any component shards declared under
- * ~/zylos/.zylos/shards.d/.
+ * The canonical instruction assembler is the only normal SessionStart hook.
+ * Legacy activity-monitor shard hooks remain registry entries solely so an
+ * upgrade can remove installed copies; they are never generated here.
  */
 export function desiredSessionStartHooks({
   zylosDir = ZYLOS_DIR,
   existsSync = fs.existsSync,
 } = {}) {
-  const { chain } = buildChain({ zylosDir });
-  const names = [
-    ...chain.map(shard => shard.name),
-    SIDE_EFFECT_NAMES.foreground,
-    SIDE_EFFECT_NAMES.startPrompt,
-  ];
-  const orchestrator = zylosClaudeScript('skills/activity-monitor/scripts/session-start-orchestrator.js');
   const instructionsDir = path.resolve(zylosDir, '.zylos', 'instructions');
   const assembler = path.join(instructionsDir, 'assembler.mjs');
   const assemblerHook = canonicalAssemblerEntry({ zylosDir });
-  const hooks = names.map(name => ({
-    type: 'command',
-    command: `${orchestrator} --shard ${name}`,
-    timeout: 20000,
-  }));
   // postinstall can run before `zylos init` materializes the assembler.
   // Do not publish a hook that cannot execute; init syncs again after deploy.
-  return existsSync(assembler) ? [assemblerHook, ...hooks] : hooks;
+  return existsSync(assembler) ? [assemblerHook] : [];
 }
 
 export function canonicalAssemblerEntry({ zylosDir = ZYLOS_DIR } = {}) {
@@ -167,60 +135,11 @@ export function desiredClaudeHooks({
   existsSync = fs.existsSync,
 } = {}) {
   const sessionStartHooks = desiredSessionStartHooks({ zylosDir, existsSync });
-  const activityHook = commandHook(
-    'skills/activity-monitor/scripts/hook-activity.js',
-    { async: true, timeout: 5 }
-  );
-
   return {
     SessionStart: ['startup', 'clear', 'compact'].map(matcher => ({
       matcher,
       hooks: sessionStartHooks.map(hook => ({ ...hook })),
     })),
-    UserPromptSubmit: [
-      {
-        hooks: [{ ...activityHook }],
-      },
-    ],
-    PreToolUse: [
-      {
-        matcher: '',
-        hooks: [{ ...activityHook }],
-      },
-    ],
-    PermissionRequest: [
-      {
-        hooks: [
-          commandHook(
-            'skills/activity-monitor/scripts/hook-auth-prompt.js',
-            { async: true, timeout: 5000 }
-          ),
-        ],
-      },
-    ],
-    PostToolUse: [
-      {
-        matcher: '',
-        hooks: [{ ...activityHook }],
-      },
-    ],
-    PostToolUseFailure: [
-      {
-        matcher: '',
-        hooks: [{ ...activityHook }],
-      },
-    ],
-    Stop: [
-      {
-        hooks: [{ ...activityHook }],
-      },
-    ],
-    Notification: [
-      {
-        matcher: 'idle_prompt',
-        hooks: [{ ...activityHook }],
-      },
-    ],
   };
 }
 
@@ -446,10 +365,12 @@ export function syncCodexConfig({
  * may claim its own old hook paths (relative to ~/zylos/.claude, enforced at
  * declaration validation), and everything unclaimed — user hooks, undeclared
  * component hooks, anything outside the zylos .claude root — is preserved.
+ * Component shard declarations belonged to the retired activity-monitor
+ * dispatcher and can no longer claim or replace normal runtime hooks.
  */
 export function claimedHookBaseKeys({ zylosDir = ZYLOS_DIR } = {}) {
-  const { declarations } = loadComponentShardDeclarations({ zylosDir });
-  return new Set(declarations.flatMap(declaration => declaration.claimHooks));
+  void zylosDir;
+  return new Set();
 }
 
 /**

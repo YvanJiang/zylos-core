@@ -101,6 +101,27 @@ describe('executor lifecycle CLI boundary', () => {
     expect(result).toMatchObject({ ok: true, previousServiceInstanceId: 'executor-old', serviceInstanceId: 'executor-new' });
   });
 
+  test('restart rejects a new healthy identity for the wrong provider', async () => {
+    const replies = [
+      health('executor-old', 'healthy', 'claude'),
+      health('executor-wrong-provider', 'healthy', 'claude'),
+    ];
+    const result = await restartExecutorService({
+      zylosDir: '/tmp/zylos-cli-fixture',
+      expectedProvider: 'codex',
+      execFileSyncFn: () => {},
+      requestFn: async () => replies.shift(),
+      retryDelaysMs: [0],
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: 'executor_provider_mismatch',
+      expectedProvider: 'codex',
+      provider: 'claude',
+    });
+  });
+
   test('self-heal is a no-op for healthy Core and starts an unavailable service', async () => {
     const healthyCommands = [];
     await expect(selfHealExecutorService({
@@ -121,6 +142,27 @@ describe('executor lifecycle CLI boundary', () => {
     })).resolves.toMatchObject({ ok: true, repaired: true, serviceInstanceId: 'executor-repaired' });
     expect(repairedCommands[0]).toEqual([
       'pm2', ['start', '/tmp/zylos-cli-fixture/pm2/ecosystem.config.cjs', '--only', EXECUTOR_SERVICE_NAME],
+    ]);
+
+    const degradedCommands = [];
+    const degradedReplies = [
+      health('executor-degraded', 'degraded'),
+      health('executor-degraded', 'degraded'),
+      health('executor-healed'),
+    ];
+    await expect(selfHealExecutorService({
+      zylosDir: '/tmp/zylos-cli-fixture',
+      execFileSyncFn: (file, args) => degradedCommands.push([file, args]),
+      requestFn: async () => degradedReplies.shift(),
+      retryDelaysMs: [0],
+    })).resolves.toMatchObject({
+      ok: true,
+      repaired: true,
+      previousServiceInstanceId: 'executor-degraded',
+      serviceInstanceId: 'executor-healed',
+    });
+    expect(degradedCommands[0]).toEqual([
+      'pm2', ['restart', '/tmp/zylos-cli-fixture/pm2/ecosystem.config.cjs', '--only', EXECUTOR_SERVICE_NAME],
     ]);
   });
 

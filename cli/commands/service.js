@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
-import { ZYLOS_DIR } from '../lib/config.js';
+import { ZYLOS_DIR, getZylosConfig } from '../lib/config.js';
 import {
   EXECUTOR_SERVICE_NAME,
   getExecutorServiceHealth,
@@ -23,6 +23,10 @@ function reportFailure(prefix, result) {
   console.error(error(`${prefix}: ${result.error ?? 'unknown failure'}`));
   process.exitCode = 1;
   return result;
+}
+
+function configuredProvider() {
+  return getZylosConfig().runtime === 'codex' ? 'codex' : 'claude';
 }
 
 export async function showStatus() {
@@ -72,7 +76,10 @@ export function showLogs(args) {
 
 export async function startServices() {
   console.log(heading('Starting Zylos executor service...'));
-  const result = await startExecutorService({ zylosDir: ZYLOS_DIR });
+  const result = await startExecutorService({
+    zylosDir: ZYLOS_DIR,
+    expectedProvider: configuredProvider(),
+  });
   if (!result.ok) return reportFailure('Executor service did not become healthy', result);
   console.log(success(`Executor service started: ${result.serviceInstanceId}`));
   return result;
@@ -88,7 +95,10 @@ export async function stopServices() {
 
 export async function restartServices() {
   console.log(heading('Restarting Zylos executor service...'));
-  const result = await restartExecutorService({ zylosDir: ZYLOS_DIR });
+  const result = await restartExecutorService({
+    zylosDir: ZYLOS_DIR,
+    expectedProvider: configuredProvider(),
+  });
   if (!result.ok) return reportFailure('Executor service restart was not confirmed', result);
   console.log(success(
     `Executor service restarted: ${result.previousServiceInstanceId} → ${result.serviceInstanceId}`,

@@ -12,9 +12,11 @@ describe('executor lifecycle doctor', () => {
       providerAuthStatus: 'success',
       coreHealth: {
         ok: true,
+        provider: 'codex',
         health: 'healthy',
         serviceInstanceId: 'executor-doctor',
         snapshot: {
+          contract: 'zylos.observability-snapshot',
           service: {
             host_id: 'host-doctor',
             service_instance_id: 'executor-doctor',
@@ -46,6 +48,40 @@ describe('executor lifecycle doctor', () => {
       passed: false,
       service: { health: 'offline', error: 'ENOENT' },
       issues: [expect.objectContaining({ id: 'executor_offline' })],
+    });
+  });
+
+  test('uses Core provider identity from a valid degraded snapshot and reports configuration drift', () => {
+    expect(buildExecutorDoctorReport({
+      initialized: true,
+      pm2Installed: true,
+      configuredProvider: 'claude',
+      provider: 'claude',
+      providerInstalled: true,
+      providerAuthStatus: 'success',
+      coreHealth: {
+        ok: false,
+        error: 'executor_degraded',
+        provider: 'codex',
+        health: 'degraded',
+        serviceInstanceId: 'executor-doctor-provider',
+        snapshot: {
+          contract: 'zylos.observability-snapshot',
+          service: {
+            host_id: 'host-doctor-provider',
+            service_instance_id: 'executor-doctor-provider',
+            started_at: '2026-07-20T12:00:00.000Z',
+          },
+        },
+      },
+    })).toMatchObject({
+      passed: false,
+      provider: { name: 'codex', transport: 'official_app_server' },
+      service: { health: 'degraded', service_instance_id: 'executor-doctor-provider' },
+      issues: [
+        expect.objectContaining({ id: 'provider_identity_mismatch' }),
+        expect.objectContaining({ id: 'executor_unhealthy' }),
+      ],
     });
   });
 });

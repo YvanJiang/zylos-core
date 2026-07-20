@@ -148,5 +148,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   };
   process.once('SIGINT', shutdown);
   process.once('SIGTERM', shutdown);
-  await daemon.closed;
+  const outcome = await daemon.closed;
+  if (outcome?.ok === false) {
+    console.error(outcome.error);
+    process.exitCode = 1;
+  }
 }

@@ -209,7 +209,10 @@ async function switchRuntime(target, flags) {
   }
 
   updateZylosConfig({ runtime: target });
-  const restarted = await restartExecutorService({ zylosDir: ZYLOS_DIR });
+  const restarted = await restartExecutorService({
+    zylosDir: ZYLOS_DIR,
+    expectedProvider: target,
+  });
   if (!restarted.ok) {
     updateZylosConfig({ runtime: current });
     console.error(red(`Executor restart failed; provider configuration restored to ${current}.`));

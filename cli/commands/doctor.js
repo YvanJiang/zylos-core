@@ -17,6 +17,8 @@ import {
 } from '../lib/executor-service-lifecycle.js';
 import { bold, dim, green, red, yellow, heading } from '../lib/colors.js';
 
+const SUPPORTED_PROVIDERS = new Set(['claude', 'codex']);
+
 function providerTransport(provider) {
   return provider === 'codex' ? 'official_app_server' : 'claude_agent_sdk';
 }
@@ -25,40 +27,62 @@ export function buildExecutorDoctorReport({
   initialized,
   pm2Installed,
   provider,
+  configuredProvider = provider,
   providerInstalled,
   providerAuthStatus,
   coreHealth,
 }) {
   const issues = [];
+  const coreAvailable = coreHealth.snapshot?.contract === 'zylos.observability-snapshot'
+    && typeof coreHealth.serviceInstanceId === 'string';
+  const coreProvider = coreAvailable && SUPPORTED_PROVIDERS.has(coreHealth.provider)
+    ? coreHealth.provider
+    : null;
+  const authoritativeProvider = coreProvider ?? provider;
   if (!initialized) {
     issues.push({ id: 'not_initialized', label: 'Zylos is not initialized', hint: 'Run: zylos init' });
   }
   if (!pm2Installed) {
     issues.push({ id: 'pm2_missing', label: 'PM2 is not installed', hint: 'Run: zylos init' });
   }
+  if (coreAvailable && coreProvider === null) {
+    issues.push({
+      id: 'provider_identity_invalid',
+      label: 'Core executor provider identity is unavailable',
+      hint: 'Restart the executor service and rerun zylos doctor',
+    });
+  } else if (coreProvider !== null && coreProvider !== configuredProvider) {
+    issues.push({
+      id: 'provider_identity_mismatch',
+      label: `Core executor provider ${coreProvider} differs from configured provider ${configuredProvider}`,
+      hint: `Run: zylos runtime ${configuredProvider}`,
+    });
+  }
   if (!providerInstalled) {
     issues.push({
       id: 'provider_missing',
-      label: `${provider} provider prerequisite is missing`,
+      label: `${authoritativeProvider} provider prerequisite is missing`,
       hint: 'Run: zylos init',
     });
   }
   if (providerInstalled && providerAuthStatus !== 'success') {
     issues.push({
       id: 'provider_auth',
-      label: `${provider} authentication is ${providerAuthStatus}`,
+      label: `${authoritativeProvider} authentication is ${providerAuthStatus}`,
       hint: 'Run: zylos init',
     });
   }
   if (!coreHealth.ok) {
     issues.push({
-      id: 'executor_offline',
-      label: 'Core executor service is unavailable',
+      id: coreAvailable ? 'executor_unhealthy' : 'executor_offline',
+      label: coreAvailable
+        ? `Core executor service is ${coreHealth.health}`
+        : 'Core executor service is unavailable',
       hint: 'Run: zylos doctor to reconcile or zylos start',
     });
   }
 
-  const service = coreHealth.ok ? {
+  const service = coreAvailable ? {
     health: coreHealth.health,
     service_instance_id: coreHealth.serviceInstanceId,
     host_id: coreHealth.snapshot.service.host_id,
@@ -76,8 +100,8 @@ export function buildExecutorDoctorReport({
     initialized,
     supervisor: { name: 'pm2', ready: pm2Installed },
     provider: {
-      name: provider,
-      transport: providerTransport(provider),
+      name: authoritativeProvider,
+      transport: providerTransport(authoritativeProvider),
       installed: providerInstalled,
       auth_status: providerAuthStatus,
       ready: providerInstalled && providerAuthStatus === 'success',
@@ -88,7 +112,15 @@ export function buildExecutorDoctorReport({
 }
 
 async function collectReport() {
-  const provider = getZylosConfig().runtime === 'codex' ? 'codex' : 'claude';
+  const configuredProvider = getZylosConfig().runtime === 'codex' ? 'codex' : 'claude';
+  const initialized = fs.existsSync(CONFIG_DIR)
+    && fs.existsSync(path.join(ZYLOS_DIR, 'pm2', 'ecosystem.config.cjs'));
+  const coreHealth = initialized
+    ? await getExecutorServiceHealth({ zylosDir: ZYLOS_DIR })
+    : { ok: false, error: 'not_initialized' };
+  const provider = SUPPORTED_PROVIDERS.has(coreHealth.provider)
+    ? coreHealth.provider
+    : configuredProvider;
   const providerInstalled = commandExists(provider);
   let providerAuthStatus = 'failure';
   if (providerInstalled) {
@@ -100,15 +132,11 @@ async function collectReport() {
       providerAuthStatus = 'uncertain';
     }
   }
-  const initialized = fs.existsSync(CONFIG_DIR)
-    && fs.existsSync(path.join(ZYLOS_DIR, 'pm2', 'ecosystem.config.cjs'));
-  const coreHealth = initialized
-    ? await getExecutorServiceHealth({ zylosDir: ZYLOS_DIR })
-    : { ok: false, error: 'not_initialized' };
   return buildExecutorDoctorReport({
     initialized,
     pm2Installed: commandExists('pm2'),
     provider,
+    configuredProvider,
     providerInstalled,
     providerAuthStatus,
     coreHealth,
@@ -143,8 +171,11 @@ export async function doctorCommand(args) {
   let report = await collectReport();
 
   if (!report.passed && !checkOnly && report.initialized && report.supervisor.ready
-    && report.provider.ready && report.service.health === 'offline') {
-    const repair = await selfHealExecutorService({ zylosDir: ZYLOS_DIR });
+    && report.provider.ready && report.service.health !== 'healthy') {
+    const repair = await selfHealExecutorService({
+      zylosDir: ZYLOS_DIR,
+      expectedProvider: report.provider.name,
+    });
     if (repair.ok) report = await collectReport();
   }
 

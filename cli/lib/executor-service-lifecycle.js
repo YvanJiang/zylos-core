@@ -63,15 +63,29 @@ function delay(milliseconds) {
   });
 }
 
-async function waitForHealthy({ zylosDir, requestFn, retryDelaysMs, previousServiceInstanceId = null }) {
+async function waitForHealthy({
+  zylosDir,
+  requestFn,
+  retryDelaysMs,
+  previousServiceInstanceId = null,
+  expectedProvider = null,
+}) {
   let last = { ok: false, error: 'executor_health_unavailable' };
   for (const waitMs of retryDelaysMs) {
     await delay(waitMs);
     last = await readHealth({ zylosDir, requestFn });
-    if (last.ok && (
+    if (last.ok && (expectedProvider === null || last.provider === expectedProvider) && (
       previousServiceInstanceId === null
       || last.serviceInstanceId !== previousServiceInstanceId
     )) return last;
+  }
+  if (last.ok && expectedProvider !== null && last.provider !== expectedProvider) {
+    return {
+      ...last,
+      ok: false,
+      error: 'executor_provider_mismatch',
+      expectedProvider,
+    };
   }
   if (last.ok && previousServiceInstanceId !== null) {
     return { ok: false, error: 'executor_identity_did_not_change' };
@@ -89,6 +103,7 @@ function pm2Failure(error) {
 
 export async function startExecutorService({
   zylosDir,
+  expectedProvider = null,
   execFileSyncFn = execFileSync,
   requestFn = requestExecutorService,
   retryDelaysMs = [0, 100, 250, 500, 1_000, 2_000],
@@ -101,7 +116,7 @@ export async function startExecutorService({
   } catch (error) {
     return pm2Failure(error);
   }
-  return waitForHealthy({ zylosDir, requestFn, retryDelaysMs });
+  return waitForHealthy({ zylosDir, requestFn, retryDelaysMs, expectedProvider });
 }
 
 export async function stopExecutorService({
@@ -133,12 +148,13 @@ export async function stopExecutorService({
 
 export async function restartExecutorService({
   zylosDir,
+  expectedProvider = null,
   execFileSyncFn = execFileSync,
   requestFn = requestExecutorService,
   retryDelaysMs = [0, 100, 250, 500, 1_000, 2_000],
 } = {}) {
   const previous = await readHealth({ zylosDir, requestFn });
-  if (!previous.ok) return previous;
+  if (typeof previous.serviceInstanceId !== 'string') return previous;
   try {
     runPm2(execFileSyncFn, [
       'restart', ecosystemPath(zylosDir), '--only', EXECUTOR_SERVICE_NAME,
@@ -152,6 +168,7 @@ export async function restartExecutorService({
     requestFn,
     retryDelaysMs,
     previousServiceInstanceId: previous.serviceInstanceId,
+    expectedProvider,
   });
   return current.ok ? { ...current, previousServiceInstanceId: previous.serviceInstanceId } : current;
 }
@@ -162,7 +179,9 @@ export async function selfHealExecutorService(options = {}) {
     requestFn: options.requestFn ?? requestExecutorService,
   });
   if (current.ok) return { ...current, repaired: false };
-  const repaired = await startExecutorService(options);
+  const repaired = typeof current.serviceInstanceId === 'string'
+    ? await restartExecutorService(options)
+    : await startExecutorService(options);
   return repaired.ok ? { ...repaired, repaired: true } : repaired;
 }
 
@@ -171,7 +190,9 @@ export async function reconcileExecutorService(options = {}) {
     zylosDir: options.zylosDir,
     requestFn: options.requestFn ?? requestExecutorService,
   });
-  return current.ok ? restartExecutorService(options) : startExecutorService(options);
+  return typeof current.serviceInstanceId === 'string'
+    ? restartExecutorService(options)
+    : startExecutorService(options);
 }
 
 export async function getExecutorServiceHealth({
