@@ -34,10 +34,7 @@ export function getDb() {
     db.pragma('busy_timeout = 5000');
     db.pragma('foreign_keys = ON');
 
-    const hasLegacyHistorySchema = db.prepare(`
-      SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'conversations'
-    `).get() !== undefined;
-    if (isNew || !hasLegacyHistorySchema) {
+    if (isNew) {
       initSchema();
     }
 

@@ -1,7 +1,22 @@
 #!/usr/bin/env node
 
 import { acceptCompatibilityInbound } from '../../../runtime/compatibility/c4-channel-fallback.js';
-import { close, getDb } from './c4-db.js';
+import Database from 'better-sqlite3';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+const ZYLOS_DIR = process.env.ZYLOS_DIR ?? path.join(os.homedir(), 'zylos');
+const DATABASE_PATH = path.join(ZYLOS_DIR, 'comm-bridge', 'c4.db');
+
+function openCoreDatabase() {
+  fs.mkdirSync(path.dirname(DATABASE_PATH), { recursive: true });
+  const database = new Database(DATABASE_PATH);
+  database.pragma('journal_mode = WAL');
+  database.pragma('busy_timeout = 5000');
+  database.pragma('foreign_keys = ON');
+  return database;
+}
 
 function printUsage() {
   console.error(`Usage: node c4-receive.js \\
@@ -138,6 +153,7 @@ function emitAccepted(json, result) {
 }
 
 function main() {
+  let database = null;
   const parsed = parseArgs(process.argv.slice(2));
   if (parsed.error) {
     printUsage();
@@ -153,8 +169,9 @@ function main() {
   }
   try {
     const receivedAt = new Date().toISOString();
+    database = openCoreDatabase();
     const result = acceptCompatibilityInbound(
-      getDb(),
+      database,
       compatibilityMessage(parsed, receivedAt),
       { now: () => receivedAt },
     );
@@ -162,7 +179,7 @@ function main() {
   } catch (error) {
     fail(parsed.json, 'INTERNAL_ERROR', error?.message ?? 'compatibility ingress failed');
   } finally {
-    close();
+    database?.close();
   }
 }
 

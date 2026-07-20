@@ -62,6 +62,14 @@ describe('normal C4 callers use durable Core contracts', () => {
     assert.equal(typeof accepted.turn_id, 'string');
 
     const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
+    const legacyTables = database.prepare(`
+      SELECT name
+      FROM sqlite_master
+      WHERE type = 'table'
+        AND name IN ('checkpoints', 'conversations', 'control_queue', 'status_notice_cooldowns')
+      ORDER BY name
+    `).all();
+    assert.equal(legacyTables.length, 0);
     assert.equal(database.prepare('SELECT state FROM runtime_turns WHERE turn_id = ?')
       .get(accepted.turn_id).state, 'queued');
     const command = JSON.parse(database.prepare(
