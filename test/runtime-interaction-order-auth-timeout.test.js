@@ -17,6 +17,13 @@ function createRunningTurn(database, suffix = 'order') {
   return createRunningInteractionTurn(database, suffix);
 }
 
+function stopActiveConversation(service, accepted, suffix = accepted.turn_id) {
+  return service.stop({
+    conversation_id: accepted.conversation_id,
+    stop_id: `stop-${suffix}`,
+  });
+}
+
 function requestInteraction(store, turnContext, suffix, overrides = {}) {
   return store.requestInteraction(turnContext, {
     provider_interaction_ref: `provider-question-${suffix}`,
@@ -599,7 +606,7 @@ describe('runtime interaction order, authorization, and timeout', () => {
     database.close();
   });
 
-  test('cancels buffered provider-neutral interaction requests without re-entering waiting', async () => {
+  test('cancels the durable interaction and fences later buffered provider requests', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedInteractionTurn(database, 'buffered-generic-cancel');
     const descriptor = (ordinal) => ({
@@ -630,9 +637,9 @@ describe('runtime interaction order, authorization, and timeout', () => {
     });
 
     await expect(service.runNext()).resolves.toMatchObject({ status: 'waiting_user' });
-    await expect(service.cancel(accepted.conversation_id)).resolves.toMatchObject({
-      status: 'cancellation_requested',
-      execution: { status: 'stopped' },
+    await expect(stopActiveConversation(service, accepted)).resolves.toMatchObject({
+      status: 'stopped',
+      active_turn: { turn_id: accepted.turn_id },
     });
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
       .get(accepted.turn_id)).toEqual({ state: 'stopped' });
@@ -640,7 +647,6 @@ describe('runtime interaction order, authorization, and timeout', () => {
       SELECT ordinal, state FROM runtime_interactions WHERE turn_id = ? ORDER BY ordinal
     `).all(accepted.turn_id)).toEqual([
       { ordinal: 1, state: 'cancelled' },
-      { ordinal: 2, state: 'cancelled' },
     ]);
 
     await service.close();

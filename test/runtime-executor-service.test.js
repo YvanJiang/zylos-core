@@ -66,6 +66,13 @@ function acceptQueuedTurn(database, suffix = 'canonical') {
   });
 }
 
+function stopActiveConversation(service, accepted, suffix = accepted.turn_id) {
+  return service.stop({
+    conversation_id: accepted.conversation_id,
+    stop_id: `stop-${suffix}`,
+  });
+}
+
 function malformedTurnStartAppServer() {
   const child = new EventEmitter();
   child.stdin = new PassThrough();
@@ -597,9 +604,9 @@ describe('runtime executor service', () => {
     });
 
     await expect(service.runNext()).resolves.toMatchObject({ status: 'waiting_user' });
-    await expect(service.cancel(accepted.conversation_id)).resolves.toMatchObject({
-      status: 'cancellation_requested',
-      execution: { status: 'stopped', turn_id: accepted.turn_id },
+    await expect(stopActiveConversation(service, accepted)).resolves.toMatchObject({
+      status: 'stopped',
+      active_turn: { turn_id: accepted.turn_id },
     });
     expect(database.prepare(`
       SELECT state FROM runtime_turns WHERE turn_id = ?
