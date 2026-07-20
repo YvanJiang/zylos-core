@@ -250,8 +250,12 @@ function broadcast(type, data) {
   let delivered = 0;
   for (const client of clients) {
     if (client.readyState === 1) { // WebSocket.OPEN
-      client.send(message);
-      delivered += 1;
+      try {
+        client.send(message);
+        delivered += 1;
+      } catch {
+        clients.delete(client);
+      }
     }
   }
   return delivered;
