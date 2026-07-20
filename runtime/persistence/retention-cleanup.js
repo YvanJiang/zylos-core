@@ -9,6 +9,27 @@ const TERMINAL_TURN_STATES = Object.freeze([
   'timed_out',
 ]);
 const BUSY_RETRY_DELAYS_MS = Object.freeze([10, 50, 250]);
+const ROW_SOURCES = Object.freeze({
+  normalized_event: Object.freeze(['runtime_normalized_events', 'event_id']),
+  provider_raw_event: Object.freeze(['runtime_provider_event_diagnostics', 'diagnostic_id']),
+  intermediate_projection: Object.freeze(['runtime_projection_snapshots', 'projection_id']),
+  terminal_projection: Object.freeze(['runtime_projection_snapshots', 'projection_id']),
+  provider_attempt_detail: Object.freeze(['runtime_provider_attempts', 'attempt_id']),
+  terminal_outbox: Object.freeze(['runtime_outbox', 'outbox_id']),
+  terminal_turn_queue: Object.freeze(['runtime_turn_queue', 'turn_id']),
+  terminal_background_work: Object.freeze([
+    'runtime_workspace_background_work',
+    'background_work_id',
+  ]),
+  terminal_workspace_lease: Object.freeze(['runtime_workspace_leases', 'workspace_lease_id']),
+  permission_audit: Object.freeze(['runtime_permission_audit', 'audit_id']),
+  operations_audit: Object.freeze(['runtime_operations_audit', 'audit_id']),
+  interaction_audit: Object.freeze(['runtime_interaction_audit', 'audit_id']),
+  permission_action_decision: Object.freeze([
+    'runtime_permission_action_decisions',
+    'decision_id',
+  ]),
+});
 
 function sleepSynchronously(delayMs) {
   const signal = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
@@ -31,6 +52,16 @@ function validateMaxLag(maxLagMs) {
   if (!Number.isSafeInteger(maxLagMs) || maxLagMs < 0) {
     throw new TypeError('maxLagMs must be a non-negative safe integer.');
   }
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => (
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+    )).join(',')}}`;
+  }
+  return JSON.stringify(value);
 }
 
 function turnIsProtected(database, turnId) {
@@ -103,103 +134,26 @@ function loadCandidates(database, transactionTime) {
   `).all(transactionTime).filter(({ turn_id: turnId }) => !turnIsProtected(database, turnId));
 }
 
-function readContent(database, candidate) {
-  if (candidate.record_kind === 'normalized_event') {
-    return database.prepare(`
-      SELECT event_json FROM runtime_normalized_events WHERE event_id = ?
-    `).get(candidate.record_id)?.event_json ?? null;
-  }
-  if (candidate.record_kind === 'provider_raw_event') {
-    return database.prepare(`
-      SELECT descriptor_json FROM runtime_provider_event_diagnostics WHERE diagnostic_id = ?
-    `).get(candidate.record_id)?.descriptor_json ?? null;
-  }
-  if (['intermediate_projection', 'terminal_projection'].includes(candidate.record_kind)) {
-    return database.prepare(`
-      SELECT render_model_json FROM runtime_projection_snapshots WHERE projection_id = ?
-    `).get(candidate.record_id)?.render_model_json ?? null;
-  }
-  if (candidate.record_kind === 'provider_attempt_detail') {
-    const row = database.prepare(`
-      SELECT runtime_instance_id, runtime_evidence_json, last_provider_event_at,
-        retry_backoff_ms, next_retry_at, error_json
-      FROM runtime_provider_attempts WHERE attempt_id = ?
-    `).get(candidate.record_id);
-    return row === undefined ? null : JSON.stringify(row);
-  }
-  if (candidate.record_kind === 'terminal_outbox') {
-    const row = database.prepare(`
-      SELECT command_json, last_error_json, result_json
-      FROM runtime_outbox WHERE outbox_id = ?
-    `).get(candidate.record_id);
-    return row === undefined ? null : JSON.stringify(row);
-  }
-  if (candidate.record_kind === 'terminal_turn_queue') {
-    const row = database.prepare(`
-      SELECT status, wait_reason, wait_detail_json, enqueued_at
-      FROM runtime_turn_queue WHERE turn_id = ?
-    `).get(candidate.record_id);
-    return row === undefined ? null : JSON.stringify(row);
-  }
-  if (candidate.record_kind === 'terminal_background_work') {
-    const row = database.prepare(`
-      SELECT provider_task_id, state, started_at, ended_at, error_json
-      FROM runtime_workspace_background_work WHERE background_work_id = ?
-    `).get(candidate.record_id);
-    return row === undefined ? null : JSON.stringify(row);
-  }
-  if (candidate.record_kind === 'terminal_workspace_lease') {
-    const row = database.prepare(`
-      SELECT workspace_root, mode, lease_epoch, lease_expires_at, state,
-        acquired_at, updated_at, released_at
-      FROM runtime_workspace_leases WHERE workspace_lease_id = ?
-    `).get(candidate.record_id);
-    return row === undefined ? null : JSON.stringify(row);
-  }
-  if (candidate.record_kind === 'permission_audit') {
-    const row = database.prepare(`
-      SELECT action, actor_id, source, scope_json, policy_revision, reason,
-        redacted_context_json, action_ref, committed_at
-      FROM runtime_permission_audit WHERE audit_id = ?
-    `).get(candidate.record_id);
-    return row === undefined ? null : JSON.stringify(row);
-  }
-  if (candidate.record_kind === 'operations_audit') {
-    const row = database.prepare(`
-      SELECT caller_namespace, control_id, action, outcome, subject_type,
-        subject_id, capability, grant_id, policy_id, policy_version,
-        target_json, expected_version_json, previous_target_version,
-        target_version, reason, error_json, committed_at
-      FROM runtime_operations_audit WHERE audit_id = ?
-    `).get(candidate.record_id);
-    return row === undefined ? null : JSON.stringify(row);
-  }
-  if (candidate.record_kind === 'interaction_audit') {
-    const row = database.prepare(`
-      SELECT interaction_id, handoff_id, outcome, provider_attempt_id,
-        lease_epoch, acknowledgement_json, created_at
-      FROM runtime_interaction_audit WHERE audit_id = ?
-    `).get(candidate.record_id);
-    return row === undefined ? null : JSON.stringify(row);
-  }
-  if (candidate.record_kind === 'permission_action_decision') {
-    const row = database.prepare(`
-      SELECT turn_id, action_ref, action_kind, outcome, basis_kind, grant_id,
-        checked_policy_revision, checked_at
-      FROM runtime_permission_action_decisions WHERE decision_id = ?
-    `).get(candidate.record_id);
-    return row === undefined ? null : JSON.stringify(row);
-  }
+function readCanonicalContent(database, candidate) {
+  let row;
   if (candidate.record_kind === 'operations_idempotency_conflict') {
     const [callerNamespace, controlId, requestHash] = JSON.parse(candidate.record_id);
-    const row = database.prepare(`
-      SELECT result_json, audit_id, committed_at
+    row = database.prepare(`
+      SELECT *
       FROM runtime_operations_idempotency_conflicts
       WHERE caller_namespace = ? AND control_id = ? AND request_hash = ?
     `).get(callerNamespace, controlId, requestHash);
-    return row === undefined ? null : JSON.stringify(row);
+  } else {
+    const source = ROW_SOURCES[candidate.record_kind];
+    if (!source) throw new Error(`Unsupported retention record kind ${candidate.record_kind}.`);
+    const [table, key] = source;
+    row = database.prepare(`SELECT * FROM ${table} WHERE ${key} = ?`).get(candidate.record_id);
   }
-  throw new Error(`Unsupported retention record kind ${candidate.record_kind}.`);
+  return row === undefined ? null : canonicalJson({
+    digest_schema_version: 1,
+    record_kind: candidate.record_kind,
+    row,
+  });
 }
 
 function disposeRecord(database, candidate) {
@@ -320,28 +274,25 @@ export function createRetentionCleanup({
       now(),
       'cleanup transaction time',
     );
-    const candidates = loadCandidates(database, transactionTime);
-    const oldestExpiryAt = candidates[0]?.expires_at ?? null;
-    const observedLagMs = oldestExpiryAt === null
-      ? 0
-      : Math.max(0, transactionTimeMs - Date.parse(oldestExpiryAt));
-    const maxLagExceeded = observedLagMs > maxLagMs;
-    const common = {
-      transaction_time: transactionTime,
-      candidates,
-      candidate_count: candidates.length,
-      oldest_expiry_at: oldestExpiryAt,
-      observed_lag_ms: observedLagMs,
-      max_lag_ms: maxLagMs,
-      max_lag_exceeded: maxLagExceeded,
-      alert: maxLagExceeded ? Object.freeze({
-        code: 'retention_cleanup_max_lag_exceeded',
-        retryable: false,
-      }) : null,
-    };
     if (dryRun) {
+      const candidates = loadCandidates(database, transactionTime);
+      const oldestExpiryAt = candidates[0]?.expires_at ?? null;
+      const observedLagMs = oldestExpiryAt === null
+        ? 0
+        : Math.max(0, transactionTimeMs - Date.parse(oldestExpiryAt));
+      const maxLagExceeded = observedLagMs > maxLagMs;
       return Object.freeze({
-        ...common,
+        transaction_time: transactionTime,
+        candidates,
+        candidate_count: candidates.length,
+        oldest_expiry_at: oldestExpiryAt,
+        observed_lag_ms: observedLagMs,
+        max_lag_ms: maxLagMs,
+        max_lag_exceeded: maxLagExceeded,
+        alert: maxLagExceeded ? Object.freeze({
+          code: 'retention_cleanup_max_lag_exceeded',
+          retryable: false,
+        }) : null,
         dry_run: true,
         disposed_count: 0,
         deleted_by_kind: Object.freeze({}),
@@ -352,13 +303,13 @@ export function createRetentionCleanup({
     let busyRetryCount = 0;
     const commit = database.transaction(() => {
       const currentCandidates = loadCandidates(database, transactionTime);
-      const expected = JSON.stringify(candidates);
-      if (JSON.stringify(currentCandidates) !== expected) {
-        throw new Error('Retention candidates changed before the cleanup transaction acquired authority.');
-      }
+      const oldestExpiryAt = currentCandidates[0]?.expires_at ?? null;
+      const observedLagMs = oldestExpiryAt === null
+        ? 0
+        : Math.max(0, transactionTimeMs - Date.parse(oldestExpiryAt));
       const deletedByKind = {};
       for (const candidate of currentCandidates) {
-        const content = readContent(database, candidate);
+        const content = readCanonicalContent(database, candidate);
         if (content === null) {
           throw new Error(`Retention source ${candidate.record_kind}:${candidate.record_id} is missing.`);
         }
@@ -371,8 +322,9 @@ export function createRetentionCleanup({
         database.prepare(`
           INSERT INTO runtime_retention_deletion_audit (
             audit_id, sweep_id, record_kind, record_id, turn_id, retention_class,
-            anchor_at, expires_at, disposal_kind, content_sha256, deleted_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            anchor_at, expires_at, disposal_kind, content_digest_version,
+            content_sha256, deleted_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
         `).run(
           auditId,
           sweepId,
@@ -414,7 +366,12 @@ export function createRetentionCleanup({
         busyRetryCount,
         transactionTime,
       );
-      return { currentCandidates, deletedByKind };
+      return {
+        currentCandidates,
+        deletedByKind,
+        oldestExpiryAt,
+        observedLagMs,
+      };
     });
     let committed;
     for (;;) {
@@ -428,10 +385,25 @@ export function createRetentionCleanup({
         sleep(delayMs, busyRetryCount);
       }
     }
-    const { currentCandidates, deletedByKind } = committed;
+    const {
+      currentCandidates,
+      deletedByKind,
+      oldestExpiryAt,
+      observedLagMs,
+    } = committed;
+    const maxLagExceeded = observedLagMs > maxLagMs;
     return Object.freeze({
-      ...common,
+      transaction_time: transactionTime,
       candidates: currentCandidates,
+      candidate_count: currentCandidates.length,
+      oldest_expiry_at: oldestExpiryAt,
+      observed_lag_ms: observedLagMs,
+      max_lag_ms: maxLagMs,
+      max_lag_exceeded: maxLagExceeded,
+      alert: maxLagExceeded ? Object.freeze({
+        code: 'retention_cleanup_max_lag_exceeded',
+        retryable: false,
+      }) : null,
       dry_run: false,
       sweep_id: sweepId,
       busy_retry_count: busyRetryCount,

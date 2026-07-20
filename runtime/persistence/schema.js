@@ -822,6 +822,7 @@ const RUNTIME_SCHEMA = `
     anchor_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
     disposal_kind TEXT NOT NULL,
+    content_digest_version INTEGER NOT NULL DEFAULT 1 CHECK (content_digest_version = 1),
     content_sha256 TEXT NOT NULL,
     deleted_at TEXT NOT NULL,
     UNIQUE (record_kind, record_id)
@@ -1347,6 +1348,12 @@ export function initializeRuntimePersistence(database) {
   addColumnIfMissing(database, 'runtime_turns', 'provider_input_json', 'TEXT');
   addColumnIfMissing(database, 'runtime_turns', 'terminal_at', 'TEXT');
   addColumnIfMissing(database, 'runtime_turns', 'detail_expires_at', 'TEXT');
+  addColumnIfMissing(
+    database,
+    'runtime_retention_deletion_audit',
+    'content_digest_version',
+    'INTEGER NOT NULL DEFAULT 1 CHECK (content_digest_version = 1)',
+  );
   addColumnIfMissing(
     database,
     'runtime_turns',

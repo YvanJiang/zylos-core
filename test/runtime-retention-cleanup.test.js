@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -31,6 +32,16 @@ function openTestDatabase() {
   temporaryDirectories.push(directory);
   const databasePath = path.join(directory, 'c4.db');
   return { database: new Database(databasePath), databasePath };
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => (
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+    )).join(',')}}`;
+  }
+  return JSON.stringify(value);
 }
 
 function envelope(suffix, occurredAt) {
@@ -599,6 +610,93 @@ describe('runtime retention cleanup', () => {
       ORDER BY expires_at LIMIT 1
     `).get().expires_at).toBe(expiryBefore);
     blocker.close();
+    database.close();
+  });
+
+  test('treats a concurrent winning sweep as an idempotent no-op after busy retry', () => {
+    const { database, databasePath } = openTestDatabase();
+    createTerminalTurn(database, 'concurrent-sweep', '2026-07-01T00:00:00.000Z');
+    const blocker = new Database(databasePath);
+    const winnerDatabase = new Database(databasePath);
+    const winner = createExecutorStore({
+      database: winnerDatabase,
+      provider: 'claude',
+      serviceInstanceId: 'executor-retention-concurrent-winner',
+      now: () => '2026-07-08T00:01:00.000Z',
+      generateId: deterministicIds('concurrent-winner'),
+    });
+    let winningResult;
+    const contender = createExecutorStore({
+      database,
+      provider: 'claude',
+      serviceInstanceId: 'executor-retention-concurrent-contender',
+      now: () => '2026-07-08T00:01:00.000Z',
+      generateId: deterministicIds('concurrent-contender'),
+      retentionCleanupSleep() {
+        blocker.exec('ROLLBACK');
+        winningResult = winner.runRetentionCleanup({ dryRun: false, maxLagMs: 30_000 });
+      },
+    });
+    database.pragma('busy_timeout = 1');
+    blocker.pragma('journal_mode = WAL');
+    blocker.exec('BEGIN IMMEDIATE');
+
+    const result = contender.runRetentionCleanup({ dryRun: false, maxLagMs: 30_000 });
+
+    expect(winningResult.disposed_count).toBeGreaterThan(0);
+    expect(result).toMatchObject({
+      busy_retry_count: 1,
+      candidate_count: 0,
+      disposed_count: 0,
+      observed_lag_ms: 0,
+      max_lag_exceeded: false,
+      alert: null,
+    });
+    expect(winnerDatabase.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_retention_sweeps
+    `).get()).toEqual({ count: 2 });
+    blocker.close();
+    winnerDatabase.close();
+    database.close();
+  });
+
+  test('deletion audit hashes a versioned canonical serialization of the complete source row', () => {
+    const { database } = openTestDatabase();
+    const terminal = createTerminalTurn(
+      database,
+      'canonical-digest',
+      '2026-07-01T00:00:00.000Z',
+    );
+    const sourceRow = database.prepare(`
+      SELECT * FROM runtime_normalized_events
+      WHERE turn_id = ? ORDER BY event_sequence LIMIT 1
+    `).get(terminal.accepted.turn_id);
+    const expectedDigest = crypto.createHash('sha256').update(canonicalJson({
+      digest_schema_version: 1,
+      record_kind: 'normalized_event',
+      row: sourceRow,
+    })).digest('hex');
+    const payloadOnlyDigest = crypto.createHash('sha256')
+      .update(sourceRow.event_json)
+      .digest('hex');
+    const cleanup = createExecutorStore({
+      database,
+      provider: 'claude',
+      serviceInstanceId: 'executor-retention-canonical-digest',
+      now: () => '2026-07-08T00:00:00.000Z',
+      generateId: deterministicIds('canonical-digest'),
+    });
+
+    cleanup.runRetentionCleanup({ dryRun: false, maxLagMs: 60_000 });
+
+    const audit = database.prepare(`
+      SELECT content_digest_version, content_sha256
+      FROM runtime_retention_deletion_audit
+      WHERE record_kind = 'normalized_event' AND record_id = ?
+    `).get(sourceRow.event_id);
+    expect(audit.content_digest_version).toBe(1);
+    expect(audit.content_sha256).toBe(expectedDigest);
+    expect(audit.content_sha256).not.toBe(payloadOnlyDigest);
     database.close();
   });
 
