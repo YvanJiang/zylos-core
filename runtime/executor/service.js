@@ -116,7 +116,7 @@ export function createExecutorService({
   serviceInstanceId,
   now = () => new Date().toISOString(),
   generateId = defaultGenerateId,
-  leaseDurationMs,
+  leaseDurationMs = 30_000,
   residentLeaseDurationMs = 60_000,
   residentHeartbeatIntervalMs = 20_000,
   scheduleResidentHeartbeat = setInterval,
@@ -200,6 +200,12 @@ export function createExecutorService({
   }
   if (!Number.isFinite(turnLeaseRenewalIntervalMs) || turnLeaseRenewalIntervalMs <= 0) {
     throw new TypeError('turnLeaseRenewalIntervalMs must be a positive finite number');
+  }
+  if (!Number.isFinite(leaseDurationMs) || leaseDurationMs <= 0) {
+    throw new TypeError('leaseDurationMs must be a positive finite number');
+  }
+  if (turnLeaseRenewalIntervalMs >= leaseDurationMs) {
+    throw new TypeError('turn lease renewal interval must be below the turn lease duration');
   }
   if (typeof scheduleTurnLeaseRenewal !== 'function') {
     throw new TypeError('scheduleTurnLeaseRenewal must be a function');
@@ -677,6 +683,7 @@ export function createExecutorService({
       persist(() => store.transitionTurn(turnContext, state, 'failed', {
         error: normalizedError,
         reasonCode: 'executor_failed',
+        providerEventObserved: true,
       }));
       activeRun.durableSettled = true;
       refresh();
@@ -694,6 +701,7 @@ export function createExecutorService({
         side_effect_status: 'unknown',
         user_message: 'The provider stream ended before the turn completed.',
       },
+      providerEventObserved: true,
     });
     activeRun.durableSettled = true;
     refresh();
@@ -742,6 +750,7 @@ export function createExecutorService({
           side_effect_status: 'unknown',
           user_message: 'The provider turn did not complete successfully.',
         } : null,
+        providerEventObserved: true,
       },
     ));
     activeRun.durableSettled = true;
@@ -1091,6 +1100,7 @@ export function createExecutorService({
       if (activeRun.providerStarted) return { status: 'already_started' };
       persist(() => store.transitionTurn(turnContext, 'starting', 'running', {
         reasonCode: 'provider_started',
+        providerEventObserved: true,
       }));
       activeRun.providerStarted = true;
       refresh();
@@ -1159,6 +1169,10 @@ export function createExecutorService({
             || providerState.provider_native_id !== activeRun.currentProviderNativeId
           ) {
             throw new TypeError('provider state must match the current started lineage');
+          }
+          if (activeRun.providerStarted) {
+            persist(() => store.recordProviderEventActivity(turnContext));
+            return { status: 'already_started' };
           }
           return activeRun.ensureProviderStarted();
         },

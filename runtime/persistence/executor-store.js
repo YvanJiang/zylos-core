@@ -2203,6 +2203,7 @@ export function createExecutorStore({
       if (!['starting', 'running'].includes(turn.state)) {
         conflict('illegal_transition', `Provider retry is invalid while turn is ${turn.state}.`);
       }
+      recordProviderEventActivityInTransaction(turnContext, occurredAt);
       transitionInTransaction(database, {
         turnId: turn.turn_id,
         fromState: turn.state,
@@ -2311,6 +2312,7 @@ export function createExecutorStore({
       if (!['starting', 'running'].includes(turn.state)) {
         conflict('illegal_transition', `Retry exhaustion is invalid while turn is ${turn.state}.`);
       }
+      recordProviderEventActivityInTransaction(turnContext, occurredAt);
       const event = buildEvent({
         turn,
         lastEvent: loadLastEvent(database, turn.turn_id),
@@ -2678,12 +2680,15 @@ export function createExecutorStore({
     turnContext,
     fromState,
     toState,
-    { error = null, reasonCode = null } = {},
+    { error = null, reasonCode = null, providerEventObserved = false } = {},
   ) {
     const transition = database.transaction(() => {
       let turn = loadTurn(database, turnContext.turn_id);
       assertTurnContextFence(turn, turnContext);
       const occurredAt = now();
+      if (providerEventObserved) {
+        recordProviderEventActivityInTransaction(turnContext, occurredAt);
+      }
       if (toState === 'stopped') {
         turn = settleBlockingInteractionsForStop(turnContext, turn, occurredAt);
       }
@@ -4332,6 +4337,42 @@ export function createExecutorStore({
     return Object.freeze({ state: turn.state });
   }
 
+  function recordProviderEventActivityInTransaction(turnContext, observedAt) {
+    if (!Number.isFinite(Date.parse(observedAt))) {
+      throw new TypeError('provider event activity requires an ISO timestamp');
+    }
+    const updated = database.prepare(`
+      UPDATE runtime_provider_attempts
+      SET last_provider_event_at = ?, updated_at = ?
+      WHERE attempt_id = ? AND turn_id = ? AND attempt_no = ? AND lease_epoch = ?
+        AND service_instance_id = ? AND executor_instance_id = ?
+        AND state IN ('starting', 'running', 'waiting_user')
+    `).run(
+      observedAt,
+      observedAt,
+      turnContext.attempt.attempt_id,
+      turnContext.turn_id,
+      turnContext.attempt.attempt_no,
+      turnContext.attempt.lease_epoch,
+      serviceInstanceId,
+      turnContext.executor_instance_id,
+    );
+    if (updated.changes !== 1) {
+      conflict('stale_attempt', 'Provider event activity lost its durable attempt fence.');
+    }
+  }
+
+  function recordProviderEventActivity(turnContext) {
+    const record = database.transaction(() => {
+      const observedAt = now();
+      const turn = loadTurn(database, turnContext.turn_id);
+      assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
+      recordProviderEventActivityInTransaction(turnContext, observedAt);
+      return Object.freeze({ status: 'recorded', observed_at: observedAt });
+    });
+    return record.immediate();
+  }
+
   function bindProviderNativeId(turnContext, providerNativeId) {
     if (typeof providerNativeId !== 'string' || providerNativeId.trim().length === 0) {
       throw new TypeError('providerNativeId must be a non-empty string');
@@ -4345,6 +4386,8 @@ export function createExecutorStore({
       if (turn.lineage_id === null) {
         conflict('lineage_resolution_pending', 'A provider native ID requires a bound lineage.');
       }
+      const boundAt = now();
+      recordProviderEventActivityInTransaction(turnContext, boundAt);
       if (turn.provider !== null || turn.provider_native_id !== null) {
         if (turn.provider === provider && turn.provider_native_id === providerNativeId) {
           database.prepare(`
@@ -4369,7 +4412,6 @@ export function createExecutorStore({
           'The lineage is already bound to a different provider native ID.',
         );
       }
-      const boundAt = now();
       const updated = database.prepare(`
         UPDATE runtime_lineages
         SET provider = ?, provider_native_id = ?, provider_native_id_bound_at = ?,
@@ -4400,6 +4442,7 @@ export function createExecutorStore({
       conflict('illegal_transition', 'Provider adapters cannot author canonical state transitions.');
     }
     const append = database.transaction(() => {
+      const occurredAt = now();
       let turn = loadTurn(database, turnContext.turn_id);
       assertTurnContextFence(turn, turnContext);
       const restoreWaitingUser = turn.state === 'waiting_user';
@@ -4411,7 +4454,7 @@ export function createExecutorStore({
           fence: turnContext.attempt,
           provider,
           serviceInstanceId,
-          occurredAt: now(),
+          occurredAt,
           generateId,
         });
         turn = loadTurn(database, turnContext.turn_id);
@@ -4423,6 +4466,7 @@ export function createExecutorStore({
       if (turn.provider_native_id !== null || descriptorNativeId !== null) {
         assertBoundProviderNativeId(turn, provider, descriptorNativeId);
       }
+      recordProviderEventActivityInTransaction(turnContext, occurredAt);
       const event = buildEvent({
         turn,
         lastEvent: loadLastEvent(database, turn.turn_id),
@@ -4432,7 +4476,7 @@ export function createExecutorStore({
           ...descriptor,
           phase: 'running',
         },
-        occurredAt: now(),
+        occurredAt,
         generateId,
       });
       commitTurnEvent(database, {
@@ -4451,7 +4495,7 @@ export function createExecutorStore({
           fence: turnContext.attempt,
           provider,
           serviceInstanceId,
-          occurredAt: now(),
+          occurredAt,
           generateId,
         });
       }
@@ -4549,14 +4593,13 @@ export function createExecutorStore({
     const updated = database.prepare(`
       UPDATE runtime_provider_attempts
       SET runtime_instance_id = ?, runtime_evidence_json = ?,
-        last_provider_event_at = ?, updated_at = ?
+        updated_at = ?
       WHERE attempt_id = ? AND turn_id = ? AND attempt_no = ? AND lease_epoch = ?
         AND service_instance_id = ? AND executor_instance_id = ?
         AND state IN ('starting', 'running')
     `).run(
       evidence.runtime_instance_id,
       JSON.stringify(evidence),
-      recordedAt,
       recordedAt,
       turnContext.attempt.attempt_id,
       turnContext.turn_id,
@@ -4663,6 +4706,7 @@ export function createExecutorStore({
         card_delivery_id: null,
       };
       validateInteractionRequest(interaction, { occurredAt: requestedAt });
+      recordProviderEventActivityInTransaction(turnContext, requestedAt);
       database.prepare(`
         INSERT INTO runtime_interactions (
           interaction_id, conversation_id, turn_id, lineage_id, parent_type, parent_id, ordinal,
@@ -7606,6 +7650,7 @@ export function createExecutorStore({
           turn.attempt_no, turn.lease_epoch,
           attempt.service_instance_id, attempt.executor_instance_id,
           attempt.runtime_instance_id, attempt.runtime_evidence_json,
+          attempt.last_provider_event_at,
           lease.lease_owner, lease.turn_id AS lease_turn_id,
           lease.attempt_id AS lease_attempt_id, lease.attempt_no AS lease_attempt_no,
           lease.lease_epoch AS lease_epoch_current, lease.lease_expires_at,
@@ -7633,6 +7678,7 @@ export function createExecutorStore({
         ORDER BY turn.created_at, turn.turn_id
       `).all(provider);
       const results = [];
+      const reconciledAtMs = Date.parse(reconciledAt);
       for (const candidate of candidates) {
         if (['redirecting', 'recovering'].includes(candidate.state)) {
           results.push({
@@ -7672,7 +7718,16 @@ export function createExecutorStore({
           && typeof evidence.handle_kind === 'string'
           && evidence.handle_kind.length > 0
           && evidence.controllable === true;
-        if (exactLocalIdentity && exactLeaseFence && durableRuntimeEvidence) {
+        const providerEventAtMs = Date.parse(candidate.last_provider_event_at);
+        const validProviderEventActivity = typeof candidate.last_provider_event_at === 'string'
+          && Number.isFinite(providerEventAtMs)
+          && providerEventAtMs <= reconciledAtMs;
+        if (
+          exactLocalIdentity
+          && exactLeaseFence
+          && durableRuntimeEvidence
+          && validProviderEventActivity
+        ) {
           results.push({ turn_id: candidate.turn_id, status: 'healthy' });
           continue;
         }
@@ -7750,6 +7805,7 @@ export function createExecutorStore({
       let turn = loadTurn(database, turnContext.turn_id);
       assertActiveFence(database, turn, turnContext.attempt, serviceInstanceId);
       if (['starting', 'running'].includes(turn.state)) {
+        recordProviderEventActivityInTransaction(turnContext, occurredAt);
         const fromState = turn.state;
         transitionInTransaction(database, {
           turnId: turn.turn_id,
@@ -7812,6 +7868,7 @@ export function createExecutorStore({
           conflict('stale_attempt', 'The unsent interaction handoff lost its provider failure fence.');
         }
       }
+      recordProviderEventActivityInTransaction(turnContext, occurredAt);
       const cancelledInteractionIds = [];
       const cancelledHandoffIds = [];
       for (const { request, handoff } of blockingEntries) {
@@ -8034,6 +8091,7 @@ export function createExecutorStore({
     releaseRecoveringExecutorOwnership,
     reconcileExpiredResidents,
     recordProviderEventDiagnostic,
+    recordProviderEventActivity,
     recordProviderRuntimeEvidence,
     recordSteerReconciliationOutcome,
     recordStopProviderOutcome,

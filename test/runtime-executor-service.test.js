@@ -179,8 +179,14 @@ describe('runtime executor service', () => {
     let finishProvider;
     const providerFinished = new Promise((resolve) => { finishProvider = resolve; });
     let renewalTick;
+    let nonterminalSweep;
     const adapter = {
       async *execute(context) {
+        context.reportRuntimeEvidence({
+          runtime_instance_id: 'codex-app-server-turn-lease-renewal',
+          handle_kind: 'codex_app_server_connection',
+          controllable: true,
+        });
         context.reportProviderState({ state: 'started', provider_native_id: null });
         await providerFinished;
       },
@@ -199,6 +205,12 @@ describe('runtime executor service', () => {
         return { unref() {} };
       },
       cancelTurnLeaseRenewal() {},
+      scheduleNonterminalSweep(callback, intervalMs) {
+        expect(intervalMs).toBe(30_000);
+        nonterminalSweep = callback;
+        return { unref() {} };
+      },
+      cancelNonterminalSweep() {},
     });
 
     service.start();
@@ -213,12 +225,21 @@ describe('runtime executor service', () => {
       attempt_id: 'attempt-turn-lease-renewal-1',
       attempt_no: 1,
       lease_epoch: 1,
-      lease_expires_at: '2026-07-19T07:01:10.000Z',
+      lease_expires_at: '2026-07-19T07:01:30.000Z',
       updated_at: '2026-07-19T07:01:00Z',
     });
 
-    clock.now = '2026-07-19T07:01:09Z';
     expect(renewalTick).toEqual(expect.any(Function));
+    clock.now = '2026-07-19T07:01:10Z';
+    renewalTick();
+    clock.now = '2026-07-19T07:01:20Z';
+    renewalTick();
+    clock.now = '2026-07-19T07:01:30Z';
+    expect(nonterminalSweep).toEqual(expect.any(Function));
+    nonterminalSweep();
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'running' });
     renewalTick();
     expect(database.prepare(`
       SELECT lease_owner, attempt_id, attempt_no, lease_epoch, lease_expires_at, updated_at
@@ -228,8 +249,8 @@ describe('runtime executor service', () => {
       attempt_id: 'attempt-turn-lease-renewal-1',
       attempt_no: 1,
       lease_epoch: 1,
-      lease_expires_at: '2026-07-19T07:01:19.000Z',
-      updated_at: '2026-07-19T07:01:09Z',
+      lease_expires_at: '2026-07-19T07:02:00.000Z',
+      updated_at: '2026-07-19T07:01:30Z',
     });
 
     finishProvider();
@@ -238,11 +259,25 @@ describe('runtime executor service', () => {
     database.close();
   });
 
+  test('rejects a renewal cadence without lease-expiry headroom', () => {
+    const database = openTestDatabase();
+    expect(() => createExecutorService({
+      database,
+      adapter: { async *execute() {} },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-invalid-renewal-headroom',
+      leaseDurationMs: 10_000,
+      turnLeaseRenewalIntervalMs: 10_000,
+    })).toThrow(/renewal interval must be below the turn lease duration/);
+    database.close();
+  });
+
   test('persists provider attempt identity and controllable runtime evidence without PID authority', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'runtime-evidence');
     let finishProvider;
     const providerFinished = new Promise((resolve) => { finishProvider = resolve; });
+    const clock = { now: '2026-07-19T07:01:00Z' };
     const adapter = {
       async *execute(context) {
         expect(context.reportRuntimeEvidence({
@@ -257,6 +292,11 @@ describe('runtime executor service', () => {
           },
         })).toMatchObject({ status: 'recorded' });
         context.reportProviderState({ state: 'started', provider_native_id: null });
+        clock.now = '2026-07-19T07:01:01Z';
+        expect(context.reportProviderState({
+          state: 'started',
+          provider_native_id: null,
+        })).toMatchObject({ status: 'already_started' });
         await providerFinished;
       },
     };
@@ -265,7 +305,7 @@ describe('runtime executor service', () => {
       adapter,
       provider: 'codex',
       serviceInstanceId: 'executor-service-runtime-evidence',
-      now: () => '2026-07-19T07:01:00Z',
+      now: () => clock.now,
       generateId: deterministicIds('runtime-evidence'),
     });
 
@@ -274,7 +314,7 @@ describe('runtime executor service', () => {
     const attempt = database.prepare(`
       SELECT turn_id, conversation_id, attempt_id, attempt_no, lease_epoch,
         provider, service_instance_id, executor_instance_id, state,
-        runtime_instance_id, runtime_evidence_json
+        runtime_instance_id, runtime_evidence_json, last_provider_event_at
       FROM runtime_provider_attempts WHERE turn_id = ?
     `).get(accepted.turn_id);
     expect(attempt).toMatchObject({
@@ -288,6 +328,7 @@ describe('runtime executor service', () => {
       executor_instance_id: 'executor-runtime-evidence-1',
       state: 'running',
       runtime_instance_id: 'codex-connection-runtime-evidence',
+      last_provider_event_at: '2026-07-19T07:01:01Z',
     });
     expect(JSON.parse(attempt.runtime_evidence_json)).toEqual({
       runtime_instance_id: 'codex-connection-runtime-evidence',
@@ -471,6 +512,36 @@ describe('runtime executor service', () => {
     await expect(running).resolves.toMatchObject({ status: 'completed' });
 
     await service.close();
+    database.close();
+  });
+
+  test('runtime evidence alone is not accepted as provider-event freshness', () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'runtime-evidence-without-provider-event');
+    const store = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-runtime-evidence-without-provider-event',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('runtime-evidence-without-provider-event'),
+    });
+    const context = store.claimNextQueuedTurn();
+    store.recordProviderRuntimeEvidence(context, {
+      runtime_instance_id: 'codex-app-server-runtime-evidence-only',
+      handle_kind: 'codex_app_server_connection',
+      controllable: true,
+    });
+
+    expect(store.reconcileNonterminalTurns([context], 'sweep_reconciliation'))
+      .toMatchObject({
+        inspected: 1,
+        healthy: 0,
+        waiting_decision: 1,
+        results: [{ turn_id: accepted.turn_id, status: 'waiting_decision' }],
+      });
+    expect(database.prepare(`
+      SELECT last_provider_event_at FROM runtime_provider_attempts WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ last_provider_event_at: null });
     database.close();
   });
 
@@ -2127,7 +2198,6 @@ describe('runtime executor service', () => {
       now: () => '2026-07-19T07:06:00Z',
       generateId: deterministicIds('resident-crash-A'),
       maxResidentExecutorsPerBot: 1,
-      leaseDurationMs: 10_000,
       residentLeaseDurationMs: 10_000,
       residentHeartbeatIntervalMs: 3_000,
     });
@@ -2146,7 +2216,6 @@ describe('runtime executor service', () => {
       now: () => '2026-07-19T07:06:11Z',
       generateId: deterministicIds('resident-crash-B'),
       maxResidentExecutorsPerBot: 1,
-      leaseDurationMs: 10_000,
       residentLeaseDurationMs: 10_000,
       residentHeartbeatIntervalMs: 3_000,
     });
