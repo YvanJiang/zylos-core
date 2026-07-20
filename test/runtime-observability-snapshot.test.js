@@ -519,27 +519,38 @@ describe('Core runtime observability snapshot publisher', () => {
     reopened.close();
   });
 
-  test('uses a consistent read snapshot without blocking a concurrent runtime writer', () => {
+  test('rejects a stale read instead of assigning it a newer replace version', () => {
     const { database, databasePath } = openDatabase();
     const writer = new Database(databasePath);
     let writeCommitted = false;
+    const concurrentPublisher = createPublisher(writer, {
+      generateId: deterministicIds('concurrent-publisher'),
+    });
+    let concurrentSnapshot;
     const publisher = createPublisher(database, {
       getServiceState() {
-        acceptNormalInbound(writer, normalEnvelope('concurrent-writer'), {
-          now: () => '2026-07-20T08:00:04Z',
-          generateId: deterministicIds('concurrent-writer'),
-        });
-        writeCommitted = true;
+        if (!writeCommitted) {
+          acceptNormalInbound(writer, normalEnvelope('concurrent-writer'), {
+            now: () => '2026-07-20T08:00:04Z',
+            generateId: deterministicIds('concurrent-writer'),
+          });
+          writeCommitted = true;
+          concurrentSnapshot = concurrentPublisher.publish();
+        }
         return {};
       },
     });
 
-    const before = publisher.publish();
+    expect(() => publisher.publish()).toThrow(/database is locked/i);
     expect(writeCommitted).toBe(true);
-    expect(before.turns.items).toEqual([]);
-    expect(before.outbox.items).toEqual([]);
+    expect(concurrentSnapshot).toMatchObject({
+      snapshot_version: 1,
+      turns: { items: [expect.any(Object)] },
+      outbox: { items: [expect.any(Object)] },
+    });
 
-    const after = createPublisher(database).publish();
+    const after = publisher.publish();
+    expect(after.snapshot_version).toBe(2);
     expect(after.turns.items).toHaveLength(1);
     expect(after.outbox.items).toHaveLength(1);
     writer.close();
@@ -697,6 +708,13 @@ describe('Core runtime observability snapshot publisher', () => {
     }));
     const jointlyHealthy = publisher.publish();
     expect(jointlyHealthy.executors.items[0].health).toBe('healthy');
+
+    database.prepare(`
+      UPDATE runtime_executor_leases SET lease_expires_at = '2026-07-20T09:00:00+02:00'
+      WHERE conversation_id = 'conversation-observability-A'
+    `).run();
+    const offsetExpired = publisher.publish();
+    expect(offsetExpired.executors.items[0].health).toBe('unknown');
     database.close();
   });
 

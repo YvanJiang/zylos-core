@@ -23,6 +23,12 @@ function requireTimestamp(name, value) {
   return validateRfc3339Timestamp(name, value);
 }
 
+function timestampIsAfter(name, value, referenceName, referenceValue) {
+  requireTimestamp(name, value);
+  requireTimestamp(referenceName, referenceValue);
+  return Date.parse(value) > Date.parse(referenceValue);
+}
+
 function parseJson(value, label) {
   if (value === null || value === undefined) return null;
   try {
@@ -128,7 +134,12 @@ function exactActiveFence(row, attempt, serviceInstanceId, generatedAt) {
     && row.lease_attempt_no === attempt.attempt_no
     && row.lease_epoch === attempt.lease_epoch
     && row.lease_expires_at !== null
-    && row.lease_expires_at > generatedAt
+    && timestampIsAfter(
+      'executor lease expiry',
+      row.lease_expires_at,
+      'snapshot time',
+      generatedAt,
+    )
     && attempt.service_instance_id === serviceInstanceId
     && evidence?.controllable === true
     && typeof attempt.last_provider_event_at === 'string';
@@ -246,7 +257,12 @@ function collectExecutors(database, serviceInstanceId, generatedAt) {
       health = row.resident_conversation_id !== null
         && row.owner_service_instance_id === serviceInstanceId
         && row.owner_expires_at !== null
-        && row.owner_expires_at > generatedAt
+        && timestampIsAfter(
+          'resident owner expiry',
+          row.owner_expires_at,
+          'snapshot time',
+          generatedAt,
+        )
         ? 'healthy'
         : 'offline';
     }
@@ -729,32 +745,29 @@ export function createRuntimeSnapshotPublisher({
         last_reconciliation_at: instance.last_reconciliation_at,
         error: serviceComplete ? null : error,
       });
-      return { service, sections, error };
-    }).deferred();
-
-    const publishVersion = database.transaction(() => {
       const advanced = database.prepare(`
         UPDATE runtime_observability_instances
         SET snapshot_version = snapshot_version + 1, updated_at = ?
         WHERE service_instance_id = ?
       `).run(generatedAt, serviceInstanceId);
       if (advanced.changes !== 1) throw new Error('observability service instance is unavailable');
-      return database.prepare(`
+      const snapshotVersion = database.prepare(`
         SELECT snapshot_version FROM runtime_observability_instances
         WHERE service_instance_id = ?
       `).get(serviceInstanceId).snapshot_version;
-    }).immediate();
+      return { service, sections, error, snapshotVersion };
+    }).deferred();
 
     const snapshot = {
-        contract: 'zylos.observability-snapshot',
-        contract_version: '1.0',
-        snapshot_id: snapshotId,
-        core_service_instance_id: serviceInstanceId,
-        generated_at: generatedAt,
-        snapshot_version: publishVersion,
-        service: readSnapshot.service,
-        ...readSnapshot.sections,
-        error: readSnapshot.error,
+      contract: 'zylos.observability-snapshot',
+      contract_version: '1.0',
+      snapshot_id: snapshotId,
+      core_service_instance_id: serviceInstanceId,
+      generated_at: generatedAt,
+      snapshot_version: readSnapshot.snapshotVersion,
+      service: readSnapshot.service,
+      ...readSnapshot.sections,
+      error: readSnapshot.error,
     };
     return validateObservabilitySnapshot(snapshot, { occurredAt: generatedAt }).forwarded;
   }
