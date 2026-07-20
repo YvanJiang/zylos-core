@@ -89,6 +89,11 @@ function projectRenderModel(renderModel, event) {
     text = 'The replied-to message lineage needs recovery. Zylos will wait until this notice is delivered, then use only a uniquely verified lineage and will not replay work with unknown side effects.';
   } else if (
     event.kind === 'turn_state_changed'
+    && event.payload.reason_code === 'steer_requested'
+  ) {
+    text = 'Steering is interrupting the current work. Completed tool calls and external side effects will not be rolled back.';
+  } else if (
+    event.kind === 'turn_state_changed'
     && event.payload.to_state === 'starting'
     && renderModel.text === 'Waiting for executor capacity.'
   ) {

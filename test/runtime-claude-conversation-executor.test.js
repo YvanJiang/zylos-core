@@ -1139,6 +1139,19 @@ describe('Claude conversation executor', () => {
         lineage_id, conversation_id, lineage_kind, is_default, created_at
       ) VALUES (?, ?, 'normal', 0, ?)
     `).run(alternateLineageId, first.conversation_id, first.committed_at);
+    const historical = acceptNormalInbound(
+      database,
+      normalEnvelope('claude-lineage-historical'),
+      {
+        now: () => '2026-07-19T09:01:30.500Z',
+        generateId: deterministicIds('inbound-claude-lineage-historical'),
+      },
+    );
+    database.prepare(`
+      UPDATE runtime_turns SET lineage_id = ?, state = 'completed' WHERE turn_id = ?
+    `).run(alternateLineageId, historical.turn_id);
+    database.prepare('DELETE FROM runtime_turn_queue WHERE turn_id = ?')
+      .run(historical.turn_id);
     database.prepare(`
       INSERT INTO runtime_message_mappings (
         region, tenant_id, channel, bot_id, platform_message_id,
@@ -1152,7 +1165,7 @@ describe('Claude conversation executor', () => {
       firstEnvelope.bot_id,
       'model-message-claude-alternate',
       first.conversation_id,
-      first.turn_id,
+      historical.turn_id,
       alternateLineageId,
       'mapping-claude-alternate',
       first.committed_at,
@@ -2244,6 +2257,63 @@ describe('Claude conversation executor', () => {
       reason_code: 'stale_attempt',
     });
 
+    await service.close();
+    database.close();
+  });
+
+  test('steers a UUID-stamped SDK turn through the adapter-private interrupt seam', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'steer-sdk-queued');
+    const fake = createQueuedReceiptQuery({ sessionId: 'claude-session-steer-sdk-queued' });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({
+        query: fake.query,
+        generateMessageUuid: () => '00000000-0000-4000-8000-000000000019',
+      }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-steer-sdk-queued',
+      now: () => '2026-07-19T09:12:17Z',
+      generateId: deterministicIds('steer-sdk-queued'),
+    });
+
+    const run = service.runNext();
+    await expect(fake.inputConsumed.promise).resolves.toMatchObject({
+      uuid: '00000000-0000-4000-8000-000000000019',
+    });
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      if (database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+        .get(accepted.turn_id).state === 'running') break;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
+      .get(accepted.turn_id)).toEqual({ state: 'running' });
+    const envelope = normalEnvelope('steer-sdk-command');
+    envelope.content = { kind: 'text', text: '/steer revise SDK direction', attachments: [] };
+    await expect(service.steer({
+      conversation_id: accepted.conversation_id,
+      turn_id: accepted.turn_id,
+      steer_id: 'steer-sdk-control',
+      envelope,
+    })).resolves.toMatchObject({
+      status: 'completed',
+      old_turn: { turn_id: accepted.turn_id, state: 'interrupted' },
+      priority_turn: {
+        status: 'queued',
+        lineage_id: accepted.lineage_id,
+        redirected_from_turn_id: accepted.turn_id,
+      },
+      provider_stop_status: 'confirmed',
+    });
+    await expect(run).resolves.toMatchObject({ status: 'interrupted' });
+    expect(fake.cancelledMessageUuids).toEqual([
+      '00000000-0000-4000-8000-000000000019',
+    ]);
+
+    await service.stop({
+      conversation_id: accepted.conversation_id,
+      stop_id: 'stop-steer-sdk-cleanup',
+    });
     await service.close();
     database.close();
   });

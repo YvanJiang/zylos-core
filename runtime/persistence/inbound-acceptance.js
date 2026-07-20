@@ -20,7 +20,7 @@ import {
 } from './main-projection.js';
 import { initializeRuntimePersistence } from './schema.js';
 
-const INBOUND_ENVELOPE_KNOWN_FIELDS = Object.freeze([
+export const INBOUND_ENVELOPE_KNOWN_FIELDS = Object.freeze([
   'contract',
   'contract_version',
   'inbound_event_id',
@@ -61,7 +61,7 @@ export function encodeConversationKey(envelope) {
 
 export { initializeRuntimePersistence };
 
-function buildLifecycleEvent({
+export function buildLifecycleEvent({
   eventId,
   traceId,
   conversationId,
@@ -106,7 +106,7 @@ function buildLifecycleEvent({
   };
 }
 
-function buildInitialDeliveryCommand({
+export function buildInitialDeliveryCommand({
   envelope,
   traceId,
   conversationId,
@@ -524,7 +524,7 @@ export function acceptNormalInbound(
     const queuedTurnCount = database.prepare(`
       SELECT COUNT(*) AS count
       FROM runtime_turn_queue
-      WHERE conversation_id = ? AND status = 'queued'
+      WHERE conversation_id = ? AND status = 'queued' AND priority = 0
     `).get(conversation.conversation_id).count;
     const pendingRecovery = lineage.recovery !== null;
     const queueFull = !pendingRecovery && queuedTurnCount >= maxQueuedTurns;

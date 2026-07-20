@@ -257,7 +257,7 @@ describe('reply mapping provisional-lineage recovery', () => {
     database.close();
   });
 
-  test('admits recovery beyond normal capacity but never leapfrogs an earlier turn', async () => {
+  test('admits recovery beyond normal capacity without leapfrogging FIFO or steer priority', async () => {
     const database = openTestDatabase();
     const source = createDeliveredSource(database, 'fifo-capacity');
     simulateMissingDeliveredMapping(database, source.result.platform_message_id);
@@ -278,8 +278,9 @@ describe('reply mapping provisional-lineage recovery', () => {
       error: null,
     });
 
+    const executedTurnIds = [];
     const execute = jest.fn((context) => (async function* executeProvider() {
-      expect(context.turn_id).toBe(source.accepted.turn_id);
+      executedTurnIds.push(context.turn_id);
       yield { type: 'turn_result', outcome: 'completed' };
     }()));
     const recoverLineage = jest.fn();
@@ -299,6 +300,7 @@ describe('reply mapping provisional-lineage recovery', () => {
       turn_id: source.accepted.turn_id,
     });
     expect(execute).toHaveBeenCalledTimes(1);
+    expect(executedTurnIds).toEqual([source.accepted.turn_id]);
     expect(recoverLineage).not.toHaveBeenCalled();
     expect(database.prepare(`
       SELECT recovery.state, queue.status, queue.wait_reason
@@ -311,12 +313,25 @@ describe('reply mapping provisional-lineage recovery', () => {
       wait_reason: 'lineage_resolution_pending',
     });
 
+    const priorityEnvelope = normalEnvelope('fifo-capacity-priority');
+    priorityEnvelope.chat_id = source.envelope.chat_id;
+    const priority = accept(database, priorityEnvelope, 'fifo-capacity-priority');
+    database.prepare(`
+      UPDATE runtime_turn_queue SET priority = 1 WHERE turn_id = ?
+    `).run(priority.turn_id);
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: priority.turn_id,
+    });
+    expect(executedTurnIds).toEqual([source.accepted.turn_id, priority.turn_id]);
+    expect(recoverLineage).not.toHaveBeenCalled();
+
     await expect(service.runNext()).resolves.toMatchObject({
       status: 'lineage_resolution_pending',
       turn_id: pending.turn_id,
       wait_reason: 'reply_mapping_notice_delivery',
     });
-    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledTimes(2);
     expect(recoverLineage).not.toHaveBeenCalled();
 
     await service.close();

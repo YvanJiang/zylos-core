@@ -799,7 +799,10 @@ export function createClaudeConversationAdapter({
     yield* output;
   }
 
-  async function cancel(context) {
+  async function cancel(context, { reason = 'stop' } = {}) {
+    if (!['stop', 'steer'].includes(reason)) {
+      throw new TypeError('Claude cancellation reason must be stop or steer.');
+    }
     const executor = executors.get(context.conversation_id);
     const activeTurn = executor?.activeTurn;
     if (!sameTurn(activeTurn, context)) {
