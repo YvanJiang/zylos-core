@@ -110,29 +110,59 @@ describe('cli add', () => {
     });
   });
 
-  it('sets require_idle and reply fields via --block-queue-until-idle', () => {
+  for (const args of [
+    ['--block-queue-until-idle'],
+    ['--require-idle'],
+    ['--reply-channel', 'telegram', '--reply-endpoint', '12345'],
+  ]) {
+    it(`rejects retired add controls: ${args.join(' ')}`, () => {
+      withTmpDir(({ dbPath, env }) => {
+        const result = cliRaw(['add', 'retired control', '--cron', '0 2 * * *', ...args], env);
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /retired.*bound-conversation-json/i);
+        const db = new Database(dbPath);
+        try {
+          assert.equal(db.prepare('SELECT COUNT(*) AS count FROM tasks').get().count, 0);
+        } finally {
+          db.close();
+        }
+      });
+    });
+  }
+
+  it('requires a complete canonical bound conversation identity', () => {
     withTmpDir(({ dbPath, env }) => {
-      cli(['add', 'idle task', '--cron', '0 2 * * *', '--block-queue-until-idle',
-           '--reply-channel', 'telegram', '--reply-endpoint', '12345'], env);
+      const incomplete = JSON.stringify({ channel: 'lark', chat_id: 'chat-only' });
+      const result = cliRaw([
+        'add', 'incomplete binding', '--cron', '0 2 * * *',
+        '--bound-conversation-json', incomplete,
+      ], env);
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /bound_conversation\.chat_type is required/);
       const db = new Database(dbPath);
       try {
-        const task = db.prepare('SELECT * FROM tasks LIMIT 1').get();
-        assert.equal(task.require_idle, 1);
-        assert.equal(task.reply_channel, 'telegram');
-        assert.equal(task.reply_endpoint, '12345');
+        assert.equal(db.prepare('SELECT COUNT(*) AS count FROM tasks').get().count, 0);
       } finally {
         db.close();
       }
     });
   });
 
-  it('still accepts legacy --require-idle', () => {
+  it('persists the complete canonical native-thread identity unchanged', () => {
     withTmpDir(({ dbPath, env }) => {
-      cli(['add', 'legacy idle task', '--cron', '0 2 * * *', '--require-idle'], env);
+      const identity = {
+        channel: 'lark', chat_type: 'thread', chat_id: 'chat-bound',
+        native_thread_or_topic_id: 'thread-bound',
+        message_id: 'reply-target-bound', root_message_id: 'root-bound',
+      };
+      cli([
+        'add', 'thread report', '--cron', '0 2 * * *',
+        '--bound-conversation-json', JSON.stringify(identity),
+      ], env);
       const db = new Database(dbPath);
       try {
-        const task = db.prepare('SELECT require_idle FROM tasks LIMIT 1').get();
-        assert.equal(task.require_idle, 1);
+        const task = db.prepare('SELECT bound_conversation_json FROM tasks').get();
+        assert.deepEqual(JSON.parse(task.bound_conversation_json), identity);
       } finally {
         db.close();
       }
@@ -227,10 +257,18 @@ describe('cli pause and resume', () => {
         cli(['pause', task.id], env);
         const paused = db.prepare('SELECT status FROM tasks WHERE id = ?').get(task.id);
         assert.equal(paused.status, 'paused');
+        db.prepare(`
+          UPDATE tasks SET requires_reconfiguration = 1, last_error = 'migration pause'
+          WHERE id = ?
+        `).run(task.id);
 
         cli(['resume', task.id], env);
-        const resumed = db.prepare('SELECT status FROM tasks WHERE id = ?').get(task.id);
-        assert.equal(resumed.status, 'pending');
+        const resumed = db.prepare(`
+          SELECT status, requires_reconfiguration, last_error FROM tasks WHERE id = ?
+        `).get(task.id);
+        assert.deepEqual(resumed, {
+          status: 'pending', requires_reconfiguration: 0, last_error: null,
+        });
       } finally {
         db.close();
       }
@@ -293,17 +331,18 @@ describe('cli update', () => {
     });
   });
 
-  it('clears reply configuration', () => {
+  it('rejects retired update reply controls without mutating the task', () => {
     withTmpDir(({ dbPath, env }) => {
-      cli(['add', 'reply task', '--cron', '0 9 * * *',
-           '--reply-channel', 'telegram', '--reply-endpoint', '123'], env);
+      cli(['add', 'reply task', '--cron', '0 9 * * *'], env);
       const db = new Database(dbPath);
       try {
-        const task = db.prepare('SELECT id FROM tasks LIMIT 1').get();
-        cli(['update', task.id, '--clear-reply'], env);
-        const updated = db.prepare('SELECT reply_channel, reply_endpoint FROM tasks WHERE id = ?').get(task.id);
-        assert.equal(updated.reply_channel, null);
-        assert.equal(updated.reply_endpoint, null);
+        const task = db.prepare('SELECT id, updated_at FROM tasks LIMIT 1').get();
+        const result = cliRaw(['update', task.id, '--clear-reply'], env);
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /retired.*bound-conversation-json/i);
+        assert.deepEqual(
+          db.prepare('SELECT id, updated_at FROM tasks WHERE id = ?').get(task.id), task,
+        );
       } finally {
         db.close();
       }
@@ -327,35 +366,25 @@ describe('cli update', () => {
     });
   });
 
-  it('disables require_idle via --no-block-queue-until-idle', () => {
-    withTmpDir(({ dbPath, env }) => {
-      cli(['add', 'idle task', '--cron', '0 9 * * *', '--block-queue-until-idle'], env);
-      const db = new Database(dbPath);
-      try {
-        const task = db.prepare('SELECT id FROM tasks LIMIT 1').get();
-        cli(['update', task.id, '--no-block-queue-until-idle'], env);
-        const updated = db.prepare('SELECT require_idle FROM tasks WHERE id = ?').get(task.id);
-        assert.equal(updated.require_idle, 0);
-      } finally {
-        db.close();
-      }
+  for (const flag of ['--no-block-queue-until-idle', '--no-require-idle']) {
+    it(`rejects retired update control ${flag}`, () => {
+      withTmpDir(({ dbPath, env }) => {
+        cli(['add', 'ordinary task', '--cron', '0 9 * * *'], env);
+        const db = new Database(dbPath);
+        try {
+          const task = db.prepare('SELECT id, updated_at FROM tasks LIMIT 1').get();
+          const result = cliRaw(['update', task.id, flag], env);
+          assert.notEqual(result.status, 0);
+          assert.match(result.stderr, /retired.*bound-conversation-json/i);
+          assert.deepEqual(
+            db.prepare('SELECT id, updated_at FROM tasks WHERE id = ?').get(task.id), task,
+          );
+        } finally {
+          db.close();
+        }
+      });
     });
-  });
-
-  it('still accepts legacy --no-require-idle', () => {
-    withTmpDir(({ dbPath, env }) => {
-      cli(['add', 'idle task', '--cron', '0 9 * * *', '--require-idle'], env);
-      const db = new Database(dbPath);
-      try {
-        const task = db.prepare('SELECT id FROM tasks LIMIT 1').get();
-        cli(['update', task.id, '--no-require-idle'], env);
-        const updated = db.prepare('SELECT require_idle FROM tasks WHERE id = ?').get(task.id);
-        assert.equal(updated.require_idle, 0);
-      } finally {
-        db.close();
-      }
-    });
-  });
+  }
 
   it('reports error with no update options', () => {
     withTmpDir(({ dbPath, env }) => {

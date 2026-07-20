@@ -13,7 +13,7 @@ const {
   step10_ensureCodexConfig,
 } = await import('../self-upgrade.js');
 const { generateMigrationHints, applyMigrationHints } = await import('../self-upgrade.js');
-const { deployManifestTemplate } = await import('../runtime/tmux-env.js');
+const { deployManifestTemplate } = await import('../runtime/runtime-env-manifest.js');
 const { activateFreshSplitInstructions } = await import('../runtime/instruction-builder.js');
 
 function fixtureZylosDir() {

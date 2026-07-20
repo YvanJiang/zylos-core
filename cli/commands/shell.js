@@ -89,6 +89,17 @@ export async function shellCommand() {
   let deliveryTimer = null;
   let rl = null;
   let cleanupPromise = null;
+  let stopping = false;
+  let pendingResponse = null;
+
+  function cancelPendingResponse(reason = new Error('shell stopped')) {
+    if (pendingResponse === null) return;
+    const pending = pendingResponse;
+    pendingResponse = null;
+    clearTimeout(pending.timer);
+    pending.reject(reason);
+  }
+
   function cleanup() {
     if (cleanupPromise !== null) return cleanupPromise;
     if (deliveryTimer !== null) clearInterval(deliveryTimer);
@@ -124,6 +135,8 @@ export async function shellCommand() {
   let shutdownPromise = null;
   function shutdown() {
     if (shutdownPromise === null) {
+      stopping = true;
+      cancelPendingResponse();
       shutdownPromise = cleanup();
       if (rl !== null && !rl.closed) rl.close();
     }
@@ -142,23 +155,24 @@ export async function shellCommand() {
   }
 
   // Start Unix socket server to receive responses
-  let pendingResolve = null;
-
   server = net.createServer((conn) => {
     let data = '';
     conn.setEncoding('utf8');
     conn.on('error', () => {}); // ignore client disconnect errors
     conn.on('data', (chunk) => { data += chunk; });
     conn.on('end', () => {
-      if (data && pendingResolve) {
-        pendingResolve(data);
-        pendingResolve = null;
+      if (stopping) return;
+      if (data && pendingResponse !== null) {
+        const pending = pendingResponse;
+        pendingResponse = null;
+        clearTimeout(pending.timer);
+        pending.resolve(data);
       } else if (data) {
         // Response arrived without a pending prompt (e.g. proactive agent message,
-        // or a late reply after the 120s timeout cleared pendingResolve).
+        // or a late reply after the 120s timeout cleared the pending response).
         // Print immediately and restore the prompt so the user can keep typing.
         process.stdout.write(`\n${formatResponse(data)}\n\n`);
-        rl?.prompt();
+        if (!stopping && rl !== null && !rl.closed) rl.prompt();
       }
     });
   });
@@ -169,12 +183,11 @@ export async function shellCommand() {
   const oldMask = process.umask(0o177);
   server.listen(socketPath, () => {
     serverState = 'listening';
-    process.umask(oldMask);
   });
+  process.umask(oldMask);
 
   server.on('error', (err) => {
     serverState = 'failed';
-    process.umask(oldMask);
     console.error(`Error: could not start shell server — ${err.message}`);
     process.exitCode = 1;
     void shutdown();
@@ -229,10 +242,11 @@ export async function shellCommand() {
   rl.prompt();
 
   rl.on('line', async (line) => {
+    if (stopping) return;
     const input = line.trim();
 
     if (!input) {
-      rl.prompt();
+      if (!stopping && !rl.closed) rl.prompt();
       return;
     }
 
@@ -245,7 +259,7 @@ export async function shellCommand() {
 
     if (input === '/help') {
       printHelp();
-      rl.prompt();
+      if (!stopping && !rl.closed) rl.prompt();
       return;
     }
 
@@ -272,7 +286,7 @@ export async function shellCommand() {
         if (stderr) errorMsg = stderr.trim();
       }
       console.log(`\n${dim('Error:')} ${errorMsg}\n`);
-      rl.prompt();
+      if (!stopping && !rl.closed) rl.prompt();
       return;
     }
 
@@ -281,6 +295,7 @@ export async function shellCommand() {
 
     try {
       const response = await waitForResponse(120000);
+      if (stopping) return;
       // Clear "thinking..." and print response
       if (process.stdout.isTTY) {
         readline.clearLine(process.stdout, 0);
@@ -290,6 +305,7 @@ export async function shellCommand() {
       }
       console.log(formatResponse(response));
     } catch {
+      if (stopping) return;
       if (process.stdout.isTTY) {
         readline.clearLine(process.stdout, 0);
         readline.cursorTo(process.stdout, 0);
@@ -299,8 +315,9 @@ export async function shellCommand() {
       console.log(dim('  (no response within timeout — message is queued, check back later)'));
     }
 
+    if (stopping) return;
     console.log();
-    rl.prompt();
+    if (!rl.closed) rl.prompt();
   });
 
   rl.on('close', () => {
@@ -309,20 +326,18 @@ export async function shellCommand() {
 
   function waitForResponse(timeoutMs) {
     return new Promise((resolve, reject) => {
-      // Reject any previously pending promise to avoid memory leaks
-      if (pendingResolve) {
-        pendingResolve = null;
+      if (stopping) {
+        reject(new Error('shell stopped'));
+        return;
       }
+      cancelPendingResponse(new Error('response superseded'));
 
       const timer = setTimeout(() => {
-        pendingResolve = null;
+        pendingResponse = null;
         reject(new Error('timeout'));
       }, timeoutMs);
 
-      pendingResolve = (data) => {
-        clearTimeout(timer);
-        resolve(data);
-      };
+      pendingResponse = { resolve, reject, timer };
     });
   }
 }

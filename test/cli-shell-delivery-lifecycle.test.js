@@ -118,4 +118,67 @@ describe('shell Core outbox owner lifecycle', () => {
     await drain.drain();
     expect(dispatchCalls).toBe(1);
   });
+
+  test('SIGTERM cancels a pending response and cannot run prompt logic after stop', async () => {
+    const root = fs.mkdtempSync('/tmp/zylos-shell-stop-');
+    const socketDir = root;
+    const receivePath = path.join(
+      root, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-receive.js',
+    );
+    fs.mkdirSync(path.dirname(receivePath), { recursive: true });
+    fs.mkdirSync(path.join(root, 'comm-bridge'));
+    fs.writeFileSync(receivePath, '#!/usr/bin/env node\n');
+
+    const child = spawn(process.execPath, ['cli/zylos.js', 'shell'], {
+      cwd: path.resolve('.'),
+      env: { ...process.env, ZYLOS_DIR: root, TMPDIR: socketDir },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let output = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { output += chunk; });
+    child.stderr.on('data', (chunk) => { output += chunk; });
+    const close = new Promise((resolve) => child.once('close', (code, signal) => {
+      resolve({ code, signal });
+    }));
+
+    try {
+      await new Promise((resolve, reject) => {
+        const deadline = setTimeout(() => reject(new Error(`shell did not start: ${output}`)), 1000);
+        const poll = setInterval(() => {
+          if (!output.includes('you> ')) return;
+          clearInterval(poll);
+          clearTimeout(deadline);
+          resolve();
+        }, 10);
+      });
+      child.stdin.write('queued message\n');
+      await new Promise((resolve, reject) => {
+        const deadline = setTimeout(() => reject(new Error(`shell did not wait: ${output}`)), 1000);
+        const poll = setInterval(() => {
+          if (!output.includes('thinking...')) return;
+          clearInterval(poll);
+          clearTimeout(deadline);
+          resolve();
+        }, 10);
+      });
+
+      const stopOffset = output.length;
+      child.kill('SIGTERM');
+      const result = await Promise.race([
+        close,
+        new Promise((resolve) => setTimeout(() => resolve(null), 750)),
+      ]);
+      if (result === null) child.kill('SIGKILL');
+
+      expect(result).toEqual({ code: 0, signal: null });
+      expect(output.slice(stopOffset)).not.toMatch(/no response within timeout|you> /);
+      expect(fs.readdirSync(socketDir).filter((name) => name.endsWith('.sock'))).toEqual([]);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      await close;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

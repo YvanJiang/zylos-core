@@ -45,12 +45,52 @@ function packedFiles() {
   return cachedPackedFiles;
 }
 
+function repositoryFiles() {
+  return execFileSync('git', ['ls-files', '-z'], {
+    cwd: path.resolve('.'), encoding: 'utf8',
+  }).split('\0').filter(Boolean).filter((file) => fs.existsSync(path.resolve(file)));
+}
+
+const migrationOnlyRepositoryFiles = new Set([
+  // Historical record: never imported, executed, packaged as an entrypoint, or dispatched.
+  'CHANGELOG.md',
+  // Executable negative/migration proofs. These files are tests only; the
+  // repository scan still covers every other tracked product, source, doc,
+  // fixture, package, and test file.
+  'cli/lib/__tests__/codex-hooks.test.js',
+  'cli/lib/__tests__/self-upgrade.test.js',
+  'cli/lib/__tests__/sync-settings-hooks.test.js',
+  'scripts/bootstrap-executor-lifecycle.js',
+  'scripts/installed-runtime-inventory.js',
+  'test/base-to-executor-bootstrap.test.js',
+  'test/exact-base-legacy-source.test.js',
+  'test/executor-service-lifecycle.test.js',
+  'test/installed-executor-upgrade.test.js',
+  'test/installer-init-executor-lifecycle.test.js',
+  'test/runtime-atomic-upgrade.test.js',
+  'test/runtime-c4-normal-callers.test.js',
+  'test/runtime-c4-source-boundary.test.js',
+  'test/runtime-normal-path-static.test.js',
+  'test/runtime-provider-neutral-health.test.js',
+  'test/runtime-upgrade-coordinator.test.js',
+]);
+
 describe('normal product paths have no retired runtime authority', () => {
+  test('the tracked repository contains retired identifiers only in isolated migration code or proofs', () => {
+    const banned = /tmux|capture-pane|send-keys|paste-buffer|agent-status\.json|global[ _-]session|terminal injection|activity-monitor|c4-dispatcher|c4-control|c4-session-init/i;
+    const violations = repositoryFiles()
+      .filter((file) => /\.(?:js|cjs|mjs|md|json|ya?ml|sh|env|sql)$/.test(file))
+      .filter((file) => !file.startsWith('runtime/migration/'))
+      .filter((file) => !migrationOnlyRepositoryFiles.has(file))
+      .filter((file) => banned.test(fs.readFileSync(path.resolve(file), 'utf8')));
+    expect(violations).toEqual([]);
+  });
+
   test('normal callers contain no terminal or host-file execution authority', () => {
     for (const file of normalRuntimeFiles) {
       const source = fs.readFileSync(path.resolve(file), 'utf8');
       expect(source).not.toMatch(
-        /\btmux\b|capture-pane|send-keys|paste-buffer|agent-status\.json|global session|runtime is alive/i,
+        /tmux|capture-pane|send-keys|paste-buffer|agent-status\.json|global session|runtime is alive/i,
       );
     }
   });
@@ -95,7 +135,8 @@ describe('normal product paths have no retired runtime authority', () => {
     expect(runner).not.toMatch(/activity-monitor|cli', 'lib', 'runtime', '__tests__/);
   });
 
-  test('the package payload excludes every repository-only executable legacy path', () => {
+  test('retired executable implementations are absent from both repository and package payload', () => {
+    const tracked = new Set(repositoryFiles());
     const files = packedFiles();
     for (const retired of [
       'skills/activity-monitor/',
@@ -110,20 +151,20 @@ describe('normal product paths have no retired runtime authority', () => {
       'cli/lib/runtime/codex.js',
       'cli/lib/runtime/tmux-helpers.js',
     ]) {
+      expect([...tracked].some((file) => file === retired || file.startsWith(retired))).toBe(false);
       expect(files.some((file) => file === retired || file.startsWith(retired))).toBe(false);
     }
   });
 
   test('every reachable packaged caller is free of retired runtime authority', () => {
     const migrationOnly = new Set([
-      'runtime/migration/legacy-c4-diagnostic.js',
-      'runtime/migration/legacy-lifecycle-artifacts.js',
-      'runtime/migration/legacy-provider-quiescence.js',
+      'scripts/bootstrap-executor-lifecycle.js',
       'scripts/installed-runtime-inventory.js',
     ]);
-    const banned = /\btmux\b|capture-pane|send-keys|paste-buffer|global[ _-]session|terminal injection|agent-status\.json|input health|window health/i;
+    const banned = /tmux|capture-pane|send-keys|paste-buffer|global[ _-]session|terminal injection|agent-status\.json|input health|window health/i;
     const violations = packedFiles()
       .filter((file) => /\.(?:js|cjs|mjs|md|json|ya?ml|sh)$/.test(file))
+      .filter((file) => !file.startsWith('runtime/migration/'))
       .filter((file) => !migrationOnly.has(file))
       .filter((file) => banned.test(fs.readFileSync(path.resolve(file), 'utf8')));
     expect(violations).toEqual([]);

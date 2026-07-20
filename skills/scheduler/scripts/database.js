@@ -54,13 +54,9 @@ function initSchema() {
       priority INTEGER DEFAULT 3 CHECK(priority BETWEEN 1 AND 3),
       status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'completed', 'failed', 'paused')),
 
-      -- Execution Control
-      require_idle INTEGER DEFAULT 0,           -- 0/1: whether task requires idle state
       miss_threshold INTEGER DEFAULT 300,       -- seconds: skip if overdue by more than this
 
-      -- Reply Configuration
-      reply_channel TEXT DEFAULT NULL,          -- reply channel (e.g., 'telegram')
-      reply_endpoint TEXT DEFAULT NULL,         -- reply endpoint (e.g., user ID)
+      -- Complete durable Core conversation identity, or NULL for a synthetic schedule conversation
       bound_conversation_json TEXT DEFAULT NULL,
 
       -- Retry Logic (reserved, not currently used)
@@ -85,7 +81,9 @@ function initSchema() {
       core_wait_reason TEXT,
       missed_notice_attempt INTEGER NOT NULL DEFAULT 1
         CHECK(missed_notice_attempt > 0),
-      missed_notice_retry_at INTEGER
+      missed_notice_retry_at INTEGER,
+      requires_reconfiguration INTEGER NOT NULL DEFAULT 0
+        CHECK(requires_reconfiguration IN (0, 1))
     );
 
     -- Critical indexes for performance
@@ -128,8 +126,29 @@ function initSchema() {
     ['core_wait_reason', 'TEXT DEFAULT NULL'],
     ['missed_notice_attempt', 'INTEGER NOT NULL DEFAULT 1'],
     ['missed_notice_retry_at', 'INTEGER DEFAULT NULL'],
+    ['requires_reconfiguration', 'INTEGER NOT NULL DEFAULT 0'],
   ]) {
     if (!taskColumns.has(name)) db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${definition}`);
+  }
+  const legacyControls = ['require_idle', 'reply_channel', 'reply_endpoint']
+    .filter((name) => taskColumns.has(name));
+  if (legacyControls.length > 0) {
+    const predicates = [];
+    if (taskColumns.has('require_idle')) predicates.push('COALESCE(require_idle, 0) != 0');
+    if (taskColumns.has('reply_channel')) predicates.push('reply_channel IS NOT NULL');
+    if (taskColumns.has('reply_endpoint')) predicates.push('reply_endpoint IS NOT NULL');
+    const assignments = [
+      "status = CASE WHEN status = 'running' THEN 'running' ELSE 'paused' END",
+      'requires_reconfiguration = 1',
+      "last_error = 'Paused during migration: retired scheduler controls require explicit canonical reconfiguration.'",
+    ];
+    if (taskColumns.has('require_idle')) assignments.push('require_idle = 0');
+    if (taskColumns.has('reply_channel')) assignments.push('reply_channel = NULL');
+    if (taskColumns.has('reply_endpoint')) assignments.push('reply_endpoint = NULL');
+    db.prepare(`
+      UPDATE tasks SET ${assignments.join(', ')}
+      WHERE status IN ('pending', 'running') AND (${predicates.join(' OR ')})
+    `).run();
   }
   const historyColumns = new Set(
     db.prepare('PRAGMA table_info(task_history)').all().map(({ name }) => name),

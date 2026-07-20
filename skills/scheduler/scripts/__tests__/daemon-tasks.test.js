@@ -48,10 +48,7 @@ function insertTask(db, overrides = {}) {
     next_run_at: currentTime + 3600,
     priority: 3,
     status: 'pending',
-    require_idle: 0,
     miss_threshold: 300,
-    reply_channel: null,
-    reply_endpoint: null,
     created_at: currentTime,
     updated_at: currentTime,
     last_error: null,
@@ -59,13 +56,13 @@ function insertTask(db, overrides = {}) {
   const task = { ...defaults, ...overrides };
   db.prepare(`
     INSERT INTO tasks (id, name, prompt, type, cron_expression, interval_seconds, timezone,
-      next_run_at, priority, status, require_idle, miss_threshold,
-      reply_channel, reply_endpoint, created_at, updated_at, last_error)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      next_run_at, priority, status, miss_threshold,
+      created_at, updated_at, last_error)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     task.id, task.name, task.prompt, task.type, task.cron_expression, task.interval_seconds,
-    task.timezone, task.next_run_at, task.priority, task.status, task.require_idle,
-    task.miss_threshold, task.reply_channel, task.reply_endpoint,
+    task.timezone, task.next_run_at, task.priority, task.status,
+    task.miss_threshold,
     task.created_at, task.updated_at, task.last_error
   );
   return task;

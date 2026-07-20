@@ -17,7 +17,7 @@ function requireTimestamp(name, value) {
   return value;
 }
 
-function createBoundConversationIdentity(occurrence) {
+export function createBoundConversationIdentity(occurrence) {
   const bound = occurrence.bound_conversation;
   if (bound === null || bound === undefined) return null;
   if (!bound || typeof bound !== 'object' || Array.isArray(bound)) {

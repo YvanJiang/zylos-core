@@ -26,7 +26,7 @@ function database(filename = ':memory:') {
       priority INTEGER, status TEXT, require_idle INTEGER, miss_threshold INTEGER,
       bound_conversation_json TEXT, created_at INTEGER, updated_at INTEGER,
       last_error TEXT, current_occurrence_id TEXT, current_turn_id TEXT,
-      last_core_state TEXT, core_wait_reason TEXT
+      last_core_state TEXT, core_wait_reason TEXT, requires_reconfiguration INTEGER DEFAULT 0
     );
     CREATE TABLE task_history (
       id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
@@ -169,6 +169,33 @@ describe('scheduler Core admission and reconciliation', () => {
       pending: 0, terminal: 0, unavailable: 0,
     });
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM task_history').get().count, 1);
+    db.close();
+  });
+
+  test('finishes an admitted migrated turn before pausing future occurrences', () => {
+    const db = database();
+    const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get('task-A');
+    recordScheduledAdmission(db, task, { status: 'accepted', turn_id: 'turn-A' }, {
+      now: () => 10,
+    });
+    db.prepare(`
+      UPDATE tasks SET requires_reconfiguration = 1,
+        last_error = 'Paused during migration: retired scheduler controls require explicit canonical reconfiguration.'
+      WHERE id = 'task-A'
+    `).run();
+
+    assert.deepEqual(reconcileRunningTasks(db, snapshot('completed'), { now: () => 20 }), {
+      pending: 0, terminal: 1, unavailable: 0,
+    });
+    assert.deepEqual(db.prepare(`
+      SELECT status, requires_reconfiguration, last_core_state FROM tasks WHERE id = 'task-A'
+    `).get(), {
+      status: 'paused', requires_reconfiguration: 1, last_core_state: 'completed',
+    });
+    assert.equal(
+      db.prepare("SELECT status FROM task_history WHERE task_id = 'task-A'").get().status,
+      'success',
+    );
     db.close();
   });
 });

@@ -86,9 +86,7 @@ async function startServer({ maxUploadMb = 20 } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wc-routes-'));
   const dbPath = path.join(root, 'comm-bridge', 'c4.db');
   const skillsDir = path.join(root, 'skills');
-  fs.mkdirSync(path.join(root, 'activity-monitor'), { recursive: true });
   fs.writeFileSync(path.join(root, '.env'), '');
-  fs.writeFileSync(path.join(root, 'activity-monitor', 'agent-status.json'), '{"state":"idle"}');
   createDb(dbPath);
   createFakeC4Receive(skillsDir, dbPath);
   const port = await freePort();

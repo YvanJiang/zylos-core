@@ -36,8 +36,10 @@ test('the scheduler daemon admission seam persists one synthetic Core turn acros
   const bound = enqueueScheduledTask(database, {
     id: 'task-bound-queue', prompt: 'Run the group report.', next_run_at: 1_784_304_001,
     bound_conversation_json: JSON.stringify({
-      channel: 'telegram', chat_type: 'group', chat_id: 'group-runtime-queue',
-      native_thread_or_topic_id: null, message_id: 'scheduler-anchor-runtime-queue',
+      channel: 'telegram', chat_type: 'thread', chat_id: 'group-runtime-queue',
+      native_thread_or_topic_id: 'native-topic-runtime-queue',
+      message_id: 'scheduler-reply-target-runtime-queue',
+      root_message_id: 'scheduler-root-runtime-queue',
     }),
   }, {
     now: () => '2026-07-20T00:00:03.000Z',
@@ -50,8 +52,20 @@ test('the scheduler daemon admission seam persists one synthetic Core turn acros
   assert.deepEqual(database.prepare(`
     SELECT chat_type, chat_id FROM runtime_conversations WHERE conversation_id = ?
   `).get(bound.conversation_id), {
-    chat_type: 'group',
+    chat_type: 'thread',
     chat_id: 'group-runtime-queue',
+  });
+  const delivery = JSON.parse(database.prepare(`
+    SELECT command_json FROM runtime_outbox WHERE turn_id = ?
+  `).get(bound.turn_id).command_json);
+  assert.deepEqual({
+    native_thread_or_topic_id: delivery.target.native_thread_or_topic_id,
+    native_thread_root_message_id: delivery.target.native_thread_root_message_id,
+    native_thread_reply_target_message_id: delivery.target.native_thread_reply_target_message_id,
+  }, {
+    native_thread_or_topic_id: 'native-topic-runtime-queue',
+    native_thread_root_message_id: 'scheduler-root-runtime-queue',
+    native_thread_reply_target_message_id: 'scheduler-reply-target-runtime-queue',
   });
   database.close();
   fs.rmSync(directory, { recursive: true, force: true });

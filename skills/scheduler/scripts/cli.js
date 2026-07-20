@@ -8,6 +8,7 @@ import { getDb, generateId, now } from './database.js';
 import { getNextRun, isValidCron, describeCron, getDefaultTimezone } from './cron-utils.js';
 import { parseTime, parseDuration, formatTime, getRelativeTime } from './time-utils.js';
 import { loadTimezone } from './tz.js';
+import { createBoundConversationIdentity } from '../../../runtime/scheduler/scheduler-queue.js';
 
 const db = getDb();
 
@@ -17,7 +18,7 @@ function escapeLike(str) {
 }
 
 const ALLOWED_UPDATE_COLUMNS = new Set([
-  'name', 'prompt', 'priority', 'require_idle', 'reply_channel', 'reply_endpoint', 'bound_conversation_json',
+  'name', 'prompt', 'priority', 'bound_conversation_json',
   'miss_threshold', 'type', 'cron_expression', 'interval_seconds', 'next_run_at', 'timezone', 'updated_at'
 ]);
 
@@ -44,28 +45,24 @@ Add Options:
   --every "<interval>"    Interval: repeat every X time (e.g., "2 hours")
   --priority <1-3>        Priority level (1=urgent, 2=high, 3=normal, default=3)
   --name "<name>"         Task name (optional)
-  --block-queue-until-idle
-                          Wait for sustained idle, then block subsequent dispatch until execution settles
-                          Legacy alias: --require-idle
-  --reply-channel "<source>"      Reply channel (e.g., "telegram", "lark")
-  --reply-endpoint "<endpoint>"  Reply endpoint (e.g., "8101553026", "chat_id topic_id")
   --bound-conversation-json "<json>"  Full Core conversation identity for a chat-bound occurrence
   --miss-threshold <seconds>  Skip if overdue by more than this (default=300)
 
 Update Options (same as Add, plus):
   --prompt "<prompt>"     Update task content
-  --no-block-queue-until-idle
-                          Disable block-queue-until-idle behavior
-                          Legacy alias: --no-require-idle
-  --clear-reply           Clear reply configuration
 
 Examples:
   ~/zylos/.claude/skills/scheduler/scripts/cli.js add "Say hello" --in "30 minutes"
   ~/zylos/.claude/skills/scheduler/scripts/cli.js add "Health check" --cron "0 8 * * *"
   ~/zylos/.claude/skills/scheduler/scripts/cli.js add "Check updates" --every "1 hour"
   ~/zylos/.claude/skills/scheduler/scripts/cli.js update task-abc --priority 1
-  ~/zylos/.claude/skills/scheduler/scripts/cli.js update task-abc --block-queue-until-idle
 `;
+
+const RETIRED_OPTIONS = new Set([
+  'block-queue-until-idle', 'no-block-queue-until-idle',
+  'require-idle', 'no-require-idle',
+  'reply-channel', 'reply-endpoint', 'clear-reply',
+]);
 
 function parseArgs(args) {
   const result = { command: null, args: [], options: {} };
@@ -203,20 +200,15 @@ function cmdAdd(args, options) {
     return;
   }
 
-  // Parse block-queue-until-idle flag (legacy alias: require-idle)
-  const requireIdle = (options['block-queue-until-idle'] || options['require-idle']) ? 1 : 0;
-
-  // Parse reply-channel and reply-endpoint
-  const replyChannel = options['reply-channel'] || null;
-  const replyEndpoint = options['reply-endpoint'] || null;
   let boundConversationJson = null;
   if (options['bound-conversation-json']) {
     try {
       const parsed = JSON.parse(options['bound-conversation-json']);
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not object');
-      boundConversationJson = JSON.stringify(parsed);
-    } catch {
-      console.error('Error: bound-conversation-json must be a JSON object');
+      const canonical = createBoundConversationIdentity({ bound_conversation: parsed });
+      boundConversationJson = JSON.stringify(canonical);
+    } catch (error) {
+      console.error(`Error: ${error.message}`);
+      process.exitCode = 2;
       return;
     }
   }
@@ -238,10 +230,9 @@ function cmdAdd(args, options) {
       id, name, prompt, type,
       cron_expression, interval_seconds,
       next_run_at, priority, status,
-      require_idle, miss_threshold,
-      reply_channel, reply_endpoint, bound_conversation_json,
+      miss_threshold, bound_conversation_json,
       created_at, updated_at, timezone
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
   `).run(
     taskId,
     options.name || prompt.substring(0, 40),  // Default name to truncated prompt
@@ -251,10 +242,7 @@ function cmdAdd(args, options) {
     intervalSeconds || null,
     nextRunAt,
     priority,
-    requireIdle,
     missThreshold,
-    replyChannel,
-    replyEndpoint,
     boundConversationJson,
     currentTime,
     currentTime,
@@ -351,7 +339,10 @@ function cmdResume(taskId) {
   }
 
   db.prepare(`
-    UPDATE tasks SET status = 'pending', updated_at = ? WHERE id = ?
+    UPDATE tasks
+    SET status = 'pending', requires_reconfiguration = 0,
+        last_error = NULL, updated_at = ?
+    WHERE id = ?
   `).run(now(), tasks[0].id);
 
   console.log(`Resumed task: ${tasks[0].id}`);
@@ -505,28 +496,17 @@ function cmdUpdate(taskId, options) {
     updatedFields.push('priority');
   }
 
-  // Update require_idle (external flag renamed to block-queue-until-idle)
-  if (options['block-queue-until-idle'] || options['require-idle']) {
-    updates.require_idle = 1;
-    updatedFields.push('require_idle');
-  } else if (options['no-block-queue-until-idle'] || options['no-require-idle']) {
-    updates.require_idle = 0;
-    updatedFields.push('require_idle');
-  }
-
-  // Update reply configuration
-  if (options['clear-reply']) {
-    updates.reply_channel = null;
-    updates.reply_endpoint = null;
-    updatedFields.push('reply_channel', 'reply_endpoint');
-  } else {
-    if (options['reply-channel']) {
-      updates.reply_channel = options['reply-channel'];
-      updatedFields.push('reply_channel');
-    }
-    if (options['reply-endpoint']) {
-      updates.reply_endpoint = options['reply-endpoint'];
-      updatedFields.push('reply_endpoint');
+  if (options['bound-conversation-json']) {
+    try {
+      const parsed = JSON.parse(options['bound-conversation-json']);
+      updates.bound_conversation_json = JSON.stringify(
+        createBoundConversationIdentity({ bound_conversation: parsed }),
+      );
+      updatedFields.push('bound_conversation_json');
+    } catch (error) {
+      console.error(`Error: ${error.message}`);
+      process.exitCode = 2;
+      return;
     }
   }
 
@@ -638,6 +618,15 @@ function main() {
   }
 
   const { command, args, options } = parseArgs(process.argv.slice(2));
+
+  const retired = Object.keys(options).find((name) => RETIRED_OPTIONS.has(name));
+  if (retired) {
+    console.error(
+      `Error: --${retired} is retired; use --bound-conversation-json with a complete Core identity.`,
+    );
+    process.exitCode = 2;
+    return;
+  }
 
   switch (command) {
     case 'list':

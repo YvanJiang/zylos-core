@@ -1268,27 +1268,6 @@ export function step11_startCoreServices(ctx, deps = {}) {
     return { step: 11, name: 'start_core_services', status: 'failed', error: `Failed to restart: ${failed.join(', ')}`, duration: Date.now() - startTime };
   }
 
-  if (started.includes('activity-monitor')) {
-    const verifyActivityMonitorEnv = deps.verifyActivityMonitorEnv ?? (() => {
-      const output = exec('pm2 jlist 2>/dev/null', {
-        encoding: 'utf8',
-        stdio: 'pipe',
-      });
-      const processes = JSON.parse(String(output));
-      const activityMonitor = processes.find(process => process.name === 'activity-monitor');
-      return Boolean(activityMonitor?.pm2_env?.ZYLOS_PACKAGE_ROOT);
-    });
-
-    try {
-      if (!verifyActivityMonitorEnv()) {
-        return { step: 11, name: 'start_core_services', status: 'failed', error: 'activity-monitor PM2 env missing ZYLOS_PACKAGE_ROOT after restart', duration: Date.now() - startTime };
-      }
-    } catch (err) {
-      const detail = err?.message ? `: ${err.message}` : '';
-      return { step: 11, name: 'start_core_services', status: 'failed', error: `failed to verify activity-monitor PM2 env after restart${detail}`, duration: Date.now() - startTime };
-    }
-  }
-
   try {
     exec('pm2 save 2>/dev/null', { stdio: 'pipe' });
   } catch {

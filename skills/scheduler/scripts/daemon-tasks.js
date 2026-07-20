@@ -143,9 +143,11 @@ export function reconcileRunningTasks(db, snapshot, {
     }
 
     const completedAt = clock();
-    const taskStatus = projection.disposition === 'succeeded'
-      ? 'completed'
-      : (task.type === 'one-time' ? 'failed' : 'completed');
+    const taskStatus = task.requires_reconfiguration === 1
+      ? 'paused'
+      : (projection.disposition === 'succeeded'
+        ? 'completed'
+        : (task.type === 'one-time' ? 'failed' : 'completed'));
     const historyStatus = projection.disposition === 'succeeded'
       ? 'success'
       : (projection.core_state === 'timed_out' ? 'timeout' : 'failed');
@@ -160,7 +162,7 @@ export function reconcileRunningTasks(db, snapshot, {
         completedAt,
         completedAt,
         projection.core_state,
-        projection.terminal_error,
+        projection.terminal_error ?? task.last_error,
         task.id,
         task.current_turn_id,
       );

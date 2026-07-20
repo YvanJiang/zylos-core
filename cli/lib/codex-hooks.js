@@ -4,6 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { parse, stringify } from 'smol-toml';
+import { isObsoleteProviderSessionHook } from '../../runtime/migration/legacy-lifecycle-artifacts.js';
 
 const SESSION_START = 'SessionStart';
 const CODEX_EVENT_KEYS = {
@@ -82,16 +83,7 @@ export function coreSessionStartCommands(zylosDir) {
 }
 
 export function isCoreCodexHook(command, zylosDir) {
-  if (!command) return false;
-  const script = path.join(
-    path.resolve(zylosDir),
-    '.claude',
-    'skills',
-    'activity-monitor',
-    'scripts',
-    'session-start-orchestrator.js'
-  );
-  return command.includes(script) || command.includes('session-start-orchestrator.js');
+  return isObsoleteProviderSessionHook(command, path.resolve(zylosDir));
 }
 
 export function readCodexHooksConfig(filePath) {
@@ -127,8 +119,8 @@ export function installCoreCodexHook({ zylosDir }) {
 
   const commands = coreSessionStartCommands(zylosDir);
 
-  // Core no longer installs provider-session hooks. Strip every retired
-  // activity-monitor hook while preserving unrelated user hook groups.
+  // Core no longer installs provider-session hooks. Strip obsolete owned hooks
+  // while preserving unrelated user hook groups.
   const existing = Array.isArray(config.hooks[SESSION_START]) ? config.hooks[SESSION_START] : [];
   const preserved = existing
     .map((group) => {
