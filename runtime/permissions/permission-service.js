@@ -1246,7 +1246,7 @@ export function bindPermissionToAcceptedTurnInTransaction(database, {
   acceptedAt,
   generateId = defaultGenerateId,
 }) {
-  let revision = currentRevision(database);
+  const revision = currentRevision(database);
   const conversation = database.prepare(`
     SELECT region, tenant_id, bot_id
     FROM runtime_conversations
@@ -1287,7 +1287,6 @@ export function bindPermissionToAcceptedTurnInTransaction(database, {
       WHERE grant_id = ? AND state = 'active'
     `).run(turnId, acceptedAt, grant.grant_id);
     if (consumed.changes !== 1) throw new Error('Next-turn permission consumption lost atomicity.');
-    revision = nextRevision(database);
     insertAudit(database, {
       generateId,
       action: 'permission_consumed',

@@ -268,7 +268,7 @@ describe('durable next-turn permission', () => {
       action: 'permission_consumed',
       turn_id: ownerTurn.turn_id,
       grant_id: expect.any(String),
-      policy_revision: 2,
+      policy_revision: 1,
     });
     database.close();
   });
@@ -742,6 +742,51 @@ describe('persistent bot permission confirmation', () => {
       reason: 'policy_revision_changed',
       error: { code: 'version_conflict' },
     });
+    database.close();
+  });
+
+  test('does not invalidate a pending bot confirmation when an unrelated next-turn grant is consumed', () => {
+    const database = openDatabase();
+    const clock = { value: '2026-07-20T01:00:00Z' };
+    const now = () => clock.value;
+    const generateId = deterministicIds('confirmation-next-consume');
+    const options = { now, generateId };
+    const manager = { actorId: 'bot-owner', roles: ['member', 'bot_owner'] };
+
+    acceptNormalInbound(database, envelope(
+      'confirmation-next-command',
+      '/permission trusted',
+      { actorId: 'other-actor', chatId: 'chat-dm-other' },
+    ), options);
+    clock.value = '2026-07-20T01:01:00Z';
+    const pending = acceptNormalInbound(database, envelope(
+      'confirmation-next-pending', '/permission trusted --bot', manager,
+    ), options);
+    const request = JSON.parse(database.prepare(`
+      SELECT request_json FROM runtime_interactions WHERE parent_id = ?
+    `).get(pending.control_id).request_json);
+    clock.value = '2026-07-20T01:02:00Z';
+    acceptNormalInbound(database, envelope(
+      'confirmation-next-turn',
+      'unrelated trusted work',
+      { actorId: 'other-actor', chatId: 'chat-dm-other' },
+    ), options);
+
+    const permissionPolicy = createPermissionService({ database, now, generateId });
+    const confirmed = permissionPolicy.submitConfirmation(confirmationAnswer(
+      request,
+      'confirmation-next-approve',
+      { actorId: 'bot-owner' },
+    ));
+    expect(confirmed).toMatchObject({
+      status: 'accepted',
+      interaction_state: 'answer_committed',
+      error: null,
+    });
+    expect(database.prepare(`
+      SELECT state FROM runtime_permission_grants
+      WHERE grant_kind = 'persistent_bot'
+    `).get()).toEqual({ state: 'active' });
     database.close();
   });
 
