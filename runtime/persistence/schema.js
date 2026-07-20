@@ -493,6 +493,17 @@ const RUNTIME_SCHEMA = `
     observed_at TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS runtime_observability_instances (
+    service_instance_id TEXT PRIMARY KEY,
+    host_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    service_version INTEGER NOT NULL DEFAULT 1 CHECK (service_version > 0),
+    snapshot_version INTEGER NOT NULL DEFAULT 0 CHECK (snapshot_version >= 0),
+    last_reconciliation_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS runtime_normalized_events (
     event_id TEXT PRIMARY KEY,
     turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),
