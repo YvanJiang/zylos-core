@@ -194,6 +194,49 @@ describe('five-repository public contract compatibility gate', () => {
     });
   });
 
+  test.each([
+    ['a valid line followed by malformed evidence', (validEvidence) => [
+      validEvidence,
+      `${COMPATIBILITY_EVIDENCE_PREFIX}{broken`,
+    ]],
+    ['duplicate valid evidence', (validEvidence) => [validEvidence, validEvidence]],
+  ])('rejects %s instead of accepting the first evidence line', (_name, evidenceLines) => {
+    const item = {
+      repository: 'luna-pet',
+      directory: '/workspace/luna',
+      flows: ['dashboard_luna_projection'],
+      assertions: COMPATIBILITY_ASSERTIONS,
+      requiresEvidence: true,
+      coreFixtureSha256: 'a'.repeat(64),
+    };
+    const validEvidence = `${COMPATIBILITY_EVIDENCE_PREFIX}${JSON.stringify({
+      schema_version: 1,
+      repository: item.repository,
+      core_fixture_sha256: item.coreFixtureSha256,
+      assertions: item.assertions,
+      flows: item.flows,
+      computations: {
+        jcs_bytes_from_raw_payload: 1,
+        idempotency_key_from_raw_payload: 1,
+        payload_hash_from_raw_payload: 1,
+      },
+    })}`;
+    const outcome = executeFiveRepoCompatibilityPlan([item], {
+      runCommand() {
+        return {
+          exitCode: 0,
+          stdout: `${evidenceLines(validEvidence).map((line) => `# ${line}`).join('\n')}\n`,
+          stderr: '',
+        };
+      },
+    });
+    expect(outcome.results[0]).toMatchObject({
+      commandExitCode: 0,
+      exitCode: 1,
+      stderr: expect.stringContaining('exactly one compatibility evidence line'),
+    });
+  });
+
   test('executes exact argv without a shell and treats process startup failures as gate failures', () => {
     const item = {
       command: '/usr/local/bin/node',

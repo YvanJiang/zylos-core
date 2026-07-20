@@ -184,10 +184,17 @@ function arraysEqual(left, right) {
 }
 
 function extractConsumerEvidence(item, stdout) {
-  const line = stdout
+  const lines = stdout
     .split(/\r?\n/u)
-    .find((candidate) => candidate.includes(COMPATIBILITY_EVIDENCE_PREFIX));
-  if (!line) throw new Error('consumer did not emit compatibility evidence');
+    .filter((candidate) => candidate.includes(COMPATIBILITY_EVIDENCE_PREFIX));
+  if (lines.length !== 1) {
+    throw new Error(
+      lines.length === 0
+        ? 'consumer did not emit compatibility evidence'
+        : 'consumer must emit exactly one compatibility evidence line',
+    );
+  }
+  const [line] = lines;
   const evidenceStart = line.indexOf(COMPATIBILITY_EVIDENCE_PREFIX)
     + COMPATIBILITY_EVIDENCE_PREFIX.length;
   let evidence;
