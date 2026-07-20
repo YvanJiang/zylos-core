@@ -31,6 +31,7 @@ const normalRuntimeFiles = [
   'templates/onboarding.md',
   'docs/hook-activity-tracking.md',
   'README.md',
+  'README.zh-CN.md',
 ];
 
 let cachedPackedFiles = null;
@@ -61,6 +62,15 @@ describe('normal product paths have no retired runtime authority', () => {
       const source = fs.readFileSync(path.resolve(file), 'utf8');
       expect(source).not.toMatch(/reply via|c4-send\.js|latest message|parent chat fallback/i);
       expect(source).toMatch(/durable (outbox|delivery)/i);
+    }
+  });
+
+  test('shipped multilingual docs do not describe global sessions or idle-gated scheduling', () => {
+    for (const file of ['README.md', 'README.zh-CN.md']) {
+      const source = fs.readFileSync(path.resolve(file), 'utf8');
+      expect(source).not.toMatch(
+        /unified (?:gateway|conversation|session)|one conversation(?:,|\s+[—-])|idle gating|统一网关|统一会话|一个对话、一份|空闲门控/i,
+      );
     }
   });
 
