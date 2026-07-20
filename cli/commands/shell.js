@@ -151,6 +151,7 @@ export async function shellCommand() {
   const deliveryTimer = setInterval(() => { void deliveryDrain.drain(); }, 250);
 
   // Cleanup on exit (guard against double invocation)
+  let rl = null;
   let cleanupPromise = null;
   function cleanup() {
     if (cleanupPromise !== null) return cleanupPromise;
@@ -170,10 +171,12 @@ export async function shellCommand() {
   function shutdown() {
     if (shutdownPromise === null) {
       shutdownPromise = cleanup();
-      if (!rl.closed) rl.close();
+      if (rl !== null && !rl.closed) rl.close();
     }
     return shutdownPromise;
   }
+  process.once('SIGINT', () => { void shutdown(); });
+  process.once('SIGTERM', () => { void shutdown(); });
   // Print banner
   console.log(bold('Zylos Shell'));
   console.log(dim('Interactive mode — type your message and press Enter.'));
@@ -181,14 +184,12 @@ export async function shellCommand() {
   console.log();
 
   // Start REPL
-  const rl = readline.createInterface({
+  rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
     prompt: cyan('you> '),
     terminal: process.stdin.isTTY !== false,
   });
-  process.once('SIGINT', () => { void shutdown(); });
-  process.once('SIGTERM', () => { void shutdown(); });
 
   rl.prompt();
 
