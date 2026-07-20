@@ -355,11 +355,6 @@ export function createLegacyProviderQuiescence({
     if (phase !== 'removed') onPhase('committing', record);
     if (server !== null) {
       signalExactIdentity(record.server, 'SIGCONT', identityOptions);
-      try {
-        tmux(['kill-session', '-t', `=${session}`]);
-      } catch (error) {
-        if (error?.status !== 1) throw error;
-      }
     }
     let survivors = exactSurvivors(record, identityOptions);
     for (const member of survivors) {

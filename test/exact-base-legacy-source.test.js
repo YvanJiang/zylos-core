@@ -209,8 +209,14 @@ describe('exact-base durable source fencing', () => {
       'tmux', ['-L', server, 'display-message', '-p', '#{pid}'], { encoding: 'utf8' },
     ).trim()));
     const signals = [];
+    const calls = [];
     const quiescence = createLegacyProviderQuiescence({
-      provider: 'claude', execFileSyncFn: execFileSync, tmuxArgsPrefix: ['-L', server],
+      provider: 'claude',
+      execFileSyncFn(file, args, options) {
+        calls.push([file, args]);
+        return execFileSync(file, args, options);
+      },
+      tmuxArgsPrefix: ['-L', server],
       signalProcess(pid, signal) {
         signals.push([pid, signal]);
         process.kill(pid, signal);
@@ -283,6 +289,8 @@ describe('exact-base durable source fencing', () => {
       .toMatchObject({ removed: true, already_removed: true });
     expect(signals).toHaveLength(signalsBeforeReusedPid);
     expect(quiescence.inspect()).toMatchObject({ active: false });
+    expect(calls.some(([file, args]) => file === 'tmux' && args.includes('kill-session')))
+      .toBe(false);
     for (const pid of suspendedAgain.members.map(({ pid }) => pid)) {
       expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
     }
