@@ -771,6 +771,76 @@ const RUNTIME_SCHEMA = `
     updated_at TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS runtime_compact_turn_summaries (
+    turn_id TEXT PRIMARY KEY REFERENCES runtime_turns(turn_id),
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    lineage_id TEXT REFERENCES runtime_lineages(lineage_id),
+    terminal_state TEXT NOT NULL CHECK (
+      terminal_state IN ('completed', 'stopped', 'cancelled', 'interrupted', 'failed', 'timed_out')
+    ),
+    terminal_at TEXT NOT NULL,
+    final_text TEXT,
+    final_error_json TEXT,
+    lane_key TEXT,
+    mapping_id TEXT,
+    aggregate_version INTEGER,
+    event_sequence_through INTEGER,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_retention_entries (
+    record_kind TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    turn_id TEXT,
+    retention_class TEXT NOT NULL CHECK (
+      retention_class IN ('raw_detail_7d', 'terminal_detail_30d', 'security_audit_180d')
+    ),
+    anchor_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    disposal_kind TEXT NOT NULL CHECK (disposal_kind IN ('delete', 'redact')),
+    registered_at TEXT NOT NULL,
+    disposed_at TEXT,
+    deletion_audit_id TEXT,
+    PRIMARY KEY (record_kind, record_id),
+    CHECK (
+      (disposed_at IS NULL AND deletion_audit_id IS NULL)
+      OR (disposed_at IS NOT NULL AND deletion_audit_id IS NOT NULL)
+    )
+  );
+
+  CREATE INDEX IF NOT EXISTS runtime_retention_entries_due
+    ON runtime_retention_entries(expires_at, record_kind)
+    WHERE disposed_at IS NULL;
+
+  CREATE TABLE IF NOT EXISTS runtime_retention_deletion_audit (
+    audit_id TEXT PRIMARY KEY,
+    sweep_id TEXT NOT NULL,
+    record_kind TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    turn_id TEXT,
+    retention_class TEXT NOT NULL,
+    anchor_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    disposal_kind TEXT NOT NULL,
+    content_digest_version INTEGER NOT NULL DEFAULT 1 CHECK (content_digest_version = 1),
+    content_sha256 TEXT NOT NULL,
+    deleted_at TEXT NOT NULL,
+    UNIQUE (record_kind, record_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_retention_sweeps (
+    sweep_id TEXT PRIMARY KEY,
+    transaction_time TEXT NOT NULL,
+    candidate_count INTEGER NOT NULL CHECK (candidate_count >= 0),
+    disposed_count INTEGER NOT NULL CHECK (disposed_count >= 0),
+    oldest_expiry_at TEXT,
+    max_lag_ms INTEGER NOT NULL CHECK (max_lag_ms >= 0),
+    observed_lag_ms INTEGER NOT NULL CHECK (observed_lag_ms >= 0),
+    max_lag_exceeded INTEGER NOT NULL CHECK (max_lag_exceeded IN (0, 1)),
+    busy_retry_count INTEGER NOT NULL CHECK (busy_retry_count >= 0),
+    committed_at TEXT NOT NULL
+  );
+
 `;
 
 const OUTBOX_V2_SCHEMA = `CREATE TABLE runtime_outbox ${OUTBOX_TABLE_SCHEMA};`;
@@ -1276,6 +1346,14 @@ export function initializeRuntimePersistence(database) {
     'INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0)',
   );
   addColumnIfMissing(database, 'runtime_turns', 'provider_input_json', 'TEXT');
+  addColumnIfMissing(database, 'runtime_turns', 'terminal_at', 'TEXT');
+  addColumnIfMissing(database, 'runtime_turns', 'detail_expires_at', 'TEXT');
+  addColumnIfMissing(
+    database,
+    'runtime_retention_deletion_audit',
+    'content_digest_version',
+    'INTEGER NOT NULL DEFAULT 1 CHECK (content_digest_version = 1)',
+  );
   addColumnIfMissing(
     database,
     'runtime_turns',
@@ -1356,7 +1434,542 @@ export function initializeRuntimePersistence(database) {
       SET recovery_version = recovery_version + 1
       WHERE recovery_id = NEW.recovery_id;
     END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_turn_terminal_retention
+    AFTER UPDATE OF state ON runtime_turns
+    WHEN NEW.state IN ('completed', 'stopped', 'cancelled', 'interrupted', 'failed', 'timed_out')
+      AND OLD.state NOT IN ('completed', 'stopped', 'cancelled', 'interrupted', 'failed', 'timed_out')
+    BEGIN
+      UPDATE runtime_turns
+      SET terminal_at = NEW.committed_at,
+        detail_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', NEW.committed_at, '+30 days')
+      WHERE turn_id = NEW.turn_id AND terminal_at IS NULL AND detail_expires_at IS NULL;
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      )
+      SELECT 'provider_attempt_detail', attempt_id, NEW.turn_id, 'terminal_detail_30d',
+        NEW.committed_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', NEW.committed_at, '+30 days'),
+        'redact', NEW.committed_at
+      FROM runtime_provider_attempts WHERE turn_id = NEW.turn_id;
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      )
+      SELECT 'terminal_outbox', outbox_id, NEW.turn_id, 'terminal_detail_30d',
+        NEW.committed_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', NEW.committed_at, '+30 days'),
+        'delete', NEW.committed_at
+      FROM runtime_outbox
+      WHERE turn_id = NEW.turn_id AND status IN ('delivered', 'superseded', 'dead_letter');
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      )
+      SELECT 'terminal_background_work', background_work_id, NEW.turn_id,
+        'terminal_detail_30d', NEW.committed_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', NEW.committed_at, '+30 days'),
+        'delete', NEW.committed_at
+      FROM runtime_workspace_background_work
+      WHERE holder_turn_id = NEW.turn_id AND state IN ('completed', 'failed');
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      )
+      SELECT 'terminal_workspace_lease', workspace_lease_id, NEW.turn_id,
+        'terminal_detail_30d', NEW.committed_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', NEW.committed_at, '+30 days'),
+        'delete', NEW.committed_at
+      FROM runtime_workspace_leases
+      WHERE holder_turn_id = NEW.turn_id AND state IN ('released', 'expired');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_normalized_event_retention
+    AFTER INSERT ON runtime_normalized_events
+    BEGIN
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      ) VALUES (
+        'normalized_event', NEW.event_id, NEW.turn_id, 'raw_detail_7d', NEW.persisted_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', NEW.persisted_at, '+7 days'),
+        'delete', NEW.persisted_at
+      );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_provider_raw_event_retention
+    AFTER INSERT ON runtime_provider_event_diagnostics
+    BEGIN
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      ) VALUES (
+        'provider_raw_event', NEW.diagnostic_id, NEW.turn_id, 'raw_detail_7d',
+        NEW.observed_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', NEW.observed_at, '+7 days'),
+        'delete', NEW.observed_at
+      );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_projection_snapshot_retention
+    AFTER INSERT ON runtime_projection_snapshots
+    BEGIN
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      )
+      SELECT
+        CASE WHEN NEW.terminal = 1 THEN 'terminal_projection' ELSE 'intermediate_projection' END,
+        NEW.projection_id, NEW.turn_id,
+        CASE WHEN NEW.terminal = 1 THEN 'terminal_detail_30d' ELSE 'raw_detail_7d' END,
+        CASE WHEN NEW.terminal = 1 THEN turn.terminal_at ELSE NEW.created_at END,
+        CASE WHEN NEW.terminal = 1
+          THEN strftime('%Y-%m-%dT%H:%M:%fZ', turn.terminal_at, '+30 days')
+          ELSE strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at, '+7 days')
+        END,
+        'delete', NEW.created_at
+      FROM runtime_turns AS turn
+      WHERE turn.turn_id = NEW.turn_id
+        AND (NEW.terminal = 0 OR turn.terminal_at IS NOT NULL);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_terminal_outbox_retention
+    AFTER UPDATE OF status ON runtime_outbox
+    WHEN NEW.turn_id IS NOT NULL
+      AND NEW.status IN ('delivered', 'superseded', 'dead_letter')
+      AND OLD.status NOT IN ('delivered', 'superseded', 'dead_letter')
+    BEGIN
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      )
+      SELECT 'terminal_outbox', NEW.outbox_id, NEW.turn_id, 'terminal_detail_30d',
+        turn.terminal_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', turn.terminal_at, '+30 days'),
+        'delete', NEW.updated_at
+      FROM runtime_turns AS turn
+      WHERE turn.turn_id = NEW.turn_id AND turn.terminal_at IS NOT NULL;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_terminal_queue_retention
+    AFTER UPDATE OF status ON runtime_turn_queue
+    WHEN NEW.status IN ('completed', 'stopped', 'cancelled', 'interrupted', 'failed', 'timed_out')
+      AND OLD.status NOT IN ('completed', 'stopped', 'cancelled', 'interrupted', 'failed', 'timed_out')
+    BEGIN
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      )
+      SELECT 'terminal_turn_queue', NEW.turn_id, NEW.turn_id, 'terminal_detail_30d',
+        turn.terminal_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', turn.terminal_at, '+30 days'),
+        'delete', turn.terminal_at
+      FROM runtime_turns AS turn
+      WHERE turn.turn_id = NEW.turn_id AND turn.terminal_at IS NOT NULL;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_terminal_background_work_retention_insert
+    AFTER INSERT ON runtime_workspace_background_work
+    WHEN NEW.state IN ('completed', 'failed')
+    BEGIN
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      )
+      SELECT 'terminal_background_work', NEW.background_work_id, NEW.holder_turn_id,
+        'terminal_detail_30d', turn.terminal_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', turn.terminal_at, '+30 days'),
+        'delete', NEW.ended_at
+      FROM runtime_turns AS turn
+      WHERE turn.turn_id = NEW.holder_turn_id AND turn.terminal_at IS NOT NULL;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_terminal_background_work_retention_update
+    AFTER UPDATE OF state ON runtime_workspace_background_work
+    WHEN NEW.state IN ('completed', 'failed') AND OLD.state = 'active'
+    BEGIN
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      )
+      SELECT 'terminal_background_work', NEW.background_work_id, NEW.holder_turn_id,
+        'terminal_detail_30d', turn.terminal_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', turn.terminal_at, '+30 days'),
+        'delete', NEW.ended_at
+      FROM runtime_turns AS turn
+      WHERE turn.turn_id = NEW.holder_turn_id AND turn.terminal_at IS NOT NULL;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_terminal_workspace_lease_retention_insert
+    AFTER INSERT ON runtime_workspace_leases
+    WHEN NEW.state IN ('released', 'expired')
+    BEGIN
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      )
+      SELECT 'terminal_workspace_lease', NEW.workspace_lease_id, NEW.holder_turn_id,
+        'terminal_detail_30d', turn.terminal_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', turn.terminal_at, '+30 days'),
+        'delete', NEW.released_at
+      FROM runtime_turns AS turn
+      WHERE turn.turn_id = NEW.holder_turn_id AND turn.terminal_at IS NOT NULL;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_terminal_workspace_lease_retention_update
+    AFTER UPDATE OF state ON runtime_workspace_leases
+    WHEN NEW.state IN ('released', 'expired') AND OLD.state IN ('active', 'uncertain')
+    BEGIN
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      )
+      SELECT 'terminal_workspace_lease', NEW.workspace_lease_id, NEW.holder_turn_id,
+        'terminal_detail_30d', turn.terminal_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', turn.terminal_at, '+30 days'),
+        'delete', NEW.released_at
+      FROM runtime_turns AS turn
+      WHERE turn.turn_id = NEW.holder_turn_id AND turn.terminal_at IS NOT NULL;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_permission_audit_retention
+    AFTER INSERT ON runtime_permission_audit
+    BEGIN
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      ) VALUES (
+        'permission_audit', NEW.audit_id, NEW.turn_id, 'security_audit_180d',
+        NEW.committed_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', NEW.committed_at, '+180 days'),
+        'delete', NEW.committed_at
+      );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_operations_audit_retention
+    AFTER INSERT ON runtime_operations_audit
+    BEGIN
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      ) VALUES (
+        'operations_audit', NEW.audit_id, json_extract(NEW.target_json, '$.turn_id'),
+        'security_audit_180d', NEW.committed_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', NEW.committed_at, '+180 days'),
+        'delete', NEW.committed_at
+      );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_interaction_audit_retention
+    AFTER INSERT ON runtime_interaction_audit
+    BEGIN
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      )
+      SELECT 'interaction_audit', NEW.audit_id, interaction.turn_id,
+        'security_audit_180d', NEW.created_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at, '+180 days'),
+        'delete', NEW.created_at
+      FROM runtime_interactions AS interaction
+      WHERE interaction.interaction_id = NEW.interaction_id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_permission_action_decision_retention
+    AFTER INSERT ON runtime_permission_action_decisions
+    BEGIN
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      ) VALUES (
+        'permission_action_decision', NEW.decision_id, NEW.turn_id,
+        'security_audit_180d', NEW.checked_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', NEW.checked_at, '+180 days'),
+        'delete', NEW.checked_at
+      );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_operations_conflict_audit_retention
+    AFTER INSERT ON runtime_operations_idempotency_conflicts
+    BEGIN
+      INSERT OR IGNORE INTO runtime_retention_entries (
+        record_kind, record_id, turn_id, retention_class, anchor_at,
+        expires_at, disposal_kind, registered_at
+      ) VALUES (
+        'operations_idempotency_conflict',
+        json_array(NEW.caller_namespace, NEW.control_id, NEW.request_hash),
+        NULL, 'security_audit_180d', NEW.committed_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', NEW.committed_at, '+180 days'),
+        'delete', NEW.committed_at
+      );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_terminal_projection_compact_summary
+    AFTER INSERT ON runtime_projection_snapshots
+    WHEN NEW.terminal = 1
+    BEGIN
+      INSERT OR IGNORE INTO runtime_compact_turn_summaries (
+        turn_id, conversation_id, lineage_id, terminal_state, terminal_at,
+        final_text, final_error_json, lane_key, mapping_id, aggregate_version,
+        event_sequence_through, created_at
+      )
+      SELECT turn.turn_id, turn.conversation_id, turn.lineage_id, turn.state,
+        turn.terminal_at, json_extract(NEW.render_model_json, '$.text'),
+        json_extract(NEW.render_model_json, '$.error'), NEW.lane_key,
+        json_extract(lane.mapping_json, '$.mapping_id'), NEW.aggregate_version,
+        NEW.event_sequence_through, NEW.created_at
+      FROM runtime_turns AS turn
+      JOIN runtime_delivery_lanes AS lane ON lane.lane_key = NEW.lane_key
+      WHERE turn.turn_id = NEW.turn_id AND turn.terminal_at IS NOT NULL;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_compact_turn_summary_immutable_update
+    BEFORE UPDATE ON runtime_compact_turn_summaries
+    BEGIN
+      SELECT RAISE(ABORT, 'runtime compact turn summary is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_compact_turn_summary_immutable_delete
+    BEFORE DELETE ON runtime_compact_turn_summaries
+    BEGIN
+      SELECT RAISE(ABORT, 'runtime compact turn summary is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_retention_deletion_audit_immutable_update
+    BEFORE UPDATE ON runtime_retention_deletion_audit
+    BEGIN
+      SELECT RAISE(ABORT, 'runtime retention deletion audit is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_retention_deletion_audit_immutable_delete
+    BEFORE DELETE ON runtime_retention_deletion_audit
+    BEGIN
+      SELECT RAISE(ABORT, 'runtime retention deletion audit is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_retention_entry_immutable_update
+    BEFORE UPDATE ON runtime_retention_entries
+    WHEN NEW.record_kind IS NOT OLD.record_kind
+      OR NEW.record_id IS NOT OLD.record_id
+      OR NEW.turn_id IS NOT OLD.turn_id
+      OR NEW.retention_class IS NOT OLD.retention_class
+      OR NEW.anchor_at IS NOT OLD.anchor_at
+      OR NEW.expires_at IS NOT OLD.expires_at
+      OR NEW.disposal_kind IS NOT OLD.disposal_kind
+      OR NEW.registered_at IS NOT OLD.registered_at
+      OR OLD.disposed_at IS NOT NULL
+      OR NEW.disposed_at IS NULL
+      OR NEW.deletion_audit_id IS NULL
+      OR NOT EXISTS (
+        SELECT 1 FROM runtime_retention_deletion_audit AS audit
+        WHERE audit.audit_id = NEW.deletion_audit_id
+          AND audit.record_kind = OLD.record_kind
+          AND audit.record_id = OLD.record_id
+          AND audit.deleted_at = NEW.disposed_at
+      )
+    BEGIN
+      SELECT RAISE(ABORT, 'runtime retention entry is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_retention_entry_immutable_delete
+    BEFORE DELETE ON runtime_retention_entries
+    BEGIN
+      SELECT RAISE(ABORT, 'runtime retention entry is immutable');
+    END;
   `);
+  database.prepare(`
+    UPDATE runtime_turns
+    SET terminal_at = committed_at,
+      detail_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', committed_at, '+30 days')
+    WHERE state IN ('completed', 'stopped', 'cancelled', 'interrupted', 'failed', 'timed_out')
+      AND terminal_at IS NULL AND detail_expires_at IS NULL
+  `).run();
+    database.prepare(`
+    INSERT OR IGNORE INTO runtime_compact_turn_summaries (
+      turn_id, conversation_id, lineage_id, terminal_state, terminal_at,
+      final_text, final_error_json, lane_key, mapping_id, aggregate_version,
+      event_sequence_through, created_at
+    )
+    SELECT turn.turn_id, turn.conversation_id, turn.lineage_id, turn.state,
+      turn.terminal_at, json_extract(projection.render_model_json, '$.text'),
+      json_extract(projection.render_model_json, '$.error'), projection.lane_key,
+      json_extract(lane.mapping_json, '$.mapping_id'), projection.aggregate_version,
+      projection.event_sequence_through, projection.created_at
+    FROM runtime_turns AS turn
+    JOIN runtime_projection_snapshots AS projection ON projection.turn_id = turn.turn_id
+      AND projection.terminal = 1
+      AND projection.aggregate_version = (
+        SELECT MAX(candidate.aggregate_version)
+        FROM runtime_projection_snapshots AS candidate
+        WHERE candidate.turn_id = turn.turn_id AND candidate.terminal = 1
+      )
+    JOIN runtime_delivery_lanes AS lane ON lane.lane_key = projection.lane_key
+    WHERE turn.terminal_at IS NOT NULL
+  `).run();
+    database.prepare(`
+    INSERT OR IGNORE INTO runtime_retention_entries (
+      record_kind, record_id, turn_id, retention_class, anchor_at,
+      expires_at, disposal_kind, registered_at
+    )
+    SELECT 'normalized_event', event_id, turn_id, 'raw_detail_7d', persisted_at,
+      strftime('%Y-%m-%dT%H:%M:%fZ', persisted_at, '+7 days'), 'delete', persisted_at
+    FROM runtime_normalized_events
+  `).run();
+    database.prepare(`
+    INSERT OR IGNORE INTO runtime_retention_entries (
+      record_kind, record_id, turn_id, retention_class, anchor_at,
+      expires_at, disposal_kind, registered_at
+    )
+    SELECT 'provider_raw_event', diagnostic_id, turn_id, 'raw_detail_7d',
+      observed_at, strftime('%Y-%m-%dT%H:%M:%fZ', observed_at, '+7 days'),
+      'delete', observed_at
+    FROM runtime_provider_event_diagnostics
+  `).run();
+    database.prepare(`
+    INSERT OR IGNORE INTO runtime_retention_entries (
+      record_kind, record_id, turn_id, retention_class, anchor_at,
+      expires_at, disposal_kind, registered_at
+    )
+    SELECT CASE WHEN projection.terminal = 1
+        THEN 'terminal_projection' ELSE 'intermediate_projection' END,
+      projection.projection_id, projection.turn_id,
+      CASE WHEN projection.terminal = 1
+        THEN 'terminal_detail_30d' ELSE 'raw_detail_7d' END,
+      CASE WHEN projection.terminal = 1 THEN turn.terminal_at ELSE projection.created_at END,
+      CASE WHEN projection.terminal = 1
+        THEN strftime('%Y-%m-%dT%H:%M:%fZ', turn.terminal_at, '+30 days')
+        ELSE strftime('%Y-%m-%dT%H:%M:%fZ', projection.created_at, '+7 days')
+      END,
+      'delete', projection.created_at
+    FROM runtime_projection_snapshots AS projection
+    JOIN runtime_turns AS turn ON turn.turn_id = projection.turn_id
+    WHERE projection.terminal = 0 OR turn.terminal_at IS NOT NULL
+  `).run();
+    database.prepare(`
+    INSERT OR IGNORE INTO runtime_retention_entries (
+      record_kind, record_id, turn_id, retention_class, anchor_at,
+      expires_at, disposal_kind, registered_at
+    )
+    SELECT 'provider_attempt_detail', attempt.attempt_id, attempt.turn_id,
+      'terminal_detail_30d', turn.terminal_at,
+      strftime('%Y-%m-%dT%H:%M:%fZ', turn.terminal_at, '+30 days'),
+      'redact', turn.terminal_at
+    FROM runtime_provider_attempts AS attempt
+    JOIN runtime_turns AS turn ON turn.turn_id = attempt.turn_id
+    WHERE turn.terminal_at IS NOT NULL
+  `).run();
+    database.prepare(`
+    INSERT OR IGNORE INTO runtime_retention_entries (
+      record_kind, record_id, turn_id, retention_class, anchor_at,
+      expires_at, disposal_kind, registered_at
+    )
+    SELECT 'terminal_outbox', outbox.outbox_id, outbox.turn_id,
+      'terminal_detail_30d', turn.terminal_at,
+      strftime('%Y-%m-%dT%H:%M:%fZ', turn.terminal_at, '+30 days'),
+      'delete', turn.terminal_at
+    FROM runtime_outbox AS outbox
+    JOIN runtime_turns AS turn ON turn.turn_id = outbox.turn_id
+    WHERE turn.terminal_at IS NOT NULL
+      AND outbox.status IN ('delivered', 'superseded', 'dead_letter')
+  `).run();
+    database.prepare(`
+    INSERT OR IGNORE INTO runtime_retention_entries (
+      record_kind, record_id, turn_id, retention_class, anchor_at,
+      expires_at, disposal_kind, registered_at
+    )
+    SELECT 'terminal_turn_queue', queue.turn_id, queue.turn_id,
+      'terminal_detail_30d', turn.terminal_at,
+      strftime('%Y-%m-%dT%H:%M:%fZ', turn.terminal_at, '+30 days'),
+      'delete', turn.terminal_at
+    FROM runtime_turn_queue AS queue
+    JOIN runtime_turns AS turn ON turn.turn_id = queue.turn_id
+    WHERE turn.terminal_at IS NOT NULL
+      AND queue.status IN ('completed', 'stopped', 'cancelled', 'interrupted', 'failed', 'timed_out')
+  `).run();
+    database.prepare(`
+    INSERT OR IGNORE INTO runtime_retention_entries (
+      record_kind, record_id, turn_id, retention_class, anchor_at,
+      expires_at, disposal_kind, registered_at
+    )
+    SELECT 'terminal_background_work', work.background_work_id, work.holder_turn_id,
+      'terminal_detail_30d', turn.terminal_at,
+      strftime('%Y-%m-%dT%H:%M:%fZ', turn.terminal_at, '+30 days'),
+      'delete', work.ended_at
+    FROM runtime_workspace_background_work AS work
+    JOIN runtime_turns AS turn ON turn.turn_id = work.holder_turn_id
+    WHERE turn.terminal_at IS NOT NULL AND work.state IN ('completed', 'failed')
+  `).run();
+    database.prepare(`
+    INSERT OR IGNORE INTO runtime_retention_entries (
+      record_kind, record_id, turn_id, retention_class, anchor_at,
+      expires_at, disposal_kind, registered_at
+    )
+    SELECT 'terminal_workspace_lease', lease.workspace_lease_id, lease.holder_turn_id,
+      'terminal_detail_30d', turn.terminal_at,
+      strftime('%Y-%m-%dT%H:%M:%fZ', turn.terminal_at, '+30 days'),
+      'delete', lease.released_at
+    FROM runtime_workspace_leases AS lease
+    JOIN runtime_turns AS turn ON turn.turn_id = lease.holder_turn_id
+    WHERE turn.terminal_at IS NOT NULL AND lease.state IN ('released', 'expired')
+  `).run();
+    database.prepare(`
+    INSERT OR IGNORE INTO runtime_retention_entries (
+      record_kind, record_id, turn_id, retention_class, anchor_at,
+      expires_at, disposal_kind, registered_at
+    )
+    SELECT 'permission_audit', audit_id, turn_id, 'security_audit_180d',
+      committed_at, strftime('%Y-%m-%dT%H:%M:%fZ', committed_at, '+180 days'),
+      'delete', committed_at
+    FROM runtime_permission_audit
+  `).run();
+    database.prepare(`
+    INSERT OR IGNORE INTO runtime_retention_entries (
+      record_kind, record_id, turn_id, retention_class, anchor_at,
+      expires_at, disposal_kind, registered_at
+    )
+    SELECT 'operations_audit', audit_id, json_extract(target_json, '$.turn_id'),
+      'security_audit_180d', committed_at,
+      strftime('%Y-%m-%dT%H:%M:%fZ', committed_at, '+180 days'),
+      'delete', committed_at
+    FROM runtime_operations_audit
+  `).run();
+    database.prepare(`
+    INSERT OR IGNORE INTO runtime_retention_entries (
+      record_kind, record_id, turn_id, retention_class, anchor_at,
+      expires_at, disposal_kind, registered_at
+    )
+    SELECT 'interaction_audit', audit.audit_id, interaction.turn_id,
+      'security_audit_180d', audit.created_at,
+      strftime('%Y-%m-%dT%H:%M:%fZ', audit.created_at, '+180 days'),
+      'delete', audit.created_at
+    FROM runtime_interaction_audit AS audit
+    JOIN runtime_interactions AS interaction
+      ON interaction.interaction_id = audit.interaction_id
+  `).run();
+    database.prepare(`
+    INSERT OR IGNORE INTO runtime_retention_entries (
+      record_kind, record_id, turn_id, retention_class, anchor_at,
+      expires_at, disposal_kind, registered_at
+    )
+    SELECT 'permission_action_decision', decision_id, turn_id,
+      'security_audit_180d', checked_at,
+      strftime('%Y-%m-%dT%H:%M:%fZ', checked_at, '+180 days'),
+      'delete', checked_at
+    FROM runtime_permission_action_decisions
+  `).run();
+  database.prepare(`
+    INSERT OR IGNORE INTO runtime_retention_entries (
+      record_kind, record_id, turn_id, retention_class, anchor_at,
+      expires_at, disposal_kind, registered_at
+    )
+    SELECT 'operations_idempotency_conflict',
+      json_array(caller_namespace, control_id, request_hash), NULL,
+      'security_audit_180d', committed_at,
+      strftime('%Y-%m-%dT%H:%M:%fZ', committed_at, '+180 days'),
+      'delete', committed_at
+    FROM runtime_operations_idempotency_conflicts
+    `).run();
   addColumnIfMissing(
     database,
     'runtime_reply_mapping_recoveries',
