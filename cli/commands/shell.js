@@ -180,46 +180,51 @@ export async function shellCommand() {
     void shutdown();
   });
 
-  fs.mkdirSync(path.dirname(CORE_DATABASE_PATH), { recursive: true });
-  database = new Database(CORE_DATABASE_PATH);
-  database.pragma('journal_mode = WAL');
-  database.pragma('busy_timeout = 5000');
-  database.pragma('foreign_keys = ON');
-  const deliveryOwner = createOutboxService({
-    database,
-    channel: 'shell',
-    targetChatId: socketPath,
-    serviceInstanceId,
-    renderer: createChannelNeutralTextRenderer({
-      async sendText(delivery) {
-        if (delivery.target.chat_id !== socketPath) {
-          throw new Error('Shell delivery target does not match this shell owner.');
-        }
-        await deliverToSocket(socketPath, delivery.text);
-        return { platform_message_id: `shell:${delivery.delivery_id}` };
+  try {
+    fs.mkdirSync(path.dirname(CORE_DATABASE_PATH), { recursive: true });
+    database = new Database(CORE_DATABASE_PATH);
+    database.pragma('journal_mode = WAL');
+    database.pragma('busy_timeout = 5000');
+    database.pragma('foreign_keys = ON');
+    const deliveryOwner = createOutboxService({
+      database,
+      channel: 'shell',
+      targetChatId: socketPath,
+      serviceInstanceId,
+      renderer: createChannelNeutralTextRenderer({
+        async sendText(delivery) {
+          if (delivery.target.chat_id !== socketPath) {
+            throw new Error('Shell delivery target does not match this shell owner.');
+          }
+          await deliverToSocket(socketPath, delivery.text);
+          return { platform_message_id: `shell:${delivery.delivery_id}` };
+        },
+      }),
+    });
+    deliveryDrain = createDeliveryDrain({
+      dispatchNext: () => deliveryOwner.dispatchNext(),
+      onError(error) {
+        console.error(`Shell delivery owner: ${error.message}`);
       },
-    }),
-  });
-  deliveryDrain = createDeliveryDrain({
-    dispatchNext: () => deliveryOwner.dispatchNext(),
-    onError(error) {
-      console.error(`Shell delivery owner: ${error.message}`);
-    },
-  });
-  deliveryTimer = setInterval(() => { void deliveryDrain.drain(); }, 250);
-  // Print banner
-  console.log(bold('Zylos Shell'));
-  console.log(dim('Interactive mode — type your message and press Enter.'));
-  console.log(dim('Commands: /quit to exit, /help for help'));
-  console.log();
+    });
+    deliveryTimer = setInterval(() => { void deliveryDrain.drain(); }, 250);
 
-  // Start REPL
-  rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    prompt: cyan('you> '),
-    terminal: process.stdin.isTTY !== false,
-  });
+    console.log(bold('Zylos Shell'));
+    console.log(dim('Interactive mode — type your message and press Enter.'));
+    console.log(dim('Commands: /quit to exit, /help for help'));
+    console.log();
+
+    rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+      prompt: cyan('you> '),
+      terminal: process.stdin.isTTY !== false,
+    });
+  } catch (error) {
+    process.exitCode = 1;
+    await shutdown();
+    throw error;
+  }
 
   rl.prompt();
 

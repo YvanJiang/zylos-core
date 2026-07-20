@@ -1,5 +1,7 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 
 import { describe, expect, test } from '@jest/globals';
 
@@ -46,6 +48,49 @@ describe('shell Core outbox owner lifecycle', () => {
     expect(listener).toMatch(/shutdown\(\)/);
     expect(listener).toMatch(/process\.exitCode\s*=\s*1/);
     expect(listener).not.toMatch(/process\.exit\(/);
+  });
+
+  test('closes its early socket and exits when database startup fails after listen', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'shell-startup-failure-'));
+    const socketDir = path.join(root, 'sockets');
+    const receivePath = path.join(
+      root, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-receive.js',
+    );
+    fs.mkdirSync(path.dirname(receivePath), { recursive: true });
+    fs.mkdirSync(socketDir);
+    fs.writeFileSync(receivePath, '');
+    fs.writeFileSync(path.join(root, 'comm-bridge'), 'blocks database directory creation');
+
+    const child = spawn(process.execPath, ['cli/zylos.js', 'shell'], {
+      cwd: path.resolve('.'),
+      env: { ...process.env, ZYLOS_DIR: root, TMPDIR: socketDir },
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    const close = new Promise((resolve) => child.once('close', (code, signal) => {
+      resolve({ code, signal });
+    }));
+    const result = await Promise.race([
+      close,
+      new Promise((resolve) => setTimeout(() => resolve(null), 1000)),
+    ]);
+    if (result === null) {
+      child.kill('SIGKILL');
+      await close;
+    }
+
+    try {
+      expect(result).toEqual({ code: 1, signal: null });
+      expect(fs.readdirSync(socketDir).filter((name) => name.endsWith('.sock'))).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('routes post-listen initialization exceptions through awaited shutdown', () => {
+    const source = fs.readFileSync(path.resolve('cli/commands/shell.js'), 'utf8');
+    expect(source).toMatch(
+      /try \{\s*fs\.mkdirSync\(path\.dirname\(CORE_DATABASE_PATH\)[\s\S]*database = new Database[\s\S]*catch \(error\) \{[\s\S]*await shutdown\(\);/,
+    );
   });
 
   test('stop waits for the current fenced dispatch result and prevents another claim', async () => {
