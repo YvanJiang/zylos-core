@@ -6,14 +6,14 @@
 
 import { getDb, cleanupHistory, now } from './database.js';
 import { getNextRun } from './cron-utils.js';
-import { sendViaC4, readStatusFile } from './runtime.js';
+import { dispatchMissedScheduledTaskNotice, dispatchScheduledTask } from './runtime.js';
+import { decideScheduledOccurrence } from '../../../runtime/scheduler/scheduler-queue.js';
 import { formatTime } from './time-utils.js';
 import { loadTimezone } from './tz.js';
 import { updateNextRunTime as _updateNextRunTime, processCompletedTasks as _processCompletedTasks, handleStaleRunningTasks as _handleStaleRunningTasks, TASK_TIMEOUT } from './daemon-tasks.js';
 
 const CHECK_INTERVAL = 5000;  // 5 seconds
 const CLEANUP_INTERVAL = 3600000;  // 1 hour
-const OFFLINE_LOG_INTERVAL = 30000;  // 30 seconds
 
 let db;
 let running = true;
@@ -42,17 +42,7 @@ function getNextPendingTask() {
 }
 
 /**
- * Check if the active agent runtime is alive.
- * @returns {boolean} True if runtime is running (busy or idle state)
- */
-function isRuntimeAlive() {
-  const status = readStatusFile();
-  if (!status) return false;
-  return status.state === 'busy' || status.state === 'idle';
-}
-
-/**
- * Dispatch a task to Claude via C4 comm-bridge
+ * Admit a task into the durable Core conversation queue.
  */
 function dispatchTask(task) {
   console.log(`[${new Date().toISOString()}] Dispatching task: ${task.id} (${task.name})`);
@@ -75,20 +65,11 @@ function dispatchTask(task) {
     VALUES (?, ?, 'started')
   `).run(task.id, now());
 
-  // Build prompt with completion instruction
-  const prompt = `[Scheduled Task: ${task.id}] ${task.prompt}
-
----- After completing this task, run: ~/zylos/.claude/skills/scheduler/scripts/cli.js done ${task.id}`;
-
-  // Send via C4 Communication Bridge
-  const success = sendViaC4(prompt, {
-    priority: task.priority,
-    requireIdle: task.require_idle === 1,
-    replyChannel: task.reply_channel,
-    replyEndpoint: task.reply_endpoint
-  });
-
-  if (!success) {
+  let admission;
+  try {
+    admission = dispatchScheduledTask(task);
+  } catch (error) {
+    console.error(`Failed to admit task ${task.id}:`, error.message);
     console.error(`Failed to dispatch task ${task.id}`);
 
     // Revert to pending
@@ -112,9 +93,18 @@ function dispatchTask(task) {
         WHERE id = ?
       `).run(now(), historyEntry.id);
     }
+    return false;
   }
-
-  return success;
+  if (admission.status === 'rejected') {
+    console.error(`Task ${task.id} was rejected by the durable queue: ${admission.error.user_message}`);
+    db.prepare(`
+      UPDATE tasks
+      SET status = 'failed', last_error = ?, updated_at = ?
+      WHERE id = ?
+    `).run(admission.error.user_message, now(), task.id);
+    return false;
+  }
+  return true;
 }
 
 function updateNextRunTime(task) {
@@ -125,10 +115,29 @@ function processCompletedTasks() {
   _processCompletedTasks(db);
 }
 
+function missedTaskNotice(task) {
+  return `Scheduled task "${task.name}" missed its occurrence and was skipped to avoid catch-up replay.`;
+}
+
+function persistMissedTaskNotice(task) {
+  const notice = missedTaskNotice(task);
+  try {
+    const admission = dispatchMissedScheduledTaskNotice(task, notice);
+    if (admission.status === 'rejected') {
+      console.error(`Missed-task notice for ${task.id} was rejected by the durable queue: ${admission.error.user_message}`);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.error(`Failed to persist missed-task notice for ${task.id}: ${error.message}`);
+    return false;
+  }
+}
+
 /**
  * Check for missed tasks (past due but still pending)
- * - Tasks overdue < miss_threshold: try to dispatch if runtime alive
- * - Tasks overdue > miss_threshold: skip to next scheduled time
+ * - Recurring and interval occurrences beyond miss_threshold are skipped once.
+ * - All other work enters the durable Core queue without a runtime-alive gate.
  */
 function handleMissedTasks() {
   const currentTime = now();
@@ -143,23 +152,28 @@ function handleMissedTasks() {
   `).all(recentMissedThreshold);
 
   for (const task of missedTasks) {
-    const overdueSeconds = currentTime - task.next_run_at;
-    const threshold = task.miss_threshold || 300;  // Default 5 minutes
+    const decision = decideScheduledOccurrence({
+      schedule_type: task.type,
+      scheduled_for: new Date(task.next_run_at * 1_000).toISOString(),
+      now: new Date(currentTime * 1_000).toISOString(),
+      miss_threshold_ms: (task.miss_threshold || 300) * 1_000,
+    });
 
-    if (overdueSeconds > threshold) {
-      // Overdue beyond threshold: skip to next schedule
-      console.log(`[${new Date().toISOString()}] Task ${task.id} (${task.name}) missed by ${overdueSeconds}s (threshold: ${threshold}s), skipping to next schedule`);
+    if (decision.status === 'skipped') {
+      // The occurrence is stale; move to the next schedule without catch-up replay.
+      console.log(`[${new Date().toISOString()}] Task ${task.id} (${task.name}) missed its occurrence; recording only the next schedule.`);
+      if (!persistMissedTaskNotice(task)) continue;
+      db.prepare(`
+        UPDATE tasks
+        SET last_error = 'Missed scheduled occurrence was skipped to avoid catch-up replay.', updated_at = ?
+        WHERE id = ?
+      `).run(currentTime, task.id);
       updateNextRunTime({
         ...task,
         status: 'completed'
       });
     } else {
-      // Within threshold: try to dispatch if runtime is alive
-      if (isRuntimeAlive()) {
-        console.log(`[${new Date().toISOString()}] Late-dispatching missed task ${task.id} (${task.name}), ${Math.round(overdueSeconds/60)}min overdue`);
-        dispatchTask(task);
-      }
-      // If runtime not alive, leave it pending - will try again next check
+      dispatchTask(task);
     }
   }
 }
@@ -180,40 +194,26 @@ async function mainLoop() {
   handleStaleRunningTasks();
 
   let lastCleanup = Date.now();
-  let lastOfflineLog = 0;
 
   while (running) {
     try {
-      // Check if runtime is alive
-      if (!isRuntimeAlive()) {
-        const msNow = Date.now();
-        if (msNow - lastOfflineLog >= OFFLINE_LOG_INTERVAL) {
-          console.log(`[${new Date().toISOString()}] Waiting for agent runtime (offline or stopped)...`);
-          lastOfflineLog = msNow;
-        }
-        await sleep(CHECK_INTERVAL);
-        continue;
-      }
-
-      // Log transition from offline to online
-      if (lastOfflineLog > 0) {
-        console.log(`[${new Date().toISOString()}] Agent runtime detected, scheduler active`);
-        lastOfflineLog = 0;
-      }
-
-      // Get next pending task
+      // The durable Core queue accepts work during maintenance or overload; execution claims later.
       const task = getNextPendingTask();
 
       // Dispatch if task is due and runtime is alive
       if (task) {
         const currentTime = now();
-        const overdueSeconds = currentTime - task.next_run_at;
-        const threshold = task.miss_threshold || 300;
+        const decision = decideScheduledOccurrence({
+          schedule_type: task.type,
+          scheduled_for: new Date(task.next_run_at * 1_000).toISOString(),
+          now: new Date(currentTime * 1_000).toISOString(),
+          miss_threshold_ms: (task.miss_threshold || 300) * 1_000,
+        });
 
-        // Check if task is overdue beyond its miss_threshold
-        if (overdueSeconds > threshold) {
+        if (decision.status === 'skipped') {
           // Skip this task
-          console.log(`[${new Date().toISOString()}] Task ${task.id} (${task.name}) overdue by ${overdueSeconds}s (threshold: ${threshold}s), skipping`);
+          console.log(`[${new Date().toISOString()}] Task ${task.id} (${task.name}) missed its occurrence; avoiding catch-up replay.`);
+          if (!persistMissedTaskNotice(task)) continue;
 
           if (task.type === 'one-time') {
             // One-time tasks: mark as failed
