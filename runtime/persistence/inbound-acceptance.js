@@ -349,7 +349,7 @@ export function acceptNormalInbound(
     const queuedTurnCount = database.prepare(`
       SELECT COUNT(*) AS count
       FROM runtime_turn_queue
-      WHERE conversation_id = ? AND status = 'queued'
+      WHERE conversation_id = ? AND status = 'queued' AND priority = 0
     `).get(conversation.conversation_id).count;
     const queueFull = queuedTurnCount >= maxQueuedTurns;
     const queueFullError = queueFull

@@ -138,6 +138,18 @@ const RUNTIME_SCHEMA = `
     updated_at TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS runtime_steer_requests (
+    steer_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    target_turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),
+    inbound_event_id TEXT NOT NULL UNIQUE REFERENCES runtime_inbound_events(inbound_event_id),
+    winner_control_id TEXT UNIQUE REFERENCES runtime_steer_controls(steer_id),
+    request_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    committed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS runtime_executor_residents (
     conversation_id TEXT PRIMARY KEY REFERENCES runtime_conversations(conversation_id),
     bot_id TEXT NOT NULL,
@@ -763,5 +775,13 @@ export function initializeRuntimePersistence(database) {
       ON runtime_steer_controls(target_turn_id);
     CREATE INDEX IF NOT EXISTS runtime_turn_queue_priority
       ON runtime_turn_queue(conversation_id, priority DESC, queue_sequence ASC, status);
+    INSERT OR IGNORE INTO runtime_steer_requests (
+      steer_id, conversation_id, target_turn_id, inbound_event_id,
+      winner_control_id, request_json, result_json, committed_at, updated_at
+    )
+    SELECT steer_id, conversation_id, target_turn_id, inbound_event_id,
+      steer_id, request_json, result_json, committed_at, updated_at
+    FROM runtime_steer_controls
+    WHERE inbound_event_id IS NOT NULL;
   `);
 }

@@ -1393,7 +1393,17 @@ export function createExecutorStore({
     };
   }
 
-  function steerSideEffectStatus(turnId) {
+  function sideEffectStatusForProviderDescriptor(descriptor, fallbackKind = null) {
+    const event = descriptor?.type === 'normalized_event'
+      ? descriptor.event
+      : descriptor;
+    const kind = event?.kind ?? fallbackKind;
+    return typeof kind === 'string' && kind.startsWith('tool_')
+      ? event?.payload?.side_effect_status
+      : null;
+  }
+
+  function steerSideEffectStatus(turnId, attempt = null) {
     let status = 'none';
     for (const { event_json: eventJson } of database.prepare(`
       SELECT event_json
@@ -1402,17 +1412,40 @@ export function createExecutorStore({
       ORDER BY event_sequence ASC
     `).all(turnId)) {
       const event = JSON.parse(eventJson);
-      const eventStatus = event.kind.startsWith('tool_')
-        ? event.payload?.side_effect_status
-        : null;
+      const eventStatus = sideEffectStatusForProviderDescriptor(event);
+      if (eventStatus === 'unknown') return 'unknown';
+      if (eventStatus === 'known') status = 'known';
+    }
+    const diagnosticRows = attempt
+      ? database.prepare(`
+        SELECT event_kind, descriptor_json
+        FROM runtime_provider_event_diagnostics
+        WHERE turn_id = ? AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+        ORDER BY observed_at ASC, diagnostic_id ASC
+      `).all(
+        turnId,
+        attempt.attempt_id,
+        attempt.attempt_no,
+        attempt.lease_epoch,
+      )
+      : [];
+    for (const row of diagnosticRows) {
+      const eventStatus = sideEffectStatusForProviderDescriptor(
+        JSON.parse(row.descriptor_json),
+        row.event_kind,
+      );
       if (eventStatus === 'unknown') return 'unknown';
       if (eventStatus === 'known') status = 'known';
     }
     return status;
   }
 
-  function rejectedSteerResult(request, persistenceError, winner = null) {
-    const rejectedAt = now();
+  function rejectedSteerResult(request, persistenceError, winner = null, {
+    committedAt = null,
+    reconciliationRequired = false,
+    interactionId = null,
+  } = {}) {
+    const rejectedAt = committedAt ?? now();
     const turn = typeof request?.turn_id === 'string'
       ? database.prepare(`
         SELECT turn_id, lineage_id, state, turn_version
@@ -1423,7 +1456,12 @@ export function createExecutorStore({
     const code = persistenceError.code ?? 'validation_error';
     const category = code === 'unauthenticated'
       ? 'authentication'
-      : (['steer_precondition_failed', 'turn_terminal'].includes(code)
+      : ([
+        'idempotency_conflict',
+        'steer_precondition_failed',
+        'steer_reconciliation_required',
+        'turn_terminal',
+      ].includes(code)
           ? 'conflict'
           : 'validation');
     return {
@@ -1460,10 +1498,69 @@ export function createExecutorStore({
         userMessage: persistenceError.message,
         occurredAt: rejectedAt,
       }),
-      committed_at: null,
+      committed_at: committedAt,
       updated_at: rejectedAt,
       deduplicated: false,
+      ...(reconciliationRequired ? {
+        reconciliation_required: true,
+        blocking_interaction_id: interactionId,
+      } : {}),
     };
+  }
+
+  function persistSteerRequestInTransaction(request, result, winnerControlId, committedAt) {
+    database.prepare(`
+      INSERT INTO runtime_steer_requests (
+        steer_id, conversation_id, target_turn_id, inbound_event_id,
+        winner_control_id, request_json, result_json, committed_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      request.steer_id,
+      request.conversation_id,
+      request.turn_id,
+      request.inbound_event_id,
+      winnerControlId,
+      canonicalizeJson(request),
+      JSON.stringify(result),
+      committedAt,
+      result.updated_at,
+    );
+  }
+
+  function replayOrConflictSteerRequestInTransaction(request) {
+    const row = database.prepare(`
+      SELECT steer_id, conversation_id, target_turn_id, winner_control_id,
+        request_json, result_json
+      FROM runtime_steer_requests
+      WHERE steer_id = ? OR inbound_event_id = ?
+      ORDER BY CASE WHEN steer_id = ? THEN 0 ELSE 1 END
+      LIMIT 1
+    `).get(request.steer_id, request.inbound_event_id, request.steer_id);
+    if (!row) return null;
+    if (
+      row.steer_id !== request.steer_id
+      || row.conversation_id !== request.conversation_id
+      || row.target_turn_id !== request.turn_id
+      || canonicalizeJson(JSON.parse(row.request_json)) !== canonicalizeJson(request)
+    ) {
+      return rejectedSteerResult(
+        request,
+        new ExecutorPersistenceError(
+          'idempotency_conflict',
+          'The steer ID or inbound event was already used by another request.',
+        ),
+        controlWinnerForTurn(request.turn_id),
+      );
+    }
+    const resultRow = row.winner_control_id === null
+      ? row
+      : database.prepare(`
+        SELECT result_json FROM runtime_steer_controls WHERE steer_id = ?
+      `).get(row.winner_control_id);
+    if (!resultRow) {
+      conflict('version_conflict', 'The steer request lost its durable winner control.');
+    }
+    return { ...JSON.parse(resultRow.result_json), deduplicated: true };
   }
 
   function controlWinnerForTurn(turnId) {
@@ -1516,11 +1613,6 @@ export function createExecutorStore({
       throw error;
     }
     const begin = database.transaction(() => {
-      const existing = database.prepare(`
-        SELECT conversation_id, target_turn_id, request_json, result_json
-        FROM runtime_steer_controls
-        WHERE steer_id = ?
-      `).get(steerId);
       const request = {
         conversation_id: conversationId,
         turn_id: turnId,
@@ -1530,16 +1622,8 @@ export function createExecutorStore({
         payload_hash: steerEnvelope.payloadHash,
         supplement: steerEnvelope.supplement,
       };
-      if (existing) {
-        if (
-          existing.conversation_id !== conversationId
-          || existing.target_turn_id !== turnId
-          || existing.request_json !== JSON.stringify(request)
-        ) {
-          conflict('idempotency_conflict', 'The steer ID was already used by another request.');
-        }
-        return { ...JSON.parse(existing.result_json), deduplicated: true };
-      }
+      const replay = replayOrConflictSteerRequestInTransaction(request);
+      if (replay) return replay;
 
       const turn = loadTurn(database, turnId);
       if (turn.conversation_id !== conversationId) {
@@ -1553,25 +1637,23 @@ export function createExecutorStore({
       if (conversation?.conversation_key !== encodeConversationKey(steerEnvelope.envelope)) {
         conflict('steer_precondition_failed', 'The steer message targets another conversation.');
       }
-      if (turn.state !== 'running') {
-        return rejectedSteerResult(request, new ExecutorPersistenceError(
-          TERMINAL_STATES.has(turn.state) ? 'turn_terminal' : 'steer_precondition_failed',
-          `/steer is only accepted while the canonical turn is running; it is ${turn.state}.`,
-        ), controlWinnerForTurn(turnId));
-      }
-      const blockingInteraction = database.prepare(`
-        SELECT interaction_id
-        FROM runtime_interactions
-        WHERE turn_id = ? AND state IN (${BLOCKING_INTERACTION_STATES_SQL})
+      const committedAt = now();
+      const existingInbound = database.prepare(`
+        SELECT inbound_event_id
+        FROM runtime_inbound_events
+        WHERE inbound_event_id = ? OR idempotency_key = ?
         LIMIT 1
-      `).get(turnId);
-      if (blockingInteraction) {
-        conflict(
-          'steer_precondition_failed',
-          '/steer cannot bypass an active interaction handoff.',
+      `).get(request.inbound_event_id, request.idempotency_key);
+      if (existingInbound) {
+        return rejectedSteerResult(
+          request,
+          new ExecutorPersistenceError(
+            'idempotency_conflict',
+            'The inbound event was already committed outside this steer request.',
+          ),
+          controlWinnerForTurn(turnId),
         );
       }
-      const committedAt = now();
       database.prepare(`
         INSERT INTO runtime_inbound_events (
           inbound_event_id, idempotency_key, conversation_id, message_id,
@@ -1587,6 +1669,52 @@ export function createExecutorStore({
         steerEnvelope.envelope.received_at,
         committedAt,
       );
+      if (turn.state !== 'running') {
+        const rejected = rejectedSteerResult(request, new ExecutorPersistenceError(
+          TERMINAL_STATES.has(turn.state) ? 'turn_terminal' : 'steer_precondition_failed',
+          `/steer is only accepted while the canonical turn is running; it is ${turn.state}.`,
+        ), controlWinnerForTurn(turnId), { committedAt });
+        persistSteerRequestInTransaction(request, rejected, null, committedAt);
+        return rejected;
+      }
+      const blockingInteraction = database.prepare(`
+        SELECT interaction_id
+        FROM runtime_interactions
+        WHERE turn_id = ? AND state IN (${BLOCKING_INTERACTION_STATES_SQL})
+        LIMIT 1
+      `).get(turnId);
+      if (blockingInteraction) {
+        transitionInTransaction(database, {
+          turnId,
+          fromState: 'running',
+          toState: 'recovering',
+          fence: {
+            attempt_id: turn.attempt_id,
+            attempt_no: turn.attempt_no,
+            lease_epoch: turn.lease_epoch,
+          },
+          provider,
+          serviceInstanceId,
+          occurredAt: committedAt,
+          generateId,
+          reasonCode: 'steer_interaction_projection_inconsistent',
+        });
+        const rejected = rejectedSteerResult(
+          request,
+          new ExecutorPersistenceError(
+            'steer_reconciliation_required',
+            '/steer found conflicting durable interaction ownership; provider work was fenced for reconciliation.',
+          ),
+          controlWinnerForTurn(turnId),
+          {
+            committedAt,
+            reconciliationRequired: true,
+            interactionId: blockingInteraction.interaction_id,
+          },
+        );
+        persistSteerRequestInTransaction(request, rejected, null, committedAt);
+        return rejected;
+      }
       const redirectEvent = transitionInTransaction(database, {
         turnId,
         fromState: 'running',
@@ -1617,7 +1745,11 @@ export function createExecutorStore({
           previous_version: turn.turn_version,
           state: 'redirecting',
           turn_version: redirectEvent.turn_version,
-          side_effect_status: steerSideEffectStatus(turnId),
+          side_effect_status: steerSideEffectStatus(turnId, {
+            attempt_id: turn.attempt_id,
+            attempt_no: turn.attempt_no,
+            lease_epoch: turn.lease_epoch,
+          }),
           attempt: {
             attempt_id: turn.attempt_id,
             attempt_no: turn.attempt_no,
@@ -1653,9 +1785,110 @@ export function createExecutorStore({
         committedAt,
         committedAt,
       );
+      persistSteerRequestInTransaction(request, result, steerId, committedAt);
       return result;
     });
     return begin.immediate();
+  }
+
+  function finalizeSteerStopBarriersInTransaction(
+    steerResult,
+    providerStopStatus,
+    leaseReleased,
+    updatedAt,
+  ) {
+    const stopRows = database.prepare(`
+      SELECT stop_id, result_json
+      FROM runtime_stop_controls
+      WHERE active_turn_id = ?
+      ORDER BY committed_at ASC, stop_id ASC
+    `).all(steerResult.old_turn.turn_id);
+    for (const row of stopRows) {
+      const currentStop = JSON.parse(row.result_json);
+      if (currentStop.active_turn?.state !== 'redirecting') continue;
+      const updatedStop = {
+        ...currentStop,
+        status: leaseReleased ? 'barrier_completed' : 'barrier_recovery_required',
+        active_turn: {
+          ...currentStop.active_turn,
+          state: 'interrupted',
+          turn_version: steerResult.old_turn.turn_version,
+        },
+        steering: {
+          ...(currentStop.steering ?? {}),
+          steer_id: steerResult.steer_id,
+          winner: steerResult.winner,
+          stop_barrier_id: steerResult.stop_barrier_id,
+          priority_turn: { ...steerResult.priority_turn },
+        },
+        provider_stop_status: providerStopStatus,
+        lease_released: leaseReleased,
+        provider_stop_updated_at: updatedAt,
+      };
+      const write = database.prepare(`
+        UPDATE runtime_stop_controls
+        SET result_json = ?
+        WHERE stop_id = ? AND result_json = ?
+      `).run(JSON.stringify(updatedStop), row.stop_id, row.result_json);
+      if (write.changes !== 1) {
+        conflict('version_conflict', 'The steer stop-barrier projection lost its durable CAS.');
+      }
+    }
+  }
+
+  function recordSteerReconciliationOutcome(steerResult, providerIsolated) {
+    if (typeof providerIsolated !== 'boolean') {
+      throw new TypeError('providerIsolated must be a boolean');
+    }
+    const record = database.transaction(() => {
+      const row = database.prepare(`
+        SELECT result_json
+        FROM runtime_steer_requests
+        WHERE steer_id = ? AND conversation_id = ? AND target_turn_id = ?
+          AND winner_control_id IS NULL
+      `).get(
+        steerResult?.steer_id,
+        steerResult?.conversation_id,
+        steerResult?.old_turn?.turn_id,
+      );
+      if (!row) {
+        conflict('steer_precondition_failed', 'The reconciliation request is not durable.');
+      }
+      const current = JSON.parse(row.result_json);
+      if (current.reconciliation_required !== true) {
+        conflict('steer_precondition_failed', 'The steer request does not require reconciliation.');
+      }
+      if (current.reconciliation) {
+        return { ...current, deduplicated: steerResult.deduplicated === true };
+      }
+      const updatedAt = now();
+      const updated = {
+        ...current,
+        reconciliation: {
+          status: providerIsolated
+            ? 'provider_isolated_manual_recovery_required'
+            : 'provider_isolation_unproven',
+          provider_isolated: providerIsolated,
+        },
+        updated_at: updatedAt,
+        deduplicated: false,
+      };
+      const write = database.prepare(`
+        UPDATE runtime_steer_requests
+        SET result_json = ?, updated_at = ?
+        WHERE steer_id = ? AND result_json = ? AND winner_control_id IS NULL
+      `).run(
+        JSON.stringify(updated),
+        updatedAt,
+        current.steer_id,
+        row.result_json,
+      );
+      if (write.changes !== 1) {
+        conflict('version_conflict', 'The steer reconciliation outcome lost its durable CAS.');
+      }
+      return { ...updated, deduplicated: steerResult.deduplicated === true };
+    });
+    return record.immediate();
   }
 
   function completeSteer(steerResult, providerStopStatus) {
@@ -1683,7 +1916,97 @@ export function createExecutorStore({
         conflict('version_conflict', 'The steer winner lost its redirecting turn fence.');
       }
       const completedAt = now();
-      const sideEffectStatus = steerSideEffectStatus(oldTurn.turn_id);
+      const sideEffectStatus = steerSideEffectStatus(
+        oldTurn.turn_id,
+        current.old_turn.attempt,
+      );
+      if (sideEffectStatus === 'unknown') {
+        const error = createContractError({
+          code: 'side_effect_unknown',
+          category: 'provider',
+          retryable: false,
+          sideEffectStatus: 'unknown',
+          userMessage: 'A late provider event reported an unknown side effect; steering work is blocked pending manual recovery.',
+          occurredAt: completedAt,
+        });
+        const terminalEvent = transitionInTransaction(database, {
+          turnId: oldTurn.turn_id,
+          fromState: 'redirecting',
+          toState: 'interrupted',
+          fence: current.old_turn.attempt,
+          provider,
+          serviceInstanceId,
+          occurredAt: completedAt,
+          generateId,
+          reasonCode: 'steer_side_effect_unknown',
+          error,
+          retainLease: true,
+        });
+        const updated = {
+          ...current,
+          status: 'failed',
+          old_turn: {
+            ...current.old_turn,
+            state: 'interrupted',
+            turn_version: terminalEvent.turn_version,
+            side_effect_status: 'unknown',
+          },
+          priority_turn: {
+            ...current.priority_turn,
+            status: 'blocked_recovery',
+            turn_id: null,
+            state: null,
+          },
+          provider_stop_status: providerStopStatus,
+          lease_released: false,
+          error,
+          updated_at: completedAt,
+          deduplicated: false,
+        };
+        const write = database.prepare(`
+          UPDATE runtime_steer_controls
+          SET result_json = ?, updated_at = ?
+          WHERE steer_id = ? AND result_json = ? AND priority_turn_id IS NULL
+        `).run(
+          JSON.stringify(updated),
+          completedAt,
+          current.steer_id,
+          row.result_json,
+        );
+        if (write.changes !== 1) {
+          conflict('version_conflict', 'The side-effect-unknown steer lost its durable CAS.');
+        }
+        finalizeSteerStopBarriersInTransaction(
+          updated,
+          providerStopStatus,
+          false,
+          completedAt,
+        );
+        const incident = markProviderStopUnknownInTransaction(
+          {
+            turn_id: oldTurn.turn_id,
+            attempt: current.old_turn.attempt,
+          },
+          providerStopStatus,
+        );
+        const durableUpdated = { ...updated, incident };
+        const incidentWrite = database.prepare(`
+          UPDATE runtime_steer_controls
+          SET result_json = ?
+          WHERE steer_id = ? AND result_json = ?
+        `).run(
+          JSON.stringify(durableUpdated),
+          current.steer_id,
+          JSON.stringify(updated),
+        );
+        if (incidentWrite.changes !== 1) {
+          conflict('version_conflict', 'The side-effect-unknown incident lost its steer CAS.');
+        }
+        return {
+          ...durableUpdated,
+          deduplicated: steerResult.deduplicated === true,
+        };
+      }
       const interruptionError = createContractError({
         code: 'turn_interrupted',
         category: 'conflict',
@@ -1744,6 +2067,12 @@ export function createExecutorStore({
         if (write.changes !== 1) {
           conflict('version_conflict', 'The stopped steer completion lost its durable CAS.');
         }
+        finalizeSteerStopBarriersInTransaction(
+          updated,
+          providerStopStatus,
+          true,
+          completedAt,
+        );
         return { ...updated, deduplicated: steerResult.deduplicated === true };
       }
 
@@ -1992,7 +2321,36 @@ export function createExecutorStore({
       if (write.changes !== 1) {
         conflict('version_conflict', 'The failed steer lost its durable CAS.');
       }
-      return { ...updated, deduplicated: steerResult.deduplicated === true };
+      finalizeSteerStopBarriersInTransaction(
+        updated,
+        providerStopStatus,
+        false,
+        failedAt,
+      );
+      const incident = markProviderStopUnknownInTransaction(
+        {
+          turn_id: turn.turn_id,
+          attempt: current.old_turn.attempt,
+        },
+        providerStopStatus,
+      );
+      const durableUpdated = { ...updated, incident };
+      const incidentWrite = database.prepare(`
+        UPDATE runtime_steer_controls
+        SET result_json = ?
+        WHERE steer_id = ? AND result_json = ?
+      `).run(
+        JSON.stringify(durableUpdated),
+        current.steer_id,
+        JSON.stringify(updated),
+      );
+      if (incidentWrite.changes !== 1) {
+        conflict('version_conflict', 'The failed steer incident lost its durable CAS.');
+      }
+      return {
+        ...durableUpdated,
+        deduplicated: steerResult.deduplicated === true,
+      };
     });
     return fail.immediate();
   }
@@ -2035,6 +2393,57 @@ export function createExecutorStore({
     }
     persistEvent(database, turn, event, generateId);
     return event;
+  }
+
+  function synchronizeSteerReconciliationWithStopInTransaction(stopResult) {
+    const activeTurn = stopResult?.active_turn;
+    if (!activeTurn?.turn_id) return;
+    const requestRows = database.prepare(`
+      SELECT steer_id, result_json
+      FROM runtime_steer_requests
+      WHERE target_turn_id = ? AND winner_control_id IS NULL
+    `).all(activeTurn.turn_id);
+    for (const row of requestRows) {
+      const current = JSON.parse(row.result_json);
+      if (current.reconciliation_required !== true) continue;
+      const providerIsolated = stopResult.lease_released === true
+        && ['confirmed', 'isolated'].includes(stopResult.provider_stop_status);
+      const updated = {
+        ...current,
+        winner: {
+          control: 'stop',
+          control_id: stopResult.stop_id,
+          turn_id: activeTurn.turn_id,
+        },
+        stop_id: stopResult.stop_id,
+        old_turn: {
+          ...current.old_turn,
+          state: activeTurn.state,
+          turn_version: activeTurn.turn_version,
+        },
+        provider_stop_status: stopResult.provider_stop_status,
+        lease_released: stopResult.lease_released === true,
+        reconciliation: {
+          status: 'superseded_by_stop',
+          provider_isolated: providerIsolated,
+        },
+        updated_at: stopResult.provider_stop_updated_at ?? now(),
+        deduplicated: false,
+      };
+      const write = database.prepare(`
+        UPDATE runtime_steer_requests
+        SET result_json = ?, updated_at = ?
+        WHERE steer_id = ? AND result_json = ? AND winner_control_id IS NULL
+      `).run(
+        JSON.stringify(updated),
+        updated.updated_at,
+        row.steer_id,
+        row.result_json,
+      );
+      if (write.changes !== 1) {
+        conflict('version_conflict', 'The stop-superseded steer result lost its CAS.');
+      }
+    }
   }
 
   function stopConversation({ conversation_id: conversationId, stop_id: stopId }) {
@@ -2092,7 +2501,7 @@ export function createExecutorStore({
         };
         if (previousState === 'redirecting') {
           const steerRow = database.prepare(`
-            SELECT steer_id, result_json
+            SELECT steer_id, stop_barrier_id, result_json
             FROM runtime_steer_controls
             WHERE target_turn_id = ?
           `).get(turn.turn_id);
@@ -2111,7 +2520,11 @@ export function createExecutorStore({
           steering = {
             steer_id: steerRow.steer_id,
             winner: steerResult.winner,
-            priority_turn: steerResult.priority_turn,
+            stop_barrier_id: steerRow.stop_barrier_id ?? stopId,
+            priority_turn: {
+              ...steerResult.priority_turn,
+              stop_barrier_id: steerRow.stop_barrier_id ?? stopId,
+            },
           };
         } else {
           turn = settleBlockingInteractionsForStop(turnContext, turn, stoppedAt);
@@ -2240,7 +2653,11 @@ export function createExecutorStore({
         JSON.stringify(result),
         stoppedAt,
       );
-      if (activeTurn?.state === 'redirecting') {
+      synchronizeSteerReconciliationWithStopInTransaction(result);
+      if (
+        activeTurn?.state === 'redirecting'
+        && steering.stop_barrier_id === stopId
+      ) {
         const steerRow = database.prepare(`
           SELECT result_json
           FROM runtime_steer_controls
@@ -2351,6 +2768,7 @@ export function createExecutorStore({
     }
     const { current, currentStatus, row } = loadStopProviderOutcomeInTransaction(stopResult);
     if (currentStatus !== 'pending') {
+      synchronizeSteerReconciliationWithStopInTransaction(current);
       return { ...current, deduplicated: stopResult.deduplicated === true };
     }
     const updated = {
@@ -2373,6 +2791,7 @@ export function createExecutorStore({
     if (write.changes !== 1) {
       conflict('version_conflict', 'The provider stop outcome lost its durable CAS.');
     }
+    synchronizeSteerReconciliationWithStopInTransaction(updated);
     return { ...updated, deduplicated: stopResult.deduplicated === true };
   }
 
@@ -3269,8 +3688,11 @@ export function createExecutorStore({
     return expire.immediate();
   }
 
-  function markProviderStopUnknown(terminalContext, providerStopStatus, stopResult = null) {
-    const markUnknown = database.transaction(() => {
+  function markProviderStopUnknownInTransaction(
+    terminalContext,
+    providerStopStatus,
+    stopResult = null,
+  ) {
       if (typeof providerStopStatus !== 'string' || providerStopStatus.length === 0) {
         throw new TypeError('providerStopStatus must be a non-empty string');
       }
@@ -3323,12 +3745,15 @@ export function createExecutorStore({
       const incidentId = generateId('provider-stop-incident');
       const outboxId = generateId('outbox');
       const deliveryId = generateId('delivery');
+      const providerIsolationProven = ['confirmed', 'isolated'].includes(providerStopStatus);
       const error = createContractError({
         code: 'side_effect_unknown',
         category: 'provider',
         retryable: false,
         sideEffectStatus: 'unknown',
-        userMessage: 'Provider stop could not be confirmed; manual recovery is required.',
+        userMessage: providerIsolationProven
+          ? 'Provider execution stopped, but a late event reported an unknown side effect; manual recovery is required.'
+          : 'Provider stop could not be confirmed; manual recovery is required.',
         occurredAt,
       });
       const target = JSON.parse(lane.target_json);
@@ -3359,7 +3784,9 @@ export function createExecutorStore({
         render_model: {
           title: 'Zylos',
           phase: turn.state,
-          text: turn.state === 'timed_out'
+          text: providerIsolationProven
+            ? 'Steering stopped the provider, but a late event reported an unknown side effect. Manual recovery is required.'
+            : turn.state === 'timed_out'
             ? 'Execution timed out, but provider stop could not be confirmed. Manual recovery is required.'
             : turn.state === 'interrupted'
               ? 'Steering interrupted the turn, but provider termination could not be confirmed. Manual recovery is required.'
@@ -3426,6 +3853,15 @@ export function createExecutorStore({
         outbox_id: outboxId,
         ...(stoppedResult ? { stop_result: stoppedResult } : {}),
       };
+  }
+
+  function markProviderStopUnknown(terminalContext, providerStopStatus, stopResult = null) {
+    const markUnknown = database.transaction(() => {
+      return markProviderStopUnknownInTransaction(
+        terminalContext,
+        providerStopStatus,
+        stopResult,
+      );
     });
     return markUnknown.immediate();
   }
@@ -3531,6 +3967,38 @@ export function createExecutorStore({
             conflict('stale_attempt', 'The recovering resident release lost its owner fence.');
           }
           residentReleased = true;
+        }
+      }
+      const reconciliationRows = database.prepare(`
+        SELECT steer_id, result_json
+        FROM runtime_steer_requests
+        WHERE target_turn_id = ? AND winner_control_id IS NULL
+      `).all(turn.turn_id);
+      for (const row of reconciliationRows) {
+        const current = JSON.parse(row.result_json);
+        if (current.reconciliation_required !== true) continue;
+        const updated = {
+          ...current,
+          lease_released: true,
+          reconciliation: {
+            status: 'provider_isolated_manual_recovery_required',
+            provider_isolated: true,
+          },
+          updated_at: releasedAt,
+          deduplicated: false,
+        };
+        const requestUpdate = database.prepare(`
+          UPDATE runtime_steer_requests
+          SET result_json = ?, updated_at = ?
+          WHERE steer_id = ? AND result_json = ? AND winner_control_id IS NULL
+        `).run(
+          JSON.stringify(updated),
+          releasedAt,
+          row.steer_id,
+          row.result_json,
+        );
+        if (requestUpdate.changes !== 1) {
+          conflict('version_conflict', 'The steer reconciliation lease result lost its CAS.');
         }
       }
       return { lease_released: true, resident_released: residentReleased };
@@ -5482,6 +5950,7 @@ export function createExecutorStore({
     releaseRecoveringExecutorOwnership,
     reconcileExpiredResidents,
     recordProviderEventDiagnostic,
+    recordSteerReconciliationOutcome,
     recordStopProviderOutcome,
     expireInteraction,
     failSteer,

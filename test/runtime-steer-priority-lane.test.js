@@ -158,6 +158,35 @@ describe('runtime /steer priority lane', () => {
     expect(database.prepare(`
       SELECT COUNT(*) AS count FROM runtime_steer_controls
     `).get().count).toBe(0);
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_steer_requests
+    `).get().count).toBe(1);
+
+    database.prepare(`
+      UPDATE runtime_turns SET state = 'running' WHERE turn_id = ?
+    `).run(queued.turn_id);
+    await expect(service.steer({
+      conversation_id: queued.conversation_id,
+      turn_id: queued.turn_id,
+      steer_id: 'steer-queued-state',
+      envelope: normalEnvelope('queued-state-command', '/steer revise the plan'),
+    })).resolves.toMatchObject({
+      status: 'rejected',
+      deduplicated: true,
+      old_turn: { turn_id: queued.turn_id, state: 'queued' },
+      error: { code: 'steer_precondition_failed' },
+    });
+
+    await expect(service.steer({
+      conversation_id: queued.conversation_id,
+      turn_id: queued.turn_id,
+      steer_id: 'steer-queued-state-other-id',
+      envelope: normalEnvelope('queued-state-command', '/steer revise the plan'),
+    })).resolves.toMatchObject({
+      status: 'rejected',
+      deduplicated: false,
+      error: { code: 'idempotency_conflict' },
+    });
 
     await service.close();
     database.close();
@@ -431,6 +460,71 @@ describe('runtime /steer priority lane', () => {
     database.close();
   });
 
+  test('does not count the queued priority lane against ordinary queue capacity', async () => {
+    const database = openTestDatabase();
+    const active = acceptTurn(database, 'ordinary-capacity-active');
+    const providerStarted = deferred();
+    const providerStopped = deferred();
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute(context) {
+          context.reportProviderState({ state: 'started', provider_native_id: null });
+          providerStarted.resolve();
+          await providerStopped.promise;
+          yield { type: 'turn_result', outcome: 'cancelled' };
+        },
+        async cancel() { providerStopped.resolve(); },
+      },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-ordinary-capacity',
+      now: () => '2026-07-20T02:02:16Z',
+      generateId: deterministicIds('ordinary-capacity'),
+    });
+    const execution = service.runNext();
+    await providerStarted.promise;
+    const ordinary = Array.from({ length: 4 }, (_value, index) => (
+      acceptTurn(database, `ordinary-capacity-${index + 1}`)
+    ));
+    const steer = await service.steer({
+      conversation_id: active.conversation_id,
+      turn_id: active.turn_id,
+      steer_id: 'steer-ordinary-capacity',
+      envelope: normalEnvelope('ordinary-capacity-command', '/steer separate lane'),
+    });
+    await execution;
+
+    const fifthOrdinary = acceptTurn(database, 'ordinary-capacity-5');
+    const overflow = acceptTurn(database, 'ordinary-capacity-overflow');
+    expect(fifthOrdinary).toMatchObject({ status: 'accepted' });
+    expect(overflow).toMatchObject({
+      status: 'rejected',
+      error: { code: 'queue_full' },
+    });
+    expect(database.prepare(`
+      SELECT priority, COUNT(*) AS count
+      FROM runtime_turn_queue
+      WHERE conversation_id = ? AND status = 'queued'
+      GROUP BY priority ORDER BY priority
+    `).all(active.conversation_id)).toEqual([
+      { priority: 0, count: 5 },
+      { priority: 1, count: 1 },
+    ]);
+
+    await expect(service.stop({
+      conversation_id: active.conversation_id,
+      stop_id: 'stop-ordinary-capacity-cleanup',
+    })).resolves.toMatchObject({
+      cancelled_turn_ids: [
+        ...ordinary.map(({ turn_id: turnId }) => turnId),
+        steer.priority_turn.turn_id,
+        fifthOrdinary.turn_id,
+      ],
+    });
+    await service.close();
+    database.close();
+  });
+
   test('rebuilds the priority lane from SQLite after a service and database restart', async () => {
     const database = openTestDatabase();
     const databasePath = database.name;
@@ -626,6 +720,88 @@ describe('runtime /steer priority lane', () => {
     database.close();
   });
 
+  test.each([
+    ['known', 'completed', 'queued'],
+    ['unknown', 'failed', 'blocked_recovery'],
+  ])(
+    'seals a late %s tool side effect from the winning attempt before deciding priority work',
+    async (sideEffectStatus, expectedStatus, expectedPriorityStatus) => {
+      const database = openTestDatabase();
+      const active = acceptTurn(database, `late-tool-${sideEffectStatus}`);
+      const providerStarted = deferred();
+      const providerStopped = deferred();
+      const adapter = {
+        async *execute(context) {
+          context.reportProviderState({ state: 'started', provider_native_id: null });
+          providerStarted.resolve();
+          await providerStopped.promise;
+          yield {
+            kind: 'tool_finished',
+            payload: {
+              tool_use_id: `tool-use-late-${sideEffectStatus}`,
+              tool_name: 'workspace_write',
+              summary: 'The provider reported this after steering won.',
+              side_effect_status: sideEffectStatus,
+            },
+            provider_native_id: null,
+          };
+          yield { type: 'turn_result', outcome: 'cancelled' };
+        },
+        async cancel() { providerStopped.resolve(); },
+      };
+      const service = createExecutorService({
+        database,
+        adapter,
+        provider: 'codex',
+        serviceInstanceId: `executor-service-late-tool-${sideEffectStatus}`,
+        now: () => '2026-07-20T02:02:50Z',
+        generateId: deterministicIds(`late-tool-${sideEffectStatus}`),
+      });
+      const execution = service.runNext();
+      await providerStarted.promise;
+
+      const steer = await service.steer({
+        conversation_id: active.conversation_id,
+        turn_id: active.turn_id,
+        steer_id: `steer-late-tool-${sideEffectStatus}`,
+        envelope: normalEnvelope(
+          `late-tool-${sideEffectStatus}-command`,
+          '/steer account for the late tool result',
+        ),
+      });
+      expect(steer).toMatchObject({
+        status: expectedStatus,
+        old_turn: { state: 'interrupted', side_effect_status: sideEffectStatus },
+        priority_turn: { status: expectedPriorityStatus },
+      });
+      if (sideEffectStatus === 'unknown') {
+        expect(steer).toMatchObject({
+          lease_released: false,
+          error: { code: 'side_effect_unknown', side_effect_status: 'unknown' },
+          incident: { status: 'manual_recovery_required' },
+        });
+      }
+      expect(database.prepare(`
+        SELECT event_kind, reason_code
+        FROM runtime_provider_event_diagnostics
+        WHERE turn_id = ? AND event_kind = 'tool_finished'
+      `).get(active.turn_id)).toEqual({
+        event_kind: 'tool_finished',
+        reason_code: 'stale_attempt',
+      });
+      await execution;
+
+      if (sideEffectStatus === 'known') {
+        await service.stop({
+          conversation_id: active.conversation_id,
+          stop_id: 'stop-late-tool-known-cleanup',
+        });
+        await service.close();
+      }
+      database.close();
+    },
+  );
+
   test('uses the durable running CAS to select one of two concurrent steers', async () => {
     const database = openTestDatabase();
     const active = acceptTurn(database, 'double-active');
@@ -656,11 +832,23 @@ describe('runtime /steer priority lane', () => {
     const execution = service.runNext();
     await providerStarted.promise;
 
-    const first = service.steer({
+    const firstRequest = {
       conversation_id: active.conversation_id,
       turn_id: active.turn_id,
       steer_id: 'steer-double-first',
       envelope: normalEnvelope('double-first', '/steer first wins'),
+    };
+    const first = service.steer(firstRequest);
+    const duplicateFirst = service.steer(structuredClone(firstRequest));
+    await expect(service.steer({
+      conversation_id: active.conversation_id,
+      turn_id: active.turn_id,
+      steer_id: 'steer-double-first',
+      envelope: normalEnvelope('double-first-conflict', '/steer conflicting replay'),
+    })).resolves.toMatchObject({
+      status: 'rejected',
+      winner: { control: 'steer', control_id: 'steer-double-first' },
+      error: { code: 'idempotency_conflict' },
     });
     await expect(service.steer({
       conversation_id: active.conversation_id,
@@ -681,6 +869,12 @@ describe('runtime /steer priority lane', () => {
     releaseCancellation.resolve();
     await expect(first).resolves.toMatchObject({
       status: 'completed',
+      winner: { control_id: 'steer-double-first' },
+      priority_turn: { status: 'queued' },
+    });
+    await expect(duplicateFirst).resolves.toMatchObject({
+      status: 'completed',
+      deduplicated: true,
       winner: { control_id: 'steer-double-first' },
       priority_turn: { status: 'queued' },
     });
@@ -818,6 +1012,19 @@ describe('runtime /steer priority lane', () => {
       provider_stop_status: 'not_applicable',
       lease_released: false,
     });
+    const redirectProjection = JSON.parse(database.prepare(`
+      SELECT render_model_json
+      FROM runtime_projection_snapshots
+      WHERE turn_id = ?
+      ORDER BY aggregate_version DESC
+      LIMIT 1
+    `).get(active.turn_id).render_model_json);
+    expect(redirectProjection).toMatchObject({
+      phase: 'redirecting',
+      terminal: false,
+      text: expect.stringMatching(/interrupting|stopping/i),
+    });
+    expect(redirectProjection.text).toMatch(/not (?:be )?rolled back/i);
     releaseCancellation.resolve();
     await expect(steer).resolves.toMatchObject({
       status: 'completed',
@@ -834,11 +1041,114 @@ describe('runtime /steer priority lane', () => {
       provider_stop_status: 'confirmed',
       lease_released: true,
     });
-    await execution;
+    await expect(execution).resolves.toMatchObject({
+      status: 'interrupted',
+      turn_id: active.turn_id,
+    });
     expect(database.prepare(`
       SELECT COUNT(*) AS count FROM runtime_turns
       WHERE redirected_from_turn_id = ?
     `).get(active.turn_id).count).toBe(0);
+
+    await service.close();
+    database.close();
+  });
+
+  test('keeps the first steer barrier while a later stop clears its newer cutoff', async () => {
+    const database = openTestDatabase();
+    const active = acceptTurn(database, 'repeat-barrier-active');
+    const providerStarted = deferred();
+    const releaseCancellation = deferred();
+    const providerStopped = deferred();
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute(context) {
+          context.reportProviderState({ state: 'started', provider_native_id: null });
+          providerStarted.resolve();
+          await providerStopped.promise;
+          yield { type: 'turn_result', outcome: 'cancelled' };
+        },
+        async cancel() {
+          await releaseCancellation.promise;
+          providerStopped.resolve();
+        },
+      },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-repeat-barrier',
+      now: () => '2026-07-20T02:05:30Z',
+      generateId: deterministicIds('repeat-barrier'),
+    });
+    const execution = service.runNext();
+    await providerStarted.promise;
+    const steer = service.steer({
+      conversation_id: active.conversation_id,
+      turn_id: active.turn_id,
+      steer_id: 'steer-repeat-barrier',
+      envelope: normalEnvelope('repeat-barrier-command', '/steer barrier in progress'),
+    });
+    await service.stop({
+      conversation_id: active.conversation_id,
+      stop_id: 'stop-repeat-barrier-first',
+    });
+    const laterIngress = acceptTurn(database, 'repeat-barrier-later-ingress');
+
+    await expect(service.stop({
+      conversation_id: active.conversation_id,
+      stop_id: 'stop-repeat-barrier-second',
+    })).resolves.toMatchObject({
+      status: 'barrier_applied',
+      active_turn: { turn_id: active.turn_id, state: 'redirecting' },
+      cancelled_turn_ids: [laterIngress.turn_id],
+      steering: {
+        steer_id: 'steer-repeat-barrier',
+        stop_barrier_id: 'stop-repeat-barrier-first',
+        priority_turn: {
+          status: 'not_created',
+          stop_barrier_id: 'stop-repeat-barrier-first',
+        },
+      },
+    });
+    releaseCancellation.resolve();
+    await expect(steer).resolves.toMatchObject({
+      status: 'completed',
+      stop_barrier_id: 'stop-repeat-barrier-first',
+      priority_turn: {
+        status: 'not_created',
+        stop_barrier_id: 'stop-repeat-barrier-first',
+      },
+    });
+    await execution;
+    expect(database.prepare(`
+      SELECT stop_id FROM runtime_stop_controls
+      WHERE conversation_id = ? ORDER BY committed_at, stop_id
+    `).all(active.conversation_id)).toEqual([
+      { stop_id: 'stop-repeat-barrier-first' },
+      { stop_id: 'stop-repeat-barrier-second' },
+    ]);
+    for (const stopId of [
+      'stop-repeat-barrier-first',
+      'stop-repeat-barrier-second',
+    ]) {
+      await expect(service.stop({
+        conversation_id: active.conversation_id,
+        stop_id: stopId,
+      })).resolves.toMatchObject({
+        status: 'barrier_completed',
+        deduplicated: true,
+        active_turn: { turn_id: active.turn_id, state: 'interrupted' },
+        steering: {
+          steer_id: 'steer-repeat-barrier',
+          stop_barrier_id: 'stop-repeat-barrier-first',
+          priority_turn: {
+            status: 'not_created',
+            stop_barrier_id: 'stop-repeat-barrier-first',
+          },
+        },
+        provider_stop_status: 'confirmed',
+        lease_released: true,
+      });
+    }
 
     await service.close();
     database.close();
@@ -1136,6 +1446,442 @@ describe('runtime /steer priority lane', () => {
     });
     expect(cancelCalls).toBe(1);
     await service.close();
+    database.close();
+  });
+
+  test.each([
+    ['pending', 'not_started'],
+    ['answer_committed', 'pending'],
+    ['answer_delivering', 'delivering'],
+    ['delivery_unknown', 'delivery_unknown'],
+  ])(
+    'moves an impossible running + %s handoff projection into fenced reconciliation',
+    async (interactionState, handoffState) => {
+      const database = openTestDatabase();
+      const active = acceptTurn(database, `interaction-inconsistent-${interactionState}`);
+      const providerStarted = deferred();
+      const providerStopped = deferred();
+      let abortCalls = 0;
+      const service = createExecutorService({
+        database,
+        adapter: {
+          async *execute(context) {
+            context.reportProviderState({ state: 'started', provider_native_id: null });
+            providerStarted.resolve();
+            await providerStopped.promise;
+            yield { type: 'turn_result', outcome: 'cancelled' };
+          },
+          async abort() {
+            abortCalls += 1;
+            providerStopped.resolve();
+          },
+        },
+        provider: 'codex',
+        serviceInstanceId: `executor-service-inconsistent-${interactionState}`,
+        now: () => '2026-07-20T02:09:30Z',
+        generateId: deterministicIds(`interaction-inconsistent-${interactionState}`),
+      });
+      const execution = service.runNext();
+      await providerStarted.promise;
+      database.prepare(`
+        INSERT INTO runtime_interactions (
+          interaction_id, conversation_id, turn_id, lineage_id,
+          parent_type, parent_id, ordinal, state, version,
+          handoff_state, handoff_version, request_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'provider_turn', ?, 99, ?, 1, ?, 1, ?, ?, ?)
+      `).run(
+        `interaction-inconsistent-${interactionState}`,
+        active.conversation_id,
+        active.turn_id,
+        active.lineage_id,
+        active.turn_id,
+        interactionState,
+        handoffState,
+        JSON.stringify({ state: interactionState, handoff_state: handoffState }),
+        '2026-07-20T02:09:30Z',
+        '2026-07-20T02:09:30Z',
+      );
+
+      const steerRequest = {
+        conversation_id: active.conversation_id,
+        turn_id: active.turn_id,
+        steer_id: `steer-inconsistent-${interactionState}`,
+        envelope: normalEnvelope(
+          `interaction-inconsistent-${interactionState}-command`,
+          '/steer cannot bypass durable interaction ownership',
+        ),
+      };
+      await expect(service.steer(steerRequest)).resolves.toMatchObject({
+        status: 'rejected',
+        reconciliation_required: true,
+        old_turn: { turn_id: active.turn_id, state: 'recovering' },
+        priority_turn: { status: 'not_created', turn_id: null },
+        lease_released: true,
+        error: { code: 'steer_reconciliation_required' },
+        reconciliation: { provider_isolated: true },
+      });
+      await expect(service.steer(steerRequest)).resolves.toMatchObject({
+        status: 'rejected',
+        deduplicated: true,
+        reconciliation_required: true,
+        reconciliation: { provider_isolated: true },
+      });
+      expect(abortCalls).toBe(1);
+      expect(database.prepare(`
+        SELECT state FROM runtime_turns WHERE turn_id = ?
+      `).get(active.turn_id)).toEqual({ state: 'recovering' });
+      expect(database.prepare(`
+        SELECT lease_owner, turn_id FROM runtime_executor_leases
+        WHERE conversation_id = ?
+      `).get(active.conversation_id)).toEqual({ lease_owner: null, turn_id: null });
+      expect(database.prepare(`
+        SELECT state, handoff_state FROM runtime_interactions WHERE turn_id = ?
+      `).get(active.turn_id)).toEqual({
+        state: interactionState,
+        handoff_state: handoffState,
+      });
+      await execution;
+      database.close();
+    },
+  );
+
+  test('keeps failed reconciliation isolation under shutdown supervision', async () => {
+    const database = openTestDatabase();
+    const active = acceptTurn(database, 'interaction-reconciliation-supervision');
+    const providerStarted = deferred();
+    const providerStopped = deferred();
+    let abortCalls = 0;
+    let closeCalls = 0;
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute(context) {
+          context.reportProviderState({ state: 'started', provider_native_id: null });
+          providerStarted.resolve();
+          await providerStopped.promise;
+          yield { type: 'turn_result', outcome: 'cancelled' };
+        },
+        async abort() {
+          abortCalls += 1;
+          throw new Error('provider isolation is not yet proven');
+        },
+        async close() {
+          closeCalls += 1;
+          providerStopped.resolve();
+          return [active.conversation_id];
+        },
+      },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-reconciliation-supervision',
+      now: () => '2026-07-20T02:09:40Z',
+      generateId: deterministicIds('interaction-reconciliation-supervision'),
+    });
+    const execution = service.runNext();
+    await providerStarted.promise;
+    database.prepare(`
+      INSERT INTO runtime_interactions (
+        interaction_id, conversation_id, turn_id, lineage_id,
+        parent_type, parent_id, ordinal, state, version,
+        handoff_state, handoff_version, request_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'provider_turn', ?, 99, 'delivery_unknown', 1,
+        'delivery_unknown', 1, ?, ?, ?)
+    `).run(
+      'interaction-reconciliation-supervision',
+      active.conversation_id,
+      active.turn_id,
+      active.lineage_id,
+      active.turn_id,
+      JSON.stringify({ state: 'delivery_unknown', handoff_state: 'delivery_unknown' }),
+      '2026-07-20T02:09:40Z',
+      '2026-07-20T02:09:40Z',
+    );
+    const steerRequest = {
+      conversation_id: active.conversation_id,
+      turn_id: active.turn_id,
+      steer_id: 'steer-reconciliation-supervision',
+      envelope: normalEnvelope(
+        'interaction-reconciliation-supervision-command',
+        '/steer preserve unproven provider supervision',
+      ),
+    };
+
+    await expect(service.steer(steerRequest)).resolves.toMatchObject({
+      status: 'rejected',
+      reconciliation_required: true,
+      lease_released: false,
+      reconciliation: {
+        status: 'provider_isolation_unproven',
+        provider_isolated: false,
+      },
+    });
+    expect(abortCalls).toBe(1);
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id FROM runtime_executor_leases
+      WHERE conversation_id = ?
+    `).get(active.conversation_id)).toEqual({
+      lease_owner: 'executor-service-reconciliation-supervision',
+      turn_id: active.turn_id,
+    });
+
+    await expect(service.close()).resolves.toBeUndefined();
+    await expect(execution).resolves.toMatchObject({ status: 'recovering' });
+    expect(closeCalls).toBe(1);
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id FROM runtime_executor_leases
+      WHERE conversation_id = ?
+    `).get(active.conversation_id)).toEqual({ lease_owner: null, turn_id: null });
+    await expect(service.steer(steerRequest)).resolves.toMatchObject({
+      status: 'rejected',
+      deduplicated: true,
+      lease_released: true,
+      reconciliation: {
+        status: 'provider_isolated_manual_recovery_required',
+        provider_isolated: true,
+      },
+    });
+    database.close();
+  });
+
+  test('uses a provider terminal proof that wins before abort rejects', async () => {
+    const database = openTestDatabase();
+    const active = acceptTurn(database, 'interaction-reconciliation-terminal-race');
+    const providerStarted = deferred();
+    const releaseProvider = deferred();
+    let execution;
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute(context) {
+          context.reportProviderState({ state: 'started', provider_native_id: null });
+          providerStarted.resolve();
+          await releaseProvider.promise;
+          yield { type: 'turn_result', outcome: 'cancelled' };
+        },
+        async abort() {
+          releaseProvider.resolve();
+          await execution;
+          throw new Error('abort acknowledgement lost after provider terminal');
+        },
+      },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-reconciliation-terminal-race',
+      now: () => '2026-07-20T02:09:45Z',
+      generateId: deterministicIds('interaction-reconciliation-terminal-race'),
+    });
+    execution = service.runNext();
+    await providerStarted.promise;
+    database.prepare(`
+      INSERT INTO runtime_interactions (
+        interaction_id, conversation_id, turn_id, lineage_id,
+        parent_type, parent_id, ordinal, state, version,
+        handoff_state, handoff_version, request_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'provider_turn', ?, 99, 'delivery_unknown', 1,
+        'delivery_unknown', 1, ?, ?, ?)
+    `).run(
+      'interaction-reconciliation-terminal-race',
+      active.conversation_id,
+      active.turn_id,
+      active.lineage_id,
+      active.turn_id,
+      JSON.stringify({ state: 'delivery_unknown', handoff_state: 'delivery_unknown' }),
+      '2026-07-20T02:09:45Z',
+      '2026-07-20T02:09:45Z',
+    );
+
+    await expect(service.steer({
+      conversation_id: active.conversation_id,
+      turn_id: active.turn_id,
+      steer_id: 'steer-reconciliation-terminal-race',
+      envelope: normalEnvelope(
+        'interaction-reconciliation-terminal-race-command',
+        '/steer preserve terminal isolation proof',
+      ),
+    })).resolves.toMatchObject({
+      status: 'rejected',
+      reconciliation_required: true,
+      lease_released: true,
+      reconciliation: {
+        status: 'provider_isolated_manual_recovery_required',
+        provider_isolated: true,
+      },
+    });
+    await expect(execution).resolves.toMatchObject({ status: 'recovering' });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id FROM runtime_executor_leases
+      WHERE conversation_id = ?
+    `).get(active.conversation_id)).toEqual({ lease_owner: null, turn_id: null });
+
+    await service.close();
+    database.close();
+  });
+
+  test('deduplicates ownership release when shutdown proves isolation before abort returns', async () => {
+    const database = openTestDatabase();
+    const active = acceptTurn(database, 'interaction-reconciliation-close-race');
+    const providerStarted = deferred();
+    const providerStopped = deferred();
+    const abortStarted = deferred();
+    const releaseAbort = deferred();
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute(context) {
+          context.reportProviderState({ state: 'started', provider_native_id: null });
+          providerStarted.resolve();
+          await providerStopped.promise;
+          yield { type: 'turn_result', outcome: 'cancelled' };
+        },
+        async abort() {
+          abortStarted.resolve();
+          await releaseAbort.promise;
+        },
+        async close() {
+          providerStopped.resolve();
+          return [active.conversation_id];
+        },
+      },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-reconciliation-close-race',
+      now: () => '2026-07-20T02:09:50Z',
+      generateId: deterministicIds('interaction-reconciliation-close-race'),
+    });
+    const execution = service.runNext();
+    await providerStarted.promise;
+    database.prepare(`
+      INSERT INTO runtime_interactions (
+        interaction_id, conversation_id, turn_id, lineage_id,
+        parent_type, parent_id, ordinal, state, version,
+        handoff_state, handoff_version, request_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'provider_turn', ?, 99, 'delivery_unknown', 1,
+        'delivery_unknown', 1, ?, ?, ?)
+    `).run(
+      'interaction-reconciliation-close-race',
+      active.conversation_id,
+      active.turn_id,
+      active.lineage_id,
+      active.turn_id,
+      JSON.stringify({ state: 'delivery_unknown', handoff_state: 'delivery_unknown' }),
+      '2026-07-20T02:09:50Z',
+      '2026-07-20T02:09:50Z',
+    );
+    const steering = service.steer({
+      conversation_id: active.conversation_id,
+      turn_id: active.turn_id,
+      steer_id: 'steer-reconciliation-close-race',
+      envelope: normalEnvelope(
+        'interaction-reconciliation-close-race-command',
+        '/steer coordinate shutdown isolation proof',
+      ),
+    });
+    await abortStarted.promise;
+
+    await expect(service.close()).resolves.toBeUndefined();
+    await expect(execution).resolves.toMatchObject({ status: 'recovering' });
+    releaseAbort.resolve();
+    await expect(steering).resolves.toMatchObject({
+      lease_released: true,
+      reconciliation: { provider_isolated: true },
+    });
+    await expect(service.runNext()).rejects.toThrow(/service is closed/i);
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id FROM runtime_executor_leases
+      WHERE conversation_id = ?
+    `).get(active.conversation_id)).toEqual({ lease_owner: null, turn_id: null });
+    database.close();
+  });
+
+  test('lets stop supersede pending reconciliation supervision and result projection', async () => {
+    const database = openTestDatabase();
+    const active = acceptTurn(database, 'interaction-reconciliation-stop-race');
+    const providerStarted = deferred();
+    const providerStopped = deferred();
+    const abortStarted = deferred();
+    const releaseAbort = deferred();
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute(context) {
+          context.reportProviderState({ state: 'started', provider_native_id: null });
+          providerStarted.resolve();
+          await providerStopped.promise;
+          yield { type: 'turn_result', outcome: 'cancelled' };
+        },
+        async abort() {
+          abortStarted.resolve();
+          await releaseAbort.promise;
+        },
+        async cancel() {
+          providerStopped.resolve();
+        },
+      },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-reconciliation-stop-race',
+      now: () => '2026-07-20T02:09:55Z',
+      generateId: deterministicIds('interaction-reconciliation-stop-race'),
+    });
+    const execution = service.runNext();
+    await providerStarted.promise;
+    database.prepare(`
+      INSERT INTO runtime_interactions (
+        interaction_id, conversation_id, turn_id, lineage_id,
+        parent_type, parent_id, ordinal, state, version,
+        handoff_state, handoff_version, request_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'provider_turn', ?, 99, 'delivery_unknown', 1,
+        'delivery_unknown', 1, ?, ?, ?)
+    `).run(
+      'interaction-reconciliation-stop-race',
+      active.conversation_id,
+      active.turn_id,
+      active.lineage_id,
+      active.turn_id,
+      JSON.stringify({ state: 'delivery_unknown', handoff_state: 'delivery_unknown' }),
+      '2026-07-20T02:09:55Z',
+      '2026-07-20T02:09:55Z',
+    );
+    const steerRequest = {
+      conversation_id: active.conversation_id,
+      turn_id: active.turn_id,
+      steer_id: 'steer-reconciliation-stop-race',
+      envelope: normalEnvelope(
+        'interaction-reconciliation-stop-race-command',
+        '/steer let durable stop supersede this reconciliation',
+      ),
+    };
+    const steering = service.steer(steerRequest);
+    await abortStarted.promise;
+
+    await expect(service.stop({
+      conversation_id: active.conversation_id,
+      stop_id: 'stop-reconciliation-stop-race',
+    })).resolves.toMatchObject({
+      status: 'stopped',
+      active_turn: { turn_id: active.turn_id, state: 'stopped' },
+      provider_stop_status: 'confirmed',
+      lease_released: true,
+    });
+    await expect(execution).resolves.toMatchObject({ status: 'stopped' });
+    releaseAbort.resolve();
+    await expect(steering).resolves.toMatchObject({
+      status: 'rejected',
+      winner: {
+        control: 'stop',
+        control_id: 'stop-reconciliation-stop-race',
+        turn_id: active.turn_id,
+      },
+      old_turn: { state: 'stopped' },
+      lease_released: true,
+      reconciliation: {
+        status: 'superseded_by_stop',
+        provider_isolated: true,
+      },
+    });
+    await expect(service.steer(steerRequest)).resolves.toMatchObject({
+      deduplicated: true,
+      winner: { control: 'stop', control_id: 'stop-reconciliation-stop-race' },
+      lease_released: true,
+      reconciliation: { status: 'superseded_by_stop' },
+    });
+    await expect(service.close()).resolves.toBeUndefined();
     database.close();
   });
 
