@@ -214,7 +214,7 @@
           "schedule_id": "schedule-daily",
           "task_id": "task-daily",
           "occurrence_id": "occurrence-2026-07-19",
-          "bound_conversation": true
+          "bound_conversation": false
         }
       }
     },

@@ -198,12 +198,22 @@ function validateEnvelopeIdentity(value, occurredAt) {
     });
   }
   if (value.source.kind === 'scheduler') {
-    if (value.chat_type !== 'synthetic' || !value.schedule) {
+    if (!value.schedule) {
       rejectContract(
         'validation_error',
-        'scheduler source requires the stable synthetic conversation identity.',
+        'scheduler source requires schedule fields.',
         { occurredAt },
       );
+    }
+    if (value.chat_type !== 'synthetic') {
+      if (!value.schedule.bound_conversation) {
+        rejectContract(
+          'validation_error',
+          'a non-synthetic scheduler occurrence must be bound to a conversation.',
+          { occurredAt },
+        );
+      }
+      return;
     }
     const expectedChatId = `scheduler:${value.bot_id}:${value.schedule.task_id}`;
     if (value.chat_id !== expectedChatId) {
@@ -218,10 +228,10 @@ function validateEnvelopeIdentity(value, occurredAt) {
 
 function validateEnvelopeSource(value, occurredAt) {
   if (value.source.kind === 'scheduler') {
-    if (value.channel !== 'scheduler' || value.actor.type !== 'scheduler') {
+    if (value.actor.type !== 'scheduler') {
       rejectContract(
         'validation_error',
-        'scheduler source requires the scheduler channel and actor type.',
+        'scheduler source requires the scheduler actor type.',
         { occurredAt },
       );
     }
@@ -232,6 +242,20 @@ function validateEnvelopeSource(value, occurredAt) {
       rejectContract('validation_error', 'legacy must be omitted for scheduler source.', { occurredAt });
     }
     validateSchedule(value.schedule, occurredAt);
+    if (value.chat_type === 'synthetic' && value.channel !== 'scheduler') {
+      rejectContract(
+        'validation_error',
+        'a synthetic scheduler occurrence requires the scheduler channel.',
+        { occurredAt },
+      );
+    }
+    if (value.chat_type !== 'synthetic' && value.channel === 'scheduler') {
+      rejectContract(
+        'validation_error',
+        'a conversation-bound scheduler occurrence requires its real channel identity.',
+        { occurredAt },
+      );
+    }
     verifyIdempotencyKey('scheduler', {
       region: value.region,
       tenant_id: value.tenant_id,

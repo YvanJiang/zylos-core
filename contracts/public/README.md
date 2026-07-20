@@ -46,10 +46,11 @@ matrices, event-kind payload rules, and fixture secret safety.
 `validateInboundEnvelope` preserves additive same-major top-level extensions while enforcing the
 six-part conversation namespace, real thread/topic identity, reply-only mapping fields,
 authenticated actor shape, attachments, and the mutually exclusive platform, scheduler, and
-legacy sources. A scheduler synthetic conversation uses
-`scheduler:<bot_id>:<task_id>` and scheduler-scope idempotency; its required
-`bound_conversation` flag does not change that identity. Legacy compatibility alone uses the
-exact `legacy-c4:<legacy_record_id>` exception.
+legacy sources. A system scheduler task uses the synthetic identity
+`scheduler:<bot_id>:<task_id>` and scheduler-scope idempotency. A scheduler occurrence with
+`bound_conversation: true` instead carries the complete existing channel identity and enters that
+conversation's normal FIFO. Legacy compatibility alone uses the exact
+`legacy-c4:<legacy_record_id>` exception.
 
 `validateInboundResult` enforces the authoritative result matrix for a normal bound turn,
 control, pending lineage recovery, persisted queue-full failure, and nullable or persisted

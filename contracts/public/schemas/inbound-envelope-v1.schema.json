@@ -93,6 +93,7 @@
   "additionalProperties": true,
   "x-zylos-semantic-constraints": {
     "scheduler_synthetic_chat_id": "scheduler:<bot_id>:<task_id>",
+    "scheduler_bound_conversation": "when true, preserve the full non-synthetic conversation identity",
     "reply_changes_conversation_identity": false,
     "idempotency_key": "recompute_after_schema_validation"
   },
