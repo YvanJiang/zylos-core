@@ -1103,6 +1103,18 @@ describe('Claude conversation executor', () => {
       PATH: '/test/bin',
     });
     expect(fake.inputs).toEqual(['turn first', 'turn second']);
+    expect(database.prepare(`
+      SELECT runtime_evidence_json FROM runtime_provider_attempts WHERE turn_id = ?
+    `).get(first.turn_id)).toEqual({
+      runtime_evidence_json: expect.any(String),
+    });
+    expect(JSON.parse(database.prepare(`
+      SELECT runtime_evidence_json FROM runtime_provider_attempts WHERE turn_id = ?
+    `).get(first.turn_id).runtime_evidence_json)).toMatchObject({
+      runtime_instance_id: expect.any(String),
+      handle_kind: 'claude_sdk_query',
+      controllable: true,
+    });
     expect(readEvents(database, first.turn_id).at(-2)).toMatchObject({
       kind: 'text_snapshot',
       provider: 'claude',

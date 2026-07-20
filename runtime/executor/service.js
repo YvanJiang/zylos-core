@@ -79,6 +79,31 @@ function isExplicitProviderError(error) {
     && typeof error.providerError === 'object';
 }
 
+const NEVER_RETRY_PROVIDER_CODES = new Set([
+  'authentication_failed',
+  'authorization_failed',
+  'cancelled',
+  'permission_denied',
+  'provider_context_invalid',
+  'provider_stop_failed',
+  'side_effect_unknown',
+  'stopped',
+  'turn_interrupted',
+  'turn_terminal',
+  'unauthenticated',
+  'unauthorized',
+]);
+
+function isSafeProviderRetry(error) {
+  return error.retryable === true
+    && error.side_effect_status === 'none'
+    && !['authentication', 'authorization', 'validation'].includes(error.category)
+    && !NEVER_RETRY_PROVIDER_CODES.has(error.code)
+    && !error.code.includes('permission')
+    && !error.code.includes('context')
+    && !error.code.includes('stop');
+}
+
 function isProviderTerminalRecord(record) {
   return record?.type === 'turn_result'
     && ['cancelled', 'completed', 'failed'].includes(record.outcome);
@@ -91,11 +116,17 @@ export function createExecutorService({
   serviceInstanceId,
   now = () => new Date().toISOString(),
   generateId = defaultGenerateId,
-  leaseDurationMs,
+  leaseDurationMs = 30_000,
   residentLeaseDurationMs = 60_000,
   residentHeartbeatIntervalMs = 20_000,
   scheduleResidentHeartbeat = setInterval,
   cancelResidentHeartbeat = clearInterval,
+  turnLeaseRenewalIntervalMs = 10_000,
+  scheduleTurnLeaseRenewal = setInterval,
+  cancelTurnLeaseRenewal = clearInterval,
+  nonterminalSweepIntervalMs = 30_000,
+  scheduleNonterminalSweep = setInterval,
+  cancelNonterminalSweep = clearInterval,
   permissionSweepIntervalMs = 1_000,
   schedulePermissionSweep = setInterval,
   cancelPermissionSweep = clearInterval,
@@ -103,6 +134,9 @@ export function createExecutorService({
   interactionHandoffDispositionAuthorizer = null,
   interactionTimeoutMs,
   providerStopTimeoutMs = 10_000,
+  providerRetryBaseDelayMs = 1_000,
+  providerRetryJitterRatio = 0.2,
+  providerRetryRandom = Math.random,
   maxResidentExecutorsPerBot = 20,
   setTimeoutFn = setTimeout,
   clearTimeoutFn = clearTimeout,
@@ -135,6 +169,19 @@ export function createExecutorService({
   if (!Number.isFinite(providerStopTimeoutMs) || providerStopTimeoutMs <= 0) {
     throw new TypeError('providerStopTimeoutMs must be a positive finite number');
   }
+  if (!Number.isSafeInteger(providerRetryBaseDelayMs) || providerRetryBaseDelayMs <= 0) {
+    throw new TypeError('providerRetryBaseDelayMs must be a positive safe integer');
+  }
+  if (
+    !Number.isFinite(providerRetryJitterRatio)
+    || providerRetryJitterRatio < 0
+    || providerRetryJitterRatio > 1
+  ) {
+    throw new TypeError('providerRetryJitterRatio must be between zero and one');
+  }
+  if (typeof providerRetryRandom !== 'function') {
+    throw new TypeError('providerRetryRandom must be a function');
+  }
   if (!Number.isFinite(residentLeaseDurationMs) || residentLeaseDurationMs <= 0) {
     throw new TypeError('residentLeaseDurationMs must be a positive finite number');
   }
@@ -150,6 +197,30 @@ export function createExecutorService({
   }
   if (typeof cancelResidentHeartbeat !== 'function') {
     throw new TypeError('cancelResidentHeartbeat must be a function');
+  }
+  if (!Number.isFinite(turnLeaseRenewalIntervalMs) || turnLeaseRenewalIntervalMs <= 0) {
+    throw new TypeError('turnLeaseRenewalIntervalMs must be a positive finite number');
+  }
+  if (!Number.isFinite(leaseDurationMs) || leaseDurationMs <= 0) {
+    throw new TypeError('leaseDurationMs must be a positive finite number');
+  }
+  if (turnLeaseRenewalIntervalMs >= leaseDurationMs) {
+    throw new TypeError('turn lease renewal interval must be below the turn lease duration');
+  }
+  if (typeof scheduleTurnLeaseRenewal !== 'function') {
+    throw new TypeError('scheduleTurnLeaseRenewal must be a function');
+  }
+  if (typeof cancelTurnLeaseRenewal !== 'function') {
+    throw new TypeError('cancelTurnLeaseRenewal must be a function');
+  }
+  if (!Number.isFinite(nonterminalSweepIntervalMs) || nonterminalSweepIntervalMs <= 0) {
+    throw new TypeError('nonterminalSweepIntervalMs must be a positive finite number');
+  }
+  if (typeof scheduleNonterminalSweep !== 'function') {
+    throw new TypeError('scheduleNonterminalSweep must be a function');
+  }
+  if (typeof cancelNonterminalSweep !== 'function') {
+    throw new TypeError('cancelNonterminalSweep must be a function');
   }
   if (!Number.isFinite(permissionSweepIntervalMs) || permissionSweepIntervalMs <= 0) {
     throw new TypeError('permissionSweepIntervalMs must be a positive finite number');
@@ -198,6 +269,8 @@ export function createExecutorService({
   let lifecycle = 'open';
   let closePromise = null;
   let residentHeartbeat = null;
+  let turnLeaseRenewal = null;
+  let nonterminalSweep = null;
   let permissionSweep = null;
   let residentHeartbeatFailure = null;
 
@@ -301,6 +374,40 @@ export function createExecutorService({
     }
     store.reconcileExpiredResidents();
     store.reconcileExpiredStartedInteractionHandoffs();
+    store.reconcileNonterminalTurns([], 'startup_reconciliation');
+    if (nonterminalSweep === null) {
+      nonterminalSweep = scheduleNonterminalSweep(() => {
+        try {
+          store.reconcileNonterminalTurns(
+            [...activeRuns.values()].map(({ turnContext }) => turnContext),
+            'sweep_reconciliation',
+          );
+          refresh();
+          reschedulePendingInteractionDeadlines();
+        } catch (error) {
+          onDeadlineError(error, Object.freeze({
+            kind: 'executor_nonterminal_reconciliation',
+            expires_at: now(),
+          }));
+        }
+      }, nonterminalSweepIntervalMs);
+      nonterminalSweep?.unref?.();
+    }
+    if (turnLeaseRenewal === null) {
+      turnLeaseRenewal = scheduleTurnLeaseRenewal(() => {
+        try {
+          store.renewOwnedTurnLeases(
+            [...activeRuns.values()].map(({ turnContext }) => turnContext),
+          );
+        } catch (error) {
+          onDeadlineError(error, Object.freeze({
+            kind: 'executor_turn_lease_renewal',
+            expires_at: now(),
+          }));
+        }
+      }, turnLeaseRenewalIntervalMs);
+      turnLeaseRenewal?.unref?.();
+    }
     if (residentHeartbeat === null) {
       residentHeartbeat = scheduleResidentHeartbeat(() => {
         try {
@@ -540,10 +647,43 @@ export function createExecutorService({
       controller.abort();
     }
     if (isExplicitProviderError(error)) {
+      const normalizedError = normalizeProviderError(error, now());
+      const attemptNo = turnContext.attempt.attempt_no;
+      if (isSafeProviderRetry(normalizedError) && attemptNo <= 3) {
+        const baseBackoff = providerRetryBaseDelayMs * (2 ** (attemptNo - 1));
+        const jitterFactor = 1 + ((providerRetryRandom() * 2) - 1) * providerRetryJitterRatio;
+        const backoffMs = Math.max(0, Math.round(baseBackoff * jitterFactor));
+        const retry = persist(
+          () => store.scheduleProviderRetry(turnContext, normalizedError, backoffMs),
+        );
+        activeRun.durableSettled = true;
+        refresh();
+        cleanupActiveRun(activeRun);
+        reschedulePendingInteractionDeadlines();
+        return resultFor(activeRun, 'retry_scheduled', { retry });
+      }
+      if (isSafeProviderRetry(normalizedError) && attemptNo === 4) {
+        persist(() => store.exhaustProviderRetries(turnContext, normalizedError));
+        activeRun.durableSettled = true;
+        refresh();
+        cleanupActiveRun(activeRun);
+        releaseAbsentResident(turnContext);
+        reschedulePendingInteractionDeadlines();
+        return resultFor(activeRun, 'failed');
+      }
+      if (normalizedError.side_effect_status === 'unknown') {
+        const recovery = persist(() => store.markProviderFailure(turnContext, normalizedError));
+        activeRun.durableSettled = true;
+        refresh();
+        cleanupActiveRun(activeRun);
+        reschedulePendingInteractionDeadlines();
+        return resultFor(activeRun, recovery.status, { recovery });
+      }
       const { state } = store.assertCurrentFence(turnContext);
       persist(() => store.transitionTurn(turnContext, state, 'failed', {
-        error: normalizeProviderError(error, now()),
+        error: normalizedError,
         reasonCode: 'executor_failed',
+        providerEventObserved: true,
       }));
       activeRun.durableSettled = true;
       refresh();
@@ -561,6 +701,7 @@ export function createExecutorService({
         side_effect_status: 'unknown',
         user_message: 'The provider stream ended before the turn completed.',
       },
+      providerEventObserved: true,
     });
     activeRun.durableSettled = true;
     refresh();
@@ -609,6 +750,7 @@ export function createExecutorService({
           side_effect_status: 'unknown',
           user_message: 'The provider turn did not complete successfully.',
         } : null,
+        providerEventObserved: true,
       },
     ));
     activeRun.durableSettled = true;
@@ -958,6 +1100,7 @@ export function createExecutorService({
       if (activeRun.providerStarted) return { status: 'already_started' };
       persist(() => store.transitionTurn(turnContext, 'starting', 'running', {
         reasonCode: 'provider_started',
+        providerEventObserved: true,
       }));
       activeRun.providerStarted = true;
       refresh();
@@ -971,6 +1114,7 @@ export function createExecutorService({
         lineage_id: turnContext.lineage_id,
         provider_native_id: turnContext.provider_native_id,
         trace_id: turnContext.trace_id,
+        executor_instance_id: turnContext.executor_instance_id,
         input: turnContext.input,
         interaction: Object.freeze({
           authorized_subjects: Object.freeze(
@@ -982,7 +1126,11 @@ export function createExecutorService({
         }),
         lineage: Object.freeze({ ...turnContext.lineage }),
         bindProviderNativeId(providerNativeId) {
-          if (committedControlStatus(activeRun) !== null) {
+          if (
+            committedControlStatus(activeRun) !== null
+            || activeRun.durableSettled
+            || activeRuns.get(turnContext.turn_id) !== activeRun
+          ) {
             persist(() => store.recordProviderEventDiagnostic(
               turnContext,
               {
@@ -1000,7 +1148,11 @@ export function createExecutorService({
           return binding;
         },
         reportProviderState(providerState) {
-          if (committedControlStatus(activeRun) !== null) {
+          if (
+            committedControlStatus(activeRun) !== null
+            || activeRun.durableSettled
+            || activeRuns.get(turnContext.turn_id) !== activeRun
+          ) {
             persist(() => store.recordProviderEventDiagnostic(
               turnContext,
               {
@@ -1018,10 +1170,38 @@ export function createExecutorService({
           ) {
             throw new TypeError('provider state must match the current started lineage');
           }
+          if (activeRun.providerStarted) {
+            persist(() => store.recordProviderEventActivity(turnContext));
+            return { status: 'already_started' };
+          }
           return activeRun.ensureProviderStarted();
         },
+        reportRuntimeEvidence(runtimeEvidence) {
+          if (
+            committedControlStatus(activeRun) !== null
+            || activeRun.durableSettled
+            || activeRuns.get(turnContext.turn_id) !== activeRun
+          ) {
+            persist(() => store.recordProviderEventDiagnostic(
+              turnContext,
+              {
+                kind: 'runtime_evidence',
+                payload: { status: 'arrived_after_control' },
+              },
+            ));
+            return { status: 'stale_attempt' };
+          }
+          return persist(() => store.recordProviderRuntimeEvidence(
+            turnContext,
+            runtimeEvidence,
+          ));
+        },
         reportProviderFailure(providerFailure) {
-          if (committedControlStatus(activeRun) !== null) {
+          if (
+            committedControlStatus(activeRun) !== null
+            || activeRun.durableSettled
+            || activeRuns.get(turnContext.turn_id) !== activeRun
+          ) {
             persist(() => store.recordProviderEventDiagnostic(
               turnContext,
               {
@@ -1030,9 +1210,6 @@ export function createExecutorService({
               },
             ));
             return { status: 'stale_attempt' };
-          }
-          if (activeRun.durableSettled) {
-            throw new Error('Provider failure arrived after the executor run settled.');
           }
           const normalizedFailure = normalizeProviderError(providerFailure, now());
           let outcome;
@@ -1581,7 +1758,11 @@ export function createExecutorService({
     if (beginning.acknowledgement !== null) {
       reschedulePendingInteractionDeadlines();
       refresh();
-      return { acknowledgement: beginning.acknowledgement, execution: null };
+      return {
+        acknowledgement: beginning.acknowledgement,
+        execution: null,
+        recovery_resolution: beginning.recovery_resolution ?? null,
+      };
     }
     if (typeof adapter.prepareInteractionAnswer !== 'function') {
       throw new TypeError('adapter.prepareInteractionAnswer must be a function');
@@ -1936,6 +2117,14 @@ export function createExecutorService({
         if (permissionSweep !== null) {
           cancelPermissionSweep(permissionSweep);
           permissionSweep = null;
+        }
+        if (turnLeaseRenewal !== null) {
+          cancelTurnLeaseRenewal(turnLeaseRenewal);
+          turnLeaseRenewal = null;
+        }
+        if (nonterminalSweep !== null) {
+          cancelNonterminalSweep(nonterminalSweep);
+          nonterminalSweep = null;
         }
         if (lifecycle === 'close_failed' && closePromise === closing) {
           closePromise = null;

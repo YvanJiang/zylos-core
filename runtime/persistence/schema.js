@@ -352,6 +352,65 @@ const RUNTIME_SCHEMA = `
     )
   );
 
+  CREATE TABLE IF NOT EXISTS runtime_provider_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+    lease_epoch INTEGER NOT NULL CHECK (lease_epoch > 0),
+    provider TEXT NOT NULL CHECK (provider IN ('claude', 'codex')),
+    service_instance_id TEXT NOT NULL,
+    executor_instance_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+      state IN (
+        'starting', 'running', 'waiting_user', 'redirecting',
+        'retry_wait', 'retrying', 'recovering',
+        'completed', 'stopped', 'cancelled', 'interrupted', 'failed', 'timed_out'
+      )
+    ),
+    runtime_instance_id TEXT,
+    runtime_evidence_json TEXT,
+    last_provider_event_at TEXT,
+    last_lease_renewed_at TEXT NOT NULL,
+    retry_backoff_ms INTEGER CHECK (retry_backoff_ms IS NULL OR retry_backoff_ms >= 0),
+    next_retry_at TEXT,
+    side_effect_status TEXT NOT NULL DEFAULT 'none'
+      CHECK (side_effect_status IN ('none', 'known', 'unknown')),
+    error_json TEXT,
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (turn_id, attempt_no),
+    UNIQUE (turn_id, lease_epoch)
+  );
+
+  CREATE INDEX IF NOT EXISTS runtime_provider_attempts_active
+    ON runtime_provider_attempts(turn_id, state, service_instance_id);
+
+  CREATE TABLE IF NOT EXISTS runtime_execution_recoveries (
+    recovery_id TEXT PRIMARY KEY,
+    turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
+    attempt_id TEXT NOT NULL,
+    attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+    lease_epoch INTEGER NOT NULL CHECK (lease_epoch > 0),
+    provider TEXT NOT NULL CHECK (provider IN ('claude', 'codex')),
+    prior_service_instance_id TEXT,
+    prior_executor_instance_id TEXT,
+    prior_runtime_instance_id TEXT,
+    recovery_kind TEXT NOT NULL CHECK (
+      recovery_kind IN ('provider_failure', 'startup_reconciliation', 'sweep_reconciliation')
+    ),
+    state TEXT NOT NULL CHECK (state IN ('waiting_decision', 'authorized', 'stopped')),
+    side_effect_status TEXT NOT NULL CHECK (side_effect_status = 'unknown'),
+    notice_event_sequence INTEGER NOT NULL CHECK (notice_event_sequence > 0),
+    interaction_id TEXT NOT NULL UNIQUE REFERENCES runtime_interactions(interaction_id),
+    error_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS runtime_execution_recovery_state
+    ON runtime_execution_recoveries(state, created_at);
+
   CREATE TABLE IF NOT EXISTS runtime_provider_stop_incidents (
     incident_id TEXT PRIMARY KEY,
     turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
