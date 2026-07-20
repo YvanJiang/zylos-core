@@ -1787,11 +1787,32 @@ export function createExecutorService({
         expected_turn_version: request.expected_version.version,
         clear_unstarted_queue: false,
       });
-    } else if (request?.action === 'evict_idle_executor' && result.status === 'accepted') {
+    } else if (request?.action === 'reconcile' && result.status === 'accepted') {
       try {
-        if (typeof adapter.evictIdle !== 'function') {
-          throw new Error('The provider adapter cannot evict a resident executor.');
-        }
+        store.reconcileExpiredResidents();
+        adoptOrphanedWorkspaceRecoveries();
+        store.reconcileExpiredStartedInteractionHandoffs();
+        store.reconcileNonterminalTurns(
+          [...activeRuns.values()].map(({ turnContext }) => turnContext),
+          'sweep_reconciliation',
+        );
+        observabilityPublisher.recordReconciliation();
+        refresh();
+        return operationsControl.completeReconciliation(request);
+      } catch (error) {
+        return operationsControl.completeReconciliation(request, error);
+      }
+    } else if (request?.action === 'evict_idle_executor' && result.status === 'accepted') {
+      if (typeof adapter.evictIdle !== 'function') {
+        return operationsControl.completeEviction(request, {
+          code: 'unsupported_capability',
+          category: 'internal',
+          retryable: false,
+          side_effect_status: 'none',
+          user_message: 'The provider adapter does not support executor eviction.',
+        });
+      }
+      try {
         const evicted = await adapter.evictIdle({
           canEvict: (conversationId) => (
             conversationId === request.target.conversation_id

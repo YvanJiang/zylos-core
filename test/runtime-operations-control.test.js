@@ -379,6 +379,55 @@ describe('capability-first operations control', () => {
     });
   });
 
+  test.each([
+    ['conversation', { aggregate_type: 'conversation', conversation_id: 'missing-conversation' }],
+    ['turn', { aggregate_type: 'turn', turn_id: 'missing-turn' }],
+    ['queue', { aggregate_type: 'queue', conversation_id: 'missing-queue-conversation' }],
+    ['executor', { aggregate_type: 'executor', executor_instance_id: 'missing-executor' }],
+    ['recovery', { aggregate_type: 'recovery', recovery_id: 'missing-recovery' }],
+    ['service', { aggregate_type: 'service', service_instance_id: 'missing-service' }],
+  ])('durably returns not_found for a canonical missing %s target', async (_, target) => {
+    const database = openTestDatabase();
+    const envelope = normalEnvelope(`missing-${target.aggregate_type}`);
+    const policy = operationsPolicy(envelope, 'unused-conversation');
+    policy.grants[0].scope = {
+      scope_type: 'tenant',
+      region: envelope.region,
+      tenant_id: envelope.tenant_id,
+      bot_id: null,
+      conversation_id: null,
+      service_instance_id: null,
+      recovery_id: null,
+    };
+    const service = createOperationsControlService({
+      database,
+      serviceInstanceId: 'core-service-operations-A',
+      deploymentPolicy: policy,
+      now: () => '2026-07-20T08:00:02Z',
+      generateId: deterministicIds(`missing-${target.aggregate_type}`),
+    });
+    const request = inspectRequest(
+      target.conversation_id ?? 'unused-conversation',
+      `missing-${target.aggregate_type}-control`,
+    );
+    request.target = target;
+
+    const result = await service.execute(request, trustedTransport());
+    const replay = await service.execute(request, trustedTransport());
+
+    expect(result).toMatchObject({
+      status: 'not_found',
+      previous_target_version: null,
+      target_version: null,
+      result: null,
+      error: { code: 'not_found', category: 'conflict' },
+    });
+    expect(replay).toEqual(result);
+    expect(database.prepare(`
+      SELECT outcome FROM runtime_operations_audit WHERE audit_id = ?
+    `).get(result.audit_id)).toEqual({ outcome: 'not_found' });
+  });
+
   test('clears only the queued cutoff under queue-version CAS and replays after reopen', async () => {
     const database = openTestDatabase();
     const envelope = normalEnvelope('queue-first');
@@ -704,17 +753,127 @@ describe('capability-first operations control', () => {
     const result = await service.executeOperationsControl(request, trustedTransport());
     const replay = await service.executeOperationsControl(request, trustedTransport());
 
+    expect(result.error).toBe(null);
+
     expect(result).toMatchObject({
-      status: 'accepted',
-      control_result_version: 1,
+      status: 'completed',
+      control_result_version: 2,
       previous_target_version: 1,
-      target_version: 2,
-      completed_at: null,
-      result: { state: 'pending' },
+      target_version: 3,
+      completed_at: '2026-07-20T08:00:02Z',
+      result: { state: 'completed' },
     });
     expect(result.result.intent_id).toMatch(/^reconciliation-intent-/);
     expect(replay).toEqual(result);
+    expect(database.prepare(`
+      SELECT caller_namespace, state
+      FROM runtime_operations_reconciliation_intents WHERE intent_id = ?
+    `).get(result.result.intent_id)).toEqual({
+      caller_namespace: request.caller_namespace,
+      state: 'completed',
+    });
+    const otherCaller = structuredClone(request);
+    otherCaller.caller_namespace = 'automation.prod';
+    otherCaller.idempotency_key = createIdempotencyKey('control', {
+      caller_namespace: otherCaller.caller_namespace,
+      control_id: otherCaller.control_id,
+    });
+    otherCaller.expected_version.version = result.target_version;
+    const otherResult = await service.executeOperationsControl(
+      otherCaller,
+      trustedTransport(),
+    );
+    expect(otherResult).toMatchObject({
+      status: 'completed',
+      control_result_version: 2,
+      previous_target_version: result.target_version,
+      target_version: result.target_version + 2,
+      result: { state: 'completed' },
+    });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_operations_reconciliation_intents
+      WHERE service_instance_id = ? AND control_id = ?
+    `).get(request.target.service_instance_id, request.control_id).count).toBe(2);
     await service.close();
+  });
+
+  test('terminalizes a failed reconciliation and replays its versioned result after reopen', async () => {
+    const database = openTestDatabase();
+    const envelope = normalEnvelope('operations-reconcile-failed');
+    const policy = operationsPolicy(envelope, 'unused-conversation');
+    policy.grants[0] = {
+      ...policy.grants[0],
+      grant_id: 'grant-service-reconcile-failed',
+      capability: 'service.reconcile',
+      scope: {
+        scope_type: 'service',
+        region: envelope.region,
+        tenant_id: envelope.tenant_id,
+        bot_id: null,
+        conversation_id: null,
+        service_instance_id: 'core-service-operations-A',
+        recovery_id: null,
+      },
+    };
+    const executor = createExecutorService({
+      database,
+      provider: 'codex',
+      adapter: { async *execute() {} },
+      serviceInstanceId: 'core-service-operations-A',
+      now: () => '2026-07-20T08:00:02Z',
+      generateId: deterministicIds('operations-reconcile-failed-executor'),
+    });
+    const control = createOperationsControlService({
+      database,
+      serviceInstanceId: 'core-service-operations-A',
+      deploymentPolicy: policy,
+      serviceNamespace: { region: envelope.region, tenant_id: envelope.tenant_id },
+      now: () => '2026-07-20T08:00:02Z',
+      generateId: deterministicIds('operations-reconcile-failed-control'),
+    });
+    const request = mutationRequest({
+      action: 'reconcile',
+      target: { aggregate_type: 'service', service_instance_id: 'core-service-operations-A' },
+      aggregateId: 'core-service-operations-A',
+      version: 1,
+      controlId: 'operations-reconcile-failed',
+    });
+
+    const accepted = await control.execute(request, trustedTransport());
+    const failed = control.completeReconciliation(
+      request,
+      new Error('simulated reconciliation failure'),
+    );
+    const databasePath = database.name;
+    await executor.close();
+    database.close();
+    const reopenedDatabase = new Database(databasePath);
+    const reopened = createOperationsControlService({
+      database: reopenedDatabase,
+      serviceInstanceId: 'core-service-operations-A',
+      deploymentPolicy: policy,
+      serviceNamespace: { region: envelope.region, tenant_id: envelope.tenant_id },
+      now: () => '2026-07-20T08:00:02Z',
+      generateId: deterministicIds('operations-reconcile-failed-reopened'),
+    });
+    const replay = await reopened.execute(request, trustedTransport());
+
+    expect(accepted).toMatchObject({ status: 'accepted', control_result_version: 1 });
+    expect(failed).toMatchObject({
+      status: 'failed',
+      control_result_version: 2,
+      result: null,
+      error: {
+        code: 'side_effect_unknown',
+        category: 'internal',
+        side_effect_status: 'unknown',
+      },
+    });
+    expect(replay).toEqual(failed);
+    expect(reopenedDatabase.prepare(`
+      SELECT state FROM runtime_operations_reconciliation_intents WHERE intent_id = ?
+    `).get(accepted.result.intent_id)).toEqual({ state: 'failed' });
+    reopenedDatabase.close();
   });
 
   test('evicts only the canonical idle executor target and never uses runtime process identity', async () => {
@@ -839,6 +998,66 @@ describe('capability-first operations control', () => {
         code: 'side_effect_unknown',
         category: 'provider',
         side_effect_status: 'unknown',
+      },
+    });
+    await service.close();
+  });
+
+  test('reports unsupported eviction without claiming an unknown provider side effect', async () => {
+    const database = openTestDatabase();
+    const envelope = normalEnvelope('operations-evict-unsupported');
+    const accepted = acceptNormalInbound(database, envelope, {
+      now: () => '2026-07-20T08:00:00Z',
+      generateId: deterministicIds('operations-evict-unsupported'),
+    });
+    const policy = operationsPolicy(envelope, accepted.conversation_id);
+    policy.grants[0].grant_id = 'grant-executor-evict-unsupported';
+    policy.grants[0].capability = 'executor.evict';
+    const service = createExecutorService({
+      database,
+      provider: 'claude',
+      adapter: {
+        async *execute(context) {
+          context.reportProviderState({
+            state: 'started',
+            provider_native_id: 'session-evict-unsupported',
+          });
+          yield { type: 'turn_result', outcome: 'completed' };
+        },
+        async close() {},
+      },
+      serviceInstanceId: 'core-service-operations-A',
+      operationsPolicy: policy,
+      now: () => '2026-07-20T08:00:02Z',
+      generateId: deterministicIds('operations-evict-unsupported-service'),
+    });
+    service.start();
+    await service.runNext();
+    const executor = service.publishObservabilitySnapshot().executors.items.find(
+      ({ conversation_id: conversationId }) => conversationId === accepted.conversation_id,
+    );
+    const request = mutationRequest({
+      action: 'evict_idle_executor',
+      target: {
+        aggregate_type: 'executor',
+        conversation_id: accepted.conversation_id,
+        executor_instance_id: executor.executor_instance_id,
+      },
+      aggregateId: executor.executor_instance_id,
+      version: executor.executor_version,
+      controlId: 'operations-evict-unsupported',
+    });
+
+    const result = await service.executeOperationsControl(request, trustedTransport());
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      control_result_version: 2,
+      result: null,
+      error: {
+        code: 'unsupported_capability',
+        category: 'internal',
+        side_effect_status: 'none',
       },
     });
     await service.close();

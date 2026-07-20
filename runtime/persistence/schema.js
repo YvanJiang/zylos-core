@@ -578,12 +578,13 @@ const RUNTIME_SCHEMA = `
   CREATE TABLE IF NOT EXISTS runtime_operations_reconciliation_intents (
     intent_id TEXT PRIMARY KEY,
     service_instance_id TEXT NOT NULL,
+    caller_namespace TEXT NOT NULL,
     expected_service_version INTEGER NOT NULL CHECK (expected_service_version > 0),
     state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed')),
     control_id TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    UNIQUE (service_instance_id, control_id)
+    UNIQUE (service_instance_id, caller_namespace, control_id)
   );
 
   CREATE TABLE IF NOT EXISTS runtime_normalized_events (

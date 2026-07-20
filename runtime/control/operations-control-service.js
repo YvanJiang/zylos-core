@@ -2,9 +2,7 @@ import crypto from 'node:crypto';
 
 import {
   canonicalizeJson,
-  CONTROL_REQUEST_V1_SCHEMA,
   createContractError,
-  createPayloadHash,
   validateControlRequest,
   validateControlResult,
   validatePublicFixtureSafety,
@@ -130,6 +128,47 @@ function scopeCovers(scope, authority) {
     default:
       return false;
   }
+}
+
+function targetAggregateId(target) {
+  return target.service_instance_id
+    ?? target.recovery_id
+    ?? target.executor_instance_id
+    ?? target.turn_id
+    ?? target.conversation_id;
+}
+
+function scopeCouldCoverMissingTarget(scope, target) {
+  switch (scope.scope_type) {
+    case 'tenant':
+      return true;
+    case 'bot':
+      return target.aggregate_type !== 'service';
+    case 'conversation':
+      return target.conversation_id === scope.conversation_id;
+    case 'service':
+      return target.aggregate_type === 'service'
+        && target.service_instance_id === scope.service_instance_id;
+    case 'recovery':
+      return target.aggregate_type === 'recovery'
+        && target.recovery_id === scope.recovery_id
+        && target.conversation_id === scope.conversation_id;
+    default:
+      return false;
+  }
+}
+
+function missingTargetAuthority(request, grant) {
+  return {
+    aggregate_type: request.target.aggregate_type,
+    aggregate_id: targetAggregateId(request.target),
+    version: null,
+    region: grant.scope.region,
+    tenant_id: grant.scope.tenant_id,
+    bot_id: grant.scope.bot_id,
+    conversation_id: request.target.conversation_id ?? grant.scope.conversation_id,
+    snapshot: null,
+  };
 }
 
 function loadConversationAuthority(database, conversationId) {
@@ -601,12 +640,8 @@ export function createOperationsControlService({
         );
       }
       const normalized = normalizeRequest(request, trusted, policy, grant, authority);
-      const validated = validateControlRequest(normalized, { occurredAt: committedAt });
-      const requestHash = createPayloadHash(normalized, {
-        scope: 'control',
-        knownFields: CONTROL_REQUEST_V1_SCHEMA.required,
-        extensionFields: Object.keys(validated.extensions),
-      });
+      validateControlRequest(normalized, { occurredAt: committedAt });
+      const requestHash = attemptHash(request, trusted);
       const existing = database.prepare(`
         SELECT request_hash, latest_result_json
         FROM runtime_operations_controls
@@ -689,6 +724,98 @@ export function createOperationsControlService({
       );
       return result;
     }).immediate();
+  }
+
+  function persistNotFound(request, trusted, grant, authority, committedAt) {
+    const normalized = normalizeRequest(request, trusted, policy, grant, authority);
+    validateControlRequest(normalized, { occurredAt: committedAt });
+    const requestHash = attemptHash(request, trusted);
+    const existing = database.prepare(`
+      SELECT request_hash, latest_result_json
+      FROM runtime_operations_controls
+      WHERE caller_namespace = ? AND control_id = ?
+    `).get(normalized.caller_namespace, normalized.control_id);
+    if (existing) {
+      if (existing.request_hash !== requestHash) {
+        return persistIdempotencyConflict({
+          normalized,
+          trusted,
+          grant,
+          authority,
+          requestHash,
+          committedAt,
+        });
+      }
+      return JSON.parse(existing.latest_result_json);
+    }
+    const auditId = generateId('operations-audit');
+    const error = createContractError({
+      code: 'not_found',
+      category: 'conflict',
+      retryable: false,
+      userMessage: 'The canonical operations target does not exist.',
+      occurredAt: committedAt,
+    });
+    const result = validateControlResult({
+      contract: 'zylos.control-result',
+      contract_version: '1.0',
+      trace_id: normalized.trace_id,
+      caller_namespace: normalized.caller_namespace,
+      control_id: normalized.control_id,
+      control_result_version: 1,
+      status: 'not_found',
+      target: structuredClone(normalized.target),
+      previous_target_version: null,
+      target_version: null,
+      audit_id: auditId,
+      result: null,
+      error,
+      accepted_at: null,
+      completed_at: committedAt,
+    }, { occurredAt: committedAt, action: normalized.action }).forwarded;
+    database.prepare(`
+      INSERT INTO runtime_operations_controls (
+        caller_namespace, control_id, action, target_json, request_hash,
+        normalized_request_json, control_result_version, latest_result_json,
+        audit_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+    `).run(
+      normalized.caller_namespace,
+      normalized.control_id,
+      normalized.action,
+      canonicalizeJson(normalized.target),
+      requestHash,
+      canonicalizeJson(normalized),
+      canonicalizeJson(result),
+      auditId,
+      committedAt,
+      committedAt,
+    );
+    database.prepare(`
+      INSERT INTO runtime_operations_audit (
+        audit_id, caller_namespace, control_id, action, outcome,
+        subject_type, subject_id, capability, grant_id, policy_id, policy_version,
+        target_json, expected_version_json, previous_target_version, target_version,
+        reason, error_json, committed_at
+      ) VALUES (?, ?, ?, ?, 'not_found', ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+    `).run(
+      auditId,
+      normalized.caller_namespace,
+      normalized.control_id,
+      normalized.action,
+      trusted.verified_subject.type,
+      trusted.verified_subject.subject_id,
+      grant.capability,
+      grant.grant_id,
+      policy.policy_id,
+      policy.policy_version,
+      canonicalizeJson(normalized.target),
+      normalized.expected_version === null ? null : canonicalizeJson(normalized.expected_version),
+      normalized.reason,
+      canonicalizeJson(error),
+      committedAt,
+    );
+    return result;
   }
 
   function persistIdempotencyConflict({
@@ -776,8 +903,6 @@ export function createOperationsControlService({
     try {
       return database.transaction(() => {
         validatePublicFixtureSafety(request, { occurredAt: committedAt });
-        const authority = loadAuthority(database, request, serviceInstanceId, serviceNamespace);
-        if (!authority) throw new TypeError('control target does not exist');
         if (
           trusted.authorization_policy_id !== policy.policy_id
           || trusted.authorization_policy_version !== policy.policy_version
@@ -790,14 +915,38 @@ export function createOperationsControlService({
           );
         }
         const requiredCapability = ACTION_CAPABILITIES[request.action];
-        const grant = policy.grants.find((candidate) => (
+        const eligibleGrant = (candidate) => (
           candidate.subject.type === trusted.verified_subject.type
           && candidate.subject.subject_id === trusted.verified_subject.subject_id
           && candidate.capability === requiredCapability
           && candidate.state === 'active'
           && (candidate.expires_at === null
             || Date.parse(candidate.expires_at) > Date.parse(committedAt))
-          && scopeCovers(candidate.scope, authority)
+        );
+        const authority = loadAuthority(database, request, serviceInstanceId, serviceNamespace);
+        if (!authority) {
+          const missingGrant = policy.grants.find((candidate) => (
+            eligibleGrant(candidate)
+            && scopeCouldCoverMissingTarget(candidate.scope, request.target)
+          ));
+          if (!missingGrant) {
+            return persistForbidden(
+              request,
+              trusted,
+              committedAt,
+              'The verified subject has no current covering operations grant.',
+            );
+          }
+          return persistNotFound(
+            request,
+            trusted,
+            missingGrant,
+            missingTargetAuthority(request, missingGrant),
+            committedAt,
+          );
+        }
+        const grant = policy.grants.find((candidate) => (
+          eligibleGrant(candidate) && scopeCovers(candidate.scope, authority)
         ));
         if (!grant) {
           return persistForbidden(
@@ -826,12 +975,8 @@ export function createOperationsControlService({
         }
 
         const normalized = normalizeRequest(request, trusted, policy, grant, authority);
-        const validated = validateControlRequest(normalized, { occurredAt: committedAt });
-        const requestHash = createPayloadHash(normalized, {
-        scope: 'control',
-        knownFields: CONTROL_REQUEST_V1_SCHEMA.required,
-        extensionFields: Object.keys(validated.extensions),
-      });
+        validateControlRequest(normalized, { occurredAt: committedAt });
+        const requestHash = attemptHash(request, trusted);
       const existing = database.prepare(`
         SELECT request_hash, latest_result_json
         FROM runtime_operations_controls
@@ -896,12 +1041,13 @@ export function createOperationsControlService({
         const intentId = generateId('reconciliation-intent');
         database.prepare(`
           INSERT INTO runtime_operations_reconciliation_intents (
-            intent_id, service_instance_id, expected_service_version,
+            intent_id, service_instance_id, caller_namespace, expected_service_version,
             state, control_id, created_at, updated_at
-          ) VALUES (?, ?, ?, 'pending', ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
         `).run(
           intentId,
           serviceInstanceId,
+          normalized.caller_namespace,
           normalized.expected_version.version,
           normalized.control_id,
           committedAt,
@@ -909,11 +1055,9 @@ export function createOperationsControlService({
         );
         const advanced = database.prepare(`
           UPDATE runtime_observability_instances
-          SET service_version = service_version + 1,
-            last_reconciliation_at = ?, updated_at = ?
+          SET service_version = service_version + 1, updated_at = ?
           WHERE service_instance_id = ? AND service_version = ?
         `).run(
-          committedAt,
           committedAt,
           serviceInstanceId,
           normalized.expected_version.version,
@@ -1059,7 +1203,16 @@ export function createOperationsControlService({
       if (providerError !== null) {
         status = 'failed';
         result = null;
-        error = createContractError({
+        const unsupported = providerError.code === 'unsupported_capability'
+          && providerError.side_effect_status === 'none';
+        error = createContractError(unsupported ? {
+          code: 'unsupported_capability',
+          category: 'internal',
+          retryable: false,
+          sideEffectStatus: 'none',
+          userMessage: 'The provider adapter does not support executor eviction.',
+          occurredAt: completedAt,
+        } : {
           code: 'side_effect_unknown',
           category: 'provider',
           retryable: false,
@@ -1124,5 +1277,101 @@ export function createOperationsControlService({
     }).immediate();
   }
 
-  return Object.freeze({ completeEviction, execute });
+  function completeReconciliation(request, reconciliationError = null) {
+    const completedAt = requireTimestamp('reconciliation completion time', now());
+    return database.transaction(() => {
+      const row = database.prepare(`
+        SELECT control.normalized_request_json, control.latest_result_json,
+          control.audit_id, intent.intent_id, intent.state AS intent_state
+        FROM runtime_operations_controls AS control
+        JOIN runtime_operations_reconciliation_intents AS intent
+          ON intent.service_instance_id = ?
+          AND intent.caller_namespace = control.caller_namespace
+          AND intent.control_id = control.control_id
+        WHERE control.caller_namespace = ? AND control.control_id = ?
+          AND control.action = 'reconcile'
+      `).get(serviceInstanceId, request.caller_namespace, request.control_id);
+      if (!row) throw new TypeError('reconciliation control intent does not exist');
+      const normalized = JSON.parse(row.normalized_request_json);
+      const current = JSON.parse(row.latest_result_json);
+      if (current.status !== 'accepted') return current;
+      if (row.intent_state !== 'pending') {
+        const conflictError = new Error('The reconciliation intent is no longer pending.');
+        conflictError.code = 'version_conflict';
+        throw conflictError;
+      }
+      const service = database.prepare(`
+        SELECT service_version FROM runtime_observability_instances
+        WHERE service_instance_id = ?
+      `).get(serviceInstanceId);
+      if (!service) throw new TypeError('observability service instance is unavailable');
+      const status = reconciliationError === null ? 'completed' : 'failed';
+      const result = reconciliationError === null
+        ? { intent_id: row.intent_id, state: 'completed' }
+        : null;
+      const error = reconciliationError === null ? null : createContractError({
+        code: 'side_effect_unknown',
+        category: 'internal',
+        retryable: true,
+        sideEffectStatus: 'unknown',
+        userMessage: 'Runtime reconciliation did not reach a proven terminal state.',
+        occurredAt: completedAt,
+      });
+      const terminal = validateControlResult({
+        ...current,
+        control_result_version: current.control_result_version + 1,
+        status,
+        target_version: service.service_version,
+        result,
+        error,
+        completed_at: completedAt,
+      }, { occurredAt: completedAt, action: 'reconcile' }).forwarded;
+      const intentUpdate = database.prepare(`
+        UPDATE runtime_operations_reconciliation_intents
+        SET state = ?, updated_at = ?
+        WHERE intent_id = ? AND service_instance_id = ?
+          AND caller_namespace = ? AND control_id = ? AND state = 'pending'
+      `).run(
+        status === 'completed' ? 'completed' : 'failed',
+        completedAt,
+        row.intent_id,
+        serviceInstanceId,
+        normalized.caller_namespace,
+        normalized.control_id,
+      );
+      const controlUpdate = database.prepare(`
+        UPDATE runtime_operations_controls
+        SET control_result_version = ?, latest_result_json = ?, updated_at = ?
+        WHERE caller_namespace = ? AND control_id = ?
+          AND control_result_version = ? AND latest_result_json = ?
+      `).run(
+        terminal.control_result_version,
+        canonicalizeJson(terminal),
+        completedAt,
+        normalized.caller_namespace,
+        normalized.control_id,
+        current.control_result_version,
+        row.latest_result_json,
+      );
+      if (intentUpdate.changes !== 1 || controlUpdate.changes !== 1) {
+        const conflictError = new Error('The reconciliation completion lost its durable fence.');
+        conflictError.code = 'version_conflict';
+        throw conflictError;
+      }
+      database.prepare(`
+        UPDATE runtime_operations_audit
+        SET outcome = ?, target_version = ?, error_json = ?, committed_at = ?
+        WHERE audit_id = ?
+      `).run(
+        status,
+        service.service_version,
+        error === null ? null : canonicalizeJson(error),
+        completedAt,
+        row.audit_id,
+      );
+      return terminal;
+    }).immediate();
+  }
+
+  return Object.freeze({ completeEviction, completeReconciliation, execute });
 }
