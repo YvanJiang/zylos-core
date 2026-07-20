@@ -173,18 +173,26 @@ describe('installed executor upgrade driver', () => {
 
 describe('installed executor production upgrade owner', () => {
   test('postcommit cleanup removes only obsolete supervisor registrations', () => {
+    const zylosDir = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-pm2-owner-'));
+    directories.push(zylosDir);
     const commands = [];
-    const result = removeLegacyServiceRegistrations((file, args) => {
+    const result = removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn: (file, args) => {
       commands.push([file, args]);
       if (args[0] === 'jlist') {
         return JSON.stringify([
-          { name: 'c4-dispatcher', pm2_env: { status: 'stopped' } },
-          { name: 'activity-monitor', pm2_env: { status: 'errored' } },
+          { name: 'c4-dispatcher', pm2_env: {
+            status: 'stopped',
+            pm_exec_path: path.join(zylosDir, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-dispatcher.js'),
+          } },
+          { name: 'activity-monitor', pm2_env: {
+            status: 'errored',
+            pm_exec_path: path.join(zylosDir, '.claude', 'skills', 'activity-monitor', 'scripts', 'activity-monitor.js'),
+          } },
           { name: 'zylos-executor', pm2_env: { status: 'online' } },
         ]);
       }
       return '';
-    });
+    } });
 
     expect(result).toEqual({ removed_services: ['c4-dispatcher', 'activity-monitor'] });
     expect(commands).toEqual([
@@ -193,6 +201,27 @@ describe('installed executor production upgrade owner', () => {
       ['pm2', ['delete', 'activity-monitor']],
       ['pm2', ['save']],
     ]);
+  });
+
+  test('fails closed on generic PM2 name collisions without deleting user services', () => {
+    const zylosDir = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-pm2-collision-'));
+    directories.push(zylosDir);
+    const commands = [];
+
+    expect(() => removeLegacyServiceRegistrations({
+      zylosDir,
+      execFileSyncFn: (file, args) => {
+        commands.push([file, args]);
+        if (args[0] === 'jlist') {
+          return JSON.stringify([{
+            name: 'scheduler',
+            pm2_env: { status: 'online', pm_exec_path: '/opt/user/scheduler.js' },
+          }]);
+        }
+        return '';
+      },
+    })).toThrow('ambiguous PM2 service name collisions: scheduler');
+    expect(commands).toEqual([['pm2', ['jlist']]]);
   });
 
   test('commits a prepared release through Global26 and removes obsolete artifacts only afterward', async () => {
@@ -204,6 +233,7 @@ describe('installed executor production upgrade owner', () => {
     for (const release of [currentRelease, downloadedSource]) {
       fs.mkdirSync(path.join(release, 'runtime', 'executor'), { recursive: true });
       fs.mkdirSync(path.join(release, 'cli'), { recursive: true });
+      fs.mkdirSync(path.join(release, 'scripts'), { recursive: true });
       fs.mkdirSync(path.join(release, 'templates', 'pm2'), { recursive: true });
       fs.writeFileSync(path.join(release, 'package.json'), JSON.stringify({
         name: 'zylos', version: release === currentRelease ? 'release-A' : 'release-B',
@@ -213,6 +243,7 @@ describe('installed executor production upgrade owner', () => {
       fs.writeFileSync(path.join(release, 'runtime', 'executor', 'launcher.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'cli', 'launcher.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'cli', 'zylos.js'), 'export {};\n');
+      fs.writeFileSync(path.join(release, 'scripts', 'postinstall.js'), 'export {};\n');
       fs.writeFileSync(
         path.join(release, 'templates', 'pm2', 'ecosystem.config.cjs'),
         release === currentRelease
@@ -238,6 +269,8 @@ describe('installed executor production upgrade owner', () => {
       }
     }
     const commands = [];
+    const commandStates = [];
+    const commandDirectories = [];
     const handler = createInstalledExecutorUpgradeHandler({
       database,
       Database,
@@ -273,8 +306,14 @@ describe('installed executor production upgrade owner', () => {
           close: () => service.close(),
         };
       },
-      execFileSyncFn: (file, args) => {
+      execFileSyncFn: (file, args, options = {}) => {
         commands.push([file, args]);
+        commandDirectories.push(options.cwd ?? null);
+        if (file === process.execPath && args[0]?.endsWith('/scripts/postinstall.js')) {
+          commandStates.push(database.prepare(
+            'SELECT state FROM runtime_upgrade_runs ORDER BY created_at DESC LIMIT 1',
+          ).get()?.state ?? null);
+        }
         if (file === 'pm2') return '[]';
         return '';
       },
@@ -290,13 +329,119 @@ describe('installed executor production upgrade owner', () => {
     });
 
     expect(result).toMatchObject({ success: true, state: 'committed', to: 'release-B' });
-    expect(commands).toContainEqual(['npm', ['install', '--omit=dev', '--no-audit', '--no-fund']]);
+    expect(commands.filter(([file, args]) => file === 'npm' && args[0] === 'ci'))
+      .toHaveLength(7);
+    expect(commands).toContainEqual(['npm', ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund']]);
+    expect(commands).toContainEqual([
+      process.execPath,
+      [expect.stringMatching(/scripts\/postinstall\.js$/)],
+    ]);
+    expect(commandStates).toEqual(['committed']);
+    const precommitDependencyDirectories = commands
+      .map((command, index) => ({ command, cwd: commandDirectories[index] }))
+      .filter(({ command: [file, args], cwd }) => (
+        file === 'npm' && args[0] === 'ci' && cwd?.startsWith(path.join(zylosDir, 'runtime', 'releases'))
+      ))
+      .map(({ cwd }) => cwd);
+    expect(precommitDependencyDirectories).toHaveLength(4);
+    expect(precommitDependencyDirectories.some((cwd) => cwd.endsWith('/skills/comm-bridge'))).toBe(true);
+    expect(commands.filter(([file, args]) => file === 'npm' && args[0] === 'ci')
+      .every(([, args]) => args.includes('--ignore-scripts'))).toBe(true);
     expect(obsoleteArtifacts.every((artifact) => !fs.existsSync(artifact))).toBe(true);
     expect(JSON.parse(fs.readFileSync(
       path.join(zylosDir, 'runtime', 'active-release.json'), 'utf8',
     ))).toMatchObject({ release_ref: 'release-B', upgrade_id: expect.stringMatching(/^upgrade-/) });
     expect(fs.readFileSync(path.join(zylosDir, 'pm2', 'ecosystem.config.cjs'), 'utf8'))
       .toBe('module.exports = { apps: [{ name: "zylos-executor" }] };\n');
+    database.close();
+  });
+
+  test('stops owned legacy registrations before activation and restores their exact state on rollback', async () => {
+    const directory = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-legacy-rollback-'));
+    directories.push(directory);
+    const currentRelease = path.join(directory, 'release-A');
+    const downloadedSource = path.join(directory, 'downloaded-B');
+    const zylosDir = path.join(directory, 'installation');
+    for (const [release, version] of [[currentRelease, 'release-A'], [downloadedSource, 'release-B']]) {
+      for (const entry of ['runtime/executor', 'cli', 'scripts', 'templates/pm2']) {
+        fs.mkdirSync(path.join(release, entry), { recursive: true });
+      }
+      fs.writeFileSync(path.join(release, 'package.json'), JSON.stringify({ name: 'zylos', version }));
+      for (const entry of [
+        'runtime/executor/daemon.js', 'runtime/executor/health-probe.js',
+        'runtime/executor/launcher.js', 'cli/launcher.js', 'cli/zylos.js', 'scripts/postinstall.js',
+      ]) fs.writeFileSync(path.join(release, entry), 'export {};\n');
+      fs.writeFileSync(
+        path.join(release, 'templates', 'pm2', 'ecosystem.config.cjs'),
+        release === currentRelease
+          ? 'module.exports = { apps: [{ name: "activity-monitor" }, { name: "c4-dispatcher" }] };\n'
+          : 'module.exports = { apps: [{ name: "zylos-executor" }] };\n',
+      );
+    }
+    fs.mkdirSync(path.join(zylosDir, 'comm-bridge'), { recursive: true });
+    fs.mkdirSync(path.join(zylosDir, 'pm2'), { recursive: true });
+    fs.writeFileSync(
+      path.join(zylosDir, 'pm2', 'ecosystem.config.cjs'),
+      fs.readFileSync(path.join(currentRelease, 'templates', 'pm2', 'ecosystem.config.cjs')),
+    );
+    const scripts = new Map([
+      ['activity-monitor', path.join(zylosDir, '.claude', 'skills', 'activity-monitor', 'scripts', 'activity-monitor.js')],
+      ['c4-dispatcher', path.join(zylosDir, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-dispatcher.js')],
+    ]);
+    const processes = new Map([
+      ['activity-monitor', 'online'],
+      ['c4-dispatcher', 'stopped'],
+    ]);
+    const commands = [];
+    const execFileSyncFn = (file, args) => {
+      commands.push([file, args]);
+      if (file !== 'pm2') return '';
+      if (args[0] === 'jlist') {
+        return JSON.stringify([...processes].map(([name, status]) => ({
+          name,
+          pm2_env: { status, pm_exec_path: scripts.get(name) },
+        })));
+      }
+      if (args[0] === 'delete') processes.delete(args[1]);
+      if (args[0] === 'start') processes.set(args[args.indexOf('--only') + 1], 'online');
+      if (args[0] === 'stop') processes.set(args[1], 'stopped');
+      return '';
+    };
+    const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
+    const handler = createInstalledExecutorUpgradeHandler({
+      database,
+      Database,
+      zylosDir,
+      currentReleasePath: currentRelease,
+      currentReleaseRef: 'release-A',
+      provider: 'codex',
+      execFileSyncFn,
+      startTargetHealth: async () => ({
+        proof: {
+          service_instance_id: 'invalid-target', snapshot_version: 1,
+          health: 'unhealthy', reconciliation: 'incomplete',
+        },
+        close: async () => {},
+      }),
+    });
+
+    await expect(handler({
+      action: 'upgrade',
+      target: { release: 'release-B', downloaded_source: downloadedSource },
+    })).resolves.toMatchObject({ success: false, state: 'rolled_back' });
+    expect(processes).toEqual(new Map([
+      ['activity-monitor', 'online'],
+      ['c4-dispatcher', 'stopped'],
+    ]));
+    expect(commands).toContainEqual(['pm2', ['delete', 'activity-monitor']]);
+    expect(commands).toContainEqual(['pm2', ['delete', 'c4-dispatcher']]);
+    expect(commands).toContainEqual([
+      'pm2', ['start', path.join(zylosDir, 'pm2', 'ecosystem.config.cjs'), '--only', 'activity-monitor'],
+    ]);
+    expect(commands).toContainEqual(['pm2', ['stop', 'c4-dispatcher']]);
+    expect(JSON.parse(fs.readFileSync(
+      path.join(zylosDir, 'runtime', 'active-release.json'), 'utf8',
+    ))).toMatchObject({ release_ref: 'release-A', upgrade_id: null });
     database.close();
   });
 
@@ -310,12 +455,14 @@ describe('installed executor production upgrade owner', () => {
     for (const [release, version] of [[currentRelease, 'release-A'], [downloadedSource, 'release-B']]) {
       fs.mkdirSync(path.join(release, 'runtime', 'executor'), { recursive: true });
       fs.mkdirSync(path.join(release, 'cli'), { recursive: true });
+      fs.mkdirSync(path.join(release, 'scripts'), { recursive: true });
       fs.mkdirSync(path.join(release, 'templates', 'pm2'), { recursive: true });
       fs.writeFileSync(path.join(release, 'package.json'), JSON.stringify({ name: 'zylos', version }));
       fs.writeFileSync(path.join(release, 'runtime', 'executor', 'daemon.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'runtime', 'executor', 'launcher.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'cli', 'launcher.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'cli', 'zylos.js'), 'export {};\n');
+      fs.writeFileSync(path.join(release, 'scripts', 'postinstall.js'), 'export {};\n');
       fs.writeFileSync(
         path.join(release, 'templates', 'pm2', 'ecosystem.config.cjs'),
         'module.exports = { apps: [{ name: "zylos-executor" }] };\n',
@@ -372,12 +519,14 @@ describe('installed executor production upgrade owner', () => {
     for (const [release, version] of [[currentRelease, 'release-A'], [downloadedSource, 'release-B']]) {
       fs.mkdirSync(path.join(release, 'runtime', 'executor'), { recursive: true });
       fs.mkdirSync(path.join(release, 'cli'), { recursive: true });
+      fs.mkdirSync(path.join(release, 'scripts'), { recursive: true });
       fs.mkdirSync(path.join(release, 'templates', 'pm2'), { recursive: true });
       fs.writeFileSync(path.join(release, 'package.json'), JSON.stringify({ name: 'zylos', version }));
       fs.writeFileSync(path.join(release, 'runtime', 'executor', 'daemon.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'runtime', 'executor', 'launcher.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'cli', 'launcher.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'cli', 'zylos.js'), 'export {};\n');
+      fs.writeFileSync(path.join(release, 'scripts', 'postinstall.js'), 'export {};\n');
       fs.writeFileSync(
         path.join(release, 'templates', 'pm2', 'ecosystem.config.cjs'),
         'module.exports = { apps: [{ name: "zylos-executor" }] };\n',
@@ -439,6 +588,7 @@ describe('installed executor production upgrade owner', () => {
     for (const [release, version] of [[currentRelease, 'release-A'], [targetRelease, 'release-B']]) {
       fs.mkdirSync(path.join(release, 'runtime', 'executor'), { recursive: true });
       fs.mkdirSync(path.join(release, 'cli'), { recursive: true });
+      fs.mkdirSync(path.join(release, 'scripts'), { recursive: true });
       fs.mkdirSync(path.join(release, 'templates', 'pm2'), { recursive: true });
       fs.writeFileSync(path.join(release, 'package.json'), JSON.stringify({ name: 'zylos', version }));
       fs.writeFileSync(path.join(release, 'runtime', 'executor', 'daemon.js'), 'export {};\n');
@@ -446,6 +596,7 @@ describe('installed executor production upgrade owner', () => {
       fs.writeFileSync(path.join(release, 'runtime', 'executor', 'launcher.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'cli', 'launcher.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'cli', 'zylos.js'), 'export {};\n');
+      fs.writeFileSync(path.join(release, 'scripts', 'postinstall.js'), 'export {};\n');
       fs.writeFileSync(
         path.join(release, 'templates', 'pm2', 'ecosystem.config.cjs'),
         'module.exports = { apps: [{ name: "zylos-executor" }] };\n',

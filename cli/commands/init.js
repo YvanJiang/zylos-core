@@ -19,7 +19,10 @@ import { bold, dim, green, red, yellow, cyan, bgGreen, success, error, warn, hea
 import { commandExists } from '../lib/shell-utils.js';
 import { reconcileExecutorService } from '../lib/executor-service-lifecycle.js';
 import { assertLegacyServicesInactive } from '../../runtime/migration/installed-executor-upgrade.js';
-import { isRetiredRuntimeSkill } from '../../runtime/migration/legacy-lifecycle-artifacts.js';
+import {
+  cleanupRetiredRuntimeSkillArtifacts,
+  isRetiredRuntimeSkill,
+} from '../../runtime/migration/legacy-lifecycle-artifacts.js';
 import {
   activateFreshSplitInstructions,
   refreshSplitInstructions,
@@ -733,6 +736,8 @@ function syncCoreSkills() {
     }
   }
 
+  cleanupRetiredRuntimeSkillArtifacts({ skillsDir: SKILLS_DIR });
+
   return { installed, updated };
 }
 
@@ -964,7 +969,7 @@ async function startCoreServices() {
     throw new Error(`Executor service configuration is missing: ${ecosystemPath}`);
   }
 
-  assertLegacyServicesInactive();
+  assertLegacyServicesInactive({ zylosDir: ZYLOS_DIR });
 
   const result = requireHealthyExecutorStart(
     await reconcileExecutorService({

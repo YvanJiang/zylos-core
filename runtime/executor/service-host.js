@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
@@ -5,6 +6,13 @@ import path from 'node:path';
 import { createExecutorService } from './service.js';
 
 const MAX_REQUEST_BYTES = 64 * 1024;
+
+function matchesSocketIdentity(stat, identity) {
+  return stat.dev === identity.dev
+    && stat.ino === identity.ino
+    && stat.ctimeNs === identity.ctimeNs
+    && stat.birthtimeNs === identity.birthtimeNs;
+}
 
 function requireSocketPath(socketPath) {
   if (typeof socketPath !== 'string' || !path.isAbsolute(socketPath)) {
@@ -16,10 +24,10 @@ function requireSocketPath(socketPath) {
   return socketPath;
 }
 
-function removeOwnedSocket(socketPath) {
+function removeOwnedSocket(socketPath, identity = null) {
   let stat;
   try {
-    stat = fs.lstatSync(socketPath);
+    stat = fs.lstatSync(socketPath, { bigint: true });
   } catch (error) {
     if (error?.code === 'ENOENT') return;
     throw error;
@@ -27,7 +35,11 @@ function removeOwnedSocket(socketPath) {
   if (!stat.isSocket()) {
     throw new Error(`Refusing to replace non-socket control path: ${socketPath}`);
   }
+  if (identity !== null && !matchesSocketIdentity(stat, identity)) {
+    return false;
+  }
   fs.unlinkSync(socketPath);
+  return true;
 }
 
 async function prepareSocketPath(socketPath) {
@@ -90,7 +102,10 @@ export function requestExecutorService(socketPath, request, { timeoutMs = 5_000 
     const socket = net.createConnection(socketPath);
     let data = '';
     const timer = setTimeout(() => {
-      socket.destroy(new Error('Executor service control request timed out.'));
+      const error = new Error('Executor service control request timed out; the durable operation outcome is unknown.');
+      error.code = 'ETIMEDOUT';
+      error.outcome = 'unknown';
+      socket.destroy(error);
     }, timeoutMs);
     timer.unref?.();
     socket.setEncoding('utf8');
@@ -129,6 +144,7 @@ export function createExecutorServiceHost({
   pollIntervalMs = 250,
   onUpgrade = null,
   onClose = null,
+  healthCheck = null,
   createService = createExecutorService,
   ...serviceOptions
 }) {
@@ -139,6 +155,9 @@ export function createExecutorServiceHost({
   if (typeof createService !== 'function') throw new TypeError('createService must be a function');
   if (onUpgrade !== null && typeof onUpgrade !== 'function') {
     throw new TypeError('onUpgrade must be a function or null');
+  }
+  if (healthCheck !== null && typeof healthCheck !== 'function') {
+    throw new TypeError('healthCheck must be a function or null');
   }
   if (onClose !== null && typeof onClose !== 'function') {
     throw new TypeError('onClose must be a function or null');
@@ -158,7 +177,7 @@ export function createExecutorServiceHost({
   let pollActive = false;
   let resourceClosePromise = null;
   let closePromise = null;
-  let ownsSocket = false;
+  let ownedSocketIdentity = null;
   let lifecycleMutation = null;
   let resolveClosed;
   const closed = new Promise((resolve) => { resolveClosed = resolve; });
@@ -194,7 +213,14 @@ export function createExecutorServiceHost({
       let request;
       Promise.resolve().then(async () => {
         request = JSON.parse(data.slice(0, newline));
+        if (lifecycle !== 'open' && request.action !== 'shutdown') {
+          throw new Error('executor_service_closing');
+        }
         if (request.action === 'health') {
+          const prerequisiteHealth = healthCheck?.();
+          if (prerequisiteHealth?.ok === false) {
+            throw new Error(prerequisiteHealth.error ?? 'executor_prerequisite_failed');
+          }
           const snapshot = service.publishObservabilitySnapshot();
           return {
             executor: {
@@ -205,6 +231,9 @@ export function createExecutorServiceHost({
           };
         }
         if (request.action === 'shutdown') {
+          if (lifecycleMutation !== null) {
+            throw new Error('executor_lifecycle_operation_in_progress');
+          }
           await closeResources();
           return { status: 'completed', service_instance_id: serviceInstanceId };
         }
@@ -248,12 +277,18 @@ export function createExecutorServiceHost({
     service.start();
     try {
       await listen(server, socketPath);
-      ownsSocket = true;
+      fs.chmodSync(socketPath, 0o600);
+      const socketStat = fs.lstatSync(socketPath, { bigint: true });
+      ownedSocketIdentity = Object.freeze({
+        dev: socketStat.dev,
+        ino: socketStat.ino,
+        ctimeNs: socketStat.ctimeNs,
+        birthtimeNs: socketStat.birthtimeNs,
+      });
     } catch (error) {
       await service.close();
       throw error;
     }
-    fs.chmodSync(socketPath, 0o600);
     lifecycle = 'open';
     pollTimer = setInterval(() => poll().catch(() => {}), pollIntervalMs);
     pollTimer.unref?.();
@@ -292,15 +327,36 @@ export function createExecutorServiceHost({
     closePromise = (async () => {
       const failures = [];
       try { await closeResources(); } catch (error) { failures.push(error); }
+      let reboundPath = null;
       try {
+        if (ownedSocketIdentity !== null) {
+          try {
+            const current = fs.lstatSync(socketPath, { bigint: true });
+            if (!matchesSocketIdentity(current, ownedSocketIdentity)) {
+              reboundPath = `${socketPath}.rebound-${process.pid}-${crypto.randomUUID()}`;
+              fs.renameSync(socketPath, reboundPath);
+            }
+          } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+          }
+        }
         const serverClosed = closeServer(server);
         for (const socket of controlSockets) socket.destroy();
         await serverClosed;
       } catch (error) { failures.push(error); }
-      if (ownsSocket) {
+      if (reboundPath !== null) {
         try {
-          removeOwnedSocket(socketPath);
-          ownsSocket = false;
+          if (fs.existsSync(socketPath)) {
+            throw new Error(`Executor control path was rebound again during shutdown: ${socketPath}`);
+          }
+          fs.renameSync(reboundPath, socketPath);
+          reboundPath = null;
+        } catch (error) { failures.push(error); }
+      }
+      if (ownedSocketIdentity !== null) {
+        try {
+          removeOwnedSocket(socketPath, ownedSocketIdentity);
+          ownedSocketIdentity = null;
         } catch (error) { failures.push(error); }
       }
       lifecycle = failures.length === 0 ? 'closed' : 'close_failed';

@@ -8,6 +8,7 @@ import { commandExists } from '../lib/shell-utils.js';
 import {
   getExecutorServiceHealth,
   restartExecutorService,
+  selfHealExecutorService,
 } from '../lib/executor-service-lifecycle.js';
 import {
   installClaude,
@@ -174,8 +175,19 @@ async function switchRuntime(target, flags) {
     return { ok: false, error: 'invalid_flags' };
   }
   if (current === target && !parsed.apiKey && !parsed.setupToken && !parsed.baseUrl) {
-    console.log(`Already using ${bold(target)}.`);
-    return { ok: true, unchanged: true, provider: target };
+    const reconciled = await selfHealExecutorService({
+      zylosDir: ZYLOS_DIR,
+      expectedProvider: target,
+    });
+    if (!reconciled.ok) {
+      console.error(red(`Executor provider reconciliation failed: ${reconciled.error}`));
+      process.exitCode = 1;
+      return reconciled;
+    }
+    console.log(reconciled.repaired
+      ? green(`Executor provider reconciled to ${bold(target)}.`)
+      : `Already using ${bold(target)}.`);
+    return { ...reconciled, provider: target, unchanged: !reconciled.repaired };
   }
 
   if (!commandExists(target)) {
@@ -208,16 +220,22 @@ async function switchRuntime(target, flags) {
     return { ok: false, error: 'instruction_migration_required' };
   }
 
-  updateZylosConfig({ runtime: target });
   const restarted = await restartExecutorService({
     zylosDir: ZYLOS_DIR,
     expectedProvider: target,
+    beforeSupervisorRestart: () => updateZylosConfig({ runtime: target }),
+    restoreConfiguration: () => updateZylosConfig({ runtime: current }),
   });
   if (!restarted.ok) {
-    updateZylosConfig({ runtime: current });
-    console.error(red(`Executor restart failed; provider configuration restored to ${current}.`));
+    const restored = restarted.configurationRollback?.ok === true;
+    console.error(red(restored
+      ? `Executor restart failed; provider configuration and service restored to ${current}.`
+      : `Executor restart failed and restoration to ${current} was not confirmed.`));
     process.exitCode = 1;
-    return { ok: false, error: restarted.error, rolledBackProvider: current };
+    return {
+      ...restarted,
+      rolledBackProvider: restored ? current : null,
+    };
   }
 
   console.log(green(`Executor provider switched to ${bold(target)}.`));

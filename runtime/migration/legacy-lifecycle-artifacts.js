@@ -17,6 +17,23 @@ export function isRetiredRuntimeSkill(skillName) {
   return RETIRED_RUNTIME_SKILLS.has(skillName);
 }
 
+export function cleanupRetiredRuntimeSkillArtifacts({ skillsDir }) {
+  const root = requireZylosDir(skillsDir);
+  const artifacts = [
+    path.join(root, 'comm-bridge', 'scripts', 'c4-dispatcher.js'),
+  ];
+  const removed = [];
+  for (const artifact of artifacts) {
+    try {
+      fs.unlinkSync(artifact);
+      removed.push(artifact);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
+  return Object.freeze({ removed: Object.freeze(removed) });
+}
+
 // These exact identifiers exist only for one-time post-commit cleanup. Nothing in
 // the normal runtime imports, dispatches, executes, or selects these artifacts.
 export function legacyLifecycleArtifactPaths(zylosDir) {
@@ -25,6 +42,7 @@ export function legacyLifecycleArtifactPaths(zylosDir) {
     path.join(root, 'pm2', 'tmux-runtime.config.cjs'),
     path.join(root, '.zylos', 'tmux-runtime.json'),
     path.join(root, 'bin', 'start-tmux-runtime.sh'),
+    path.join(root, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-dispatcher.js'),
     path.join(root, '.claude', 'skills', 'activity-monitor'),
     path.join(root, '.codex', 'skills', 'activity-monitor'),
   ]);

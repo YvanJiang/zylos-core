@@ -20,6 +20,10 @@ import { execFileSync } from 'node:child_process';
 import { smartSync, formatMergeResult } from '../cli/lib/smart-merge.js';
 import { copyTree } from '../cli/lib/fs-utils.js';
 import { generateManifest, saveManifest, saveOriginals } from '../cli/lib/manifest.js';
+import {
+  cleanupRetiredRuntimeSkillArtifacts,
+  isRetiredRuntimeSkill,
+} from '../runtime/migration/legacy-lifecycle-artifacts.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(process.env.HOME, 'zylos');
@@ -41,6 +45,7 @@ function syncSkills() {
   const entries = fs.readdirSync(CORE_SKILLS_SRC, { withFileTypes: true });
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
+    if (isRetiredRuntimeSkill(entry.name)) continue;
 
     const srcDir = path.join(CORE_SKILLS_SRC, entry.name);
     const destDir = path.join(SKILLS_DIR, entry.name);
@@ -82,6 +87,8 @@ function syncSkills() {
       console.log(`  Warning: Failed to update ${entry.name}: ${err.message}`);
     }
   }
+
+  cleanupRetiredRuntimeSkillArtifacts({ skillsDir: SKILLS_DIR });
 
   if (added > 0 || updated > 0 || unchanged > 0) {
     console.log(`Core Skills: ${added} added, ${updated} updated, ${unchanged} unchanged.`);

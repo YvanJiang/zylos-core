@@ -18,6 +18,7 @@ import {
 
 import { resolveCliEntry } from '../cli/launcher.js';
 import { runtimeCommand } from '../cli/commands/runtime.js';
+import { classifyExecutorUpgradeControlFailure } from '../cli/commands/component.js';
 
 function health(instanceId, status = 'healthy', provider = 'codex') {
   return {
@@ -33,7 +34,24 @@ function health(instanceId, status = 'healthy', provider = 'codex') {
   };
 }
 
+function shutdown(instanceId) {
+  return { ok: true, result: { status: 'completed', service_instance_id: instanceId } };
+}
+
 describe('executor lifecycle CLI boundary', () => {
+  test('classifies a control timeout as an unknown durable outcome without a fake failed step', () => {
+    const timeout = Object.assign(new Error('timed out'), {
+      code: 'ETIMEDOUT', outcome: 'unknown',
+    });
+    expect(classifyExecutorUpgradeControlFailure(timeout)).toEqual({
+      action: 'self_upgrade',
+      success: false,
+      state: 'uncertain',
+      uncertain: true,
+      failedStep: null,
+      error: 'Upgrade result is uncertain; Core may still commit. Reconnect and query the authoritative upgrade state before retrying.',
+    });
+  });
   test('runtime status reports the provider and identity from Core health', async () => {
     const log = jest.spyOn(console, 'log').mockImplementation(() => {});
     try {
@@ -86,7 +104,10 @@ describe('executor lifecycle CLI boundary', () => {
 
   test('restart succeeds only after Core reports a new healthy identity', async () => {
     const commands = [];
-    const replies = [health('executor-old'), health('executor-old'), health('executor-new')];
+    const replies = [
+      health('executor-old'), shutdown('executor-old'),
+      health('executor-old'), health('executor-new'),
+    ];
     const result = await restartExecutorService({
       zylosDir: '/tmp/zylos-cli-fixture',
       execFileSyncFn: (file, args) => commands.push([file, args]),
@@ -104,6 +125,7 @@ describe('executor lifecycle CLI boundary', () => {
   test('restart rejects a new healthy identity for the wrong provider', async () => {
     const replies = [
       health('executor-old', 'healthy', 'claude'),
+      shutdown('executor-old'),
       health('executor-wrong-provider', 'healthy', 'claude'),
     ];
     const result = await restartExecutorService({
@@ -120,6 +142,94 @@ describe('executor lifecycle CLI boundary', () => {
       expectedProvider: 'codex',
       provider: 'claude',
     });
+  });
+
+  test('restart does not invoke the supervisor while Core is in lifecycle maintenance', async () => {
+    const commands = [];
+    const busy = health('executor-busy');
+    busy.result.snapshot.service.maintenance = true;
+    const result = await restartExecutorService({
+      zylosDir: '/tmp/zylos-cli-fixture',
+      execFileSyncFn: (file, args) => commands.push([file, args]),
+      requestFn: async () => busy,
+      retryDelaysMs: [0],
+    });
+
+    expect(result).toEqual({ ok: false, error: 'executor_lifecycle_operation_in_progress' });
+    expect(commands).toEqual([]);
+  });
+
+  test('provider reconfiguration rolls back the configuration and old provider on failed health', async () => {
+    const events = [];
+    const replies = [
+      health('executor-old', 'healthy', 'claude'),
+      shutdown('executor-old'),
+      health('executor-wrong', 'healthy', 'claude'),
+      health('executor-restored', 'healthy', 'claude'),
+    ];
+    const result = await restartExecutorService({
+      zylosDir: '/tmp/zylos-cli-fixture',
+      expectedProvider: 'codex',
+      beforeSupervisorRestart: async () => events.push('configure-codex'),
+      restoreConfiguration: async () => events.push('restore-claude'),
+      execFileSyncFn: (file, args) => events.push(`${file}:${args[0]}`),
+      requestFn: async (_socket, request) => {
+        events.push(`core:${request.action}`);
+        return replies.shift();
+      },
+      retryDelaysMs: [0],
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: 'executor_provider_mismatch',
+      configurationRollback: {
+        ok: true,
+        provider: 'claude',
+        serviceInstanceId: 'executor-restored',
+      },
+    });
+    expect(events).toEqual([
+      'core:health', 'core:shutdown', 'configure-codex',
+      'pm2:restart', 'pm2:save', 'core:health', 'restore-claude',
+      'pm2:restart', 'pm2:save', 'core:health',
+    ]);
+  });
+
+  test('configuration preparation failure restarts the acknowledged old executor after restoring config', async () => {
+    const events = [];
+    const replies = [
+      health('executor-old', 'healthy', 'claude'),
+      shutdown('executor-old'),
+      health('executor-restored', 'healthy', 'claude'),
+    ];
+    const result = await restartExecutorService({
+      zylosDir: '/tmp/zylos-cli-fixture',
+      expectedProvider: 'codex',
+      beforeSupervisorRestart: async () => {
+        events.push('configure-codex');
+        throw new Error('config write failed');
+      },
+      restoreConfiguration: async () => events.push('restore-claude'),
+      execFileSyncFn: (file, args) => events.push(`${file}:${args[0]}`),
+      requestFn: async (_socket, request) => {
+        events.push(`core:${request.action}`);
+        return replies.shift();
+      },
+      retryDelaysMs: [0],
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: 'config write failed',
+      configurationRollback: {
+        ok: true, provider: 'claude', serviceInstanceId: 'executor-restored',
+      },
+    });
+    expect(events).toEqual([
+      'core:health', 'core:shutdown', 'configure-codex', 'restore-claude',
+      'pm2:restart', 'pm2:save', 'core:health',
+    ]);
   });
 
   test('self-heal is a no-op for healthy Core and starts an unavailable service', async () => {
@@ -148,6 +258,7 @@ describe('executor lifecycle CLI boundary', () => {
     const degradedReplies = [
       health('executor-degraded', 'degraded'),
       health('executor-degraded', 'degraded'),
+      shutdown('executor-degraded'),
       health('executor-healed'),
     ];
     await expect(selfHealExecutorService({
@@ -162,6 +273,26 @@ describe('executor lifecycle CLI boundary', () => {
       serviceInstanceId: 'executor-healed',
     });
     expect(degradedCommands[0]).toEqual([
+      'pm2', ['restart', '/tmp/zylos-cli-fixture/pm2/ecosystem.config.cjs', '--only', EXECUTOR_SERVICE_NAME],
+    ]);
+
+    const mismatchCommands = [];
+    const mismatchReplies = [
+      health('executor-claude', 'healthy', 'claude'),
+      health('executor-claude', 'healthy', 'claude'),
+      shutdown('executor-claude'),
+      health('executor-codex', 'healthy', 'codex'),
+    ];
+    await expect(selfHealExecutorService({
+      zylosDir: '/tmp/zylos-cli-fixture',
+      expectedProvider: 'codex',
+      execFileSyncFn: (file, args) => mismatchCommands.push([file, args]),
+      requestFn: async () => mismatchReplies.shift(),
+      retryDelaysMs: [0],
+    })).resolves.toMatchObject({
+      ok: true, repaired: true, provider: 'codex', serviceInstanceId: 'executor-codex',
+    });
+    expect(mismatchCommands[0]).toEqual([
       'pm2', ['restart', '/tmp/zylos-cli-fixture/pm2/ecosystem.config.cjs', '--only', EXECUTOR_SERVICE_NAME],
     ]);
   });
@@ -187,6 +318,7 @@ describe('executor lifecycle CLI boundary', () => {
     const replies = [
       health('executor-before-init'),
       health('executor-before-init'),
+      shutdown('executor-before-init'),
       health('executor-after-init'),
     ];
     await expect(reconcileExecutorService({

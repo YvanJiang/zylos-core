@@ -149,28 +149,91 @@ export async function stopExecutorService({
 export async function restartExecutorService({
   zylosDir,
   expectedProvider = null,
+  beforeSupervisorRestart = null,
+  restoreConfiguration = null,
   execFileSyncFn = execFileSync,
   requestFn = requestExecutorService,
   retryDelaysMs = [0, 100, 250, 500, 1_000, 2_000],
 } = {}) {
   const previous = await readHealth({ zylosDir, requestFn });
   if (typeof previous.serviceInstanceId !== 'string') return previous;
+  if (previous.snapshot?.service?.maintenance === true
+    || previous.snapshot?.service?.draining === true) {
+    return { ok: false, error: 'executor_lifecycle_operation_in_progress' };
+  }
+  let shutdown;
+  try {
+    shutdown = await requestFn(executorServiceSocketPath(zylosDir), { action: 'shutdown' });
+  } catch (error) {
+    return { ok: false, error: error?.code ?? error?.message ?? 'shutdown_unavailable' };
+  }
+  if (shutdown?.ok !== true || shutdown.result?.status !== 'completed') {
+    return { ok: false, error: shutdown?.error ?? 'shutdown_not_acknowledged' };
+  }
+  try {
+    await beforeSupervisorRestart?.();
+  } catch (error) {
+    let rollback = null;
+    if (restoreConfiguration !== null) {
+      try {
+        await restoreConfiguration();
+        runPm2(execFileSyncFn, [
+          'restart', ecosystemPath(zylosDir), '--only', EXECUTOR_SERVICE_NAME,
+        ]);
+        runPm2(execFileSyncFn, ['save']);
+        rollback = await waitForHealthy({
+          zylosDir, requestFn, retryDelaysMs,
+          previousServiceInstanceId: previous.serviceInstanceId,
+          expectedProvider: previous.provider ?? null,
+        });
+      } catch (rollbackError) {
+        rollback = {
+          ok: false,
+          error: rollbackError?.message ?? 'executor_provider_rollback_failed',
+        };
+      }
+    }
+    return {
+      ok: false,
+      error: error?.message ?? 'executor_restart_prepare_failed',
+      configurationRollback: rollback,
+    };
+  }
+  let restartFailure = null;
   try {
     runPm2(execFileSyncFn, [
       'restart', ecosystemPath(zylosDir), '--only', EXECUTOR_SERVICE_NAME,
     ]);
     runPm2(execFileSyncFn, ['save']);
   } catch (error) {
-    return pm2Failure(error);
+    restartFailure = pm2Failure(error);
   }
-  const current = await waitForHealthy({
-    zylosDir,
-    requestFn,
-    retryDelaysMs,
-    previousServiceInstanceId: previous.serviceInstanceId,
-    expectedProvider,
+  const current = restartFailure ?? await waitForHealthy({
+    zylosDir, requestFn, retryDelaysMs,
+    previousServiceInstanceId: previous.serviceInstanceId, expectedProvider,
   });
-  return current.ok ? { ...current, previousServiceInstanceId: previous.serviceInstanceId } : current;
+  if (current.ok) return { ...current, previousServiceInstanceId: previous.serviceInstanceId };
+  if (restoreConfiguration === null) return current;
+
+  let rollback;
+  try {
+    await restoreConfiguration();
+    runPm2(execFileSyncFn, [
+      'restart', ecosystemPath(zylosDir), '--only', EXECUTOR_SERVICE_NAME,
+    ]);
+    runPm2(execFileSyncFn, ['save']);
+    rollback = await waitForHealthy({
+      zylosDir, requestFn, retryDelaysMs,
+      previousServiceInstanceId: previous.serviceInstanceId,
+      expectedProvider: previous.provider ?? null,
+    });
+  } catch (error) {
+    rollback = { ok: false, error: error?.message ?? 'executor_provider_rollback_failed' };
+  }
+  return {
+    ...current,
+    configurationRollback: rollback,
+  };
 }
 
 export async function selfHealExecutorService(options = {}) {
@@ -178,7 +241,9 @@ export async function selfHealExecutorService(options = {}) {
     zylosDir: options.zylosDir,
     requestFn: options.requestFn ?? requestExecutorService,
   });
-  if (current.ok) return { ...current, repaired: false };
+  const providerMatches = options.expectedProvider == null
+    || current.provider === options.expectedProvider;
+  if (current.ok && providerMatches) return { ...current, repaired: false };
   const repaired = typeof current.serviceInstanceId === 'string'
     ? await restartExecutorService(options)
     : await startExecutorService(options);

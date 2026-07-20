@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
+import { EventEmitter } from 'node:events';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -14,6 +15,7 @@ import {
   requestExecutorService,
 } from '../runtime/executor/service-host.js';
 import { runExecutorDaemon } from '../runtime/executor/daemon.js';
+import { createExecutorPrerequisiteOwner } from '../runtime/executor/prerequisite-owner.js';
 import {
   cleanupObsoleteLifecycleArtifacts,
   legacyLifecycleArtifactPaths,
@@ -151,6 +153,40 @@ describe('executor service lifecycle host', () => {
     fs.rmSync(state.socketPath, { force: true });
   });
 
+  test('does not unlink a replacement socket that rebinds the control path', async () => {
+    const state = fixture();
+    const host = createExecutorServiceHost({
+      database: state.database,
+      adapter: inertAdapter(),
+      provider: 'claude',
+      serviceInstanceId: 'service-fixture-rebound-socket',
+      socketPath: state.socketPath,
+      workspaceRoot: state.directory,
+    });
+    hosts.push(host);
+    await host.start();
+
+    fs.unlinkSync(state.socketPath);
+    const replacement = net.createServer((socket) => {
+      socket.once('data', () => socket.end('{"ok":true,"owner":"replacement"}\n'));
+    });
+    await new Promise((resolve, reject) => {
+      replacement.once('error', reject);
+      replacement.listen(state.socketPath, resolve);
+    });
+    try {
+      await host.close();
+      expect(fs.existsSync(state.socketPath)).toBe(true);
+      await expect(requestExecutorService(state.socketPath, { action: 'health' }))
+        .resolves.toEqual({ ok: true, owner: 'replacement' });
+    } finally {
+      await new Promise((resolve, reject) => replacement.close((error) => (
+        error ? reject(error) : resolve()
+      )));
+      fs.rmSync(state.socketPath, { force: true });
+    }
+  });
+
   test('an idle control client cannot block executor shutdown', async () => {
     const state = fixture();
     const host = createExecutorServiceHost({
@@ -253,6 +289,35 @@ describe('executor service lifecycle host', () => {
     await expect(closing).resolves.toBeUndefined();
     expect(cleanup).toEqual(['upgrade-complete', 'resources-closed']);
     await Promise.allSettled([upgrade]);
+  });
+
+  test('rejects new lifecycle work after resource shutdown begins', async () => {
+    const state = fixture();
+    let releaseClose;
+    let markClosing;
+    const closeGate = new Promise((resolve) => { releaseClose = resolve; });
+    const closingStarted = new Promise((resolve) => { markClosing = resolve; });
+    let upgrades = 0;
+    const host = createExecutorServiceHost({
+      database: state.database,
+      adapter: inertAdapter(),
+      provider: 'claude',
+      serviceInstanceId: 'service-fixture-closing-rejects-upgrade',
+      socketPath: state.socketPath,
+      workspaceRoot: state.directory,
+      onUpgrade: async () => { upgrades += 1; return { state: 'rolled_back' }; },
+      onClose: async () => { markClosing(); await closeGate; },
+    });
+    hosts.push(host);
+    await host.start();
+    const closing = host.close();
+    await closingStarted;
+
+    await expect(requestExecutorService(state.socketPath, { action: 'upgrade', target: {} }))
+      .resolves.toEqual({ ok: false, error: 'executor_service_closing' });
+    expect(upgrades).toBe(0);
+    releaseClose();
+    await closing;
   });
 
   test('runs the owning resource cleanup when remote shutdown completes', async () => {
@@ -386,6 +451,11 @@ describe('executor daemon resource ownership', () => {
       Database: function DatabaseFixture() { return database; },
       createAdapter: () => inertAdapter(),
       createUpgradeHandler: () => async () => ({ state: 'committed' }),
+      createPrerequisiteOwner: () => ({
+        async start() { events.push('prerequisites-start'); },
+        health() { return { ok: true }; },
+        async close() { events.push('prerequisites-close'); },
+      }),
       createHost: (options) => {
         hostOptions = options;
         return host;
@@ -393,7 +463,52 @@ describe('executor daemon resource ownership', () => {
     });
 
     await daemon.close();
-    expect(events).toEqual(['host-start', 'host-close', 'database-close']);
+    expect(events).toEqual([
+      'prerequisites-start', 'host-start', 'host-close',
+      'prerequisites-close', 'database-close',
+    ]);
+  });
+});
+
+describe('executor prerequisite ownership', () => {
+  test('owns scheduler and web-console children without starting retired runtime daemons', async () => {
+    const state = fixture();
+    const scheduler = path.join(state.directory, '.claude', 'skills', 'scheduler', 'scripts', 'daemon.js');
+    const webConsole = path.join(state.directory, '.claude', 'skills', 'web-console', 'scripts', 'server.js');
+    fs.mkdirSync(path.dirname(scheduler), { recursive: true });
+    fs.mkdirSync(path.dirname(webConsole), { recursive: true });
+    fs.writeFileSync(scheduler, '');
+    fs.writeFileSync(webConsole, '');
+    const spawned = [];
+
+    class ChildFixture extends EventEmitter {
+      exitCode = null;
+      signalCode = null;
+      kill(signal) {
+        this.signalCode = signal;
+        setImmediate(() => this.emit('close', null, signal));
+        return true;
+      }
+    }
+    const owner = createExecutorPrerequisiteOwner({
+      zylosDir: state.directory,
+      inspectLegacy: () => [],
+      spawnFn: (command, args, options) => {
+        spawned.push({ command, args, options });
+        const child = new ChildFixture();
+        setImmediate(() => child.emit('spawn'));
+        return child;
+      },
+    });
+
+    await expect(owner.start()).resolves.toMatchObject({
+      ok: true,
+      services: ['scheduler', 'web-console'],
+    });
+    expect(spawned.map(({ args }) => args[0])).toEqual([scheduler, webConsole]);
+    expect(JSON.stringify(spawned)).not.toMatch(/activity-monitor|c4-dispatcher|tmux/);
+    await owner.close();
+    expect(owner.health()).toMatchObject({ ok: true, services: [] });
   });
 });
 

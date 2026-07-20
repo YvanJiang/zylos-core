@@ -13,6 +13,7 @@ import { createClaudeConversationAdapter } from '../providers/claude/conversatio
 import { createCodexAppServerAdapter } from '../providers/codex-app-server-adapter.js';
 import { createInstalledExecutorUpgradeHandler } from '../migration/installed-executor-upgrade.js';
 import { createExecutorServiceHost } from './service-host.js';
+import { createExecutorPrerequisiteOwner } from './prerequisite-owner.js';
 
 const require = createRequire(new URL('../../skills/comm-bridge/package.json', import.meta.url));
 
@@ -52,6 +53,7 @@ export async function runExecutorDaemon({
   createAdapter = createConfiguredProviderAdapter,
   createHost = createExecutorServiceHost,
   createUpgradeHandler = createInstalledExecutorUpgradeHandler,
+  createPrerequisiteOwner = createExecutorPrerequisiteOwner,
 } = {}) {
   if (!path.isAbsolute(zylosDir) || path.parse(zylosDir).root === zylosDir) {
     throw new TypeError('ZYLOS_DIR must be an explicit absolute non-root path');
@@ -107,7 +109,9 @@ export async function runExecutorDaemon({
     });
   }
   let host = null;
+  const prerequisiteOwner = createPrerequisiteOwner({ zylosDir });
   try {
+    await prerequisiteOwner.start();
     const adapter = createAdapter({ provider, zylosDir, environment: process.env });
     host = createHost({
       database,
@@ -120,11 +124,21 @@ export async function runExecutorDaemon({
       releaseRef: process.env.ZYLOS_RELEASE_REF || null,
       upgradeId: process.env.ZYLOS_UPGRADE_ID || null,
       onUpgrade,
-      onClose: closeDatabase,
+      healthCheck: prerequisiteOwner.health,
+      onClose: async () => {
+        const failures = [];
+        try { await prerequisiteOwner.close(); } catch (error) { failures.push(error); }
+        try { closeDatabase(); } catch (error) { failures.push(error); }
+        if (failures.length === 1) throw failures[0];
+        if (failures.length > 1) throw new AggregateError(failures, 'Executor prerequisite shutdown failed.');
+      },
     });
     await host.start();
   } catch (error) {
-    if (host === null) closeDatabase();
+    if (host === null) {
+      await prerequisiteOwner.close().catch(() => {});
+      closeDatabase();
+    }
     else await host.close().catch(() => closeDatabase());
     throw error;
   }

@@ -796,9 +796,10 @@ async function main() {
   process.exit(0);
 }
 
-// PM2 sets argv[1] to its own ProcessContainerFork.js, so classic ESM
-// isMainModule checks are unreliable here. Keep the default auto-start
-// behavior, but allow tests to disable the live loop before import.
+// The dispatcher implementation remains importable only for one-time migration
+// characterization. Normal execution is permanently fail-closed: Core owns
+// ingress and provider delivery and must never fall back to session injection.
 if (process.env.C4_DISPATCHER_DISABLE_MAIN !== '1') {
-  main();
+  console.error('Legacy C4 dispatcher is disabled; use the Core executor service.');
+  process.exitCode = 1;
 }

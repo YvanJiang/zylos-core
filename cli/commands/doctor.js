@@ -30,6 +30,8 @@ export function buildExecutorDoctorReport({
   configuredProvider = provider,
   providerInstalled,
   providerAuthStatus,
+  configuredProviderInstalled = providerInstalled,
+  configuredProviderAuthStatus = providerAuthStatus,
   coreHealth,
 }) {
   const issues = [];
@@ -101,6 +103,8 @@ export function buildExecutorDoctorReport({
     supervisor: { name: 'pm2', ready: pm2Installed },
     provider: {
       name: authoritativeProvider,
+      configured_name: configuredProvider,
+      configured_ready: configuredProviderInstalled && configuredProviderAuthStatus === 'success',
       transport: providerTransport(authoritativeProvider),
       installed: providerInstalled,
       auth_status: providerAuthStatus,
@@ -132,6 +136,21 @@ async function collectReport() {
       providerAuthStatus = 'uncertain';
     }
   }
+  const configuredProviderInstalled = provider === configuredProvider
+    ? providerInstalled
+    : commandExists(configuredProvider);
+  let configuredProviderAuthStatus = provider === configuredProvider
+    ? providerAuthStatus
+    : 'failure';
+  if (provider !== configuredProvider && configuredProviderInstalled) {
+    try {
+      configuredProviderAuthStatus = (
+        configuredProvider === 'codex' ? isCodexAuthenticated() : isClaudeAuthenticated()
+      ) ? 'success' : 'failure';
+    } catch {
+      configuredProviderAuthStatus = 'uncertain';
+    }
+  }
   return buildExecutorDoctorReport({
     initialized,
     pm2Installed: commandExists('pm2'),
@@ -139,6 +158,8 @@ async function collectReport() {
     configuredProvider,
     providerInstalled,
     providerAuthStatus,
+    configuredProviderInstalled,
+    configuredProviderAuthStatus,
     coreHealth,
   });
 }
@@ -170,11 +191,13 @@ export async function doctorCommand(args) {
   const checkOnly = args.includes('--check');
   let report = await collectReport();
 
+  const providerMismatch = report.issues.some(({ id }) => id === 'provider_identity_mismatch');
   if (!report.passed && !checkOnly && report.initialized && report.supervisor.ready
-    && report.provider.ready && report.service.health !== 'healthy') {
+    && report.provider.configured_ready
+    && (report.service.health !== 'healthy' || providerMismatch)) {
     const repair = await selfHealExecutorService({
       zylosDir: ZYLOS_DIR,
-      expectedProvider: report.provider.name,
+      expectedProvider: report.provider.configured_name,
     });
     if (repair.ok) report = await collectReport();
   }

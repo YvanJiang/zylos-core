@@ -19,6 +19,51 @@ const LEGACY_SERVICE_NAMES = Object.freeze([
   'activity-monitor', 'c4-dispatcher', 'scheduler', 'web-console', 'caddy',
 ]);
 
+function expectedLegacyServicePaths(zylosDir) {
+  const skills = path.join(zylosDir, '.claude', 'skills');
+  return new Map([
+    ['activity-monitor', path.join(skills, 'activity-monitor', 'scripts', 'activity-monitor.js')],
+    ['c4-dispatcher', path.join(skills, 'comm-bridge', 'scripts', 'c4-dispatcher.js')],
+    ['scheduler', path.join(skills, 'scheduler', 'scripts', 'daemon.js')],
+    ['web-console', path.join(skills, 'web-console', 'scripts', 'server.js')],
+    ['caddy', path.join(zylosDir, 'bin', 'caddy')],
+  ]);
+}
+
+function readPm2Processes(execFileSyncFn) {
+  const parsed = JSON.parse(execFileSyncFn('pm2', ['jlist'], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000,
+  }));
+  if (!Array.isArray(parsed)) throw new Error('PM2 process inventory must be an array.');
+  return parsed;
+}
+
+export function inspectLegacyServiceRegistrations({ zylosDir, execFileSyncFn = execFileSync }) {
+  const expected = expectedLegacyServicePaths(requireDirectory('zylosDir', zylosDir));
+  const owned = [];
+  const collisions = [];
+  for (const processInfo of readPm2Processes(execFileSyncFn)) {
+    if (!LEGACY_SERVICE_NAMES.includes(processInfo.name)) continue;
+    const actualPath = processInfo.pm2_env?.pm_exec_path ?? processInfo.pm_exec_path;
+    const expectedPath = expected.get(processInfo.name);
+    if (typeof actualPath !== 'string' || path.resolve(actualPath) !== path.resolve(expectedPath)) {
+      collisions.push(Object.freeze({ name: processInfo.name, actual_path: actualPath ?? null }));
+      continue;
+    }
+    const status = processInfo.pm2_env?.status ?? 'unknown';
+    owned.push(Object.freeze({
+      name: processInfo.name,
+      status,
+      was_running: !['stopped', 'errored'].includes(status),
+      script_path: path.resolve(actualPath),
+    }));
+  }
+  if (collisions.length > 0) {
+    throw new Error(`Refusing to control ambiguous PM2 service name collisions: ${collisions.map(({ name }) => name).join(', ')}`);
+  }
+  return Object.freeze(owned);
+}
+
 function requireDirectory(name, value) {
   if (typeof value !== 'string' || !path.isAbsolute(value)
     || path.parse(value).root === value) {
@@ -133,6 +178,7 @@ function readPackageRelease(releasePath) {
     path.join(releasePath, 'runtime', 'executor', 'daemon.js'),
     path.join(releasePath, 'runtime', 'executor', 'health-probe.js'),
     path.join(releasePath, 'runtime', 'executor', 'launcher.js'),
+    path.join(releasePath, 'scripts', 'postinstall.js'),
     path.join(releasePath, 'templates', 'pm2', 'ecosystem.config.cjs'),
   ]) {
     if (!fs.statSync(entry).isFile()) throw new Error(`Downloaded release is missing ${entry}.`);
@@ -140,25 +186,18 @@ function readPackageRelease(releasePath) {
   return packageDocument.version;
 }
 
-export function assertLegacyServicesInactive(execFileSyncFn = execFileSync) {
-  const processes = JSON.parse(execFileSyncFn('pm2', ['jlist'], {
-    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000,
-  }));
-  const active = processes.filter((processInfo) => LEGACY_SERVICE_NAMES.includes(processInfo.name)
-    && !['stopped', 'errored'].includes(processInfo.pm2_env?.status));
+export function assertLegacyServicesInactive({ zylosDir, execFileSyncFn = execFileSync }) {
+  const active = inspectLegacyServiceRegistrations({ zylosDir, execFileSyncFn })
+    .filter(({ was_running: wasRunning }) => wasRunning);
   if (active.length > 0) {
     throw new Error(`Obsolete runtime services are still active: ${active.map(({ name }) => name).join(', ')}`);
   }
   return { stopped: true, stopped_at: new Date().toISOString() };
 }
 
-export function removeLegacyServiceRegistrations(execFileSyncFn = execFileSync) {
-  const processes = JSON.parse(execFileSyncFn('pm2', ['jlist'], {
-    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000,
-  }));
-  const registered = [...new Set(processes
-    .map(({ name }) => name)
-    .filter((name) => LEGACY_SERVICE_NAMES.includes(name)))];
+export function removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn = execFileSync }) {
+  const registered = inspectLegacyServiceRegistrations({ zylosDir, execFileSyncFn })
+    .map(({ name }) => name);
   for (const serviceName of registered) {
     execFileSyncFn('pm2', ['delete', serviceName], { stdio: 'pipe', timeout: 30_000 });
   }
@@ -181,17 +220,27 @@ function prepareRelease({ source, releaseRef, branch, releaseRoot, execFileSyncF
   const releasePath = path.join(releaseRoot, `${safeRef}-${crypto.randomUUID()}`);
   fs.mkdirSync(releaseRoot, { recursive: true });
   fs.cpSync(sourcePath, releasePath, { recursive: true, errorOnExist: true, force: false });
-  execFileSyncFn('npm', ['install', '--omit=dev', '--no-audit', '--no-fund'], {
+  const dependencyArgs = ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund'];
+  execFileSyncFn('npm', dependencyArgs, {
     cwd: releasePath,
     stdio: 'pipe',
     timeout: 15 * 60_000,
   });
+  for (const skill of ['comm-bridge', 'scheduler', 'web-console']) {
+    execFileSyncFn('npm', dependencyArgs, {
+      cwd: path.join(releasePath, 'skills', skill),
+      stdio: 'pipe',
+      timeout: 15 * 60_000,
+    });
+  }
   return Object.freeze({ packageVersion, releasePath, releaseRef });
 }
 
 function decorateReleaseAdapter(adapter, activeReleaseFile, execFileSyncFn, {
   ecosystemSource,
   ecosystemDestination,
+  zylosDir,
+  targetReleasePath,
 }) {
   return Object.freeze({
     async activate(request) {
@@ -214,8 +263,28 @@ function decorateReleaseAdapter(adapter, activeReleaseFile, execFileSyncFn, {
     },
     async cleanup(request) {
       const deployedConfig = deployManagedFile(ecosystemSource, ecosystemDestination);
+      execFileSyncFn(process.execPath, [path.join(targetReleasePath, 'scripts', 'postinstall.js')], {
+        cwd: targetReleasePath,
+        env: {
+          ...process.env,
+          HOME: path.dirname(zylosDir),
+          ZYLOS_DIR: zylosDir,
+          ZYLOS_SKIP_POSTINSTALL: '',
+          CI: '',
+        },
+        stdio: 'pipe',
+        timeout: 15 * 60_000,
+      });
+      const dependencyArgs = ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund'];
+      for (const skill of ['comm-bridge', 'scheduler', 'web-console']) {
+        execFileSyncFn('npm', dependencyArgs, {
+          cwd: path.join(zylosDir, '.claude', 'skills', skill),
+          stdio: 'pipe',
+          timeout: 15 * 60_000,
+        });
+      }
       const result = await adapter.cleanup(request);
-      const registrations = removeLegacyServiceRegistrations(execFileSyncFn);
+      const registrations = removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn });
       return Object.freeze({
         ...result,
         ...registrations,
@@ -363,8 +432,91 @@ export function createInstalledExecutorUpgradeHandler({
   const releaseRoot = path.join(installationRoot, 'runtime', 'releases');
   const planDirectory = path.join(installationRoot, 'runtime', 'upgrade-plans');
 
+  function legacyServiceStateFile(upgradeId) {
+    return path.join(installationRoot, 'runtime', 'legacy-upgrade-audit', `${upgradeId}-services.json`);
+  }
+
+  function readLegacyServiceState(upgradeId) {
+    return JSON.parse(fs.readFileSync(legacyServiceStateFile(upgradeId), 'utf8'));
+  }
+
+  function stopOwnedLegacyServices({ upgradeId, stepId }) {
+    const stateFile = legacyServiceStateFile(upgradeId);
+    let state;
+    try {
+      state = readLegacyServiceState(upgradeId);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      state = {
+        schema_version: 1,
+        upgrade_id: upgradeId,
+        services: inspectLegacyServiceRegistrations({
+          zylosDir: installationRoot,
+          execFileSyncFn,
+        }),
+        recorded_at: now(),
+      };
+      atomicJson(stateFile, state);
+    }
+    if (state.upgrade_id !== upgradeId || !Array.isArray(state.services)) {
+      throw new Error('Legacy service ownership record conflicts with the upgrade.');
+    }
+    // Re-inspect before any destructive command so generic-name collisions
+    // always fail closed and remain untouched.
+    const currentlyOwned = inspectLegacyServiceRegistrations({
+      zylosDir: installationRoot,
+      execFileSyncFn,
+    });
+    for (const { name } of currentlyOwned) {
+      execFileSyncFn('pm2', ['delete', name], { stdio: 'pipe', timeout: 30_000 });
+    }
+    if (currentlyOwned.length > 0) {
+      execFileSyncFn('pm2', ['save'], { stdio: 'pipe', timeout: 30_000 });
+    }
+    const remaining = inspectLegacyServiceRegistrations({
+      zylosDir: installationRoot,
+      execFileSyncFn,
+    });
+    if (remaining.length > 0) throw new Error('Obsolete runtime services remained registered after isolation.');
+    return Object.freeze({
+      step_id: stepId,
+      stopped: true,
+      stopped_at: now(),
+      services_were_running: Object.freeze(
+        state.services.filter(({ was_running: wasRunning }) => wasRunning).map(({ name }) => name),
+      ),
+    });
+  }
+
+  function restartOwnedLegacyServices({ upgradeId, stepId }) {
+    const state = readLegacyServiceState(upgradeId);
+    const ecosystem = path.join(installationRoot, 'pm2', 'ecosystem.config.cjs');
+    inspectLegacyServiceRegistrations({ zylosDir: installationRoot, execFileSyncFn });
+    for (const serviceState of state.services) {
+      execFileSyncFn('pm2', ['start', ecosystem, '--only', serviceState.name], {
+        stdio: 'pipe', timeout: 30_000,
+      });
+      if (!serviceState.was_running) {
+        execFileSyncFn('pm2', ['stop', serviceState.name], { stdio: 'pipe', timeout: 30_000 });
+      }
+    }
+    if (state.services.length > 0) {
+      execFileSyncFn('pm2', ['save'], { stdio: 'pipe', timeout: 30_000 });
+    }
+    const restored = inspectLegacyServiceRegistrations({
+      zylosDir: installationRoot,
+      execFileSyncFn,
+    });
+    for (const expected of state.services) {
+      const actual = restored.find(({ name }) => name === expected.name);
+      if (!actual || actual.was_running !== expected.was_running) {
+        throw new Error(`Legacy service ${expected.name} did not restore its recorded state.`);
+      }
+    }
+    return Object.freeze({ step_id: stepId, restarted: true, restarted_at: now() });
+  }
+
   async function executePlan(plan) {
-    assertLegacyServicesInactive(execFileSyncFn);
     const releases = {
       [plan.preflight.from_release]: requireDirectory('from_release_path', plan.from_release_path),
       [plan.preflight.to_release]: requireDirectory('to_release_path', plan.to_release_path),
@@ -390,16 +542,20 @@ export function createInstalledExecutorUpgradeHandler({
           'pm2',
           'ecosystem.config.cjs',
         ),
+        zylosDir: installationRoot,
+        targetReleasePath: plan.to_release_path,
       },
     );
     const legacySourceAdapter = createLegacySourceQueueAdapter({
       sourceQueueFile: plan.legacy_queue_file,
       auditDirectory: path.join(installationRoot, 'runtime', 'legacy-upgrade-audit'),
-      stopLegacyDispatcher: async () => assertLegacyServicesInactive(execFileSyncFn),
-      restartLegacyDispatcher: async ({ step_id: stepId }) => ({
-        step_id: stepId,
-        restarted: true,
-        restarted_at: now(),
+      stopLegacyDispatcher: async ({ step_id: stepId }) => stopOwnedLegacyServices({
+        upgradeId: plan.upgrade_id,
+        stepId,
+      }),
+      restartLegacyDispatcher: async ({ step_id: stepId }) => restartOwnedLegacyServices({
+        upgradeId: plan.upgrade_id,
+        stepId,
       }),
     });
     let targetHealth = null;
@@ -461,6 +617,7 @@ export function createInstalledExecutorUpgradeHandler({
     if (orchestrationComplete) {
       fs.rmSync(plan.legacy_queue_file, { force: true });
       fs.rmSync(upgradePlanPath(planDirectory, plan.upgrade_id), { force: true });
+      fs.rmSync(legacyServiceStateFile(plan.upgrade_id), { force: true });
     }
     return result;
   }
@@ -495,7 +652,6 @@ export function createInstalledExecutorUpgradeHandler({
         `Runtime upgrade ${blocking.upgrade_id} is already ${blocking.state}; restart the executor to resume it.`,
       );
     }
-    assertLegacyServicesInactive(execFileSyncFn);
     const fromRelease = process.env.ZYLOS_RELEASE_REF || currentReleaseRef;
     if (typeof fromRelease !== 'string' || fromRelease.length === 0) {
       throw new Error('Current executor release identity is unavailable.');

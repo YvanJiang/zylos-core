@@ -26,6 +26,25 @@ import { fetchRawFile } from '../lib/github.js';
 import { promptYesNo } from '../lib/prompts.js';
 import { evaluateUpgrade } from '../lib/claude-eval.js';
 
+export function classifyExecutorUpgradeControlFailure(cause) {
+  if (cause?.outcome === 'unknown' || cause?.code === 'ETIMEDOUT') {
+    return Object.freeze({
+      action: 'self_upgrade',
+      success: false,
+      state: 'uncertain',
+      uncertain: true,
+      failedStep: null,
+      error: 'Upgrade result is uncertain; Core may still commit. Reconnect and query the authoritative upgrade state before retrying.',
+    });
+  }
+  return Object.freeze({
+    action: 'self_upgrade',
+    success: false,
+    failedStep: 0,
+    error: `Executor upgrade control failed: ${cause?.message ?? 'unknown control failure'}`,
+  });
+}
+
 /**
  * Print a single upgrade step result in real time.
  * Each step result includes { step, total, name, status, message?, error? }.
@@ -126,6 +145,7 @@ function formatC4Reply(type, data) {
     case 'self-upgrade': {
       const { success, from, to, changelog, failedStep, error, rollback, migrationHints, mergeConflicts, mergedFiles, instructionFilesRebuilt, settingsChanged } = data;
       if (!success) {
+        if (data.uncertain) return error;
         let r = `zylos-core upgrade failed (step ${failedStep}): ${error}`;
         if (rollback?.performed) {
           r += '\nRollback: ' + rollback.steps.map(s => `${s.success ? 'OK' : 'FAIL'}: ${s.action}`).join(', ');
@@ -1143,12 +1163,7 @@ async function upgradeSelfCore({ branch, beta = false, mode = 'merge' } = {}) {
         ? response.result
         : { action: 'self_upgrade', success: false, failedStep: 0, error: response.error };
     } catch (cause) {
-      result = {
-        action: 'self_upgrade',
-        success: false,
-        failedStep: 0,
-        error: `Executor upgrade control failed: ${cause.message}`,
-      };
+      result = classifyExecutorUpgradeControlFailure(cause);
     }
 
     // Output result
@@ -1196,6 +1211,8 @@ async function upgradeSelfCore({ branch, beta = false, mode = 'merge' } = {}) {
       if (result.backupDir) {
         cleanupBackup(result.backupDir);
       }
+    } else if (result.uncertain) {
+      console.log(`\n${warn(result.error)}`);
     } else {
       console.log(`\n${error(`Self-upgrade failed (step ${result.failedStep}): ${result.error}`)}`);
 
