@@ -1283,7 +1283,7 @@ describe('Claude conversation executor', () => {
     database.close();
   });
 
-  test('keeps a sent SDK answer in delivering state when durable acknowledgement fails', async () => {
+  test('persists delivery_unknown when provider ack cannot be durably committed', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'permission-ack-failure');
     const fake = createPermissionQuery({ sessionId: 'claude-session-permission-ack-failure' });
@@ -1303,6 +1303,7 @@ describe('Claude conversation executor', () => {
     database.exec(`
       CREATE TRIGGER fail_permission_ack_audit
       BEFORE INSERT ON runtime_interaction_audit
+      WHEN NEW.outcome = 'accepted'
       BEGIN
         SELECT RAISE(ABORT, 'forced permission acknowledgement failure');
       END;
@@ -1317,8 +1318,8 @@ describe('Claude conversation executor', () => {
     expect(database.prepare(`
       SELECT state, handoff_state FROM runtime_interactions WHERE interaction_id = ?
     `).get(waiting.request.interaction_id)).toEqual({
-      state: 'answer_delivering',
-      handoff_state: 'delivering',
+      state: 'delivery_unknown',
+      handoff_state: 'delivery_unknown',
     });
     expect(database.prepare(`SELECT state FROM runtime_turns WHERE turn_id = ?`)
       .get(accepted.turn_id)).toEqual({ state: 'recovering' });

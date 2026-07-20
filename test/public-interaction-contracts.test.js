@@ -654,6 +654,29 @@ describe('durable interaction handoff v1 record contract', () => {
     })).toThrow(ContractKernelError);
   });
 
+  test('preserves unproven provider side effects when preparation is cancelled before send', () => {
+    const cancelled = handoff({
+      state: 'cancelled',
+      handoff_attempt_id: 'handoff-attempt-1',
+      handoff_attempt_no: 1,
+      claimed_by: 'executor-A',
+      claimed_at: '2026-07-19T05:04:02Z',
+      reason_code: 'pre_send_non_retryable_failure',
+      error: {
+        code: 'provider_context_invalid',
+        category: 'provider',
+        retryable: false,
+        side_effect_status: 'unknown',
+        user_message: 'Provider preparation did not prove that no side effect occurred.',
+        occurred_at: '2026-07-19T05:04:03Z',
+      },
+      side_effect_status: 'unknown',
+    });
+
+    expect(validateInteractionHandoff(cancelled)).toEqual(cancelled);
+    expect(cancelled.last_send_started_at).toBeNull();
+  });
+
   test('only permits retry_wait before answer delivery starts', () => {
     const retryWait = handoff({
       state: 'retry_wait',

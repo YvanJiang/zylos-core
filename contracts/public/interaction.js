@@ -1045,15 +1045,6 @@ export function validateInteractionHandoff(value, { occurredAt } = {}) {
         occurredAt,
       );
     }
-    if (
-      value.last_send_started_at === null
-      && (
-        value.side_effect_status !== 'none'
-        || (value.error !== null && value.error.side_effect_status !== 'none')
-      )
-    ) {
-      reject('Pre-send cancellation cannot claim provider side effects.', occurredAt);
-    }
   }
   return structuredClone(value);
 }

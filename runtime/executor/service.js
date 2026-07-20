@@ -48,8 +48,9 @@ function normalizePreSendProviderError(error, occurredAt) {
       return createContractError({
         code: descriptor.code,
         category: descriptor.category,
-        retryable: descriptor.retryable === true,
-        sideEffectStatus: 'none',
+        retryable: descriptor.retryable === true
+          && descriptor.side_effect_status === 'none',
+        sideEffectStatus: descriptor.side_effect_status,
         userMessage: descriptor.user_message,
         occurredAt,
       });
@@ -61,8 +62,8 @@ function normalizePreSendProviderError(error, occurredAt) {
     code: 'provider_context_invalid',
     category: 'provider',
     retryable: false,
-    sideEffectStatus: 'none',
-    userMessage: 'The provider rejected the answer before delivery began.',
+    sideEffectStatus: 'unknown',
+    userMessage: 'Provider preparation failed without proving that no side effect occurred.',
     occurredAt,
   });
 }
@@ -375,6 +376,58 @@ export function createExecutorService({
       return true;
     }
     return false;
+  }
+
+  async function recoverUnknownInteractionDelivery(
+    activeRun,
+    delivery,
+    cause,
+    providerError = null,
+  ) {
+    const recovery = {
+      activeRun,
+      delivery,
+      providerError,
+      deliveryUnknown: null,
+      isolationProven: false,
+      marked: false,
+    };
+    pendingInteractionRecoveries.set(delivery.request.turn_id, recovery);
+    try {
+      recovery.deliveryUnknown = persist(
+        () => store.markInteractionHandoffDeliveryUnknown(delivery, providerError),
+      );
+      recovery.marked = true;
+    } catch (markFailure) {
+      lifecycle = 'close_failed';
+      cause.markFailure = markFailure;
+    }
+    if (activeRun && !activeRun.durableSettled) {
+      try {
+        recovery.isolationProven = await isolateInteractionRecovery(activeRun);
+      } catch (isolationFailure) {
+        lifecycle = 'close_failed';
+        cause.isolationFailure = isolationFailure;
+      }
+    }
+    if (!recovery.isolationProven) lifecycle = 'close_failed';
+    if (recovery.marked && activeRun && !activeRun.durableSettled) {
+      activeRun.durableSettled = true;
+      refresh();
+      cleanupActiveRun(activeRun);
+    }
+    if (recovery.marked && recovery.isolationProven) {
+      try {
+        releaseRecoveringOwnership(activeRun.turnContext);
+      } catch (ownershipFailure) {
+        lifecycle = 'close_failed';
+        cause.ownershipFailure = ownershipFailure;
+      }
+      pendingInteractionRecoveries.delete(delivery.request.turn_id);
+    }
+    reschedulePendingInteractionDeadlines();
+    if (recovery.deliveryUnknown) cause.deliveryUnknown = recovery.deliveryUnknown;
+    return recovery;
   }
 
   async function awaitCancellationSettlement(turnId) {
@@ -1043,60 +1096,16 @@ export function createExecutorService({
       if (provider === 'codex' && isExplicitProviderError(error)) {
         const providerError = normalizeProviderError(error, now());
         if (providerError.side_effect_status === 'unknown') {
-          const deliveryUnknown = persist(
-            () => store.markInteractionHandoffDeliveryUnknown(sendingDelivery, providerError),
+          const recovery = await recoverUnknownInteractionDelivery(
+            activeRun,
+            sendingDelivery,
+            error,
+            providerError,
           );
-          if (activeRun && !activeRun.durableSettled) {
-            activeRun.durableSettled = true;
-            cleanupActiveRun(activeRun);
-          }
-          reschedulePendingInteractionDeadlines();
-          refresh();
-          return deliveryUnknown;
+          if (recovery.deliveryUnknown) return recovery.deliveryUnknown;
         }
       }
-      const recovery = {
-        activeRun,
-        delivery: sendingDelivery,
-        deliveryUnknown: null,
-        isolationProven: false,
-        marked: false,
-      };
-      pendingInteractionRecoveries.set(delivery.request.turn_id, recovery);
-      try {
-        recovery.deliveryUnknown = persist(
-          () => store.markInteractionHandoffDeliveryUnknown(sendingDelivery),
-        );
-        recovery.marked = true;
-      } catch (markFailure) {
-        lifecycle = 'close_failed';
-        error.markFailure = markFailure;
-      }
-      if (activeRun && !activeRun.durableSettled) {
-        try {
-          recovery.isolationProven = await isolateInteractionRecovery(activeRun);
-        } catch (isolationFailure) {
-          lifecycle = 'close_failed';
-          error.isolationFailure = isolationFailure;
-        }
-      }
-      if (!recovery.isolationProven) lifecycle = 'close_failed';
-      if (recovery.marked && activeRun && !activeRun.durableSettled) {
-        activeRun.durableSettled = true;
-        refresh();
-        cleanupActiveRun(activeRun);
-      }
-      if (recovery.marked && recovery.isolationProven) {
-        try {
-          releaseRecoveringOwnership(activeRun.turnContext);
-        } catch (ownershipFailure) {
-          lifecycle = 'close_failed';
-          error.ownershipFailure = ownershipFailure;
-        }
-        pendingInteractionRecoveries.delete(delivery.request.turn_id);
-      }
-      reschedulePendingInteractionDeadlines();
-      if (recovery.deliveryUnknown) error.deliveryUnknown = recovery.deliveryUnknown;
+      await recoverUnknownInteractionDelivery(activeRun, sendingDelivery, error);
       throw error;
     }
     const managedPermissions = permissionControllers.get(delivery.request.turn_id)?.size ?? 0;
@@ -1107,26 +1116,7 @@ export function createExecutorService({
           || handlerAcknowledgement.blocking_interactions_remaining === true,
       });
     } catch (error) {
-      if (activeRun && !activeRun.durableSettled) {
-        let recoveryPersisted = false;
-        try {
-          transitionToRecovery(activeRun, 'interaction_ack_persistence_failed');
-          recoveryPersisted = true;
-        } catch (recoveryFailure) {
-          lifecycle = 'close_failed';
-          error.recoveryFailure = recoveryFailure;
-        }
-        try {
-          const isolationProven = await isolateInteractionRecovery(activeRun);
-          if (recoveryPersisted && isolationProven) {
-            releaseRecoveringOwnership(activeRun.turnContext);
-          }
-          if (!isolationProven) lifecycle = 'close_failed';
-        } catch (isolationFailure) {
-          lifecycle = 'close_failed';
-          error.isolationFailure = isolationFailure;
-        }
-      }
+      await recoverUnknownInteractionDelivery(activeRun, sendingDelivery, error);
       throw error;
     }
     reschedulePendingInteractionDeadlines();
@@ -1161,6 +1151,7 @@ export function createExecutorService({
       throw new TypeError('adapter.queryInteractionHandoffAcceptance must be a function');
     }
     const delivery = store.getInteractionHandoffForRecovery(handoffId);
+    store.assertInteractionHandoffRecoveryNoticeDelivered(delivery);
     const proof = await adapter.queryInteractionHandoffAcceptance(deepFreeze(delivery));
     if (proof?.status === 'accepted') {
       const acknowledgement = persist(
@@ -1182,6 +1173,7 @@ export function createExecutorService({
       throw new TypeError('No interaction handoff disposition authorizer is configured.');
     }
     const delivery = store.getInteractionHandoffForRecovery(handoffId);
+    store.assertInteractionHandoffRecoveryNoticeDelivered(delivery);
     const decision = Object.freeze({
       capability: 'interaction.handoff.resolve',
       scope: Object.freeze({
@@ -1189,7 +1181,7 @@ export function createExecutorService({
         turn_id: delivery.request.turn_id,
         handoff_id: delivery.handoff.handoff_id,
         action: disposition?.action,
-        replacement_interaction_id: disposition?.replacement_interaction_id,
+        replacement_interaction: disposition?.replacement_interaction,
       }),
     });
     const authorization = await interactionHandoffDispositionAuthorizer(
@@ -1252,6 +1244,7 @@ export function createExecutorService({
             try {
               recovery.deliveryUnknown = store.markInteractionHandoffDeliveryUnknown(
                 recovery.delivery,
+                recovery.providerError,
               );
               recovery.marked = true;
             } catch (error) {

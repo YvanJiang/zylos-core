@@ -8,6 +8,7 @@ import {
   validateNormalizedEvent,
 } from '../contracts/public/index.js';
 import { createExecutorService } from '../runtime/executor/service.js';
+import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import {
   acceptQueuedInteractionTurn,
   cleanupInteractionTestDatabases,
@@ -16,6 +17,7 @@ import {
   interactionAnswer,
   openInteractionTestDatabase,
 } from './helpers/runtime-interaction-fixtures.js';
+import { deliveredResult } from './helpers/delivered-result.js';
 
 function openTestDatabase() {
   return openInteractionTestDatabase('interaction-happy-path');
@@ -99,6 +101,29 @@ function preparedInteractionAnswer(handler) {
       },
     });
   };
+}
+
+function markLatestTurnProjectionDelivered(database, turnId) {
+  const outbox = createOutboxService({
+    database,
+    serviceInstanceId: `delivery-service-${turnId}`,
+    now: () => '2026-07-19T07:02:00Z',
+    generateId: deterministicIds(`delivery-${turnId}`),
+    throttleMs: 0,
+  });
+  for (let count = 0; count < 100; count += 1) {
+    const command = outbox.claimNext();
+    if (command === null) break;
+    expect(outbox.recordResult(deliveredResult(command, '2026-07-19T07:02:00Z')))
+      .toMatchObject({ status: 'applied', outbox_status: 'delivered' });
+  }
+  expect(database.prepare(`
+    SELECT COUNT(*) AS count
+    FROM runtime_projection_snapshots AS projection
+    JOIN runtime_outbox AS outbox
+      ON outbox.outbox_id = projection.materialized_outbox_id
+    WHERE projection.turn_id = ? AND outbox.status = 'delivered'
+  `).get(turnId).count).toBeGreaterThan(0);
 }
 
 afterEach(() => {
@@ -454,6 +479,8 @@ describe('runtime interaction happy path', () => {
       error: null,
       side_effect_status: 'none',
     });
+    expect(() => store.markInteractionHandoffSendStarted(firstDelivery))
+      .toThrow(expect.objectContaining({ code: 'stale_attempt' }));
     const beforeLateAck = readInteractionAuthority(database, request.turn_id);
     expect(() => store.acknowledgeInteractionHandoff({
       status: 'accepted',
@@ -463,7 +490,12 @@ describe('runtime interaction happy path', () => {
       handoff_attempt_no: firstDelivery.handoff.handoff_attempt_no,
       lease_epoch: firstDelivery.handoff.lease_epoch,
     })).toThrow(expect.objectContaining({ code: 'stale_attempt' }));
-    expect(readInteractionAuthority(database, request.turn_id)).toEqual(beforeLateAck);
+    const afterLateAck = readInteractionAuthority(database, request.turn_id);
+    expect({ ...afterLateAck, audits: afterLateAck.audits.slice(0, -1) }).toEqual(beforeLateAck);
+    expect(afterLateAck.audits.at(-1)).toMatchObject({
+      outcome: 'late_ack_ignored',
+      handoff_id: firstDelivery.handoff.handoff_id,
+    });
 
     database.close();
   });
@@ -769,7 +801,7 @@ describe('runtime interaction happy path', () => {
     database.close();
   });
 
-  test('does not retry a non-retryable pre-send failure', async () => {
+  test('does not retry when preparation cannot prove no provider side effect', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'service-pre-send-terminal');
     let sendCalls = 0;
@@ -793,9 +825,9 @@ describe('runtime interaction happy path', () => {
         error.providerError = {
           code: 'provider_context_invalid',
           category: 'provider',
-          retryable: false,
-          side_effect_status: 'none',
-          user_message: 'The provider cannot accept this answer.',
+          retryable: true,
+          side_effect_status: 'unknown',
+          user_message: 'Preparation may have crossed the provider boundary.',
         };
         throw error;
       },
@@ -829,7 +861,10 @@ describe('runtime interaction happy path', () => {
         state: 'cancelled',
         handoff_state: 'cancelled',
       })],
-      handoffs: [expect.objectContaining({ state: 'cancelled' })],
+      handoffs: [expect.objectContaining({
+        state: 'cancelled',
+        record_json: expect.stringContaining('"side_effect_status":"unknown"'),
+      })],
       audits: expect.arrayContaining([
         expect.objectContaining({ outcome: 'cancelled_pre_send' }),
       ]),
@@ -860,9 +895,11 @@ describe('runtime interaction happy path', () => {
     const sending = store.markInteractionHandoffSendStarted(claimed);
     store.markInteractionHandoffDeliveryUnknown(sending);
 
+    let queryCalls = 0;
     const adapter = {
       async *execute() {},
       async queryInteractionHandoffAcceptance(delivery) {
+        queryCalls += 1;
         return {
           status: 'accepted',
           read_only: true,
@@ -887,6 +924,10 @@ describe('runtime interaction happy path', () => {
       generateId: deterministicIds('query-accepted-recovery'),
     });
 
+    await expect(service.reconcileInteractionHandoff(committed.handoff_id))
+      .rejects.toMatchObject({ code: 'notification_pending' });
+    expect(queryCalls).toBe(0);
+    markLatestTurnProjectionDelivered(database, request.turn_id);
     await expect(service.reconcileInteractionHandoff(committed.handoff_id)).resolves.toMatchObject({
       status: 'accepted',
       acknowledgement_source: 'read_only_idempotent_query',
@@ -971,6 +1012,7 @@ describe('runtime interaction happy path', () => {
       generateId: deterministicIds('query-unproven-recovery'),
     });
 
+    markLatestTurnProjectionDelivered(database, request.turn_id);
     await expect(service.reconcileInteractionHandoff(committed.handoff_id)).resolves.toMatchObject({
       status: 'unknown',
       handoff_id: committed.handoff_id,
@@ -1009,6 +1051,7 @@ describe('runtime interaction happy path', () => {
     store.markInteractionHandoffDeliveryUnknown(sending);
 
     let authorized = false;
+    let authorizationCalls = 0;
     const service = createExecutorService({
       database,
       adapter: { async *execute() {} },
@@ -1017,6 +1060,7 @@ describe('runtime interaction happy path', () => {
       now: () => '2026-07-19T07:02:00Z',
       generateId: deterministicIds('authorized-termination-disposition'),
       async interactionHandoffDispositionAuthorizer(decision) {
+        authorizationCalls += 1;
         if (!authorized) return null;
         return {
           decision_id: 'disposition-decision-authorized-termination',
@@ -1033,7 +1077,13 @@ describe('runtime interaction happy path', () => {
 
     await expect(service.resolveInteractionHandoff(committed.handoff_id, {
       action: 'terminate',
-      replacement_interaction_id: null,
+      replacement_interaction: null,
+    })).rejects.toMatchObject({ code: 'notification_pending' });
+    expect(authorizationCalls).toBe(0);
+    markLatestTurnProjectionDelivered(database, request.turn_id);
+    await expect(service.resolveInteractionHandoff(committed.handoff_id, {
+      action: 'terminate',
+      replacement_interaction: null,
     })).rejects.toMatchObject({ code: 'authorization_denied' });
     expect(readInteractionAuthority(database, request.turn_id)).toMatchObject({
       turn: { state: 'recovering' },
@@ -1043,7 +1093,7 @@ describe('runtime interaction happy path', () => {
     authorized = true;
     await expect(service.resolveInteractionHandoff(committed.handoff_id, {
       action: 'terminate',
-      replacement_interaction_id: null,
+      replacement_interaction: null,
     })).resolves.toMatchObject({
       status: 'terminated',
       interaction_id: request.interaction_id,
@@ -1071,7 +1121,7 @@ describe('runtime interaction happy path', () => {
       reason_code: 'authorized_delivery_unknown_termination',
     });
     expect(JSON.parse(authority.audits.at(-1).acknowledgement_json)).toMatchObject({
-      disposition: { action: 'terminate', replacement_interaction_id: null },
+      disposition: { action: 'terminate', replacement_interaction: null },
       authorization: {
         decision_id: 'disposition-decision-authorized-termination',
         capability: 'interaction.handoff.resolve',
@@ -1089,11 +1139,17 @@ describe('runtime interaction happy path', () => {
       handoff_attempt_no: sending.handoff.handoff_attempt_no,
       lease_epoch: sending.handoff.lease_epoch,
     })).toThrow(expect.objectContaining({ code: 'stale_attempt' }));
+    expect(readInteractionAuthority(database, request.turn_id).audits).toEqual(
+      expect.arrayContaining([expect.objectContaining({
+        outcome: 'late_ack_ignored',
+        handoff_id: sending.handoff.handoff_id,
+      })]),
+    );
 
     database.close();
   });
 
-  test('authorized supersession reopens only an already-durable newer interaction', async () => {
+  test('authorized recovery atomically establishes a new fenced interaction', async () => {
     const database = openTestDatabase();
     const { store, turnContext } = createRunningTurn(database, 'authorized-supersession');
     const first = store.requestInteraction(turnContext, {
@@ -1105,21 +1161,14 @@ describe('runtime interaction happy path', () => {
       authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
       allowed_sources: ['card_action'],
     });
-    const replacement = store.requestInteraction(turnContext, {
-      provider_interaction_ref: 'provider-question-authorized-supersession-new',
-      tool_use_id: 'tool-use-authorized-supersession-new',
-      kind: 'recovery_decision',
-      prompt: 'Choose how to continue after uncertain delivery.',
-      choices: [],
-      authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
-      allowed_sources: ['card_action'],
-    });
     const committed = store.commitInteractionAnswer(
       interactionAnswer(first, 'authorized-supersession'),
     );
     const claimed = store.claimInteractionHandoff(committed.handoff_id);
     const sending = store.markInteractionHandoffSendStarted(claimed);
     store.markInteractionHandoffDeliveryUnknown(sending);
+    markLatestTurnProjectionDelivered(database, first.turn_id);
+    store.releaseRecoveringExecutorOwnership(turnContext);
     const service = createExecutorService({
       database,
       adapter: { async *execute() {} },
@@ -1141,12 +1190,21 @@ describe('runtime interaction happy path', () => {
       },
     });
 
-    await expect(service.resolveInteractionHandoff(committed.handoff_id, {
-      action: 'supersede',
-      replacement_interaction_id: replacement.interaction_id,
-    })).resolves.toMatchObject({
-      status: 'superseded',
-      replacement_interaction_id: replacement.interaction_id,
+    const resolution = await service.resolveInteractionHandoff(committed.handoff_id, {
+      action: 'establish_interaction',
+      replacement_interaction: {
+        provider_interaction_ref: 'provider-question-authorized-supersession-new',
+        tool_use_id: 'tool-use-authorized-supersession-new',
+        kind: 'recovery_decision',
+        prompt: 'Choose how to continue after uncertain delivery.',
+        choices: [],
+        authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+        allowed_sources: ['card_action'],
+      },
+    });
+    expect(resolution).toMatchObject({
+      status: 'interaction_established',
+      replacement_interaction_id: expect.any(String),
       turn_state: 'waiting_user',
     });
     expect(readInteractionAuthority(database, first.turn_id)).toMatchObject({
@@ -1157,11 +1215,29 @@ describe('runtime interaction happy path', () => {
           state: 'cancelled',
         }),
         expect.objectContaining({
-          interaction_id: replacement.interaction_id,
+          interaction_id: resolution.replacement_interaction_id,
           state: 'pending',
           handoff_state: 'not_started',
         }),
       ],
+    });
+    const replacementRequest = JSON.parse(readInteractionAuthority(
+      database,
+      first.turn_id,
+    ).interactions[1].request_json);
+    expect(replacementRequest).toMatchObject({
+      interaction_id: resolution.replacement_interaction_id,
+      parent_type: 'provider_turn',
+      ordinal: 2,
+      kind: 'recovery_decision',
+      prompt: 'Choose how to continue after uncertain delivery.',
+      state: 'pending',
+      handoff_state: 'not_started',
+      runtime_fence: {
+        provider_attempt_id: first.runtime_fence.provider_attempt_id,
+        lease_epoch: first.runtime_fence.lease_epoch,
+        provider_interaction_ref: 'provider-question-authorized-supersession-new',
+      },
     });
 
     database.close();
@@ -2028,7 +2104,12 @@ describe('runtime interaction happy path', () => {
       handoff_attempt_no: delivery.handoff.handoff_attempt_no,
       lease_epoch: delivery.handoff.lease_epoch + 1,
     })).toThrow(expect.objectContaining({ code: 'stale_attempt' }));
-    expect(readInteractionAuthority(database, accepted.turn_id)).toEqual(before);
+    const after = readInteractionAuthority(database, accepted.turn_id);
+    expect({ ...after, audits: after.audits.slice(0, -1) }).toEqual(before);
+    expect(after.audits.at(-1)).toMatchObject({
+      outcome: 'late_ack_ignored',
+      handoff_id: delivery.handoff.handoff_id,
+    });
 
     database.close();
   });
