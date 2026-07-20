@@ -454,6 +454,10 @@ describe('Codex app-server provider adapter', () => {
             apps: false,
             hooks: false,
             multi_agent: false,
+            multi_agent_v2: false,
+            enable_fanout: false,
+            collaboration_modes: false,
+            multi_agent_mode: false,
             code_mode: false,
             image_generation: false,
             request_permissions: false,
@@ -1615,6 +1619,50 @@ describe('Codex app-server provider adapter', () => {
     expect(JSON.stringify(response)).not.toMatch(
       /acceptForSession|acceptWithExecpolicyAmendment|applyNetworkPolicyAmendment/,
     );
+  });
+
+  test('declines command-level additional permissions instead of creating a sticky turn grant', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart(details) {
+        sendStartedCommand(details, 'sticky-permission-command');
+        details.send({
+          id: 'sticky-permission-approval',
+          method: 'item/commandExecution/requestApproval',
+          params: {
+            threadId: details.threadId,
+            turnId: details.turnId,
+            itemId: 'sticky-permission-command',
+            startedAtMs: 1,
+            environmentId: null,
+            command: 'touch approved.txt',
+            cwd: '/workspace',
+            additionalPermissions: {
+              network: null,
+              fileSystem: { read: [], write: ['/workspace'] },
+            },
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: '/workspace',
+    });
+
+    await expect(collect(adapter.execute(executionContext(), {
+      assertWorkspaceWrite: jest.fn(() => ({ status: 'current' })),
+      authorizeProtectedAction: jest.fn(() => ({ trusted: true })),
+    }))).rejects.toMatchObject({
+      providerError: { code: 'unsupported_capability' },
+    });
+    expect(server.received).toContainEqual({
+      id: 'sticky-permission-approval',
+      result: { decision: 'decline' },
+    });
+    expect(server.received).not.toContainEqual({
+      id: 'sticky-permission-approval',
+      result: { decision: 'accept' },
+    });
   });
 
   test.each([

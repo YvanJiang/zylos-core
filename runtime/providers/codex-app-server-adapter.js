@@ -279,7 +279,9 @@ const APP_SERVER_LOCKDOWN_CONFIG = Object.freeze({
     apps: false,
     browser_use: false,
     code_mode: false,
+    collaboration_modes: false,
     computer_use: false,
+    enable_fanout: false,
     enable_mcp_apps: false,
     exec_permission_approvals: false,
     hooks: false,
@@ -288,6 +290,8 @@ const APP_SERVER_LOCKDOWN_CONFIG = Object.freeze({
     js_repl: false,
     js_repl_tools_only: false,
     multi_agent: false,
+    multi_agent_mode: false,
+    multi_agent_v2: false,
     plugin_hooks: false,
     plugin_sharing: false,
     plugins: false,
@@ -1564,19 +1568,12 @@ export function createCodexAppServerAdapter({
       );
     }
     const paths = [effectiveCwd];
-    const additionalFileSystem = group.params.additionalPermissions?.fileSystem;
-    for (const requestedPath of additionalFileSystem?.write ?? []) {
-      paths.push(path.resolve(effectiveCwd, requestedPath));
-    }
-    for (const entry of additionalFileSystem?.entries ?? []) {
-      if (entry.access !== 'write') continue;
-      if (typeof entry.path !== 'string') {
-        rejectProtocol(
-          'Codex app-server requested a non-path filesystem write capability.',
-          'unsupported_capability',
-        );
-      }
-      paths.push(path.resolve(effectiveCwd, entry.path));
+    if (group.params.additionalPermissions !== undefined
+      && group.params.additionalPermissions !== null) {
+      rejectProtocol(
+        'Codex app-server requested sticky command permissions.',
+        'unsupported_capability',
+      );
     }
     return [...new Set(paths)].sort();
   }
@@ -1762,6 +1759,19 @@ export function createCodexAppServerAdapter({
       failConnection(target, new CodexAppServerAdapterError(
         'unsupported_capability',
         'Codex MCP execution is disabled because its tool calls lack a synchronous Core fence.',
+      ));
+      return;
+    }
+    if (
+      message.method === 'item/commandExecution/requestApproval'
+      && message.params.additionalPermissions !== undefined
+      && message.params.additionalPermissions !== null
+    ) {
+      group.response_sent = true;
+      sendServerResponse(target, message.id, { decision: 'decline' });
+      failConnection(target, new CodexAppServerAdapterError(
+        'unsupported_capability',
+        'Codex command-level additional permissions are disabled because they create a sticky turn grant.',
       ));
       return;
     }

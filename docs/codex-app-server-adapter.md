@@ -80,7 +80,8 @@ requires the current executor owner, unexpired executor and workspace leases, ma
 epochs, the durably bound provider thread, a null environment, the canonical workspace cwd, and
 write paths contained by the workspace root. Only then may the official client return
 `{"decision":"accept"}` for that request. It never returns `acceptForSession`, an exec-policy or
-network amendment, a session scope, or a filesystem/network permission profile. A stale or
+network amendment, a session scope, or a filesystem/network permission profile. It declines every
+command request with non-null `additionalPermissions` before authorization. A stale or
 mismatched approval receives `decline` before the shared connection is retired into the existing
 uncertain-recovery boundary.
 
@@ -96,7 +97,9 @@ The read-only OS sandbox is the enforcement layer that prevents the built-in she
 paths from writing before that response. The adapter also locks each new/resumed thread with empty
 MCP and dynamic-tool configuration and disables apps/connectors, plugins, hooks, code mode, browser,
 computer use, image generation, web search, collaboration/subagents, JS REPL, tool search, and the
-permission-request tools. An unexpected hook, MCP/dynamic/collaboration/web/image item, dynamic tool
+permission-request tools. Both legacy and v2/fanout/collaboration-mode multi-agent feature keys are
+disabled so an inherited local configuration cannot reopen a background execution surface. An
+unexpected hook, MCP/dynamic/collaboration/web/image item, dynamic tool
 server request, permission-profile request, or MCP elicitation is refused and retires the
 connection; its item-start notification is only contradiction evidence, never claimed as the
 pre-action fence.
