@@ -300,3 +300,12 @@ individual repositories with `ZYLOS_FEISHU_CONTRACT_REPO`, `ZYLOS_LARK_CONTRACT_
 `ZYLOS_DASHBOARD_CONTRACT_REPO`, and `ZYLOS_LUNA_CONTRACT_REPO`. The gate passes the Core contract
 directory through `ZYLOS_CORE_PUBLIC_CONTRACTS_DIR`; consumer tests must recompute values with their
 own implementation and must not accept precomputed Core validation results as evidence.
+
+A consumer exit code alone is not compatibility evidence. Each consumer suite must emit one line
+containing `ZYLOS_CONTRACT_COMPATIBILITY_EVIDENCE=` followed by JSON containing schema version 1,
+its repository name, the exact Core fixture-set SHA-256 computed from the provided directory, the assertions and
+flows it exercised, and positive independent computation counts for raw JCS bytes, idempotency
+keys, and payload hashes. Missing, stale, malformed, or incomplete evidence makes the whole gate
+fail even when every selected test process exits zero. This prevents skipped fixtures, a different
+Core checkout, or tests that merely compare Core-precomputed strings from producing a false-green
+release decision.

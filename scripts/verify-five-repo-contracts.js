@@ -36,7 +36,7 @@ if (plan) {
     runCommand: runRepositoryCompatibilityCommand,
   });
   for (const result of outcome.results) {
-    const label = `${result.repository} exit=${result.exitCode}`;
+    const label = `${result.repository} test_exit=${result.commandExitCode} gate_exit=${result.exitCode}`;
     console.log(`\n===== ${label} =====`);
     if (result.stdout) process.stdout.write(result.stdout);
     if (result.stderr) process.stderr.write(result.stderr);

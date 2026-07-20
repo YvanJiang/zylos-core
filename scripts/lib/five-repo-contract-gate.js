@@ -1,4 +1,9 @@
-import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+} from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
@@ -23,6 +28,8 @@ export const CONTRACT_FLOWS = Object.freeze([
   'dashboard_luna_projection',
 ]);
 
+export const COMPATIBILITY_EVIDENCE_PREFIX = 'ZYLOS_CONTRACT_COMPATIBILITY_EVIDENCE=';
+
 function matrixEntry(repository, directoryKey, flows, testFiles) {
   return Object.freeze({
     repository,
@@ -30,6 +37,7 @@ function matrixEntry(repository, directoryKey, flows, testFiles) {
     flows: Object.freeze(flows),
     assertions: COMPATIBILITY_ASSERTIONS,
     testFiles: Object.freeze(testFiles),
+    requiresEvidence: directoryKey !== 'core',
   });
 }
 
@@ -94,6 +102,24 @@ function requireFile(filename, description) {
   }
 }
 
+function hashCoreFixtures(publicContractsDirectory) {
+  const fixturesDirectory = path.join(publicContractsDirectory, 'fixtures');
+  const fixtureFiles = readdirSync(fixturesDirectory)
+    .filter((filename) => filename.endsWith('.json'))
+    .sort();
+  if (fixtureFiles.length === 0) {
+    throw new Error(`No Core public JSON fixtures were found at ${fixturesDirectory}.`);
+  }
+  const hash = createHash('sha256');
+  for (const filename of fixtureFiles) {
+    hash.update(filename, 'utf8');
+    hash.update(Buffer.from([0]));
+    hash.update(readFileSync(path.join(fixturesDirectory, filename)));
+    hash.update(Buffer.from([0]));
+  }
+  return hash.digest('hex');
+}
+
 function repositoryDirectory(entry, { coreDirectory, workspaceDirectory, environment }) {
   if (entry.directoryKey === 'core') return coreDirectory;
   const configured = environment[REPOSITORY_DIRECTORY_ENV[entry.directoryKey]];
@@ -118,6 +144,7 @@ export function buildFiveRepoCompatibilityPlan({
     path.join(publicContractsDirectory, 'fixtures', 'idempotency-v1.json'),
     'The raw canonicalization/idempotency fixture',
   );
+  const coreFixtureSha256 = hashCoreFixtures(publicContractsDirectory);
 
   return FIVE_REPO_CONTRACT_MATRIX.map((entry) => {
     const directory = repositoryDirectory(entry, {
@@ -132,6 +159,7 @@ export function buildFiveRepoCompatibilityPlan({
     return Object.freeze({
       ...entry,
       directory,
+      coreFixtureSha256,
       command: process.execPath,
       arguments: Object.freeze(isCore
         ? [
@@ -149,13 +177,67 @@ export function buildFiveRepoCompatibilityPlan({
   });
 }
 
+function arraysEqual(left, right) {
+  return Array.isArray(left)
+    && left.length === right.length
+    && left.every((value, index) => value === right[index]);
+}
+
+function extractConsumerEvidence(item, stdout) {
+  const line = stdout
+    .split(/\r?\n/u)
+    .find((candidate) => candidate.includes(COMPATIBILITY_EVIDENCE_PREFIX));
+  if (!line) throw new Error('consumer did not emit compatibility evidence');
+  const evidenceStart = line.indexOf(COMPATIBILITY_EVIDENCE_PREFIX)
+    + COMPATIBILITY_EVIDENCE_PREFIX.length;
+  let evidence;
+  try {
+    evidence = JSON.parse(line.slice(evidenceStart));
+  } catch {
+    throw new Error('consumer emitted invalid JSON compatibility evidence');
+  }
+  if (
+    evidence?.schema_version !== 1
+    || evidence.repository !== item.repository
+    || evidence.core_fixture_sha256 !== item.coreFixtureSha256
+    || !arraysEqual(evidence.assertions, item.assertions)
+    || !arraysEqual(evidence.flows, item.flows)
+  ) {
+    throw new Error('consumer compatibility evidence does not match the current Core matrix');
+  }
+  for (const assertion of [
+    'jcs_bytes_from_raw_payload',
+    'idempotency_key_from_raw_payload',
+    'payload_hash_from_raw_payload',
+  ]) {
+    if (!Number.isSafeInteger(evidence.computations?.[assertion])
+      || evidence.computations[assertion] < 1) {
+      throw new Error(`consumer compatibility evidence is missing ${assertion}`);
+    }
+  }
+  return Object.freeze(evidence);
+}
+
 export function executeFiveRepoCompatibilityPlan(plan, { runCommand }) {
   if (typeof runCommand !== 'function') {
     throw new TypeError('runCommand must execute one repository compatibility item.');
   }
   const results = plan.map((item) => {
     const result = runCommand(item);
-    const exitCode = Number.isInteger(result?.exitCode) ? result.exitCode : 1;
+    const commandExitCode = Number.isInteger(result?.exitCode) ? result.exitCode : 1;
+    const stdout = typeof result?.stdout === 'string' ? result.stdout : '';
+    let stderr = typeof result?.stderr === 'string' ? result.stderr : '';
+    let evidence = null;
+    let evidenceError = null;
+    if (commandExitCode === 0 && item.requiresEvidence) {
+      try {
+        evidence = extractConsumerEvidence(item, stdout);
+      } catch (error) {
+        evidenceError = error;
+        stderr += `${stderr && !stderr.endsWith('\n') ? '\n' : ''}${error.message}\n`;
+      }
+    }
+    const exitCode = commandExitCode === 0 && !evidenceError ? 0 : 1;
     return Object.freeze({
       repository: item.repository,
       directory: item.directory,
@@ -163,8 +245,10 @@ export function executeFiveRepoCompatibilityPlan(plan, { runCommand }) {
       assertions: item.assertions,
       passed: exitCode === 0,
       exitCode,
-      stdout: typeof result?.stdout === 'string' ? result.stdout : '',
-      stderr: typeof result?.stderr === 'string' ? result.stderr : '',
+      commandExitCode,
+      stdout,
+      stderr,
+      evidence,
     });
   });
   return Object.freeze({
@@ -182,8 +266,8 @@ export function runRepositoryCompatibilityCommand(item, { spawn = spawnSync } = 
   });
   const stdout = typeof result?.stdout === 'string' ? result.stdout : '';
   let stderr = typeof result?.stderr === 'string' ? result.stderr : '';
-  if (result?.error) stderr += `${stderr ? '\n' : ''}${result.error.message}`;
-  if (result?.signal) stderr += `${stderr ? '\n' : ''}terminated by ${result.signal}`;
+  if (result?.error) stderr += `${stderr && !stderr.endsWith('\n') ? '\n' : ''}${result.error.message}\n`;
+  if (result?.signal) stderr += `${stderr && !stderr.endsWith('\n') ? '\n' : ''}terminated by ${result.signal}\n`;
   return {
     exitCode: Number.isInteger(result?.status) ? result.status : 1,
     stdout,

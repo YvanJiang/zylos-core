@@ -6,6 +6,7 @@ import path from 'node:path';
 import {
   buildFiveRepoCompatibilityPlan,
   COMPATIBILITY_ASSERTIONS,
+  COMPATIBILITY_EVIDENCE_PREFIX,
   CONTRACT_FLOWS,
   executeFiveRepoCompatibilityPlan,
   FIVE_REPO_CONTRACT_MATRIX,
@@ -93,9 +94,23 @@ describe('five-repository public contract compatibility gate', () => {
     const outcome = executeFiveRepoCompatibilityPlan(plan, {
       runCommand(item) {
         calls.push(item.repository);
+        const evidence = {
+          schema_version: 1,
+          repository: item.repository,
+          core_fixture_sha256: item.coreFixtureSha256,
+          assertions: item.assertions,
+          flows: item.flows,
+          computations: {
+            jcs_bytes_from_raw_payload: 1,
+            idempotency_key_from_raw_payload: 1,
+            payload_hash_from_raw_payload: 1,
+          },
+        };
         return {
           exitCode: item.repository === 'zylos-lark' ? 1 : 0,
-          stdout: `${item.repository} stdout`,
+          stdout: item.requiresEvidence
+            ? `${item.repository} stdout\n# ${COMPATIBILITY_EVIDENCE_PREFIX}${JSON.stringify(evidence)}\n`
+            : `${item.repository} stdout`,
           stderr: `${item.repository} stderr`,
         };
       },
@@ -106,6 +121,76 @@ describe('five-repository public contract compatibility gate', () => {
     expect(outcome.results.find(({ repository }) => repository === 'zylos-lark')).toMatchObject({
       passed: false,
       exitCode: 1,
+      commandExitCode: 1,
+    });
+  });
+
+  test('a zero-exit consumer without current-fixture independent evidence still fails closed', () => {
+    const item = {
+      repository: 'luna-pet',
+      directory: '/workspace/luna',
+      flows: ['dashboard_luna_projection'],
+      assertions: COMPATIBILITY_ASSERTIONS,
+      requiresEvidence: true,
+      coreFixtureSha256: 'a'.repeat(64),
+    };
+    const outcome = executeFiveRepoCompatibilityPlan([item], {
+      runCommand() {
+        return { exitCode: 0, stdout: '7 tests passed\n', stderr: '' };
+      },
+    });
+    expect(outcome.passed).toBe(false);
+    expect(outcome.results[0]).toMatchObject({
+      passed: false,
+      exitCode: 1,
+      commandExitCode: 0,
+      stderr: expect.stringContaining('compatibility evidence'),
+    });
+  });
+
+  test.each([
+    ['malformed JSON', `${COMPATIBILITY_EVIDENCE_PREFIX}{broken`, 'invalid JSON'],
+    ['stale fixture hash', `${COMPATIBILITY_EVIDENCE_PREFIX}${JSON.stringify({
+      schema_version: 1,
+      repository: 'luna-pet',
+      core_fixture_sha256: 'b'.repeat(64),
+      assertions: COMPATIBILITY_ASSERTIONS,
+      flows: ['dashboard_luna_projection'],
+      computations: {
+        jcs_bytes_from_raw_payload: 1,
+        idempotency_key_from_raw_payload: 1,
+        payload_hash_from_raw_payload: 1,
+      },
+    })}`, 'current Core matrix'],
+    ['missing independent computation', `${COMPATIBILITY_EVIDENCE_PREFIX}${JSON.stringify({
+      schema_version: 1,
+      repository: 'luna-pet',
+      core_fixture_sha256: 'a'.repeat(64),
+      assertions: COMPATIBILITY_ASSERTIONS,
+      flows: ['dashboard_luna_projection'],
+      computations: {
+        jcs_bytes_from_raw_payload: 1,
+        idempotency_key_from_raw_payload: 1,
+      },
+    })}`, 'payload_hash_from_raw_payload'],
+  ])('rejects %s evidence after a successful consumer test process', (_name, evidenceLine, error) => {
+    const item = {
+      repository: 'luna-pet',
+      directory: '/workspace/luna',
+      flows: ['dashboard_luna_projection'],
+      assertions: COMPATIBILITY_ASSERTIONS,
+      requiresEvidence: true,
+      coreFixtureSha256: 'a'.repeat(64),
+    };
+    const outcome = executeFiveRepoCompatibilityPlan([item], {
+      runCommand() {
+        return { exitCode: 0, stdout: `# ${evidenceLine}\n`, stderr: '' };
+      },
+    });
+    expect(outcome.results[0]).toMatchObject({
+      commandExitCode: 0,
+      exitCode: 1,
+      stderr: expect.stringContaining(error),
     });
   });
 
