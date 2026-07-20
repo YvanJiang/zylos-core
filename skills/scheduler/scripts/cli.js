@@ -31,7 +31,6 @@ Commands:
   add <prompt> [options]  Add a new task
   update <task-id> [options]  Update an existing task
   remove <task-id>        Remove a task
-  done <task-id>          Mark task as completed
   pause <task-id>         Pause a task
   resume <task-id>        Resume a paused task
   history [task-id]       Show execution history
@@ -66,7 +65,6 @@ Examples:
   ~/zylos/.claude/skills/scheduler/scripts/cli.js add "Check updates" --every "1 hour"
   ~/zylos/.claude/skills/scheduler/scripts/cli.js update task-abc --priority 1
   ~/zylos/.claude/skills/scheduler/scripts/cli.js update task-abc --block-queue-until-idle
-  ~/zylos/.claude/skills/scheduler/scripts/cli.js done task-abc123
 `;
 
 function parseArgs(args) {
@@ -301,64 +299,6 @@ function cmdRemove(taskId) {
   console.log(`Removed task: ${tasks[0].id}`);
 }
 
-function cmdDone(taskId) {
-  if (!taskId) {
-    console.error('Error: Task ID is required');
-    return;
-  }
-
-  // Support partial ID match
-  const tasks = db.prepare(`
-    SELECT * FROM tasks WHERE id LIKE ? ESCAPE '!'
-  `).all(escapeLike(taskId) + '%');
-
-  if (tasks.length === 0) {
-    console.error(`Error: Task not found: ${taskId}`);
-    return;
-  }
-
-  if (tasks.length > 1) {
-    console.error(`Error: Ambiguous task ID prefix '${taskId}' matches multiple tasks:`);
-    tasks.forEach(t => console.error(`  - ${t.id}`));
-    console.error('Please provide a more specific prefix.');
-    return;
-  }
-
-  const task = tasks[0];
-
-  const currentTime = now();
-
-  // Update task status
-  db.prepare(`
-    UPDATE tasks
-    SET status = 'completed', last_run_at = ?, updated_at = ?
-    WHERE id = ?
-  `).run(currentTime, currentTime, task.id);
-
-  // Update history entry
-  const historyEntry = db.prepare(`
-    SELECT id, executed_at FROM task_history
-    WHERE task_id = ? AND status = 'started'
-    ORDER BY executed_at DESC LIMIT 1
-  `).get(task.id);
-
-  if (historyEntry) {
-    const durationMs = (currentTime - historyEntry.executed_at) * 1000;
-    db.prepare(`
-      UPDATE task_history
-      SET status = 'success', completed_at = ?, duration_ms = ?
-      WHERE id = ?
-    `).run(currentTime, durationMs, historyEntry.id);
-  }
-
-  console.log(`Completed task: ${task.id}`);
-
-  // If recurring/interval, scheduler will handle next run
-  if (task.type !== 'one-time') {
-    console.log('(Scheduler will calculate next run time)');
-  }
-}
-
 function cmdPause(taskId) {
   if (!taskId) {
     console.error('Error: Task ID is required');
@@ -500,19 +440,19 @@ function cmdRunning() {
     return;
   }
 
-  console.log('\n  ⚠️  Running Tasks (complete these before compacting!):\n');
-  console.log('  ID              | Started            | Name');
-  console.log('  ' + '-'.repeat(60));
+  console.log('\n  Running Tasks (authoritative state from Core):\n');
+  console.log('  ID              | Core state    | Wait reason       | Name');
+  console.log('  ' + '-'.repeat(82));
 
   for (const task of tasks) {
     const id = task.id.substring(0, 14).padEnd(14);
-    const started = formatTime(task.updated_at).padEnd(18);
+    const coreState = (task.last_core_state || 'unknown').padEnd(13);
+    const waitReason = (task.core_wait_reason || '-').padEnd(17);
     const name = task.name || task.prompt.substring(0, 30);
 
-    console.log(`  ${id} | ${started} | ${name}`);
+    console.log(`  ${id} | ${coreState} | ${waitReason} | ${name}`);
   }
-
-  console.log('\n  Run "cli.js done <task-id>" to complete them before /compact\n');
+  console.log();
 }
 
 function cmdUpdate(taskId, options) {
@@ -713,10 +653,6 @@ function main() {
     case 'rm':
     case 'delete':
       cmdRemove(args[0]);
-      break;
-    case 'done':
-    case 'complete':
-      cmdDone(args[0]);
       break;
     case 'pause':
       cmdPause(args[0]);

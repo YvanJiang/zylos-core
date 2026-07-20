@@ -1,64 +1,33 @@
 ---
 name: comm-bridge
 description: >-
-  C4 communication bridge — central gateway for ALL external communication (Telegram, Lark, etc.).
-  Use when replying to users via the "reply via" path, sending proactive messages to external channels,
-  querying recent conversations or checkpoint status (prefer c4-db.js CLI; sqlite3 OK for unsupported queries),
-  fetching conversation history for Memory Sync, or creating checkpoints after sync.
-  Incoming messages are durably accepted and executed by the Core executor service.
+  Compatibility ingress and historical conversation/checkpoint queries. Normal
+  outbound replies are durable Core outbox commands delivered by channel owners.
 ---
 
 # Communication Bridge (C4)
 
-Central message hub - all communication is persisted and owned by Core.
-
-## Architecture
-
 ```
-Channels ──► Core ingress/queue ──► executor service ──► provider adapter
+channel ingress -> Core queue -> executor -> Core outbox -> channel delivery owner
 ```
 
-## Components
+`c4-receive.js` accepts authenticated compatibility-channel text into the same
+canonical Core ingress used by channel adapters. It requires a stable native
+message ID and actor ID. Core persists the turn and the initial
+`zylos.delivery-command@1.1` `send_text` command atomically.
+
+Normal outbound replies must never invoke `c4-send.js`. Core owns their durable
+outbox record, retry state, delivery target mapping, and reply lineage; a channel
+owner supplies rendering and delivery. `c4-send.js` is restricted to the
+record-only `void` channel used by explicit session-handoff audit flows.
 
 | Script | Purpose | Reference |
 |--------|---------|-----------|
-| `c4-receive.js` | Compatible text/event ingress into Core | [c4-receive](references/c4-receive.md) |
-| `c4-send.js` | Claude → External (route outgoing messages) | [c4-send](references/c4-send.md) |
-| `c4-fetch.js` | Fetch conversations by id range | [c4-fetch](references/c4-fetch.md) |
-| `c4-db.js` | Database module and CLI for querying conversations and checkpoints | [c4-db](references/c4-db.md) |
-| `c4-checkpoint.js` | Create/query checkpoints (sync boundaries) | [c4-checkpoint](references/c4-checkpoint.md) |
+| `c4-receive.js` | Compatibility ingress into Core | `references/c4-receive.md` |
+| `c4-send.js` | Record-only `void` audit message | `references/c4-send.md` |
+| `c4-fetch.js` | Query historical conversation records | `references/c4-fetch.md` |
+| `c4-db.js` | Historical record/checkpoint database CLI | `references/c4-db.md` |
+| `c4-checkpoint.js` | Create/query sync checkpoints | `references/c4-checkpoint.md` |
 
-## Sending Messages
-
-```bash
-# Send to Telegram DM
-cat <<'EOF' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js telegram 8101553026
-Hello! Quotes, $vars, **markdown** — all safe via stdin.
-EOF
-
-# Send to Lark group thread
-cat <<'EOF' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js lark "chat_xxx|type:group|root:msg_yyy"
-Report ready.
-EOF
-```
-
-Always pipe messages via stdin heredoc — never pass as CLI arguments. See [c4-send](references/c4-send.md) for full reference.
-Treat the heredoc wrapper as fixed shell syntax: only the message body goes between the start line and the closing terminator line, and the terminator itself must never be copied into the actual outgoing message.
-
-## Database
-
-SQLite at `~/zylos/comm-bridge/c4.db`:
-- `conversations`: All messages (in/out) with priority, status, retry tracking
-- `checkpoints`: Recovery points with conversation id ranges
-- legacy control records are retained only for one-time migration audit and are
-  not a selectable executor control path
-
-## Health & Service Management
-
-```bash
-zylos status
-zylos doctor --check
-```
-
-Core's executor identity and observability snapshot are authoritative. Do not
-infer health from a provider session or deliver control through terminal input.
+Use `zylos status` or `zylos doctor --check --json` for Core health. Provider
+session and user-interface state are not health or routing authority.

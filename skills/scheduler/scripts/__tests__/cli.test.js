@@ -199,26 +199,20 @@ describe('cli list', () => {
   });
 });
 
-describe('cli done', () => {
-  it('completes a task and updates history', () => {
+describe('cli terminal authority', () => {
+  it('fails closed instead of allowing a caller to complete a Core-owned turn', () => {
     withTmpDir(({ dbPath, env }) => {
       cli(['add', 'complete me', '--cron', '0 9 * * *'], env);
       const db = new Database(dbPath);
       try {
         const task = db.prepare('SELECT id FROM tasks LIMIT 1').get();
-        cli(['done', task.id], env);
+        const { stderr, stdout } = cliRaw(['done', task.id], env);
+        assert.ok(`${stderr}${stdout}`.includes('Unknown command: done'));
         const updated = db.prepare('SELECT status FROM tasks WHERE id = ?').get(task.id);
-        assert.equal(updated.status, 'completed');
+        assert.equal(updated.status, 'pending');
       } finally {
         db.close();
       }
-    });
-  });
-
-  it('reports error for non-existent task', () => {
-    withTmpDir(({ env }) => {
-      const { stderr } = cliRaw(['done', 'nonexistent-id'], env);
-      assert.ok(stderr.includes('not found'));
     });
   });
 });
@@ -434,24 +428,6 @@ describe('cli help', () => {
       const { stderr, stdout } = cliRaw(['unknown-command'], env);
       const output = stderr + stdout;
       assert.ok(output.includes('Unknown command') || output.includes('Usage'));
-    });
-  });
-});
-
-describe('cli partial ID match', () => {
-  it('supports partial task ID for done command', () => {
-    withTmpDir(({ dbPath, env }) => {
-      cli(['add', 'partial id test', '--cron', '0 9 * * *'], env);
-      const db = new Database(dbPath);
-      try {
-        const task = db.prepare('SELECT id FROM tasks LIMIT 1').get();
-        const prefix = task.id.substring(0, 10);
-        cli(['done', prefix], env);
-        const updated = db.prepare('SELECT status FROM tasks WHERE id = ?').get(task.id);
-        assert.equal(updated.status, 'completed');
-      } finally {
-        db.close();
-      }
     });
   });
 });

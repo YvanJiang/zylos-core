@@ -32,6 +32,8 @@ import {
   uploadKind
 } from './attachment-utils.js';
 import { openDb, SessionStore, PersistentUploadRegistry } from './db.js';
+import { readExecutorObservability } from '../../../runtime/observability/executor-snapshot-client.js';
+import { projectRuntimeHealth } from '../../../runtime/observability/health-projection.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -47,7 +49,6 @@ const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const SKILLS_DIR = process.env.WEB_CONSOLE_SKILLS_DIR || path.join(os.homedir(), 'zylos', '.claude', 'skills');
 const DB_DIR = path.join(ZYLOS_DIR, 'comm-bridge');
 const DB_PATH = path.join(DB_DIR, 'c4.db');
-const STATUS_FILE = path.join(ZYLOS_DIR, 'activity-monitor', 'agent-status.json');
 const MEDIA_DIR = path.join(ZYLOS_DIR, 'web-console', 'media');
 const MAX_UPLOAD_MB = Number.parseInt(process.env.WEB_CONSOLE_MAX_UPLOAD_MB || '20', 10);
 const MAX_UPLOAD_BYTES = Math.max(1, MAX_UPLOAD_MB) * 1024 * 1024;
@@ -165,24 +166,31 @@ let lastStatus = null;
 let lastMessageId = 0;
 
 /**
- * Read current Claude status
+ * Read provider-neutral Core runtime health.
  */
-function readStatus() {
+async function readStatus() {
   try {
-    if (fs.existsSync(STATUS_FILE)) {
-      return JSON.parse(fs.readFileSync(STATUS_FILE, 'utf8'));
-    }
-    return { state: 'unknown', message: 'Status file not found' };
+    return projectRuntimeHealth(await readExecutorObservability({ zylosDir: ZYLOS_DIR }));
   } catch (err) {
-    return { state: 'error', message: err.message };
+    return {
+      contract: 'zylos.observability-health-projection',
+      contract_version: '1.0',
+      state: 'unavailable',
+      service: null,
+      executors: null,
+      turns: null,
+      outbox: null,
+      error: { code: 'executor_observability_unavailable', user_message: err.message },
+    };
   }
 }
 
 /**
  * Strip internal routing info from message content for display
  */
-function stripReplyVia(content) {
-  // Remove "---- reply via: ..." suffix
+function stripLegacyDirectRoute(content) {
+  // Historical display sanitization only. The corresponding direct route is
+  // not importable or executable from the normal runtime.
   const idx = content.indexOf(' ---- reply via:');
   if (idx !== -1) {
     return content.substring(0, idx);
@@ -196,7 +204,7 @@ function stripReplyVia(content) {
 function cleanMessageForDisplay(msg) {
   const cleaned = {
     ...msg,
-    content: stripReplyVia(msg.content)
+    content: stripLegacyDirectRoute(msg.content)
   };
   const classified = classifyConversationMessage(cleaned);
   if (classified.kind === 'media') return classified;
@@ -285,7 +293,14 @@ function buildSendContent(content, attachmentEntries) {
   return message;
 }
 
-function sendToC4(content) {
+function webMessageId(value) {
+  if (typeof value !== 'string' || value.length === 0) {
+    return `web-console-${crypto.randomUUID()}`;
+  }
+  return `web-console-${crypto.createHash('sha256').update(value).digest('hex')}`;
+}
+
+function sendToC4(content, messageId) {
   const c4Receive = path.join(C4_SCRIPT_DIR, 'c4-receive.js');
 
   return new Promise((resolve, reject) => {
@@ -293,6 +308,8 @@ function sendToC4(content) {
       c4Receive,
       '--channel', 'web-console',
       '--endpoint', 'console',
+      '--message-id', messageId,
+      '--actor-id', 'web-console-user',
       '--content', content
     ], { stdio: 'pipe' });
 
@@ -316,7 +333,7 @@ function sendToC4(content) {
   });
 }
 
-async function sendConsoleMessage({ content, attachmentIds, sessionId }) {
+async function sendConsoleMessage({ content, attachmentIds, sessionId, messageId }) {
   const ids = normalizeAttachmentIds(attachmentIds);
   validateSendPayload(content, ids);
 
@@ -342,7 +359,7 @@ async function sendConsoleMessage({ content, attachmentIds, sessionId }) {
     }
   }
   try {
-    await sendToC4(combined);
+    await sendToC4(combined, webMessageId(messageId));
   } catch (err) {
     uploadRegistry.restoreMany(attachmentEntries);
     throw err;
@@ -384,10 +401,11 @@ function getMediaRow(messageId) {
 /**
  * Check for status changes and new messages
  */
-function checkUpdates() {
+async function checkUpdates() {
   // Check status changes
-  const currentStatus = readStatus();
-  if (!lastStatus || currentStatus.state !== lastStatus.state) {
+  const currentStatus = await readStatus();
+  if (!lastStatus || currentStatus.snapshot_id !== lastStatus.snapshot_id
+    || currentStatus.state !== lastStatus.state) {
     lastStatus = currentStatus;
     broadcast('status', currentStatus);
   }
@@ -401,7 +419,12 @@ function checkUpdates() {
 }
 
 // Start update checker (every 500ms for responsiveness)
-setInterval(checkUpdates, 500);
+let updateInFlight = false;
+setInterval(() => {
+  if (updateInFlight) return;
+  updateInFlight = true;
+  checkUpdates().catch(() => {}).finally(() => { updateInFlight = false; });
+}, 500);
 
 // Initialize lastMessageId
 try {
@@ -430,8 +453,9 @@ wss.on('connection', (ws, req) => {
   console.log(`WebSocket client connected (${clients.size} total)`);
 
   // Send current status immediately
-  const status = readStatus();
-  ws.send(JSON.stringify({ type: 'status', data: status }));
+  readStatus().then((status) => {
+    if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'status', data: status }));
+  }).catch(() => {});
 
   // Handle client messages
   ws.on('message', async (data) => {
@@ -444,7 +468,8 @@ wss.on('connection', (ws, req) => {
           await sendConsoleMessage({
             content: msg.content || '',
             attachmentIds: msg.attachments,
-            sessionId: getSessionId(req)
+            sessionId: getSessionId(req),
+            messageId: tempId,
           });
           ws.send(JSON.stringify({ type: 'sent', success: true, tempId }));
         } catch (err) {
@@ -477,7 +502,9 @@ wss.on('connection', (ws, req) => {
  * Get Claude status (HTTP fallback)
  */
 app.get('/api/status', (req, res) => {
-  res.json(readStatus());
+  readStatus().then((status) => res.json(status)).catch((err) => {
+    res.status(503).json({ state: 'unavailable', error: err.message });
+  });
 });
 
 /**
@@ -577,7 +604,8 @@ app.post('/api/send', (req, res) => {
   sendConsoleMessage({
     content: req.body.message || '',
     attachmentIds: req.body.attachments,
-    sessionId: getSessionId(req)
+    sessionId: getSessionId(req),
+    messageId: req.body.message_id,
   }).then(() => {
     res.json({ success: true, message: 'Message sent to Claude' });
   }).catch((err) => jsonError(res, err));

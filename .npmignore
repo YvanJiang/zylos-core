@@ -26,7 +26,9 @@ skills/activity-monitor/
 skills/comm-bridge/scripts/c4-dispatcher.js
 skills/comm-bridge/scripts/tmux-input-state.js
 skills/comm-bridge/scripts/c4-control.js
+skills/comm-bridge/scripts/c4-session-init.js
 skills/comm-bridge/references/c4-control.md
+skills/comm-bridge/references/hooks.md
 cli/lib/tmux-input-state.js
 cli/lib/runtime/base.js
 cli/lib/runtime/claude.js

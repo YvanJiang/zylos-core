@@ -95,7 +95,7 @@ To enable password protection (recommended when exposing externally):
 
 ## Features
 
-- Real-time status indicator (busy/idle/offline)
+- Provider-neutral Core service, executor, turn, queue, and outbox status
 - Message polling every 2 seconds
 - Auto-resizing input
 - Browser file/image upload via attach button, drag/drop, and paste
@@ -113,11 +113,14 @@ Browser uploads are stored under `~/zylos/web-console/media/` and delivered to t
 [attachment:file /Users/howard/zylos/web-console/media/wc-...pdf name="report.pdf" 1.2MB]
 ```
 
-Agent replies can include a single media row using the same C4 convention as other channels:
+Agent replies can include one media marker as normal current-turn output:
 
-```bash
-node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js web-console console "[MEDIA:image]/absolute/path/to/image.png"
-node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js web-console console "[MEDIA:file]/absolute/path/to/report.pdf"
+```text
+[MEDIA:image]/absolute/path/to/image.png
+[MEDIA:file]/absolute/path/to/report.pdf
 ```
+
+Core persists the reply in its durable outbox. The web-console channel owner
+renders it; the agent never invokes a direct send script.
 
 The browser only requests media by C4 message id. The server rechecks the row is an outbound web-console console message, resolves the target with `realpath`, and serves only paths under `ZYLOS_DIR` or `/tmp`.

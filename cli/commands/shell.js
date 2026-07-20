@@ -8,6 +8,7 @@
 import readline from 'node:readline';
 import net from 'node:net';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -120,6 +121,8 @@ export async function shellCommand() {
         C4_RECEIVE,
         '--channel', 'shell',
         '--endpoint', socketPath,
+        '--message-id', `shell-${crypto.randomUUID()}`,
+        '--actor-id', 'local-shell-user',
         '--content', input,
         '--json',
       ], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });

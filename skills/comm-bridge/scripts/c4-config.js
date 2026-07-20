@@ -33,18 +33,9 @@ const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 
 export const DATA_DIR = path.join(ZYLOS_DIR, 'comm-bridge');
 export const DB_PATH = path.join(DATA_DIR, 'c4.db');
-export const ACTIVITY_MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
-export const AGENT_STATUS_FILE = path.join(ACTIVITY_MONITOR_DIR, 'agent-status.json');
-export const PROC_STATE_FILE = path.join(ACTIVITY_MONITOR_DIR, 'proc-state.json');
-export const API_ACTIVITY_FILE = path.join(ACTIVITY_MONITOR_DIR, 'api-activity.json');
-export const PENDING_CHANNELS_FILE = path.join(ACTIVITY_MONITOR_DIR, 'pending-channels.jsonl');
 export const ATTACHMENTS_DIR = path.join(DATA_DIR, 'attachments');
 export const SKILLS_DIR = path.join(ZYLOS_DIR, '.claude', 'skills');
 
-// Single source of truth for the Memory Sync checkpoint threshold (unsummarized
-// conversation count that triggers a sync). Imported by the activity-monitor
-// context-monitor / monitor scripts — do NOT re-declare it as a literal elsewhere.
+// Historical record-query thresholds. These are not runtime health facts.
 export const CHECKPOINT_THRESHOLD = 15;
 export const SESSION_INIT_RECENT_COUNT = 6;  // max conversations returned by session-init when above threshold
-
-export const STALE_STATUS_THRESHOLD = 5000; // ms

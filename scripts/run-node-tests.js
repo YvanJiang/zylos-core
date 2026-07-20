@@ -6,8 +6,7 @@ import { spawnSync } from 'node:child_process';
 const ROOT = process.cwd();
 const TEST_ROOTS = [
   path.join(ROOT, 'cli', 'lib', '__tests__'),
-  path.join(ROOT, 'cli', 'lib', 'runtime', '__tests__'),
-  path.join(ROOT, 'skills', 'activity-monitor', 'scripts', '__tests__'),
+  path.join(ROOT, 'skills', 'scheduler', 'scripts', '__tests__'),
 ];
 
 function walk(dir, files = []) {
@@ -26,8 +25,7 @@ function walk(dir, files = []) {
 function isNodeTest(file) {
   const rel = path.relative(ROOT, file).split(path.sep).join('/');
   if (rel.startsWith('cli/lib/__tests__/')) return true;
-  if (rel.startsWith('cli/lib/runtime/__tests__/')) return true;
-  if (rel.startsWith('skills/activity-monitor/scripts/__tests__/')) return true;
+  if (rel.startsWith('skills/scheduler/scripts/__tests__/')) return true;
   return false;
 }
 

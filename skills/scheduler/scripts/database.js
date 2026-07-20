@@ -76,7 +76,13 @@ function initSchema() {
 
       -- Error Tracking
       last_error TEXT,
-      failed_at INTEGER
+      failed_at INTEGER,
+
+      -- Durable Core occurrence projection
+      current_occurrence_id TEXT,
+      current_turn_id TEXT,
+      last_core_state TEXT,
+      core_wait_reason TEXT
     );
 
     -- Critical indexes for performance
@@ -88,6 +94,8 @@ function initSchema() {
     CREATE TABLE IF NOT EXISTS task_history (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       task_id TEXT NOT NULL,
+      occurrence_id TEXT,
+      turn_id TEXT,
       executed_at INTEGER NOT NULL,
       completed_at INTEGER,
       status TEXT NOT NULL CHECK(status IN ('started', 'success', 'failed', 'timeout')),
@@ -108,11 +116,24 @@ function initSchema() {
     );
   `);
 
-  const columns = new Set(db.prepare('PRAGMA table_info(tasks)').all().map(({ name }) => name));
-  if (!columns.has('bound_conversation_json')) {
-    db.exec('ALTER TABLE tasks ADD COLUMN bound_conversation_json TEXT DEFAULT NULL');
+  const taskColumns = new Set(db.prepare('PRAGMA table_info(tasks)').all().map(({ name }) => name));
+  for (const [name, definition] of [
+    ['bound_conversation_json', 'TEXT DEFAULT NULL'],
+    ['current_occurrence_id', 'TEXT DEFAULT NULL'],
+    ['current_turn_id', 'TEXT DEFAULT NULL'],
+    ['last_core_state', 'TEXT DEFAULT NULL'],
+    ['core_wait_reason', 'TEXT DEFAULT NULL'],
+  ]) {
+    if (!taskColumns.has(name)) db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${definition}`);
   }
-
+  const historyColumns = new Set(
+    db.prepare('PRAGMA table_info(task_history)').all().map(({ name }) => name),
+  );
+  for (const name of ['occurrence_id', 'turn_id']) {
+    if (!historyColumns.has(name)) {
+      db.exec(`ALTER TABLE task_history ADD COLUMN ${name} TEXT DEFAULT NULL`);
+    }
+  }
 }
 
 // Clean up old history entries (older than HISTORY_RETENTION_DAYS)

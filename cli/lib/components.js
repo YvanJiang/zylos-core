@@ -3,6 +3,7 @@
  */
 
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { COMPONENTS_FILE } from './config.js';
@@ -215,8 +216,11 @@ export function outputTask(action, data) {
   try {
     const taskMessage = `[COMPONENT_TASK] ${JSON.stringify(task)}`;
     // Use spawnSync with args array to avoid shell escaping issues
-    // Use --no-reply since CLI tasks don't need a reply channel (zylos-cli has no send.js)
-    const result = spawnSync('node', [c4ReceivePath, '--no-reply', '--content', taskMessage], {
+    const result = spawnSync('node', [c4ReceivePath,
+      '--channel', 'zylos-cli', '--endpoint', 'local',
+      '--message-id', `component-${crypto.randomUUID()}`,
+      '--actor-id', 'local-cli-user', '--content', taskMessage,
+    ], {
       stdio: 'pipe',
       encoding: 'utf8'
     });

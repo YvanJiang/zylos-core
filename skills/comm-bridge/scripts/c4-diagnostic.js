@@ -1,8 +1,8 @@
 /**
  * C4 Diagnostic Logging Utilities
- * Shared by dispatcher, hooks, and other C4 scripts.
+ * Shared diagnostic writer for repository-only migration hooks and record tools.
  *
- * Log files are stored in ~/zylos/activity-monitor/ with automatic rotation.
+ * Log files are stored under the provider-neutral runtime diagnostics path.
  */
 
 import fs from 'fs';
@@ -10,7 +10,7 @@ import path from 'path';
 import os from 'os';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
-const DIAG_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
+const DIAG_DIR = path.join(ZYLOS_DIR, 'runtime', 'diagnostics');
 
 const MAX_LOG_SIZE = 100 * 1024; // 100KB — rotate when exceeded
 const KEEP_RATIO = 0.5;          // Keep last 50% of lines after rotation

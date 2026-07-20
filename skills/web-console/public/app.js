@@ -250,7 +250,7 @@ class ZylosConsole {
     this.autoResize();
 
     // Add temporary message
-    const tempId = `temp-${Date.now()}`;
+    const tempId = `temp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const tempAttachments = readyAttachments.map((item) => ({
       kind: item.kind,
       name: item.name,
@@ -273,7 +273,7 @@ class ZylosConsole {
         this.ws.send(JSON.stringify(payload));
       } else {
         // Fallback to HTTP
-        const body = { message };
+        const body = { message, message_id: tempId };
         if (attachmentIds.length > 0) body.attachments = attachmentIds;
         const response = await fetch(`${this.basePath}/api/send`, {
           method: 'POST',

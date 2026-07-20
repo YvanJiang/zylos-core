@@ -1,34 +1,18 @@
 # Lifecycle Commands
 
-All commands support partial task ID matching.
-
-## done
-
-`cli.js done <task-id>`
-
-Marks a task as completed. For recurring/interval tasks, the daemon will automatically calculate the next run time.
+The commands below manage future scheduling state. They cannot complete an
+admitted occurrence; completion is reconciled from its durable Core turn.
 
 ## remove
 
-`cli.js remove <task-id>`
-
-Permanently deletes a task and its history.
+`cli.js remove <task-id>` permanently removes a task and its local history.
 
 ## pause
 
-`cli.js pause <task-id>`
-
-Pauses a pending task. Paused tasks are skipped by the daemon.
+`cli.js pause <task-id>` pauses a pending future occurrence.
 
 ## resume
 
-`cli.js resume <task-id>`
+`cli.js resume <task-id>` returns a paused occurrence to pending.
 
-Resumes a paused task back to pending status.
-
-```bash
-cli.js done task-abc
-cli.js remove task-abc
-cli.js pause task-abc
-cli.js resume task-abc
-```
+All commands support an unambiguous partial task ID.

@@ -53,9 +53,9 @@ surface.
 Do not send the full handoff summary to the active external user channel
 (Telegram, Lark, Feishu, HXA, etc.). Handoff summaries are operational context
 for the next agent session and may contain task state from outside the current
-conversation. If the user is actively waiting, send only a short user-facing
-notice to their current `reply via` path, without internal task inventory or
-cross-channel context.
+conversation. If the user is actively waiting, return only a short user-facing
+notice in the current turn, without internal task inventory or cross-channel
+context. Core owns its durable delivery target.
 
 ### 5. Restart through Core service control
 

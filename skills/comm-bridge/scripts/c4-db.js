@@ -9,7 +9,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { DATA_DIR, DB_PATH, CONTROL_MAX_RETRIES } from './c4-config.js';
-import { buildReplyViaSuffix, hasLegacyReplyViaSuffix, truncateForDelivery } from './c4-utils.js';
+import { truncateForDelivery } from './c4-utils.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -34,7 +34,10 @@ export function getDb() {
     db.pragma('busy_timeout = 5000');
     db.pragma('foreign_keys = ON');
 
-    if (isNew) {
+    const hasLegacyHistorySchema = db.prepare(`
+      SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'conversations'
+    `).get() !== undefined;
+    if (isNew || !hasLegacyHistorySchema) {
       initSchema();
     }
 
@@ -743,9 +746,8 @@ export function formatConversations(conversations) {
 }
 
 /**
- * Format conversation records for agent-facing context. Unlike
- * formatConversations(), this adds reply routing only while each original
- * record is still available, never by post-processing the flattened output.
+ * Format historical conversation records for agent-facing context without
+ * creating routing authority from display data.
  * @param {array} conversations - array of conversation records
  * @param {object} [options]
  * @param {boolean} [options.spill=true] - when true, messages over the
@@ -765,15 +767,10 @@ export function formatConversationsForAgent(conversations, { spill = true } = {}
     const dir = conv.direction === 'in' ? 'IN' : 'OUT';
     const endpoint = conv.endpoint_id ? `:${conv.endpoint_id}` : '';
     const content = conv.content || '';
-    const replyViaSuffix = (
-      conv.direction === 'in' &&
-      conv.endpoint_id &&
-      !hasLegacyReplyViaSuffix(content)
-    ) ? buildReplyViaSuffix(conv.channel, conv.endpoint_id) : '';
     lines.push(`[${conv.timestamp}] ${dir} (${conv.channel}${endpoint}):`);
     lines.push(spill
-      ? truncateForDelivery(content, replyViaSuffix, conv.id)
-      : content + replyViaSuffix);
+      ? truncateForDelivery(content, '', conv.id)
+      : content);
     lines.push('');
   }
 
