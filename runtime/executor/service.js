@@ -40,6 +40,11 @@ function isExplicitProviderError(error) {
     && typeof error.providerError === 'object';
 }
 
+function isProviderTerminalRecord(record) {
+  return record?.type === 'turn_result'
+    && ['cancelled', 'completed', 'failed'].includes(record.outcome);
+}
+
 export function createExecutorService({
   database,
   adapter,
@@ -118,18 +123,16 @@ export function createExecutorService({
   let started = false;
   const activeRuns = new Map();
   const activeTurns = new Map();
-  const cancelledTurnIds = new Set();
   const closingPermissionTurnIds = new Set();
   const permissionControllers = new Map();
   const activeRunSettlements = new Set();
   const interactionDeliverySettlements = new Set();
-  const cancellationSettlements = new Map();
   const endedResidentFences = new Map();
   const pendingInteractionRecoveries = new Map();
   const pendingRecoveryIsolations = new Map();
   const recoveringOwnershipReleases = new Map();
   const timedOutLeaseReleases = new Map();
-  const uncertainTurnIds = new Set();
+  const stopSettlements = new Map();
   let lifecycle = 'open';
   let closePromise = null;
   let residentHeartbeat = null;
@@ -279,9 +282,6 @@ export function createExecutorService({
     if (activeTurns.get(turnContext.conversation_id) === turnContext) {
       activeTurns.delete(turnContext.conversation_id);
     }
-    cancelledTurnIds.delete(turnContext.turn_id);
-    uncertainTurnIds.delete(turnContext.turn_id);
-    cancellationSettlements.delete(turnContext.turn_id);
     const controllers = permissionControllers.get(turnContext.turn_id);
     if (!controllers || controllers.size === 0) {
       permissionControllers.delete(turnContext.turn_id);
@@ -290,7 +290,7 @@ export function createExecutorService({
     if (!activeRun.settled) {
       activeRun.settled = true;
       activeRunSettlements.delete(activeRun.settlement);
-      activeRun.resolveSettlement();
+      activeRun.resolveSettlement(activeRun.providerTerminalObserved);
     }
   }
 
@@ -337,11 +337,6 @@ export function createExecutorService({
       return true;
     }
     return false;
-  }
-
-  async function awaitCancellationSettlement(turnId) {
-    const settlement = cancellationSettlements.get(turnId);
-    if (settlement) await settlement.promise;
   }
 
   function transitionToRecovery(activeRun, reasonCode = 'provider_execution_uncertain') {
@@ -398,25 +393,11 @@ export function createExecutorService({
       cleanupActiveRun(activeRun);
       throw error;
     }
-    await awaitCancellationSettlement(turnContext.turn_id);
     closingPermissionTurnIds.add(turnContext.turn_id);
     for (const controller of permissionControllers.get(turnContext.turn_id) ?? []) {
       controller.abort();
     }
-    if (uncertainTurnIds.has(turnContext.turn_id)) {
-      const isolationProven = cancellationSettlements.get(turnContext.turn_id)?.isolationProven;
-      const recovery = transitionToRecovery(activeRun);
-      if (isolationProven) {
-        try {
-          releaseRecoveringOwnership(turnContext);
-        } catch (ownershipFailure) {
-          residentHeartbeatFailure = ownershipFailure;
-        }
-      }
-      return recovery;
-    }
-    const cancelled = cancelledTurnIds.has(turnContext.turn_id);
-    if (isExplicitProviderError(error) && !cancelled) {
+    if (isExplicitProviderError(error)) {
       const { state } = store.assertCurrentFence(turnContext);
       persist(() => store.transitionTurn(turnContext, state, 'failed', {
         error: normalizeProviderError(error, now()),
@@ -429,10 +410,9 @@ export function createExecutorService({
       reschedulePendingInteractionDeadlines();
       return resultFor(activeRun, 'failed');
     }
-    const terminalState = cancelled ? 'stopped' : 'failed';
     const { state } = store.assertCurrentFence(turnContext);
-    store.transitionTurn(turnContext, state, terminalState, {
-      error: cancelled ? null : {
+    store.transitionTurn(turnContext, state, 'failed', {
+      error: {
         code: 'provider_stream_failed',
         category: 'provider',
         retryable: false,
@@ -445,7 +425,7 @@ export function createExecutorService({
     cleanupActiveRun(activeRun);
     releaseAbsentResident(turnContext);
     reschedulePendingInteractionDeadlines();
-    return resultFor(activeRun, terminalState);
+    return resultFor(activeRun, 'failed');
   }
 
   async function finishRun(activeRun) {
@@ -456,20 +436,6 @@ export function createExecutorService({
       return resultFor(activeRun, 'stopped');
     }
     activeRun.ensureProviderStarted();
-    await awaitCancellationSettlement(activeRun.turnContext.turn_id);
-    if (uncertainTurnIds.has(activeRun.turnContext.turn_id)) {
-      const { turnContext } = activeRun;
-      const isolationProven = cancellationSettlements.get(turnContext.turn_id)?.isolationProven;
-      const recovery = transitionToRecovery(activeRun);
-      if (isolationProven) {
-        try {
-          releaseRecoveringOwnership(turnContext);
-        } catch (ownershipFailure) {
-          residentHeartbeatFailure = ownershipFailure;
-        }
-      }
-      return recovery;
-    }
     const terminalState = activeRun.outcome === 'cancelled'
       ? 'stopped'
       : (activeRun.outcome === 'failed' ? 'failed' : 'completed');
@@ -510,6 +476,17 @@ export function createExecutorService({
             activeRun.turnContext,
             next.value,
           ));
+          if (isProviderTerminalRecord(next.value)) {
+            activeRun.providerTerminalObserved = true;
+          }
+          if (
+            next.value?.type === 'provider_native_id'
+            && typeof next.value.acknowledge === 'function'
+          ) {
+            next.value.acknowledge(new Error(
+              'Provider identity arrived after the durable stop fence.',
+            ));
+          }
           continue;
         }
         if (activeRun.providerFailureOutcome?.status === 'recovering') {
@@ -519,7 +496,6 @@ export function createExecutorService({
         const record = next.value;
         if (record?.type === 'interaction_persisted') {
           reschedulePendingInteractionDeadlines();
-          if (cancelledTurnIds.has(activeRun.turnContext.turn_id)) continue;
           activeRun.pauseKind = 'interaction';
           refresh();
           return resultFor(activeRun, 'waiting_user', { request: record.request });
@@ -531,7 +507,6 @@ export function createExecutorService({
             record.payload,
           ));
           reschedulePendingInteractionDeadlines();
-          if (cancelledTurnIds.has(activeRun.turnContext.turn_id)) continue;
           activeRun.pauseKind = 'interaction';
           refresh();
           return resultFor(activeRun, 'waiting_user', { request });
@@ -562,6 +537,7 @@ export function createExecutorService({
           activeRun.usesManagedRecords = true;
           activeRun.ensureProviderStarted();
           activeRun.outcome = record.outcome;
+          activeRun.providerTerminalObserved = isProviderTerminalRecord(record);
           continue;
         }
         activeRun.ensureProviderStarted();
@@ -645,10 +621,7 @@ export function createExecutorService({
           controllers.delete(controller);
           if (controllers.size === 0) {
             permissionControllers.delete(turnContext.turn_id);
-            if (
-              !cancelledTurnIds.has(turnContext.turn_id)
-              && !closingPermissionTurnIds.has(turnContext.turn_id)
-            ) {
+            if (!closingPermissionTurnIds.has(turnContext.turn_id)) {
               const resumed = persist(() => store.resumeTurnAfterPermission(turnContext));
               if (resumed.resumed && activeRun.pauseKind === 'interaction') {
                 activeRun.pauseKind = null;
@@ -712,6 +685,7 @@ export function createExecutorService({
       providerFailureOutcome: null,
       providerFailurePersistenceError: null,
       providerStarted: false,
+      providerTerminalObserved: false,
       resolveSettlement,
       settled: false,
       settlement,
@@ -841,106 +815,81 @@ export function createExecutorService({
     return advanceRun(activeRun);
   }
 
-  async function cancel(conversationId) {
-    if (typeof conversationId !== 'string' || conversationId.length === 0) {
-      throw new TypeError('conversationId must be a non-empty string');
-    }
-    const turnContext = activeTurns.get(conversationId);
-    if (!turnContext) return { status: 'idle', conversation_id: conversationId };
-    store.assertCurrentFence(turnContext);
-    if (typeof adapter.cancel !== 'function') {
-      throw new TypeError('adapter.cancel must be a function to cancel an active turn');
-    }
-    if (cancellationSettlements.has(turnContext.turn_id)) {
-      throw new Error('Cancellation is already pending for the active turn.');
-    }
-    let resolveCancellation;
-    const cancellation = {
-      isolationProven: false,
-      promise: new Promise((resolve) => { resolveCancellation = resolve; }),
-      resolve: () => resolveCancellation(),
-      status: 'pending',
-    };
-    cancellationSettlements.set(turnContext.turn_id, cancellation);
-    cancelledTurnIds.add(turnContext.turn_id);
-    for (const controller of permissionControllers.get(turnContext.turn_id) ?? []) {
-      controller.abort();
-    }
-    try {
-      await adapter.cancel(turnContext);
-    } catch (error) {
-      cancelledTurnIds.delete(turnContext.turn_id);
-      if (error.cancellationUncertain) {
-        uncertainTurnIds.add(turnContext.turn_id);
-        cancellation.status = 'uncertain';
-        if (typeof adapter.abort === 'function') {
-          try {
-            await adapter.abort(turnContext);
-            cancellation.isolationProven = true;
-          } catch (abortFailure) {
-            error.abortFailure = abortFailure;
-          }
-        }
-        cancellation.resolve();
-      } else {
-        cancellation.status = 'failed';
-        cancellation.resolve();
-      }
-      throw error;
-    }
-    cancellation.status = 'confirmed';
-    cancellation.resolve();
-    const activeRun = activeRuns.get(turnContext.turn_id);
-    let execution = null;
-    if (activeRun?.pauseKind === 'interaction') {
-      activeRun.pauseKind = null;
-      execution = await advanceRun(activeRun);
-    }
-    return {
-      status: 'cancellation_requested',
-      conversation_id: turnContext.conversation_id,
-      turn_id: turnContext.turn_id,
-      ...turnContext.attempt,
-      ...(execution ? { execution } : {}),
-    };
-  }
-
-  async function stop(request) {
+  async function performStop(request) {
     // Commit the provider-neutral terminal winner before asking an adapter to
     // terminate private provider work; subsequent provider output is fenced.
     const result = persist(() => store.stopConversation(request));
-    refresh();
-    reschedulePendingInteractionDeadlines();
-    if (result.deduplicated || result.active_turn === null) return result;
-
-    const activeRun = activeRuns.get(result.active_turn.turn_id);
-    const turnContext = activeRun?.turnContext ?? {
+    const activeRun = result.active_turn
+      ? activeRuns.get(result.active_turn.turn_id)
+      : null;
+    const turnContext = result.active_turn ? (activeRun?.turnContext ?? {
       conversation_id: result.conversation_id,
       turn_id: result.active_turn.turn_id,
       attempt: result.active_turn.attempt,
-    };
+    }) : null;
     if (activeRun) activeRun.stopCommitted = true;
-    closingPermissionTurnIds.add(turnContext.turn_id);
-    for (const controller of permissionControllers.get(turnContext.turn_id) ?? []) {
-      controller.abort();
+    if (turnContext) {
+      closingPermissionTurnIds.add(turnContext.turn_id);
+      for (const controller of permissionControllers.get(turnContext.turn_id) ?? []) {
+        controller.abort();
+      }
     }
-    let providerStopStatus = 'confirmed';
+    // These are rebuildable local projections. A failure must not reopen the
+    // durable stop fence or prevent provider isolation.
+    try { refresh(); } catch {}
+    try { reschedulePendingInteractionDeadlines(); } catch {}
+    const durableProviderStopStatus = result.provider_stop_status
+      ?? (result.active_turn ? 'pending' : 'not_applicable');
+    if (result.active_turn === null || durableProviderStopStatus !== 'pending') return result;
+
+    async function requestProviderIsolation() {
+      if (typeof adapter.abort !== 'function') return false;
+      let isolationTimeoutHandle;
+      const isolation = Promise.resolve()
+        .then(() => adapter.abort(turnContext))
+        .then(() => true, () => false);
+      const isolated = await Promise.race([
+        isolation,
+        new Promise((resolve) => {
+          isolationTimeoutHandle = setTimeoutFn(
+            () => resolve(false),
+            providerStopTimeoutMs,
+          );
+        }),
+      ]);
+      clearProviderStopTimeout(isolationTimeoutHandle);
+      return isolated;
+    }
+    function clearProviderStopTimeout(timeoutHandle) {
+      if (timeoutHandle === undefined) return;
+      try { clearTimeoutFn(timeoutHandle); } catch {}
+    }
+    let providerStopStatus;
     let isolationProven = false;
-    try {
+    let cancellationTimeoutHandle;
+    const cancellation = Promise.resolve().then(async () => {
       if (typeof adapter.cancel !== 'function') {
         throw new TypeError('adapter.cancel must be a function to stop an active turn');
       }
       await adapter.cancel(turnContext);
-    } catch {
-      providerStopStatus = 'uncertain';
-      if (typeof adapter.abort === 'function') {
-        try {
-          await adapter.abort(turnContext);
-          providerStopStatus = 'isolated';
-          isolationProven = true;
-        } catch {
-          isolationProven = false;
-        }
+      return 'confirmed';
+    }).catch(() => 'uncertain');
+    providerStopStatus = await Promise.race([
+      cancellation,
+      new Promise((resolve) => {
+        cancellationTimeoutHandle = setTimeoutFn(
+          () => resolve('terminal_unconfirmed'),
+          providerStopTimeoutMs,
+        );
+      }),
+    ]);
+    if (providerStopStatus !== 'terminal_unconfirmed') {
+      clearProviderStopTimeout(cancellationTimeoutHandle);
+    }
+    if (providerStopStatus !== 'confirmed') {
+      isolationProven = await requestProviderIsolation();
+      if (isolationProven) {
+        providerStopStatus = 'isolated';
       }
     }
     if (!isolationProven && providerStopStatus === 'confirmed') {
@@ -949,29 +898,26 @@ export function createExecutorService({
         advanceRun(activeRun).catch(() => {});
       }
       if (!activeRun) {
-        isolationProven = true;
+        providerStopStatus = 'terminal_unconfirmed';
+        isolationProven = await requestProviderIsolation();
+        if (isolationProven) providerStopStatus = 'isolated';
       } else {
         let timeoutHandle;
         const settled = await Promise.race([
-          activeRun.settlement.then(() => true),
+          activeRun.settlement.then((terminalObserved) => terminalObserved === true),
           new Promise((resolve) => {
             timeoutHandle = setTimeoutFn(() => resolve(false), providerStopTimeoutMs);
           }),
         ]);
-        if (settled && timeoutHandle !== undefined) clearTimeoutFn(timeoutHandle);
+        clearProviderStopTimeout(timeoutHandle);
         isolationProven = settled;
         if (!settled) {
           providerStopStatus = 'terminal_unconfirmed';
-          if (typeof adapter.abort === 'function') {
-            try {
-              await adapter.abort(turnContext);
-              activeRun.durableSettled = true;
-              cleanupActiveRun(activeRun);
-              providerStopStatus = 'isolated';
-              isolationProven = true;
-            } catch {
-              isolationProven = false;
-            }
+          isolationProven = await requestProviderIsolation();
+          if (isolationProven) {
+            activeRun.durableSettled = true;
+            cleanupActiveRun(activeRun);
+            providerStopStatus = 'isolated';
           }
         }
       }
@@ -981,29 +927,57 @@ export function createExecutorService({
       cleanupActiveRun(activeRun);
     }
     if (!isolationProven) {
-      const incident = persist(() => store.markProviderStopUnknown(
+      const persistedIncident = persist(() => store.markProviderStopUnknown(
         {
           turn_id: result.active_turn.turn_id,
           attempt: result.active_turn.attempt,
         },
         providerStopStatus,
+        result,
       ));
-      refresh();
+      const { stop_result: stoppedResult, ...incident } = persistedIncident;
+      try { refresh(); } catch {}
       return {
-        ...result,
-        lease_released: false,
-        provider_stop_status: providerStopStatus,
+        ...stoppedResult,
         incident,
       };
     }
-    const leaseReleased = persist(() => store.releaseStoppedExecutorLease(result));
+    const stoppedResult = persist(() => store.recordStopProviderOutcome(
+      result,
+      providerStopStatus,
+    ));
     if (activeRun) releaseAbsentResident(activeRun.turnContext);
-    refresh();
-    return {
-      ...result,
-      lease_released: leaseReleased,
-      provider_stop_status: providerStopStatus,
-    };
+    try { refresh(); } catch {}
+    return stoppedResult;
+  }
+
+  function stop(request) {
+    const conversationId = request?.conversation_id;
+    const stopId = request?.stop_id;
+    if (
+      typeof conversationId !== 'string'
+      || conversationId.length === 0
+      || typeof stopId !== 'string'
+      || stopId.length === 0
+    ) {
+      return performStop(request);
+    }
+    const settlementKey = `${stopId}\u0000${conversationId}`;
+    const existing = stopSettlements.get(settlementKey);
+    if (existing) {
+      return existing.then((settledResult) => ({
+        ...settledResult,
+        deduplicated: true,
+      }));
+    }
+    const settlement = performStop(request);
+    stopSettlements.set(settlementKey, settlement);
+    settlement.finally(() => {
+      if (stopSettlements.get(settlementKey) === settlement) {
+        stopSettlements.delete(settlementKey);
+      }
+    }).catch(() => {});
+    return settlement;
   }
 
   async function evictIdleExecutors() {
@@ -1461,7 +1435,6 @@ export function createExecutorService({
   }
 
   return Object.freeze({
-    cancel,
     close,
     deliverInteractionAnswer,
     evictIdleExecutors,

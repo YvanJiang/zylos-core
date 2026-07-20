@@ -8,6 +8,7 @@ import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/inde
 import { createIdempotencyKey } from '../contracts/public/index.js';
 import { createExecutorService } from '../runtime/executor/service.js';
 import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { createExecutorStore } from '../runtime/persistence/executor-store.js';
 import { interactionAnswer } from './helpers/runtime-interaction-fixtures.js';
 
 const inboundFixture = JSON.parse(fs.readFileSync(
@@ -178,15 +179,9 @@ describe('runtime /stop linearization', () => {
     });
     await cancellationEntered.promise;
 
-    await expect(service.stop({
+    const sameStopReplay = service.stop({
       conversation_id: active.conversation_id,
       stop_id: 'stop-repeat-1',
-    })).resolves.toMatchObject({
-      status: 'stopped',
-      stop_id: 'stop-repeat-1',
-      active_turn: { turn_id: active.turn_id, state: 'stopped' },
-      cancelled_turn_ids: [queued.turn_id],
-      deduplicated: true,
     });
     await expect(service.stop({
       conversation_id: active.conversation_id,
@@ -202,6 +197,13 @@ describe('runtime /stop linearization', () => {
 
     allowCancellation.resolve();
     await expect(firstStop).resolves.toMatchObject({ status: 'stopped' });
+    await expect(sameStopReplay).resolves.toMatchObject({
+      status: 'stopped',
+      stop_id: 'stop-repeat-1',
+      active_turn: { turn_id: active.turn_id, state: 'stopped' },
+      cancelled_turn_ids: [queued.turn_id],
+      deduplicated: true,
+    });
     await expect(execution).resolves.toMatchObject({ status: 'stopped' });
     expect(database.prepare(`
       SELECT COUNT(*) AS count
@@ -211,6 +213,239 @@ describe('runtime /stop linearization', () => {
         AND json_extract(event_json, '$.phase') = 'stopped'
     `).get(active.turn_id)).toEqual({ count: 1 });
 
+    database.close();
+  });
+
+  test('replays unfinished provider termination after the stop commit crash window', async () => {
+    const database = openTestDatabase();
+    const active = acceptTurn(database, 'replay-provider-stop');
+    let cancellationCount = 0;
+    let abortCount = 0;
+    const serviceInstanceId = 'executor-service-stop-replay-provider';
+    const adapter = {
+      async *execute() {},
+      async cancel() {
+        cancellationCount += 1;
+      },
+      async abort() {
+        abortCount += 1;
+      },
+    };
+    const store = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId,
+      now: () => '2026-07-20T01:02:30Z',
+      generateId: deterministicIds('stop-replay-provider-store'),
+    });
+    expect(store.reserveNextExecutor({ maxResidentExecutorsPerBot: 20 }))
+      .toMatchObject({ status: 'ready', conversation_id: active.conversation_id });
+    const turnContext = store.claimNextQueuedTurn({ conversationId: active.conversation_id });
+    store.transitionTurn(turnContext, 'starting', 'running');
+    expect(store.stopConversation({
+      conversation_id: active.conversation_id,
+      stop_id: 'stop-replay-provider-1',
+    })).toMatchObject({
+      status: 'stopped',
+      provider_stop_status: 'pending',
+      lease_released: false,
+    });
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId,
+      now: () => '2026-07-20T01:02:30Z',
+      generateId: deterministicIds('stop-replay-provider-service'),
+    });
+
+    await expect(service.stop({
+      conversation_id: active.conversation_id,
+      stop_id: 'stop-replay-provider-1',
+    })).resolves.toMatchObject({
+      status: 'stopped',
+      deduplicated: true,
+      provider_stop_status: 'isolated',
+      lease_released: true,
+    });
+    expect(cancellationCount).toBe(1);
+    expect(abortCount).toBe(1);
+
+    database.close();
+  });
+
+  test('bounds missing-local-run isolation and retains the lease without proof', async () => {
+    const database = openTestDatabase();
+    const active = acceptTurn(database, 'replay-abort-hangs');
+    const serviceInstanceId = 'executor-service-stop-replay-abort-hangs';
+    const store = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId,
+      now: () => '2026-07-20T01:02:40Z',
+      generateId: deterministicIds('stop-replay-abort-hangs-store'),
+    });
+    expect(store.reserveNextExecutor({ maxResidentExecutorsPerBot: 20 }))
+      .toMatchObject({ status: 'ready', conversation_id: active.conversation_id });
+    const turnContext = store.claimNextQueuedTurn({ conversationId: active.conversation_id });
+    store.transitionTurn(turnContext, 'starting', 'running');
+    store.stopConversation({
+      conversation_id: active.conversation_id,
+      stop_id: 'stop-replay-abort-hangs-1',
+    });
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute() {},
+        async cancel() {},
+        async abort() { await new Promise(() => {}); },
+      },
+      provider: 'codex',
+      serviceInstanceId,
+      now: () => '2026-07-20T01:02:40Z',
+      providerStopTimeoutMs: 1,
+      generateId: deterministicIds('stop-replay-abort-hangs-service'),
+    });
+
+    await expect(service.stop({
+      conversation_id: active.conversation_id,
+      stop_id: 'stop-replay-abort-hangs-1',
+    })).resolves.toMatchObject({
+      status: 'stopped',
+      provider_stop_status: 'terminal_unconfirmed',
+      lease_released: false,
+      incident: { disposition: 'manual_recovery_required' },
+    });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(active.conversation_id)).toEqual({
+      lease_owner: serviceInstanceId,
+      turn_id: active.turn_id,
+    });
+
+    database.close();
+  });
+
+  test('atomically rolls back lease release when the durable outcome CAS fails', () => {
+    const database = openTestDatabase();
+    const active = acceptTurn(database, 'provider-outcome-rollback');
+    const serviceInstanceId = 'executor-service-stop-outcome-rollback';
+    const store = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId,
+      now: () => '2026-07-20T01:02:42Z',
+      generateId: deterministicIds('stop-outcome-rollback'),
+    });
+    expect(store.reserveNextExecutor({ maxResidentExecutorsPerBot: 20 }))
+      .toMatchObject({ status: 'ready', conversation_id: active.conversation_id });
+    const turnContext = store.claimNextQueuedTurn({ conversationId: active.conversation_id });
+    store.transitionTurn(turnContext, 'starting', 'running');
+    const stopped = store.stopConversation({
+      conversation_id: active.conversation_id,
+      stop_id: 'stop-outcome-rollback-1',
+    });
+    database.exec(`
+      CREATE TEMP TRIGGER fail_stop_outcome_update
+      BEFORE UPDATE OF result_json ON runtime_stop_controls
+      BEGIN
+        SELECT RAISE(ABORT, 'forced stop outcome write failure');
+      END;
+    `);
+
+    let writeFailure;
+    try {
+      store.recordStopProviderOutcome(stopped, 'isolated');
+    } catch (error) {
+      writeFailure = error;
+    }
+    expect(writeFailure).toMatchObject({
+      name: 'SqliteError',
+      code: 'SQLITE_CONSTRAINT_TRIGGER',
+      message: 'forced stop outcome write failure',
+    });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(active.conversation_id)).toEqual({
+      lease_owner: serviceInstanceId,
+      turn_id: active.turn_id,
+    });
+    expect(database.prepare(`
+      SELECT json_extract(result_json, '$.provider_stop_status') AS provider_stop_status,
+        json_extract(result_json, '$.lease_released') AS lease_released
+      FROM runtime_stop_controls WHERE stop_id = ?
+    `).get(stopped.stop_id)).toEqual({
+      provider_stop_status: 'pending',
+      lease_released: 0,
+    });
+
+    database.exec('DROP TRIGGER fail_stop_outcome_update');
+    expect(store.recordStopProviderOutcome(stopped, 'isolated')).toMatchObject({
+      provider_stop_status: 'isolated',
+      lease_released: true,
+    });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(active.conversation_id)).toEqual({ lease_owner: null, turn_id: null });
+
+    database.close();
+  });
+
+  test('keeps the lease when an unknown outcome wins before late isolation proof', () => {
+    const database = openTestDatabase();
+    const active = acceptTurn(database, 'provider-unknown-wins');
+    const serviceInstanceId = 'executor-service-stop-unknown-wins';
+    const store = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId,
+      now: () => '2026-07-20T01:02:44Z',
+      generateId: deterministicIds('stop-unknown-wins'),
+    });
+    expect(store.reserveNextExecutor({ maxResidentExecutorsPerBot: 20 }))
+      .toMatchObject({ status: 'ready', conversation_id: active.conversation_id });
+    const turnContext = store.claimNextQueuedTurn({ conversationId: active.conversation_id });
+    store.transitionTurn(turnContext, 'starting', 'running');
+    const stopped = store.stopConversation({
+      conversation_id: active.conversation_id,
+      stop_id: 'stop-unknown-wins-1',
+    });
+    expect(store.markProviderStopUnknown(
+      { turn_id: active.turn_id, attempt: turnContext.attempt },
+      'uncertain',
+      stopped,
+    )).toMatchObject({
+      provider_stop_status: 'uncertain',
+      stop_result: { lease_released: false },
+    });
+
+    expect(store.recordStopProviderOutcome(stopped, 'isolated')).toMatchObject({
+      provider_stop_status: 'uncertain',
+      lease_released: false,
+    });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(active.conversation_id)).toEqual({
+      lease_owner: serviceInstanceId,
+      turn_id: active.turn_id,
+    });
+
+    database.close();
+  });
+
+  test('exposes stop as the only public conversation termination control', () => {
+    const database = openTestDatabase();
+    const service = createExecutorService({
+      database,
+      adapter: { async *execute() {} },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-stop-public-control',
+      now: () => '2026-07-20T01:02:45Z',
+      generateId: deterministicIds('stop-public-control'),
+    });
+
+    expect(Object.hasOwn(service, 'stop')).toBe(true);
+    expect(Object.hasOwn(service, 'cancel')).toBe(false);
     database.close();
   });
 
@@ -649,6 +884,7 @@ describe('runtime /stop linearization', () => {
     const database = openTestDatabase();
     const active = acceptTurn(database, 'recovering');
     const cancellationContexts = [];
+    const isolationContexts = [];
     const providerFailure = Object.assign(new Error('transport lost'), {
       providerError: {
         code: 'side_effect_unknown',
@@ -666,6 +902,9 @@ describe('runtime /stop linearization', () => {
       },
       async cancel(context) {
         cancellationContexts.push(context);
+      },
+      async abort(context) {
+        isolationContexts.push(context);
       },
     };
     const service = createExecutorService({
@@ -687,6 +926,7 @@ describe('runtime /stop linearization', () => {
     })).resolves.toMatchObject({
       status: 'stopped',
       active_turn: { previous_state: 'recovering', state: 'stopped' },
+      provider_stop_status: 'isolated',
       lease_released: true,
     });
     expect(cancellationContexts).toEqual([
@@ -696,6 +936,7 @@ describe('runtime /stop linearization', () => {
         attempt: expect.objectContaining({ lease_epoch: 1 }),
       }),
     ]);
+    expect(isolationContexts).toEqual(cancellationContexts);
 
     database.close();
   });
@@ -810,6 +1051,107 @@ describe('runtime /stop linearization', () => {
 
     providerEventuallyEnds.resolve();
     await expect(execution).resolves.toMatchObject({ status: 'stopped' });
+    database.close();
+  });
+
+  test('does not treat a post-cancel stream failure as provider terminal proof', async () => {
+    const database = openTestDatabase();
+    const active = acceptTurn(database, 'provider-stream-fails-after-cancel');
+    const providerStarted = deferred();
+    const cancelAccepted = deferred();
+    const adapter = {
+      async *execute(context) {
+        context.reportProviderState({ state: 'started', provider_native_id: null });
+        providerStarted.resolve();
+        await cancelAccepted.promise;
+        throw new Error('provider connection failed after cancel acceptance');
+      },
+      async cancel() {
+        cancelAccepted.resolve();
+      },
+      async abort() {
+        throw new Error('provider isolation unavailable');
+      },
+    };
+    const serviceInstanceId = 'executor-service-stop-stream-failure';
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId,
+      now: () => '2026-07-20T01:10:30Z',
+      generateId: deterministicIds('stop-stream-failure'),
+    });
+
+    const execution = service.runNext();
+    await providerStarted.promise;
+    await expect(service.stop({
+      conversation_id: active.conversation_id,
+      stop_id: 'stop-stream-failure-1',
+    })).resolves.toMatchObject({
+      status: 'stopped',
+      provider_stop_status: 'terminal_unconfirmed',
+      lease_released: false,
+      incident: { disposition: 'manual_recovery_required' },
+    });
+    await expect(execution).resolves.toMatchObject({ status: 'stopped' });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(active.conversation_id)).toEqual({
+      lease_owner: serviceInstanceId,
+      turn_id: active.turn_id,
+    });
+
+    database.close();
+  });
+
+  test('bounds a non-settling provider cancel and isolates before releasing the lease', async () => {
+    const database = openTestDatabase();
+    const active = acceptTurn(database, 'provider-cancel-hangs');
+    const providerStarted = deferred();
+    const providerStopped = deferred();
+    let abortCount = 0;
+    const adapter = {
+      async *execute(context) {
+        context.reportProviderState({ state: 'started', provider_native_id: null });
+        providerStarted.resolve();
+        await providerStopped.promise;
+        yield { type: 'turn_result', outcome: 'cancelled' };
+      },
+      async cancel() {
+        await new Promise(() => {});
+      },
+      async abort() {
+        abortCount += 1;
+        providerStopped.resolve();
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-stop-cancel-hangs',
+      now: () => '2026-07-20T01:11:00Z',
+      providerStopTimeoutMs: 1,
+      generateId: deterministicIds('stop-cancel-hangs'),
+    });
+
+    const execution = service.runNext();
+    await providerStarted.promise;
+    await expect(service.stop({
+      conversation_id: active.conversation_id,
+      stop_id: 'stop-cancel-hangs-1',
+    })).resolves.toMatchObject({
+      status: 'stopped',
+      provider_stop_status: 'isolated',
+      lease_released: true,
+    });
+    await expect(execution).resolves.toMatchObject({ status: 'stopped' });
+    expect(abortCount).toBe(1);
+    expect(database.prepare(`
+      SELECT lease_owner FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(active.conversation_id)).toEqual({ lease_owner: null });
+
     database.close();
   });
 });

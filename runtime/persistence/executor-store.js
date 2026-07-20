@@ -1407,6 +1407,9 @@ export function createExecutorStore({
         stop_cutoff_queue_sequence: cutoff,
         active_turn: activeTurn,
         cancelled_turn_ids: cancelledTurnIds,
+        provider_stop_status: activeTurn ? 'pending' : 'not_applicable',
+        lease_released: activeTurn === null,
+        provider_stop_updated_at: stoppedAt,
         committed_at: stoppedAt,
         deduplicated: false,
       };
@@ -1428,41 +1431,116 @@ export function createExecutorStore({
     return stop.immediate();
   }
 
-  function releaseStoppedExecutorLease(stopResult) {
+  function loadStopProviderOutcomeInTransaction(stopResult) {
+    if (!stopResult || typeof stopResult.stop_id !== 'string') {
+      throw new TypeError('stopResult must identify a durable stop control');
+    }
+    const row = database.prepare(`
+      SELECT conversation_id, result_json
+      FROM runtime_stop_controls
+      WHERE stop_id = ?
+    `).get(stopResult.stop_id);
+    if (!row) conflict('stop_not_found', `Stop ${stopResult.stop_id} does not exist.`);
+    if (row.conversation_id !== stopResult.conversation_id) {
+      conflict('idempotency_conflict', 'The stop ID belongs to another conversation.');
+    }
+    const current = JSON.parse(row.result_json);
+    if (current.active_turn?.turn_id !== stopResult.active_turn?.turn_id) {
+      conflict('version_conflict', 'The provider stop outcome lost its active turn fence.');
+    }
+    const currentStatus = current.provider_stop_status
+      ?? (current.active_turn ? 'pending' : 'not_applicable');
+    return { current, currentStatus, row };
+  }
+
+  function updateStopProviderOutcomeInTransaction(
+    stopResult,
+    providerStopStatus,
+    leaseReleased,
+  ) {
+    if (!['confirmed', 'isolated', 'uncertain', 'terminal_unconfirmed'].includes(
+      providerStopStatus,
+    )) {
+      throw new TypeError('providerStopStatus must be a canonical provider stop outcome');
+    }
+    if (typeof leaseReleased !== 'boolean') {
+      throw new TypeError('leaseReleased must be a boolean');
+    }
+    const { current, currentStatus, row } = loadStopProviderOutcomeInTransaction(stopResult);
+    if (currentStatus !== 'pending') {
+      return { ...current, deduplicated: stopResult.deduplicated === true };
+    }
+    const updated = {
+      ...current,
+      provider_stop_status: providerStopStatus,
+      lease_released: leaseReleased,
+      provider_stop_updated_at: now(),
+      deduplicated: false,
+    };
+    const write = database.prepare(`
+      UPDATE runtime_stop_controls
+      SET result_json = ?
+      WHERE stop_id = ? AND conversation_id = ? AND result_json = ?
+    `).run(
+      JSON.stringify(updated),
+      stopResult.stop_id,
+      stopResult.conversation_id,
+      row.result_json,
+    );
+    if (write.changes !== 1) {
+      conflict('version_conflict', 'The provider stop outcome lost its durable CAS.');
+    }
+    return { ...updated, deduplicated: stopResult.deduplicated === true };
+  }
+
+  function releaseStoppedExecutorLeaseInTransaction(stopResult) {
     const activeTurn = stopResult?.active_turn;
     if (!activeTurn) return false;
-    const release = database.transaction(() => {
-      const turn = loadTurn(database, activeTurn.turn_id);
-      if (turn.state !== 'stopped') {
-        conflict('turn_terminal', 'The stopped turn no longer has stopped authority.');
+    const turn = loadTurn(database, activeTurn.turn_id);
+    if (turn.state !== 'stopped') {
+      conflict('turn_terminal', 'The stopped turn no longer has stopped authority.');
+    }
+    const lease = database.prepare(`
+      SELECT lease_owner, turn_id, attempt_id, attempt_no, lease_epoch
+      FROM runtime_executor_leases
+      WHERE conversation_id = ?
+    `).get(turn.conversation_id);
+    if (!lease || lease.lease_owner === null) return true;
+    const released = database.prepare(`
+      UPDATE runtime_executor_leases
+      SET lease_owner = NULL, turn_id = NULL, attempt_id = NULL,
+        attempt_no = NULL, lease_expires_at = NULL, updated_at = ?
+      WHERE conversation_id = ? AND lease_owner = ? AND turn_id = ?
+        AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+    `).run(
+      now(),
+      turn.conversation_id,
+      serviceInstanceId,
+      turn.turn_id,
+      turn.attempt_id,
+      turn.attempt_no,
+      turn.lease_epoch,
+    );
+    if (released.changes !== 1) {
+      conflict('stale_attempt', 'The stopped turn lost its executor lease fence.');
+    }
+    return true;
+  }
+
+  function recordStopProviderOutcome(stopResult, providerStopStatus) {
+    const record = database.transaction(() => {
+      const { current, currentStatus } = loadStopProviderOutcomeInTransaction(stopResult);
+      if (currentStatus !== 'pending') {
+        return { ...current, deduplicated: stopResult.deduplicated === true };
       }
-      const lease = database.prepare(`
-        SELECT lease_owner, turn_id, attempt_id, attempt_no, lease_epoch
-        FROM runtime_executor_leases
-        WHERE conversation_id = ?
-      `).get(turn.conversation_id);
-      if (!lease || lease.lease_owner === null) return false;
-      const released = database.prepare(`
-        UPDATE runtime_executor_leases
-        SET lease_owner = NULL, turn_id = NULL, attempt_id = NULL,
-          attempt_no = NULL, lease_expires_at = NULL, updated_at = ?
-        WHERE conversation_id = ? AND lease_owner = ? AND turn_id = ?
-          AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
-      `).run(
-        now(),
-        turn.conversation_id,
-        serviceInstanceId,
-        turn.turn_id,
-        turn.attempt_id,
-        turn.attempt_no,
-        turn.lease_epoch,
+      const leaseReleased = releaseStoppedExecutorLeaseInTransaction(stopResult);
+      return updateStopProviderOutcomeInTransaction(
+        stopResult,
+        providerStopStatus,
+        leaseReleased,
       );
-      if (released.changes !== 1) {
-        conflict('stale_attempt', 'The stopped turn lost its executor lease fence.');
-      }
-      return true;
     });
-    return release.immediate();
+    return record.immediate();
   }
 
   function assertCurrentFence(turnContext) {
@@ -2282,7 +2360,7 @@ export function createExecutorStore({
     return expire.immediate();
   }
 
-  function markProviderStopUnknown(terminalContext, providerStopStatus) {
+  function markProviderStopUnknown(terminalContext, providerStopStatus, stopResult = null) {
     const markUnknown = database.transaction(() => {
       if (typeof providerStopStatus !== 'string' || providerStopStatus.length === 0) {
         throw new TypeError('providerStopStatus must be a non-empty string');
@@ -2295,7 +2373,20 @@ export function createExecutorStore({
         FROM runtime_provider_stop_incidents
         WHERE turn_id = ?
       `).get(terminalContext.turn_id);
-      if (existing) return { status: 'manual_recovery_required', ...existing };
+      if (existing) {
+        const stoppedResult = stopResult
+          ? updateStopProviderOutcomeInTransaction(
+            stopResult,
+            existing.provider_stop_status,
+            false,
+          )
+          : null;
+        return {
+          status: 'manual_recovery_required',
+          ...existing,
+          ...(stoppedResult ? { stop_result: stoppedResult } : {}),
+        };
+      }
 
       const occurredAt = now();
       const turn = loadTurn(database, terminalContext.turn_id);
@@ -2412,6 +2503,9 @@ export function createExecutorStore({
         outboxId,
         occurredAt,
       );
+      const stoppedResult = stopResult
+        ? updateStopProviderOutcomeInTransaction(stopResult, providerStopStatus, false)
+        : null;
       return {
         status: 'manual_recovery_required',
         incident_id: incidentId,
@@ -2419,6 +2513,7 @@ export function createExecutorStore({
         side_effect_status: 'unknown',
         disposition: 'manual_recovery_required',
         outbox_id: outboxId,
+        ...(stoppedResult ? { stop_result: stoppedResult } : {}),
       };
     });
     return markUnknown.immediate();
@@ -3234,11 +3329,11 @@ export function createExecutorStore({
     releaseRecoveringExecutorOwnership,
     reconcileExpiredResidents,
     recordProviderEventDiagnostic,
+    recordStopProviderOutcome,
     expireInteraction,
     listPendingInteractionDeadlines,
     rebuildExecutorCache,
     releaseTimedOutExecutorLease,
-    releaseStoppedExecutorLease,
     requestInteraction,
     resumeTurnAfterPermission,
     reserveNextExecutor,
