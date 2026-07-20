@@ -133,6 +133,7 @@ export function createExecutorService({
   const recoveringOwnershipReleases = new Map();
   const timedOutLeaseReleases = new Map();
   const stopSettlements = new Map();
+  const steerSettlements = new Map();
   let lifecycle = 'open';
   let closePromise = null;
   let residentHeartbeat = null;
@@ -274,6 +275,12 @@ export function createExecutorService({
     };
   }
 
+  function committedControlStatus(activeRun) {
+    if (activeRun.steerCommitted) return 'interrupted';
+    if (activeRun.stopCommitted) return 'stopped';
+    return null;
+  }
+
   function cleanupActiveRun(activeRun) {
     const { turnContext } = activeRun;
     if (activeRuns.get(turnContext.turn_id) === activeRun) {
@@ -367,11 +374,12 @@ export function createExecutorService({
 
   async function handleRunFailure(activeRun, error) {
     const { turnContext } = activeRun;
-    if (activeRun.stopCommitted) {
+    const controlStatus = committedControlStatus(activeRun);
+    if (controlStatus !== null) {
       activeRun.durableSettled = true;
       cleanupActiveRun(activeRun);
       refresh();
-      return resultFor(activeRun, 'stopped');
+      return resultFor(activeRun, controlStatus);
     }
     if (activeRun.providerFailureOutcome?.status === 'recovering') {
       return retainRecoveringRun(activeRun);
@@ -429,11 +437,12 @@ export function createExecutorService({
   }
 
   async function finishRun(activeRun) {
-    if (activeRun.stopCommitted) {
+    const controlStatus = committedControlStatus(activeRun);
+    if (controlStatus !== null) {
       activeRun.durableSettled = true;
       cleanupActiveRun(activeRun);
       refresh();
-      return resultFor(activeRun, 'stopped');
+      return resultFor(activeRun, controlStatus);
     }
     activeRun.ensureProviderStarted();
     const terminalState = activeRun.outcome === 'cancelled'
@@ -470,7 +479,7 @@ export function createExecutorService({
     try {
       while (true) {
         const next = await activeRun.iterator.next();
-        if (activeRun.stopCommitted) {
+        if (committedControlStatus(activeRun) !== null) {
           if (next.done) return await finishRun(activeRun);
           persist(() => store.recordProviderEventDiagnostic(
             activeRun.turnContext,
@@ -484,7 +493,7 @@ export function createExecutorService({
             && typeof next.value.acknowledge === 'function'
           ) {
             next.value.acknowledge(new Error(
-              'Provider identity arrived after the durable stop fence.',
+              'Provider identity arrived after the durable control fence.',
             ));
           }
           continue;
@@ -693,6 +702,7 @@ export function createExecutorService({
       turnContext,
       usesManagedRecords: false,
       stopCommitted: false,
+      steerCommitted: false,
     };
     activeRunSettlements.add(settlement);
     activeRuns.set(turnContext.turn_id, activeRun);
@@ -725,7 +735,7 @@ export function createExecutorService({
         }),
         lineage: Object.freeze({ ...turnContext.lineage }),
         bindProviderNativeId(providerNativeId) {
-          if (activeRun.stopCommitted) {
+          if (committedControlStatus(activeRun) !== null) {
             persist(() => store.recordProviderEventDiagnostic(
               turnContext,
               {
@@ -743,7 +753,7 @@ export function createExecutorService({
           return binding;
         },
         reportProviderState(providerState) {
-          if (activeRun.stopCommitted) {
+          if (committedControlStatus(activeRun) !== null) {
             persist(() => store.recordProviderEventDiagnostic(
               turnContext,
               {
@@ -764,12 +774,12 @@ export function createExecutorService({
           return activeRun.ensureProviderStarted();
         },
         reportProviderFailure(providerFailure) {
-          if (activeRun.stopCommitted) {
+          if (committedControlStatus(activeRun) !== null) {
             persist(() => store.recordProviderEventDiagnostic(
               turnContext,
               {
                 kind: 'provider_failure',
-                payload: { status: 'arrived_after_stop' },
+                payload: { status: 'arrived_after_control' },
               },
             ));
             return { status: 'stale_attempt' };
@@ -980,6 +990,129 @@ export function createExecutorService({
     return settlement;
   }
 
+  async function performSteer(request) {
+    // The durable running -> redirecting CAS selects the steer winner before
+    // any provider-private cancellation is requested.
+    const result = persist(() => store.beginSteer(request));
+    if (result.status !== 'redirecting') return result;
+    const activeRun = activeRuns.get(result.old_turn.turn_id);
+    const turnContext = activeRun?.turnContext ?? {
+      conversation_id: result.conversation_id,
+      turn_id: result.old_turn.turn_id,
+      attempt: result.old_turn.attempt,
+    };
+    if (activeRun) activeRun.steerCommitted = true;
+    closingPermissionTurnIds.add(turnContext.turn_id);
+    for (const controller of permissionControllers.get(turnContext.turn_id) ?? []) {
+      controller.abort();
+    }
+    try { refresh(); } catch {}
+    try { reschedulePendingInteractionDeadlines(); } catch {}
+
+    function clearProviderStopTimeout(timeoutHandle) {
+      if (timeoutHandle === undefined) return;
+      try { clearTimeoutFn(timeoutHandle); } catch {}
+    }
+    async function requestProviderIsolation() {
+      if (typeof adapter.abort !== 'function') return false;
+      let timeoutHandle;
+      const isolated = await Promise.race([
+        Promise.resolve().then(() => adapter.abort(turnContext)).then(() => true, () => false),
+        new Promise((resolve) => {
+          timeoutHandle = setTimeoutFn(() => resolve(false), providerStopTimeoutMs);
+        }),
+      ]);
+      clearProviderStopTimeout(timeoutHandle);
+      return isolated;
+    }
+
+    let cancellationTimeoutHandle;
+    let providerStopStatus = await Promise.race([
+      Promise.resolve().then(async () => {
+        if (typeof adapter.cancel !== 'function') {
+          throw new TypeError('adapter.cancel must be a function to steer an active turn');
+        }
+        await adapter.cancel(turnContext, { reason: 'steer' });
+        return 'confirmed';
+      }).catch(() => 'uncertain'),
+      new Promise((resolve) => {
+        cancellationTimeoutHandle = setTimeoutFn(
+          () => resolve('terminal_unconfirmed'),
+          providerStopTimeoutMs,
+        );
+      }),
+    ]);
+    if (providerStopStatus !== 'terminal_unconfirmed') {
+      clearProviderStopTimeout(cancellationTimeoutHandle);
+    }
+
+    let isolationProven = false;
+    if (providerStopStatus === 'confirmed' && activeRun) {
+      let settlementTimeoutHandle;
+      isolationProven = await Promise.race([
+        activeRun.settlement.then((terminalObserved) => terminalObserved === true),
+        new Promise((resolve) => {
+          settlementTimeoutHandle = setTimeoutFn(() => resolve(false), providerStopTimeoutMs);
+        }),
+      ]);
+      clearProviderStopTimeout(settlementTimeoutHandle);
+      if (!isolationProven) providerStopStatus = 'terminal_unconfirmed';
+    }
+    if (!isolationProven) {
+      isolationProven = await requestProviderIsolation();
+      if (isolationProven) providerStopStatus = 'isolated';
+    }
+    if (isolationProven && activeRun && !activeRun.settled) {
+      activeRun.durableSettled = true;
+      cleanupActiveRun(activeRun);
+    }
+    if (!isolationProven) {
+      const failed = persist(() => store.failSteer(result, providerStopStatus));
+      const incident = persist(() => store.markProviderStopUnknown(
+        {
+          turn_id: result.old_turn.turn_id,
+          attempt: result.old_turn.attempt,
+        },
+        providerStopStatus,
+      ));
+      try { refresh(); } catch {}
+      return { ...failed, incident };
+    }
+
+    const completed = persist(() => store.completeSteer(result, providerStopStatus));
+    try { refresh(); } catch {}
+    return completed;
+  }
+
+  function steer(request) {
+    const conversationId = request?.conversation_id;
+    const steerId = request?.steer_id;
+    if (
+      typeof conversationId !== 'string'
+      || conversationId.length === 0
+      || typeof steerId !== 'string'
+      || steerId.length === 0
+    ) {
+      return performSteer(request);
+    }
+    const settlementKey = `${steerId}\u0000${conversationId}`;
+    const existing = steerSettlements.get(settlementKey);
+    if (existing) {
+      return existing.then((settledResult) => ({
+        ...settledResult,
+        deduplicated: true,
+      }));
+    }
+    const settlement = performSteer(request);
+    steerSettlements.set(settlementKey, settlement);
+    settlement.finally(() => {
+      if (steerSettlements.get(settlementKey) === settlement) {
+        steerSettlements.delete(settlementKey);
+      }
+    }).catch(() => {});
+    return settlement;
+  }
+
   async function evictIdleExecutors() {
     if (typeof adapter.evictIdle !== 'function') return [];
     const evicted = await adapter.evictIdle({
@@ -1127,7 +1260,7 @@ export function createExecutorService({
         Object.freeze(delivery),
       );
     } catch (error) {
-      if (activeRun?.stopCommitted) {
+      if (activeRun && committedControlStatus(activeRun) !== null) {
         return recordLateInteractionAcknowledgement(
           activeRun,
           delivery,
@@ -1193,7 +1326,7 @@ export function createExecutorService({
       if (recovery.deliveryUnknown) error.deliveryUnknown = recovery.deliveryUnknown;
       throw error;
     }
-    if (activeRun?.stopCommitted) {
+    if (activeRun && committedControlStatus(activeRun) !== null) {
       return recordLateInteractionAcknowledgement(
         activeRun,
         delivery,
@@ -1442,6 +1575,7 @@ export function createExecutorService({
     runNext,
     snapshot,
     start,
+    steer,
     stop,
     submitInteractionAnswer,
   });

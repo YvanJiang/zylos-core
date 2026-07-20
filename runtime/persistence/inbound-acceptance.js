@@ -19,7 +19,7 @@ import {
 } from './main-projection.js';
 import { initializeRuntimePersistence } from './schema.js';
 
-const INBOUND_ENVELOPE_KNOWN_FIELDS = Object.freeze([
+export const INBOUND_ENVELOPE_KNOWN_FIELDS = Object.freeze([
   'contract',
   'contract_version',
   'inbound_event_id',
@@ -60,7 +60,7 @@ export function encodeConversationKey(envelope) {
 
 export { initializeRuntimePersistence };
 
-function buildLifecycleEvent({
+export function buildLifecycleEvent({
   eventId,
   traceId,
   conversationId,
@@ -105,7 +105,7 @@ function buildLifecycleEvent({
   };
 }
 
-function buildInitialDeliveryCommand({
+export function buildInitialDeliveryCommand({
   envelope,
   traceId,
   conversationId,

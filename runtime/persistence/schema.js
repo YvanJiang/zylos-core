@@ -90,6 +90,8 @@ const RUNTIME_SCHEMA = `
     attempt_no INTEGER CHECK (attempt_no IS NULL OR attempt_no > 0),
     lease_epoch INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0),
     queue_sequence INTEGER NOT NULL CHECK (queue_sequence > 0),
+    provider_input_json TEXT,
+    redirected_from_turn_id TEXT UNIQUE REFERENCES runtime_turns(turn_id),
     created_at TEXT NOT NULL,
     committed_at TEXT NOT NULL,
     CHECK (
@@ -104,6 +106,7 @@ const RUNTIME_SCHEMA = `
     queue_sequence INTEGER NOT NULL CHECK (queue_sequence > 0),
     turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
     status TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1)),
     wait_reason TEXT,
     enqueued_at TEXT NOT NULL,
     PRIMARY KEY (conversation_id, queue_sequence)
@@ -120,6 +123,19 @@ const RUNTIME_SCHEMA = `
     active_turn_id TEXT REFERENCES runtime_turns(turn_id),
     result_json TEXT NOT NULL,
     committed_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runtime_steer_controls (
+    steer_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    target_turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
+    inbound_event_id TEXT UNIQUE REFERENCES runtime_inbound_events(inbound_event_id),
+    priority_turn_id TEXT UNIQUE REFERENCES runtime_turns(turn_id),
+    stop_barrier_id TEXT UNIQUE REFERENCES runtime_stop_controls(stop_id),
+    request_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    committed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS runtime_executor_residents (
@@ -512,6 +528,19 @@ export function initializeRuntimePersistence(database) {
     'lease_epoch',
     'INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0)',
   );
+  addColumnIfMissing(database, 'runtime_turns', 'provider_input_json', 'TEXT');
+  addColumnIfMissing(
+    database,
+    'runtime_turns',
+    'redirected_from_turn_id',
+    'TEXT REFERENCES runtime_turns(turn_id)',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_turn_queue',
+    'priority',
+    'INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1))',
+  );
   addColumnIfMissing(database, 'runtime_turn_queue', 'wait_reason', 'TEXT');
   addColumnIfMissing(database, 'runtime_executor_residents', 'owner_service_instance_id', 'TEXT');
   addColumnIfMissing(
@@ -600,5 +629,12 @@ export function initializeRuntimePersistence(database) {
       ON runtime_outbox(status, next_attempt_at, priority, created_at);
     CREATE INDEX IF NOT EXISTS runtime_outbox_lane
       ON runtime_outbox(lane_key, aggregate_version, status);
+    CREATE UNIQUE INDEX IF NOT EXISTS runtime_turns_one_redirect_per_turn
+      ON runtime_turns(redirected_from_turn_id)
+      WHERE redirected_from_turn_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS runtime_steer_controls_one_winner_per_turn
+      ON runtime_steer_controls(target_turn_id);
+    CREATE INDEX IF NOT EXISTS runtime_turn_queue_priority
+      ON runtime_turn_queue(conversation_id, priority DESC, queue_sequence ASC, status);
   `);
 }
