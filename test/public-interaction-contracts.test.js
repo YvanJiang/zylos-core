@@ -675,6 +675,15 @@ describe('durable interaction handoff v1 record contract', () => {
 
     expect(validateInteractionHandoff(cancelled)).toEqual(cancelled);
     expect(cancelled.last_send_started_at).toBeNull();
+    expect(() => validateInteractionHandoff({
+      ...cancelled,
+      error: null,
+    })).toThrow(ContractKernelError);
+    expect(() => validateInteractionHandoff({
+      ...cancelled,
+      error: { ...cancelled.error, side_effect_status: 'known' },
+      side_effect_status: 'known',
+    })).toThrow(ContractKernelError);
   });
 
   test('only permits retry_wait before answer delivery starts', () => {

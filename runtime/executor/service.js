@@ -258,6 +258,7 @@ export function createExecutorService({
     }
     if (started) return snapshot();
     store.reconcileExpiredResidents();
+    store.reconcileExpiredStartedInteractionHandoffs();
     if (residentHeartbeat === null) {
       residentHeartbeat = scheduleResidentHeartbeat(() => {
         try {
@@ -1059,6 +1060,22 @@ export function createExecutorService({
     }
     const delivery = store.claimInteractionHandoff(handoffId);
     const activeRun = activeRuns.get(delivery.request.turn_id);
+    if (delivery.request.parent_type === 'recovery_control') {
+      const sendingDelivery = persist(
+        () => store.markInteractionHandoffSendStarted(delivery),
+      );
+      const acknowledgement = persist(() => store.acknowledgeInteractionHandoff({
+        status: 'accepted',
+        handoff_id: sendingDelivery.handoff.handoff_id,
+        provider_attempt_id: null,
+        handoff_attempt_id: sendingDelivery.handoff.handoff_attempt_id,
+        handoff_attempt_no: sendingDelivery.handoff.handoff_attempt_no,
+        lease_epoch: null,
+      }));
+      reschedulePendingInteractionDeadlines();
+      refresh();
+      return { acknowledgement, execution: null };
+    }
     let prepared;
     try {
       prepared = await adapter.prepareInteractionAnswer(deepFreeze(delivery));

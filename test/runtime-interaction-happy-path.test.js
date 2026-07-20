@@ -873,6 +873,67 @@ describe('runtime interaction happy path', () => {
     database.close();
   });
 
+  test('startup recovers an expired sent handoff after a worker crash', () => {
+    const database = openTestDatabase();
+    const { store, turnContext } = createRunningTurn(database, 'crashed-sent-handoff');
+    const request = store.requestInteraction(turnContext, {
+      provider_interaction_ref: 'provider-question-crashed-sent-handoff',
+      tool_use_id: 'tool-use-crashed-sent-handoff',
+      kind: 'tool_approval',
+      prompt: 'Allow the action before the worker crashes?',
+      choices: [],
+      authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+      allowed_sources: ['card_action'],
+    });
+    const committed = store.commitInteractionAnswer(
+      interactionAnswer(request, 'crashed-sent-handoff'),
+    );
+    const claimed = store.claimInteractionHandoff(committed.handoff_id);
+    const sending = store.markInteractionHandoffSendStarted(claimed);
+    const restarted = createExecutorService({
+      database,
+      adapter: {
+        async *execute() {},
+        async prepareInteractionAnswer() {
+          throw new Error('The crashed answer must never be resent.');
+        },
+      },
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-crash-restart',
+      now: () => '2026-07-19T07:03:00Z',
+      generateId: deterministicIds('crash-restart'),
+    });
+
+    restarted.start();
+    expect(readInteractionAuthority(database, request.turn_id)).toMatchObject({
+      turn: { state: 'recovering' },
+      interactions: [expect.objectContaining({
+        interaction_id: request.interaction_id,
+        state: 'delivery_unknown',
+        handoff_state: 'delivery_unknown',
+      })],
+      handoffs: [expect.objectContaining({ state: 'delivery_unknown' })],
+      audits: [expect.objectContaining({
+        outcome: 'delivery_unknown',
+        acknowledgement_json: expect.stringContaining('expired_writer_lease'),
+      })],
+    });
+    expect(readEvents(database, request.turn_id).at(-1)).toMatchObject({
+      kind: 'interaction_answer_delivery_unknown',
+      phase: 'recovering',
+    });
+    expect(() => store.acknowledgeInteractionHandoff({
+      status: 'accepted',
+      handoff_id: sending.handoff.handoff_id,
+      provider_attempt_id: sending.handoff.provider_attempt_id,
+      handoff_attempt_id: sending.handoff.handoff_attempt_id,
+      handoff_attempt_no: sending.handoff.handoff_attempt_no,
+      lease_epoch: sending.handoff.lease_epoch,
+    })).toThrow(expect.objectContaining({ code: 'stale_attempt' }));
+
+    database.close();
+  });
+
   test('completes delivery_unknown only from a read-only idempotent same-handoff proof', async () => {
     const database = openTestDatabase();
     const { accepted, store, turnContext } = createRunningTurn(
@@ -1149,7 +1210,7 @@ describe('runtime interaction happy path', () => {
     database.close();
   });
 
-  test('authorized recovery atomically establishes a new fenced interaction', async () => {
+  test('authorized recovery establishes an answerable Core-owned interaction', async () => {
     const database = openTestDatabase();
     const { store, turnContext } = createRunningTurn(database, 'authorized-supersession');
     const first = store.requestInteraction(turnContext, {
@@ -1171,7 +1232,12 @@ describe('runtime interaction happy path', () => {
     store.releaseRecoveringExecutorOwnership(turnContext);
     const service = createExecutorService({
       database,
-      adapter: { async *execute() {} },
+      adapter: {
+        async *execute() {},
+        async prepareInteractionAnswer() {
+          throw new Error('Core recovery control must not call the provider adapter.');
+        },
+      },
       provider: 'claude',
       serviceInstanceId: 'executor-service-authorized-supersession',
       now: () => '2026-07-19T07:02:00Z',
@@ -1193,8 +1259,6 @@ describe('runtime interaction happy path', () => {
     const resolution = await service.resolveInteractionHandoff(committed.handoff_id, {
       action: 'establish_interaction',
       replacement_interaction: {
-        provider_interaction_ref: 'provider-question-authorized-supersession-new',
-        tool_use_id: 'tool-use-authorized-supersession-new',
         kind: 'recovery_decision',
         prompt: 'Choose how to continue after uncertain delivery.',
         choices: [],
@@ -1205,39 +1269,56 @@ describe('runtime interaction happy path', () => {
     expect(resolution).toMatchObject({
       status: 'interaction_established',
       replacement_interaction_id: expect.any(String),
-      turn_state: 'waiting_user',
+      turn_state: 'recovering',
     });
     expect(readInteractionAuthority(database, first.turn_id)).toMatchObject({
-      turn: { state: 'waiting_user' },
-      interactions: [
-        expect.objectContaining({
-          interaction_id: first.interaction_id,
-          state: 'cancelled',
-        }),
+      turn: { state: 'recovering' },
+      interactions: expect.arrayContaining([
+        expect.objectContaining({ interaction_id: first.interaction_id, state: 'cancelled' }),
         expect.objectContaining({
           interaction_id: resolution.replacement_interaction_id,
           state: 'pending',
           handoff_state: 'not_started',
         }),
-      ],
+      ]),
     });
-    const replacementRequest = JSON.parse(readInteractionAuthority(
-      database,
-      first.turn_id,
-    ).interactions[1].request_json);
+    const replacementRow = readInteractionAuthority(database, first.turn_id).interactions
+      .find(({ interaction_id: interactionId }) => (
+        interactionId === resolution.replacement_interaction_id
+      ));
+    const replacementRequest = JSON.parse(replacementRow.request_json);
     expect(replacementRequest).toMatchObject({
       interaction_id: resolution.replacement_interaction_id,
-      parent_type: 'provider_turn',
-      ordinal: 2,
+      parent_type: 'recovery_control',
+      control_id: expect.any(String),
+      ordinal: 1,
       kind: 'recovery_decision',
       prompt: 'Choose how to continue after uncertain delivery.',
       state: 'pending',
       handoff_state: 'not_started',
-      runtime_fence: {
-        provider_attempt_id: first.runtime_fence.provider_attempt_id,
-        lease_epoch: first.runtime_fence.lease_epoch,
-        provider_interaction_ref: 'provider-question-authorized-supersession-new',
+      runtime_fence: null,
+    });
+    const recoveryAnswer = service.submitInteractionAnswer(
+      interactionAnswer(replacementRequest, 'authorized-recovery-control'),
+    );
+    expect(recoveryAnswer).toMatchObject({
+      status: 'accepted',
+      control_id: replacementRequest.control_id,
+      handoff_state: 'pending',
+    });
+    await expect(service.deliverInteractionAnswer(recoveryAnswer.handoff_id)).resolves.toMatchObject({
+      acknowledgement: {
+        status: 'accepted',
+        resumed: false,
+        turn_state: 'recovering',
       },
+      execution: null,
+    });
+    expect(JSON.parse(database.prepare(`
+      SELECT request_json FROM runtime_interactions WHERE interaction_id = ?
+    `).get(replacementRequest.interaction_id).request_json)).toMatchObject({
+      state: 'answered',
+      handoff_state: 'accepted',
     });
 
     database.close();

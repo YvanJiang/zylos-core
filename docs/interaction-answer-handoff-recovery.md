@@ -15,6 +15,9 @@ The state paths are deliberately asymmetric:
 - Any failure after send start becomes `delivery_unknown` with the original send evidence,
   unknown side effects, audit, projection, and outbox notification. Core never automatically
   resends that answer.
+- Service startup performs only the issue-17-specific reconciliation: a provider handoff with a
+  persisted send barrier and an expired exact writer lease becomes `delivery_unknown`. It does not
+  claim or replay provider work; broader lease renewal and health reconciliation remain separate.
 
 Neither query reconciliation nor an authorized disposition can begin merely because the notice is
 queued. Core requires a delivered outbox result for a materialized projection whose event sequence
@@ -27,11 +30,13 @@ their adapters return an audited `unknown` result and leave the turn recovering.
 
 Otherwise, `resolveInteractionHandoff` requires an injected trusted authorizer for the exact
 conversation, turn, handoff, action, and replacement descriptor. It may terminate the uncertain
-handoff or, after provider isolation releases the writer lease, atomically establish a new pending
-interaction under the same runtime fence. The replacement descriptor and resulting request are
-both retained with the prior request, handoff, and authorization decision in the audit entry. A
-late worker acknowledgement cannot advance either terminalized handoff and is itself recorded as
-an ignored diagnostic.
+handoff or, after the prior writer lease is released or expires under the exact old fence,
+atomically establish a Core-owned `recovery_control` interaction. That interaction has no provider
+runtime fence, leaves the original turn `recovering`, and its answer is acknowledged by Core without
+calling either provider adapter. The replacement descriptor and resulting request are retained with
+the prior request, handoff, and authorization decision in the audit entry. A late worker
+acknowledgement cannot advance either terminalized handoff and is itself recorded as an ignored
+diagnostic.
 
 Provider-native request IDs, connection handles, and acknowledgement mechanics remain private to
 the Claude and Codex adapters. The executor/store recovery methods expose only Core interaction,

@@ -1045,6 +1045,20 @@ export function validateInteractionHandoff(value, { occurredAt } = {}) {
         occurredAt,
       );
     }
+    if (
+      value.last_send_started_at === null
+      && (
+        !['none', 'unknown'].includes(value.side_effect_status)
+        || (value.error === null && value.side_effect_status !== 'none')
+        || (value.error !== null
+          && value.error.side_effect_status !== value.side_effect_status)
+      )
+    ) {
+      reject(
+        'Pre-send cancellation must preserve coherent none or unknown side-effect evidence.',
+        occurredAt,
+      );
+    }
   }
   return structuredClone(value);
 }
