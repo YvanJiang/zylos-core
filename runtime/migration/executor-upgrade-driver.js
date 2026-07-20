@@ -39,6 +39,35 @@ export async function driveInstalledRuntimeUpgrade({ host, preflight, legacyBatc
     throw new TypeError('legacyBatch must be a canonical migration batch');
   }
   let latest = await host.attach(preflight);
+  if (latest?.state === 'rolled_back') {
+    return upgradeResult(preflight, latest, {
+      success: false,
+      error: latest.failure?.message ?? 'Durable runtime upgrade was rolled back.',
+      rollback: { performed: true, state: latest.state, steps: [] },
+    });
+  }
+  if (latest?.state === 'rollback_required') {
+    try {
+      const rolledBack = await advanceUntil({
+        host,
+        preflight,
+        legacyBatch,
+        onAdvance: (result) => { latest = result; },
+        terminal: (result) => result.state === 'rolled_back',
+      });
+      return upgradeResult(preflight, rolledBack, {
+        success: false,
+        error: latest.failure?.message ?? 'Durable runtime upgrade rollback resumed.',
+        rollback: { performed: true, state: rolledBack.state, steps: [] },
+      });
+    } catch (rollbackError) {
+      return upgradeResult(preflight, { state: 'rollback_failed' }, {
+        success: false,
+        error: latest.failure?.message ?? 'Durable runtime upgrade rollback remains incomplete.',
+        rollback: { performed: false, error: rollbackError.message },
+      });
+    }
+  }
   try {
     const committed = await advanceUntil({
       host,

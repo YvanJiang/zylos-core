@@ -308,31 +308,39 @@ install_zylos() {
         return "$resume_status"
       fi
     fi
-    local installed_ecosystem="$zylos_dir/pm2/ecosystem.config.cjs"
-    if [ -f "$installed_ecosystem" ] \
-      && [ -f "$installed_root/runtime/executor/launcher.js" ] \
-      && grep -q 'zylos-executor' "$installed_ecosystem"; then
+    local bootstrap_root inventory_root inventory_json inventory_state inventory_reasons
+    bootstrap_root="$zylos_dir/runtime"
+    mkdir -p "$bootstrap_root"
+    inventory_root="$(mktemp -d "$bootstrap_root/install-inventory.XXXXXX")"
+    mkdir -p "$inventory_root/target-source"
+    git clone --depth 1 --branch "$BRANCH" "$ZYLOS_REPO" "$inventory_root/target-source"
+    inventory_json="$(node "$inventory_root/target-source/scripts/installed-runtime-inventory.js" \
+      --zylos-dir "$zylos_dir" --installed-root "$installed_root")"
+    inventory_state="$(node -e 'const v=JSON.parse(process.argv[1]);process.stdout.write(v.state)' "$inventory_json")"
+    inventory_reasons="$(node -e 'const v=JSON.parse(process.argv[1]);process.stdout.write((v.reasons||[]).join(", "))' "$inventory_json")"
+    if [ "$inventory_state" = "executor" ]; then
+      find "$inventory_root" -depth -delete
       info "Existing executor installation detected; delegating upgrade to authoritative Core control."
       zylos upgrade --self --yes --branch "$BRANCH"
       return $?
     fi
-    if [ -f "$installed_ecosystem" ] && grep -q 'zylos-executor' "$installed_ecosystem"; then
-      warn "Executor service configuration does not match the installed package; refusing ambiguous migration."
+    if [ "$inventory_state" = "ambiguous" ]; then
+      find "$inventory_root" -depth -delete
+      warn "Existing runtime identity is ambiguous; refusing global package replacement (${inventory_reasons:-unknown evidence})."
       return 1
     fi
-    if [ -f "$installed_ecosystem" ]; then
-      local bootstrap_root base_name target_name
-      bootstrap_root="$zylos_dir/runtime"
-      mkdir -p "$bootstrap_root"
-      bootstrap_backup="$(mktemp -d "$bootstrap_root/base-to-executor.XXXXXX")"
-      mkdir -p "$bootstrap_backup/base-release" "$bootstrap_backup/target-source" "$bootstrap_backup/target-release"
+    if [ "$inventory_state" = "legacy" ]; then
+      local base_name target_name
+      bootstrap_backup="$inventory_root"
+      mkdir -p "$bootstrap_backup/base-release" "$bootstrap_backup/target-release"
       cp -R "$installed_root/." "$bootstrap_backup/base-release/"
       base_name="$(cd "$bootstrap_backup/base-release" && npm pack --ignore-scripts --pack-destination "$bootstrap_backup" --silent)"
       mv "$bootstrap_backup/$base_name" "$bootstrap_backup/exact-base-package.tgz"
-      git clone --depth 1 --branch "$BRANCH" "$ZYLOS_REPO" "$bootstrap_backup/target-source"
       target_name="$(cd "$bootstrap_backup/target-source" && npm pack --ignore-scripts --pack-destination "$bootstrap_backup" --silent)"
       mv "$bootstrap_backup/$target_name" "$bootstrap_backup/executor-package.tgz"
       tar -xzf "$bootstrap_backup/executor-package.tgz" -C "$bootstrap_backup/target-release" --strip-components=1
+    else
+      find "$inventory_root" -depth -delete
     fi
   fi
 

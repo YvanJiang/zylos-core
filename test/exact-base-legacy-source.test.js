@@ -13,6 +13,8 @@ import {
 import { createLegacyProviderQuiescence } from '../runtime/migration/legacy-provider-quiescence.js';
 import { createInstalledExecutorUpgradeHandler } from '../runtime/migration/installed-executor-upgrade.js';
 import { createExecutorService } from '../runtime/executor/service.js';
+import { createOutboxService } from '../runtime/delivery/outbox-service.js';
+import { deliveredResult } from './helpers/delivered-result.js';
 
 const roots = [];
 const tmuxServers = new Map();
@@ -80,9 +82,10 @@ describe('exact-base durable source fencing', () => {
     const database = exactBaseDatabase();
     database.prepare(`
       INSERT INTO conversations (direction, channel, endpoint_id, content, status)
-      VALUES ('in', 'feishu', 'chat-one', 'pending message', 'pending'),
-             ('in', 'lark', 'chat-two', 'running message', 'running'),
-             ('out', 'feishu', 'chat-one', 'delivered reply', 'delivered')
+      VALUES ('in', 'feishu', 'chat-one|type:group|root:root-one|parent:parent-one|msg:message-one|thread:thread-one', 'pending message', 'pending'),
+             ('in', 'lark', 'chat-two|type:group|root:root-two|parent:parent-two|msg:message-two|thread:thread-two', 'running message', 'running'),
+             ('out', 'feishu', 'chat-one|type:group|root:root-one|msg:message-out|thread:thread-one', 'delivered reply', 'delivered'),
+             ('in', 'feishu', 'chat-incomplete|type:group|root:root-incomplete|msg:message-incomplete', 'ambiguous pending', 'pending')
     `).run();
     database.prepare(`
       INSERT INTO control_queue (raw_content, content, status, created_at, updated_at)
@@ -99,9 +102,24 @@ describe('exact-base durable source fencing', () => {
       expect.objectContaining({
         kind: 'c4', legacy_record_id: 'conversation:1', legacy_state: 'pending',
         route: 'unique', legacy_queue_sequence: 1,
+        envelope: expect.objectContaining({
+          chat_type: 'thread', chat_id: 'chat-one',
+          native_thread_or_topic_id: 'thread-one', message_id: 'message-one',
+          reply: {
+            root_message_id: 'root-one', parent_message_id: 'parent-one',
+            reply_to_message_id: 'parent-one',
+          },
+        }),
       }),
       expect.objectContaining({
         kind: 'c4', legacy_record_id: 'conversation:2', legacy_state: 'running',
+        notification_target: {
+          region: 'global', tenant_id: 'legacy-exact-base', channel: 'lark',
+          bot_id: 'legacy-exact-base', chat_type: 'thread', chat_id: 'chat-two',
+          native_thread_or_topic_id: 'thread-two',
+          native_thread_root_message_id: 'root-two',
+          native_thread_reply_target_message_id: 'message-two',
+        },
       }),
       expect.objectContaining({
         kind: 'runtime_control', legacy_record_id: 'control:1', legacy_state: 'pending',
@@ -109,19 +127,23 @@ describe('exact-base durable source fencing', () => {
       expect.objectContaining({
         kind: 'c4', legacy_record_id: 'provider-session:codex', legacy_state: 'running',
       }),
+      expect.objectContaining({
+        kind: 'c4', legacy_record_id: 'conversation:4', legacy_state: 'pending',
+        route: 'ambiguous',
+      }),
     ]));
     expect(() => database.prepare(`
       INSERT INTO conversations (direction, channel, endpoint_id, content) VALUES ('in','lark','late','late')
     `).run()).toThrow('legacy source fenced');
 
     reconcileLegacyBaseRollback({
-      database,
-      rollbackBatch: { batch_id: batch.batch_id, records: [batch.records[0]] },
+      database, rollbackBatch: batch,
     });
     expect(database.prepare('SELECT id, status FROM conversations ORDER BY id').all()).toEqual([
       { id: 1, status: 'pending' },
       { id: 2, status: 'failed' },
       { id: 3, status: 'delivered' },
+      { id: 4, status: 'pending' },
     ]);
     expect(database.prepare('SELECT status FROM control_queue WHERE id = 1').get().status).toBe('failed');
     expect(() => database.prepare(`
@@ -142,19 +164,42 @@ describe('exact-base durable source fencing', () => {
     const quiescence = createLegacyProviderQuiescence({
       provider: 'claude', execFileSyncFn: execFileSync, tmuxArgsPrefix: ['-L', server],
     });
-    const suspended = quiescence.suspend();
+    const phases = [];
+    const phaseJournal = { onPhase: (phase) => phases.push(phase) };
+    const suspended = quiescence.suspend(null, phaseJournal);
     expect(suspended).toMatchObject({ active: true, suspended: true, session: 'claude-main' });
-    const state = execFileSync('ps', ['-o', 'state=', '-p', String(suspended.pane_pid)], {
+    expect(suspended.process_group_id).toBe(suspended.pane.pgid);
+    expect(new Set(suspended.members.map(({ pgid }) => pgid))).toEqual(
+      new Set([suspended.process_group_id]),
+    );
+    const state = execFileSync('ps', ['-o', 'state=', '-p', String(suspended.pane.pid)], {
       encoding: 'utf8',
     }).trim();
     expect(state).toMatch(/^T/);
-    expect(quiescence.resume(suspended)).toMatchObject({ resumed: true });
-    expect(execFileSync('ps', ['-o', 'state=', '-p', String(suspended.pane_pid)], {
+    const reusedIdentity = {
+      ...suspended,
+      members: suspended.members.map((member, index) => (
+        index === 0 ? { ...member, birth_identity: 'reused process identity' } : member
+      )),
+    };
+    expect(() => quiescence.resume(reusedIdentity, phaseJournal)).toThrow('reused or changed identity');
+    expect(execFileSync('ps', ['-o', 'state=', '-p', String(suspended.pane.pid)], {
+      encoding: 'utf8',
+    }).trim()).toMatch(/^T/);
+    expect(quiescence.resume(suspended, phaseJournal)).toMatchObject({ resumed: true });
+    expect(execFileSync('ps', ['-o', 'state=', '-p', String(suspended.pane.pid)], {
       encoding: 'utf8',
     }).trim()).not.toMatch(/^T/);
-    const suspendedAgain = quiescence.suspend();
-    expect(quiescence.commit(suspendedAgain)).toMatchObject({ removed: true });
+    const suspendedAgain = quiescence.suspend(null, phaseJournal);
+    expect(quiescence.commit(suspendedAgain, phaseJournal)).toMatchObject({ removed: true });
     expect(quiescence.inspect()).toMatchObject({ active: false });
+    for (const pid of suspendedAgain.members.map(({ pid }) => pid)) {
+      expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
+    }
+    expect(phases).toEqual([
+      'suspending', 'suspended', 'resuming', 'resuming', 'resumed',
+      'suspending', 'suspended', 'committing', 'removed',
+    ]);
   });
 
   test('commits an exact-base SQLite, PM2, and disposable provider fixture without old/new overlap', async () => {
@@ -184,7 +229,7 @@ describe('exact-base durable source fencing', () => {
         available_at INTEGER, last_error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
       );
       INSERT INTO conversations (direction, channel, endpoint_id, content, status)
-      VALUES ('in', 'feishu', 'chat-commit', 'pending commit work', 'pending');
+      VALUES ('in', 'feishu', 'chat-commit|type:p2p|msg:message-commit', 'pending commit work', 'pending');
     `);
     const server = `zylos-issue27-commit-${process.pid}-${Date.now()}`;
     execFileSync('tmux', [
@@ -217,20 +262,29 @@ describe('exact-base durable source fencing', () => {
     };
     const packageCalls = [];
     let healthShouldPass = false;
-    const deliveryTimer = setInterval(() => {
-      for (const row of database.prepare(`
-        SELECT outbox_id, delivery_id FROM runtime_outbox WHERE status = 'pending'
-      `).all()) {
-        const proof = {
-          status: 'delivered', delivery_id: row.delivery_id,
-          delivered_at: '2026-07-21T00:00:20.000Z',
-        };
-        database.prepare(`
-          UPDATE runtime_outbox SET status = 'delivered', result_json = ?, updated_at = ?
-          WHERE outbox_id = ?
-        `).run(JSON.stringify(proof), proof.delivered_at, row.outbox_id);
+    let deliveryEnabled = false;
+    let stopDeliveryOwner = false;
+    let deliveryOwnerError = null;
+    const deliveredNotices = [];
+    const deliveryService = createOutboxService({
+      database,
+      renderer: {
+        async deliver(command) {
+          deliveredNotices.push(command);
+          return deliveredResult(command, '2026-07-23T00:00:00.000Z');
+        },
+      },
+      serviceInstanceId: 'exact-base-channel-delivery-owner',
+      now: () => '2026-07-23T00:00:00.000Z',
+      leaseDurationMs: 100,
+      throttleMs: 0,
+    });
+    const deliveryOwner = (async () => {
+      while (!stopDeliveryOwner) {
+        if (deliveryEnabled) await deliveryService.dispatchNext();
+        await new Promise((resolve) => setTimeout(resolve, 2));
       }
-    }, 5);
+    })().catch((error) => { deliveryOwnerError = error; });
     try {
       const handler = createInstalledExecutorUpgradeHandler({
         database, Database, zylosDir,
@@ -241,7 +295,7 @@ describe('exact-base durable source fencing', () => {
         legacyProviderQuiescence: createLegacyProviderQuiescence({
           provider: 'claude', execFileSyncFn: fixtureExec, tmuxArgsPrefix: ['-L', server],
         }),
-        noticeDeliveryTimeoutMs: 1_000,
+        noticeDeliveryTimeoutMs: 50,
         packageLifecycle: {
           async activate() { packageCalls.push('activate'); return { installed: true }; },
           async restore() { packageCalls.push('restore'); return { restored: true }; },
@@ -292,7 +346,21 @@ describe('exact-base durable source fencing', () => {
           downloaded_source: targetRelease,
         },
       });
-      expect(rollback).toMatchObject({ success: false, state: 'rolled_back' });
+      expect(rollback.error).toContain('not durably delivered');
+      expect(rollback.rollback?.error).toContain('not durably delivered');
+      expect(rollback).toMatchObject({ success: false, state: 'rollback_failed' });
+      expect(deliveredNotices).toHaveLength(0);
+      expect(packageCalls).toEqual(['activate']);
+      expect(processes.size).toBe(0);
+
+      deliveryEnabled = true;
+      const recoveredRollback = await handler.resumeBlocking();
+      expect(deliveryOwnerError).toBeNull();
+      expect(database.prepare(`
+        SELECT status FROM runtime_outbox ORDER BY created_at, outbox_id
+      `).all()).toEqual(expect.arrayContaining([{ status: 'delivered' }]));
+      expect(recoveredRollback.rollback?.error ?? null).toBeNull();
+      expect(recoveredRollback).toMatchObject({ success: false, state: 'rolled_back' });
       expect(packageCalls).toEqual(['activate', 'restore']);
       expect(processes).toEqual(new Map([
         ['activity-monitor', 'online'], ['c4-dispatcher', 'online'],
@@ -304,7 +372,7 @@ describe('exact-base durable source fencing', () => {
         .toBe('pending');
       database.prepare(`
         INSERT INTO conversations (direction, channel, endpoint_id, content, status)
-        VALUES ('in', 'feishu', 'chat-late', 'late rollback-safe work', 'pending')
+        VALUES ('in', 'feishu', 'chat-late|type:p2p|msg:message-late', 'late rollback-safe work', 'pending')
       `).run();
 
       healthShouldPass = true;
@@ -318,6 +386,16 @@ describe('exact-base durable source fencing', () => {
       expect(result.error ?? null).toBeNull();
       expect(result).toMatchObject({ success: true, state: 'committed' });
       expect(packageCalls).toEqual(['activate', 'restore', 'activate']);
+      expect(deliveredNotices).not.toHaveLength(0);
+      expect(deliveredNotices).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          target: expect.objectContaining({
+            chat_type: 'dm', chat_id: 'chat-commit',
+            native_thread_root_message_id: null,
+            native_thread_reply_target_message_id: null,
+          }),
+        }),
+      ]));
       expect(processes.size).toBe(0);
       expect(() => execFileSync(
         'tmux', ['-L', server, 'has-session', '-t', '=claude-main'], { stdio: 'ignore' },
@@ -336,7 +414,8 @@ describe('exact-base durable source fencing', () => {
         WHERE legacy_kind = 'c4' AND legacy_record_id = 'conversation:2'
       `).get()).toEqual({ disposition: 'migrated_pending' });
     } finally {
-      clearInterval(deliveryTimer);
+      stopDeliveryOwner = true;
+      await deliveryOwner;
       database.close();
     }
   }, 15_000);

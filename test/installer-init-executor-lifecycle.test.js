@@ -8,6 +8,7 @@ import { describe, expect, test } from '@jest/globals';
 import { requireHealthyExecutorStart } from '../cli/commands/init.js';
 import { desiredClaudeHooks } from '../cli/lib/sync-settings-hooks.js';
 import { cleanupRetiredRuntimeSkillArtifacts } from '../runtime/migration/legacy-lifecycle-artifacts.js';
+import { inspectInstalledRuntime } from '../scripts/installed-runtime-inventory.js';
 
 describe('installer and init executor lifecycle', () => {
   test('init accepts only healthy Core service identity as startup success', () => {
@@ -27,6 +28,37 @@ describe('installer and init executor lifecycle', () => {
     const installer = fs.readFileSync(new URL('../scripts/install.sh', import.meta.url), 'utf8');
     expect(installer).toContain('return "$init_exit"');
     expect(installer).not.toMatch(/\btmux\b/i);
+  });
+
+  test('installer fails closed when active legacy state has lost its service config', () => {
+    const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'zylos-install-inventory-'));
+    const zylosDir = path.join(root, 'zylos');
+    const installedRoot = path.join(root, 'installed-package');
+    fs.mkdirSync(path.join(zylosDir, 'comm-bridge'), { recursive: true });
+    fs.mkdirSync(installedRoot, { recursive: true });
+    fs.writeFileSync(path.join(zylosDir, 'comm-bridge', 'c4.db'), 'fixture');
+    try {
+      const result = inspectInstalledRuntime({
+        zylosDir, installedRoot,
+        execFileSyncFn(file, args) {
+          expect([file, args]).toEqual(['pm2', ['jlist']]);
+          return JSON.stringify([{
+            name: 'activity-monitor', pm2_env: {
+              status: 'online',
+              pm_exec_path: path.join(
+                zylosDir, '.claude', 'skills', 'activity-monitor', 'scripts', 'activity-monitor.js',
+              ),
+            },
+          }]);
+        },
+      });
+      expect(result).toMatchObject({ state: 'ambiguous' });
+      expect(result.reasons).toEqual(expect.arrayContaining([
+        'legacy_pm2_without_service_config', 'legacy_database_without_service_config',
+      ]));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('fresh executor settings never select the retired activity monitor', () => {
