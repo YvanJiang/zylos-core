@@ -2089,7 +2089,7 @@ export function createCodexAppServerAdapter({
     };
   }
 
-  async function handleInteractionAnswer(delivery) {
+  async function prepareInteractionAnswer(delivery) {
     const providerInteractionRef = delivery?.request?.runtime_fence?.provider_interaction_ref;
     const entry = pendingInteractions.get(providerInteractionRef);
     const target = connection;
@@ -2119,15 +2119,75 @@ export function createCodexAppServerAdapter({
     const candidateAnswers = new Map(group.answers);
     candidateAnswers.set(entry.component_key, structuredClone(delivery.answer.value));
     const providerResponse = buildProviderResponse(group, candidateAnswers);
-    group.answers.set(entry.component_key, structuredClone(delivery.answer.value));
-    group.response_sent = true;
-    sendServerResponse(target, group.request_id, providerResponse);
-    await group.resolved;
-    providerRequests.delete(group.request_key);
-    for (const [reference, component] of pendingInteractions) {
-      if (component.group === group) pendingInteractions.delete(reference);
-    }
-    return acknowledgementFor(delivery);
+    const expected = {
+      interaction_id: delivery.request.interaction_id,
+      request_version: delivery.request.version,
+      provider_attempt_id: delivery.handoff.provider_attempt_id,
+      lease_epoch: delivery.handoff.lease_epoch,
+      handoff_id: delivery.handoff.handoff_id,
+      handoff_attempt_id: delivery.handoff.handoff_attempt_id,
+      handoff_attempt_no: delivery.handoff.handoff_attempt_no,
+      answer_value: structuredClone(delivery.answer.value),
+    };
+    let sent = false;
+    return Object.freeze({
+      async send(startedDelivery) {
+        const currentEntry = pendingInteractions.get(providerInteractionRef);
+        const currentTarget = connection;
+        const currentRun = activeRuns.get(activeRunKey(group.thread_id, group.turn_id));
+        if (
+          sent
+          || currentEntry !== entry
+          || !currentTarget
+          || currentTarget !== target
+          || currentTarget.failed
+          || currentRun !== group.run
+          || currentRun.connection_id !== currentTarget.connection_id
+          || startedDelivery?.request?.interaction_id !== expected.interaction_id
+          || startedDelivery?.request?.version !== expected.request_version
+          || startedDelivery?.request?.runtime_fence?.provider_attempt_id
+            !== expected.provider_attempt_id
+          || startedDelivery?.request?.runtime_fence?.lease_epoch !== expected.lease_epoch
+          || startedDelivery?.handoff?.handoff_id !== expected.handoff_id
+          || startedDelivery?.handoff?.provider_attempt_id !== expected.provider_attempt_id
+          || startedDelivery?.handoff?.lease_epoch !== expected.lease_epoch
+          || startedDelivery?.handoff?.handoff_attempt_id !== expected.handoff_attempt_id
+          || startedDelivery?.handoff?.handoff_attempt_no !== expected.handoff_attempt_no
+          || typeof startedDelivery?.handoff?.last_send_started_at !== 'string'
+          || JSON.stringify(startedDelivery?.answer?.value) !== JSON.stringify(expected.answer_value)
+          || group.answers.has(entry.component_key)
+          || group.response_sent
+        ) {
+          rejectProtocol('The prepared interaction answer lost its provider handoff fence.');
+        }
+        sent = true;
+        group.answers.set(entry.component_key, structuredClone(expected.answer_value));
+        group.response_sent = true;
+        sendServerResponse(currentTarget, group.request_id, providerResponse);
+        await group.resolved;
+        providerRequests.delete(group.request_key);
+        for (const [reference, component] of pendingInteractions) {
+          if (component.group === group) pendingInteractions.delete(reference);
+        }
+        return acknowledgementFor(startedDelivery);
+      },
+    });
+  }
+
+  async function queryInteractionHandoffAcceptance(delivery) {
+    return Object.freeze({
+      status: 'unknown',
+      read_only: true,
+      idempotent: true,
+      handoff_id: delivery?.handoff?.handoff_id,
+      provider_attempt_id: delivery?.handoff?.provider_attempt_id,
+      handoff_attempt_id: delivery?.handoff?.handoff_attempt_id,
+      handoff_attempt_no: delivery?.handoff?.handoff_attempt_no,
+      lease_epoch: delivery?.handoff?.lease_epoch,
+      accepted_at: null,
+      evidence_ref: null,
+      reason_code: 'provider_acceptance_query_unavailable',
+    });
   }
 
   async function cancel(context) {
@@ -2259,5 +2319,13 @@ export function createCodexAppServerAdapter({
     return [...target.affected_conversation_ids];
   }
 
-  return Object.freeze({ abort, cancel, close, execute, handleInteractionAnswer, interrupt });
+  return Object.freeze({
+    abort,
+    cancel,
+    close,
+    execute,
+    interrupt,
+    prepareInteractionAnswer,
+    queryInteractionHandoffAcceptance,
+  });
 }

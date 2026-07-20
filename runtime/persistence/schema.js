@@ -201,7 +201,11 @@ const RUNTIME_SCHEMA = `
     interaction_id TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
     turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),
-    lineage_id TEXT NOT NULL REFERENCES runtime_lineages(lineage_id),
+    lineage_id TEXT REFERENCES runtime_lineages(lineage_id),
+    parent_type TEXT NOT NULL CHECK (
+      parent_type IN ('provider_turn', 'security_control', 'recovery_control')
+    ),
+    parent_id TEXT NOT NULL,
     ordinal INTEGER NOT NULL CHECK (ordinal > 0),
     state TEXT NOT NULL,
     version INTEGER NOT NULL CHECK (version > 0),
@@ -210,7 +214,7 @@ const RUNTIME_SCHEMA = `
     request_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    UNIQUE (turn_id, ordinal)
+    UNIQUE (parent_type, parent_id, ordinal)
   );
 
   CREATE TABLE IF NOT EXISTS runtime_interaction_answers (
@@ -228,15 +232,22 @@ const RUNTIME_SCHEMA = `
     interaction_id TEXT NOT NULL UNIQUE REFERENCES runtime_interactions(interaction_id),
     answer_id TEXT NOT NULL UNIQUE,
     state TEXT NOT NULL,
-    provider_attempt_id TEXT NOT NULL,
+    parent_type TEXT NOT NULL CHECK (
+      parent_type IN ('provider_turn', 'security_control', 'recovery_control')
+    ),
+    provider_attempt_id TEXT,
     handoff_attempt_id TEXT,
     handoff_attempt_no INTEGER CHECK (
       handoff_attempt_no IS NULL OR handoff_attempt_no > 0
     ),
-    lease_epoch INTEGER NOT NULL CHECK (lease_epoch > 0),
+    lease_epoch INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0),
     record_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    CHECK (
+      (parent_type = 'provider_turn' AND provider_attempt_id IS NOT NULL AND lease_epoch IS NOT NULL)
+      OR (parent_type != 'provider_turn' AND provider_attempt_id IS NULL AND lease_epoch IS NULL)
+    )
   );
 
   CREATE TABLE IF NOT EXISTS runtime_interaction_audit (
@@ -244,8 +255,8 @@ const RUNTIME_SCHEMA = `
     interaction_id TEXT NOT NULL REFERENCES runtime_interactions(interaction_id),
     handoff_id TEXT NOT NULL REFERENCES runtime_interaction_handoffs(handoff_id),
     outcome TEXT NOT NULL,
-    provider_attempt_id TEXT NOT NULL,
-    lease_epoch INTEGER NOT NULL CHECK (lease_epoch > 0),
+    provider_attempt_id TEXT,
+    lease_epoch INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0),
     acknowledgement_json TEXT NOT NULL,
     created_at TEXT NOT NULL
   );
@@ -347,6 +358,121 @@ function addColumnIfMissing(database, tableName, columnName, definition) {
   const columns = database.prepare(`PRAGMA table_info(${tableName})`).all();
   if (columns.some(({ name }) => name === columnName)) return;
   database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+}
+
+function migrateInteractionControlStorage(database) {
+  const columns = database.prepare("PRAGMA table_info('runtime_interactions')").all();
+  if (columns.some(({ name }) => name === 'parent_type')) return;
+
+  database.pragma('foreign_keys = OFF');
+  try {
+    const migrate = database.transaction(() => {
+      database.exec(`
+        ALTER TABLE runtime_interactions RENAME TO runtime_interactions_issue16;
+        ALTER TABLE runtime_interaction_answers RENAME TO runtime_interaction_answers_issue16;
+        ALTER TABLE runtime_interaction_handoffs RENAME TO runtime_interaction_handoffs_issue16;
+        ALTER TABLE runtime_interaction_audit RENAME TO runtime_interaction_audit_issue16;
+
+        CREATE TABLE runtime_interactions (
+          interaction_id TEXT PRIMARY KEY,
+          conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+          turn_id TEXT NOT NULL REFERENCES runtime_turns(turn_id),
+          lineage_id TEXT REFERENCES runtime_lineages(lineage_id),
+          parent_type TEXT NOT NULL CHECK (
+            parent_type IN ('provider_turn', 'security_control', 'recovery_control')
+          ),
+          parent_id TEXT NOT NULL,
+          ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+          state TEXT NOT NULL,
+          version INTEGER NOT NULL CHECK (version > 0),
+          handoff_state TEXT NOT NULL,
+          handoff_version INTEGER CHECK (handoff_version IS NULL OR handoff_version > 0),
+          request_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE (parent_type, parent_id, ordinal)
+        );
+        INSERT INTO runtime_interactions (
+          interaction_id, conversation_id, turn_id, lineage_id, parent_type, parent_id,
+          ordinal, state, version, handoff_state, handoff_version, request_json,
+          created_at, updated_at
+        )
+        SELECT interaction_id, conversation_id, turn_id, lineage_id, 'provider_turn', turn_id,
+          ordinal, state, version, handoff_state, handoff_version, request_json,
+          created_at, updated_at
+        FROM runtime_interactions_issue16;
+
+        CREATE TABLE runtime_interaction_answers (
+          answer_id TEXT PRIMARY KEY,
+          interaction_id TEXT NOT NULL UNIQUE REFERENCES runtime_interactions(interaction_id),
+          idempotency_key TEXT NOT NULL UNIQUE,
+          payload_hash TEXT NOT NULL,
+          answer_json TEXT NOT NULL,
+          result_json TEXT NOT NULL,
+          committed_at TEXT NOT NULL
+        );
+        INSERT INTO runtime_interaction_answers
+        SELECT * FROM runtime_interaction_answers_issue16;
+
+        CREATE TABLE runtime_interaction_handoffs (
+          handoff_id TEXT PRIMARY KEY,
+          interaction_id TEXT NOT NULL UNIQUE REFERENCES runtime_interactions(interaction_id),
+          answer_id TEXT NOT NULL UNIQUE,
+          state TEXT NOT NULL,
+          parent_type TEXT NOT NULL CHECK (
+            parent_type IN ('provider_turn', 'security_control', 'recovery_control')
+          ),
+          provider_attempt_id TEXT,
+          handoff_attempt_id TEXT,
+          handoff_attempt_no INTEGER CHECK (
+            handoff_attempt_no IS NULL OR handoff_attempt_no > 0
+          ),
+          lease_epoch INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0),
+          record_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          CHECK (
+            (parent_type = 'provider_turn' AND provider_attempt_id IS NOT NULL
+              AND lease_epoch IS NOT NULL)
+            OR (parent_type != 'provider_turn' AND provider_attempt_id IS NULL
+              AND lease_epoch IS NULL)
+          )
+        );
+        INSERT INTO runtime_interaction_handoffs (
+          handoff_id, interaction_id, answer_id, state, parent_type, provider_attempt_id,
+          handoff_attempt_id, handoff_attempt_no, lease_epoch, record_json, created_at, updated_at
+        )
+        SELECT handoff_id, interaction_id, answer_id, state, 'provider_turn', provider_attempt_id,
+          handoff_attempt_id, handoff_attempt_no, lease_epoch, record_json, created_at, updated_at
+        FROM runtime_interaction_handoffs_issue16;
+
+        CREATE TABLE runtime_interaction_audit (
+          audit_id TEXT PRIMARY KEY,
+          interaction_id TEXT NOT NULL REFERENCES runtime_interactions(interaction_id),
+          handoff_id TEXT NOT NULL REFERENCES runtime_interaction_handoffs(handoff_id),
+          outcome TEXT NOT NULL,
+          provider_attempt_id TEXT,
+          lease_epoch INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0),
+          acknowledgement_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        INSERT INTO runtime_interaction_audit
+        SELECT * FROM runtime_interaction_audit_issue16;
+
+        DROP TABLE runtime_interaction_audit_issue16;
+        DROP TABLE runtime_interaction_handoffs_issue16;
+        DROP TABLE runtime_interaction_answers_issue16;
+        DROP TABLE runtime_interactions_issue16;
+      `);
+      const violations = database.prepare('PRAGMA foreign_key_check').all();
+      if (violations.length > 0) {
+        throw new Error('Interaction control storage migration violated foreign keys.');
+      }
+    });
+    migrate.immediate();
+  } finally {
+    database.pragma('foreign_keys = ON');
+  }
 }
 
 function hasLegacyAggregateVersionConstraint(database) {
@@ -522,6 +648,7 @@ export function initializeRuntimePersistence(database) {
   );
   addColumnIfMissing(database, 'runtime_executor_residents', 'owner_expires_at', 'TEXT');
   addColumnIfMissing(database, 'runtime_interaction_answers', 'payload_hash', 'TEXT');
+  migrateInteractionControlStorage(database);
   addColumnIfMissing(
     database,
     'runtime_lineages',
