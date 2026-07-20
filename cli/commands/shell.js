@@ -83,6 +83,7 @@ export async function shellCommand() {
   // can exist. Node delivers signals between turns, so all resources registered
   // during this synchronous startup are visible to the same cleanup barrier.
   let server = null;
+  let serverState = 'absent';
   let database = null;
   let deliveryDrain = null;
   let deliveryTimer = null;
@@ -97,10 +98,17 @@ export async function shellCommand() {
         await new Promise((resolve) => {
           const close = () => {
             server.off('error', close);
-            if (server.listening) server.close(() => resolve());
-            else resolve();
+            if (server.listening) {
+              server.close(() => {
+                serverState = 'closed';
+                resolve();
+              });
+            } else {
+              resolve();
+            }
           };
           if (server.listening) close();
+          else if (serverState === 'failed' || serverState === 'closed') resolve();
           else {
             server.once('listening', close);
             server.once('error', close);
@@ -154,17 +162,22 @@ export async function shellCommand() {
       }
     });
   });
+  serverState = 'starting';
+  server.once('close', () => { serverState = 'closed'; });
 
   // Set umask before listen to create socket with correct permissions (owner-only)
   const oldMask = process.umask(0o177);
   server.listen(socketPath, () => {
+    serverState = 'listening';
     process.umask(oldMask);
   });
 
   server.on('error', (err) => {
+    serverState = 'failed';
     process.umask(oldMask);
     console.error(`Error: could not start shell server — ${err.message}`);
-    process.exit(1);
+    process.exitCode = 1;
+    void shutdown();
   });
 
   fs.mkdirSync(path.dirname(CORE_DATABASE_PATH), { recursive: true });

@@ -38,6 +38,16 @@ describe('shell Core outbox owner lifecycle', () => {
     }
   });
 
+  test('routes fatal socket errors through the same awaited shutdown fence', () => {
+    const source = fs.readFileSync(path.resolve('cli/commands/shell.js'), 'utf8');
+    const listenerStart = source.indexOf("server.on('error'");
+    const listenerEnd = source.indexOf('\n  });', listenerStart);
+    const listener = source.slice(listenerStart, listenerEnd);
+    expect(listener).toMatch(/shutdown\(\)/);
+    expect(listener).toMatch(/process\.exitCode\s*=\s*1/);
+    expect(listener).not.toMatch(/process\.exit\(/);
+  });
+
   test('stop waits for the current fenced dispatch result and prevents another claim', async () => {
     let releaseDispatch;
     let dispatchCalls = 0;
