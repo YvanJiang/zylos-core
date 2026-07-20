@@ -33,6 +33,7 @@ import {
 } from './inbound-acceptance.js';
 import { initializeMainProjection, stageMainProjection } from './main-projection.js';
 import { initializeRuntimePersistence } from './schema.js';
+import { createRetentionCleanup } from './retention-cleanup.js';
 import {
   createWorkspaceLeaseCoordinator,
   normalizeWorkspaceRoot,
@@ -585,6 +586,7 @@ export function createExecutorStore({
   residentLeaseDurationMs = 60_000,
   workspaceLeaseDurationMs = 10_000,
   interactionTimeoutMs = 10 * 60_000,
+  retentionCleanupSleep,
 }) {
   initializeRuntimePersistence(database);
   const workspaceLeases = createWorkspaceLeaseCoordinator({
@@ -593,6 +595,12 @@ export function createExecutorStore({
     now,
     generateId,
     leaseDurationMs: workspaceLeaseDurationMs,
+  });
+  const retentionCleanup = createRetentionCleanup({
+    database,
+    now,
+    generateId,
+    ...(retentionCleanupSleep === undefined ? {} : { sleep: retentionCleanupSleep }),
   });
 
   function assertResidentOwner(conversationId, expectedEpoch = null) {
@@ -9177,6 +9185,7 @@ export function createExecutorStore({
     reconcileNonterminalTurns,
     releaseTimedOutExecutorLease,
     requestInteraction,
+    runRetentionCleanup: retentionCleanup.run,
     resumeTurnAfterPermission,
     reserveNextExecutor,
     startWorkspaceBackgroundWork,
