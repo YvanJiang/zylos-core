@@ -649,7 +649,7 @@ function invalidateStaleConfirmation(database, {
     controlId: confirmation.control_id,
     redactedContext: { action_kind: confirmation.action_kind },
   });
-  return error;
+  return Object.freeze({ error, request: invalidatedRequest });
 }
 
 function resolveConfirmationInTransaction(database, {
@@ -717,13 +717,14 @@ function resolveConfirmationInTransaction(database, {
       confirmation.bot_id,
     ) === undefined;
   if (!revisionMatches || !targetStateMatches) {
-    return interactionErrorResult(answer, invalidateStaleConfirmation(database, {
+    const invalidated = invalidateStaleConfirmation(database, {
       confirmation,
       request,
       envelope,
       committedAt,
       generateId,
-    }), request);
+    });
+    return interactionErrorResult(answer, invalidated.error, invalidated.request);
   }
   validateInteractionAnswerAgainstRequest(answer, request, {
     interactions: [request],

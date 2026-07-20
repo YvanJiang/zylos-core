@@ -716,11 +716,21 @@ describe('persistent bot permission confirmation', () => {
     ));
     expect(rejected).toMatchObject({
       status: 'rejected',
+      interaction_state: 'expired',
+      interaction_version: request.version + 1,
       error: { code: 'version_conflict' },
     });
     expect(database.prepare(`
-      SELECT status FROM runtime_permission_confirmations WHERE control_id = ?
-    `).get(pending.control_id)).toEqual({ status: 'expired' });
+      SELECT confirmation.status, interaction.state, interaction.version
+      FROM runtime_permission_confirmations AS confirmation
+      JOIN runtime_interactions AS interaction
+        ON interaction.interaction_id = confirmation.interaction_id
+      WHERE confirmation.control_id = ?
+    `).get(pending.control_id)).toEqual({
+      status: 'expired',
+      state: 'expired',
+      version: request.version + 1,
+    });
     expect(database.prepare(`
       SELECT COUNT(*) AS count FROM runtime_permission_grants
       WHERE grant_kind = 'persistent_bot'
@@ -971,6 +981,92 @@ describe('executor protected-action integration', () => {
       { outcome: 'requires_approval', count: 1 },
       { outcome: 'trusted', count: 1 },
     ]);
+    database.close();
+  });
+
+  test('atomically binds next-turn trusted to a steer-created executable priority turn', async () => {
+    const database = openDatabase();
+    const now = () => '2026-07-20T01:00:00Z';
+    const generateId = deterministicIds('steer-permission');
+    const options = { now, generateId };
+    const actorId = 'steer-permission-actor';
+    const providerStarted = {};
+    providerStarted.promise = new Promise((resolve) => {
+      providerStarted.resolve = resolve;
+    });
+    const providerStopped = {};
+    providerStopped.promise = new Promise((resolve) => {
+      providerStopped.resolve = resolve;
+    });
+    const decisions = [];
+    let activeTurnId;
+    const adapter = {
+      async *execute(context, controls) {
+        if (context.turn_id === activeTurnId) {
+          context.reportProviderState({ state: 'started', provider_native_id: null });
+          providerStarted.resolve();
+          await providerStopped.promise;
+          yield { type: 'turn_result', outcome: 'cancelled' };
+          return;
+        }
+        decisions.push(await controls.requestPermission({ tool_name: 'shell' }));
+        yield { type: 'turn_result', outcome: 'completed' };
+      },
+      async cancel(_context, { reason } = {}) {
+        expect(reason).toBe('steer');
+        providerStopped.resolve();
+      },
+    };
+
+    const active = acceptNormalInbound(database, envelope(
+      'steer-active',
+      'active work',
+      { actorId },
+    ), options);
+    activeTurnId = active.turn_id;
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'permission-steer-service',
+      now,
+      generateId,
+    });
+    const execution = service.runNext();
+    await providerStarted.promise;
+    acceptNormalInbound(database, envelope(
+      'steer-command',
+      '/permission trusted',
+      { actorId },
+    ), options);
+
+    const steered = await service.steer({
+      conversation_id: active.conversation_id,
+      turn_id: active.turn_id,
+      steer_id: 'permission-steer-control',
+      envelope: envelope(
+        'steer-control',
+        '/steer continue with the trusted action',
+        { actorId },
+      ),
+    });
+    await expect(execution).resolves.toMatchObject({ status: 'interrupted' });
+    expect(database.prepare(`
+      SELECT mode, basis_kind, actor_id
+      FROM runtime_turn_permissions
+      WHERE turn_id = ?
+    `).get(steered.priority_turn.turn_id)).toEqual({
+      mode: 'trusted',
+      basis_kind: 'next_turn',
+      actor_id: actorId,
+    });
+    await expect(service.runNext()).resolves.toMatchObject({ status: 'completed' });
+    expect(decisions).toEqual([expect.objectContaining({
+      behavior: 'allow',
+      permission_basis: 'next_turn',
+    })]);
+
+    await service.close();
     database.close();
   });
 });
