@@ -1214,16 +1214,14 @@ export function createExecutorService({
     if (typeof adapter.prepareInteractionAnswer !== 'function') {
       throw new TypeError('adapter.prepareInteractionAnswer must be a function');
     }
-    const delivery = store.claimInteractionHandoff(handoffId);
-    const activeRun = activeRuns.get(delivery.request.turn_id);
-    if (delivery.request.parent_type === 'recovery_control') {
-      const { acknowledgement } = persist(
-        () => store.completeRecoveryControlHandoff(delivery),
-      );
+    const beginning = persist(() => store.beginInteractionHandoff(handoffId));
+    if (beginning.acknowledgement !== null) {
       reschedulePendingInteractionDeadlines();
       refresh();
-      return { acknowledgement, execution: null };
+      return { acknowledgement: beginning.acknowledgement, execution: null };
     }
+    const { delivery } = beginning;
+    const activeRun = activeRuns.get(delivery.request.turn_id);
     let prepared;
     try {
       prepared = await adapter.prepareInteractionAnswer(deepFreeze(delivery));

@@ -3650,6 +3650,18 @@ export function createExecutorStore({
     return complete.immediate();
   }
 
+  function beginInteractionHandoff(handoffId) {
+    const begin = database.transaction(() => {
+      const delivery = claimInteractionHandoff(handoffId);
+      if (delivery.request.parent_type !== 'recovery_control') {
+        return { acknowledgement: null, delivery };
+      }
+      const { acknowledgement } = completeRecoveryControlHandoff(delivery);
+      return { acknowledgement, delivery: null };
+    });
+    return begin.immediate();
+  }
+
   function getInteractionHandoffForRecovery(handoffId) {
     const row = database.prepare(`
       SELECT interaction.handoff_version, interaction.request_json,
@@ -4613,11 +4625,11 @@ export function createExecutorStore({
     appendAdapterEvent,
     assertInteractionHandoffRecoveryNoticeDelivered,
     assertCurrentFence,
+    beginInteractionHandoff,
     bindProviderNativeId,
     claimNextQueuedTurn,
     claimInteractionHandoff,
     commitInteractionAnswer,
-    completeRecoveryControlHandoff,
     markProviderFailure,
     markProviderStopUnknown,
     heartbeatOwnedResidents,

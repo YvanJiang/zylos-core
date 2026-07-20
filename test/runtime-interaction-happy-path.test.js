@@ -1324,7 +1324,7 @@ describe('runtime interaction happy path', () => {
     database.close();
   });
 
-  test('rolls back a Core-owned recovery handoff when its acknowledgement cannot commit', () => {
+  test('rolls back a Core-owned recovery claim when its acknowledgement cannot commit', async () => {
     const database = openTestDatabase();
     const { store, turnContext } = createRunningTurn(database, 'recovery-control-rollback');
     const original = store.requestInteraction(turnContext, {
@@ -1381,8 +1381,20 @@ describe('runtime interaction happy path', () => {
     const answer = store.commitInteractionAnswer(
       interactionAnswer(replacementRequest, 'recovery-control-rollback'),
     );
-    const delivery = store.claimInteractionHandoff(answer.handoff_id);
     const before = readInteractionAuthority(database, original.turn_id);
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute() {},
+        async prepareInteractionAnswer() {
+          throw new Error('Core recovery control must not call the provider adapter.');
+        },
+      },
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-recovery-control-rollback',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('recovery-control-rollback-service'),
+    });
     database.exec(`
       CREATE TRIGGER force_recovery_control_audit_failure
       BEFORE INSERT ON runtime_interaction_audit
@@ -1392,17 +1404,32 @@ describe('runtime interaction happy path', () => {
       END;
     `);
 
-    expect(() => store.completeRecoveryControlHandoff(delivery))
-      .toThrow(/forced recovery control audit failure/);
+    await expect(service.deliverInteractionAnswer(answer.handoff_id))
+      .rejects.toThrow(/forced recovery control audit failure/);
     expect(readInteractionAuthority(database, original.turn_id)).toEqual(before);
     const persistedHandoff = JSON.parse(database.prepare(`
       SELECT record_json FROM runtime_interaction_handoffs WHERE handoff_id = ?
     `).get(answer.handoff_id).record_json);
     expect(persistedHandoff).toMatchObject({
-      state: 'delivering',
+      state: 'pending',
       last_send_started_at: null,
       provider_acked_at: null,
       side_effect_status: 'none',
+    });
+    database.exec('DROP TRIGGER force_recovery_control_audit_failure;');
+    await expect(service.deliverInteractionAnswer(answer.handoff_id)).resolves.toMatchObject({
+      acknowledgement: {
+        status: 'accepted',
+        resumed: false,
+        turn_state: 'recovering',
+      },
+      execution: null,
+    });
+    expect(JSON.parse(database.prepare(`
+      SELECT request_json FROM runtime_interactions WHERE interaction_id = ?
+    `).get(replacementRequest.interaction_id).request_json)).toMatchObject({
+      state: 'answered',
+      handoff_state: 'accepted',
     });
 
     database.close();
