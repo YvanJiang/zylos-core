@@ -6,11 +6,18 @@ import { afterEach, describe, expect, test } from '@jest/globals';
 import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/index.js';
 
 import {
+  createIdempotencyKey,
   resolveObservabilitySnapshotUpdate,
   validateObservabilitySnapshot,
 } from '../contracts/public/index.js';
 import { createExecutorService } from '../runtime/executor/service.js';
 import { createRuntimeSnapshotPublisher } from '../runtime/observability/snapshot-publisher.js';
+import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+
+const inboundFixture = JSON.parse(fs.readFileSync(
+  new URL('../contracts/public/fixtures/inbound-envelope-v1.json', import.meta.url),
+  'utf8',
+));
 
 const temporaryDirectories = [];
 
@@ -26,6 +33,43 @@ function openDatabase(name = 'c4.db') {
 function deterministicIds(namespace) {
   let sequence = 0;
   return (kind) => `${kind}-${namespace}-${++sequence}`;
+}
+
+function instrumentPrepares(database) {
+  let prepareCount = 0;
+  return {
+    exec: database.exec.bind(database),
+    pragma: database.pragma.bind(database),
+    transaction: database.transaction.bind(database),
+    prepare(...args) {
+      prepareCount += 1;
+      return database.prepare(...args);
+    },
+    resetPrepareCount() {
+      prepareCount = 0;
+    },
+    get prepareCount() {
+      return prepareCount;
+    },
+  };
+}
+
+function normalEnvelope(suffix) {
+  const fixture = inboundFixture.valid.find(
+    ({ name }) => name === 'authenticated_dm_with_attachment',
+  ).document;
+  const envelope = structuredClone(fixture);
+  envelope.inbound_event_id = `evt-${suffix}`;
+  envelope.trace_id = `trace-${suffix}`;
+  envelope.message_id = `message-${suffix}`;
+  envelope.idempotency_key = createIdempotencyKey('inbound', {
+    region: envelope.region,
+    tenant_id: envelope.tenant_id,
+    channel: envelope.channel,
+    bot_id: envelope.bot_id,
+    inbound_event_id: envelope.inbound_event_id,
+  });
+  return envelope;
 }
 
 function createPublisher(database, overrides = {}) {
@@ -159,18 +203,6 @@ function seedUnknownRuntimeState(database) {
       'conversation-observability-A',
       'turn-observability-A',
       '2026-07-20T07:59:30Z',
-    );
-    database.prepare(`
-      INSERT INTO runtime_executor_residents (
-        conversation_id, bot_id, provider, owner_service_instance_id,
-        owner_epoch, owner_expires_at, admitted_at, last_used_at
-      ) VALUES (?, 'bot-A', 'codex', ?, 9, ?, ?, ?)
-    `).run(
-      'conversation-observability-A',
-      'core-service-observability-A',
-      '2026-07-20T08:00:15Z',
-      '2026-07-20T07:59:30Z',
-      '2026-07-20T08:00:03Z',
     );
     database.prepare(`
       INSERT INTO runtime_executor_leases (
@@ -351,6 +383,60 @@ describe('Core runtime observability snapshot publisher', () => {
     database.close();
   });
 
+  test('publishes an active non-resident Codex executor from the real service path', async () => {
+    const { database } = openDatabase();
+    const accepted = acceptNormalInbound(database, normalEnvelope('codex-observability'), {
+      now: () => '2026-07-20T08:00:00Z',
+      generateId: deterministicIds('codex-inbound'),
+    });
+    let finishProvider;
+    const providerFinished = new Promise((resolve) => { finishProvider = resolve; });
+    const service = createExecutorService({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'core-service-codex-observability',
+      now: () => '2026-07-20T08:00:05Z',
+      generateId: deterministicIds('codex-observability'),
+      adapter: {
+        async *execute(context) {
+          context.reportRuntimeEvidence({
+            runtime_instance_id: 'codex-runtime-observability',
+            handle_kind: 'codex_app_server_connection',
+            controllable: true,
+          });
+          context.reportProviderState({
+            state: 'started',
+            provider_native_id: null,
+          });
+          await providerFinished;
+        },
+      },
+    });
+
+    const running = service.runNext();
+    await new Promise((resolve) => setImmediate(resolve));
+    try {
+      const snapshot = service.publishObservabilitySnapshot();
+      expect(snapshot.executors).toMatchObject({
+        complete: true,
+        items: [expect.objectContaining({
+          conversation_id: accepted.conversation_id,
+          provider: 'codex',
+          provider_native_id: null,
+          resident: false,
+          evictable: false,
+          active_turn_id: accepted.turn_id,
+          health: 'healthy',
+        })],
+      });
+    } finally {
+      finishProvider();
+      await running;
+    }
+    await service.close();
+    database.close();
+  });
+
   test('publishes complete full replacements with durable monotonic versions across reopen', () => {
     const { database, databasePath } = openDatabase();
     const firstPublisher = createPublisher(database);
@@ -405,6 +491,77 @@ describe('Core runtime observability snapshot publisher', () => {
     reopened.close();
   });
 
+  test('rejects non-RFC timestamps before persistence and rejects poisoned registrations', () => {
+    const { database, databasePath } = openDatabase();
+    createPublisher(database);
+    expect(() => createPublisher(database, {
+      serviceInstanceId: 'core-service-invalid-time',
+      startedAt: 'July 20, 2026',
+    })).toThrow(/RFC 3339/);
+    expect(database.prepare(`
+      SELECT 1 FROM runtime_observability_instances
+      WHERE service_instance_id = 'core-service-invalid-time'
+    `).get()).toBeUndefined();
+
+    database.prepare(`
+      UPDATE runtime_observability_instances SET started_at = 'July 20, 2026'
+      WHERE service_instance_id = 'core-service-observability-A'
+    `).run();
+    database.close();
+
+    const reopened = new Database(databasePath);
+    expect(() => createPublisher(reopened)).toThrow(/RFC 3339/);
+    reopened.prepare(`
+      UPDATE runtime_observability_instances SET started_at = '2026-07-20T07:59:00Z'
+      WHERE service_instance_id = 'core-service-observability-A'
+    `).run();
+    expect(createPublisher(reopened).publish().snapshot_version).toBe(1);
+    reopened.close();
+  });
+
+  test('uses a consistent read snapshot without blocking a concurrent runtime writer', () => {
+    const { database, databasePath } = openDatabase();
+    const writer = new Database(databasePath);
+    let writeCommitted = false;
+    const publisher = createPublisher(database, {
+      getServiceState() {
+        acceptNormalInbound(writer, normalEnvelope('concurrent-writer'), {
+          now: () => '2026-07-20T08:00:04Z',
+          generateId: deterministicIds('concurrent-writer'),
+        });
+        writeCommitted = true;
+        return {};
+      },
+    });
+
+    const before = publisher.publish();
+    expect(writeCommitted).toBe(true);
+    expect(before.turns.items).toEqual([]);
+    expect(before.outbox.items).toEqual([]);
+
+    const after = createPublisher(database).publish();
+    expect(after.turns.items).toHaveLength(1);
+    expect(after.outbox.items).toHaveLength(1);
+    writer.close();
+    database.close();
+  });
+
+  test('uses a fixed batch-query count as durable history grows', () => {
+    const { database } = openDatabase();
+    const instrumented = instrumentPrepares(database);
+    const publisher = createPublisher(instrumented);
+
+    instrumented.resetPrepareCount();
+    publisher.publish();
+    const emptyPrepareCount = instrumented.prepareCount;
+
+    seedUnknownRuntimeState(database);
+    instrumented.resetPrepareCount();
+    publisher.publish();
+    expect(instrumented.prepareCount).toBe(emptyPrepareCount);
+    database.close();
+  });
+
   test('projects every durable aggregate, unknown states, and diagnostic-only identities', () => {
     const { database } = openDatabase();
     const publisher = createPublisher(database);
@@ -419,6 +576,8 @@ describe('Core runtime observability snapshot publisher', () => {
         provider: 'codex',
         provider_native_id: 'native-thread-observability-A',
         health: 'degraded',
+        resident: false,
+        evictable: false,
         active_turn_id: 'turn-observability-A',
         wait_reason: 'interaction_delivery_unknown',
         runtime_identity: {

@@ -4,6 +4,7 @@ import {
   validateContractError,
   validateObservabilitySnapshot,
   validatePublicFixtureSafety,
+  validateRfc3339Timestamp,
 } from '../../contracts/public/index.js';
 import { initializeRuntimePersistence } from '../persistence/schema.js';
 
@@ -19,10 +20,7 @@ function requireNonEmptyString(name, value) {
 }
 
 function requireTimestamp(name, value) {
-  if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) {
-    throw new TypeError(`${name} must be an RFC 3339 timestamp`);
-  }
-  return value;
+  return validateRfc3339Timestamp(name, value);
 }
 
 function parseJson(value, label) {
@@ -87,38 +85,24 @@ function collect(name, collector, failures) {
   }
 }
 
-function latestLineage(database, conversationId, activeLineageId) {
-  if (activeLineageId !== null) {
-    return database.prepare(`
-      SELECT lineage_id, provider, provider_native_id
-      FROM runtime_lineages
-      WHERE lineage_id = ? AND conversation_id = ?
-    `).get(activeLineageId, conversationId);
+function firstBy(rows, key) {
+  const result = new Map();
+  for (const row of rows) {
+    const value = row[key];
+    if (!result.has(value)) result.set(value, row);
   }
-  return database.prepare(`
-    SELECT lineage_id, provider, provider_native_id
-    FROM runtime_lineages
-    WHERE conversation_id = ? AND provider IS NOT NULL
-    ORDER BY is_default DESC, created_at DESC, lineage_id DESC
-    LIMIT 1
-  `).get(conversationId);
+  return result;
 }
 
-function latestAttempt(database, conversationId, turnId) {
-  if (turnId !== null) {
-    return database.prepare(`
-      SELECT * FROM runtime_provider_attempts
-      WHERE turn_id = ?
-      ORDER BY attempt_no DESC
-      LIMIT 1
-    `).get(turnId);
+function groupBy(rows, key) {
+  const result = new Map();
+  for (const row of rows) {
+    const value = row[key];
+    const group = result.get(value) ?? [];
+    group.push(row);
+    result.set(value, group);
   }
-  return database.prepare(`
-    SELECT * FROM runtime_provider_attempts
-    WHERE conversation_id = ?
-    ORDER BY updated_at DESC, attempt_no DESC
-    LIMIT 1
-  `).get(conversationId);
+  return result;
 }
 
 function runtimeIdentity(attempt) {
@@ -151,115 +135,135 @@ function exactActiveFence(row, attempt, serviceInstanceId, generatedAt) {
 }
 
 function collectExecutors(database, serviceInstanceId, generatedAt) {
-  const residents = database.prepare(`
-    SELECT resident.*, conversation.region, conversation.tenant_id,
+  const candidates = database.prepare(`
+    WITH executor_conversations AS (
+      SELECT conversation_id FROM runtime_executor_residents
+      UNION
+      SELECT conversation_id FROM runtime_provider_attempts
+    )
+    SELECT conversation.conversation_id, conversation.region, conversation.tenant_id,
+      conversation.bot_id AS conversation_bot_id,
       conversation.chat_type, conversation.chat_id,
       conversation.native_thread_or_topic_id,
+      resident.conversation_id AS resident_conversation_id,
+      resident.provider AS resident_provider,
+      resident.owner_service_instance_id, resident.owner_epoch, resident.owner_expires_at,
       active.turn_id AS active_turn_id, active.lineage_id AS active_lineage_id,
       active.state AS active_state, active.turn_version AS active_turn_version,
       lease.lease_owner, lease.lease_epoch, lease.turn_id AS lease_turn_id,
       lease.attempt_id AS lease_attempt_id, lease.attempt_no AS lease_attempt_no,
       lease.lease_expires_at
-    FROM runtime_executor_residents AS resident
+    FROM executor_conversations AS candidate
     JOIN runtime_conversations AS conversation
-      ON conversation.conversation_id = resident.conversation_id
+      ON conversation.conversation_id = candidate.conversation_id
+    LEFT JOIN runtime_executor_residents AS resident
+      ON resident.conversation_id = candidate.conversation_id
     LEFT JOIN runtime_turns AS active
-      ON active.conversation_id = resident.conversation_id
+      ON active.conversation_id = candidate.conversation_id
       AND active.state IN ('starting', 'running', 'waiting_user', 'redirecting', 'recovering')
     LEFT JOIN runtime_executor_leases AS lease
-      ON lease.conversation_id = resident.conversation_id
-    ORDER BY resident.conversation_id
+      ON lease.conversation_id = candidate.conversation_id
+    ORDER BY candidate.conversation_id
   `).all();
+  const lineages = database.prepare(`
+    SELECT lineage_id, conversation_id, provider, provider_native_id
+    FROM runtime_lineages
+    ORDER BY conversation_id, is_default DESC, created_at DESC, lineage_id DESC
+  `).all();
+  const lineageById = new Map(lineages.map((lineage) => [lineage.lineage_id, lineage]));
+  const latestLineageByConversation = firstBy(lineages, 'conversation_id');
+  const attempts = database.prepare(`
+    SELECT * FROM runtime_provider_attempts
+    ORDER BY conversation_id, updated_at DESC, attempt_no DESC
+  `).all();
+  const latestAttemptByConversation = firstBy(attempts, 'conversation_id');
+  const attemptsByTurn = groupBy(attempts, 'turn_id');
+  const queuedRows = database.prepare(`
+    SELECT conversation_id, wait_reason
+    FROM runtime_turn_queue
+    WHERE status = 'queued'
+    ORDER BY conversation_id, priority DESC, queue_sequence ASC
+  `).all();
+  const queueByConversation = groupBy(queuedRows, 'conversation_id');
+  const latestEvents = firstBy(database.prepare(`
+    SELECT turn.conversation_id, event.event_id, event.persisted_at
+    FROM runtime_normalized_events AS event
+    JOIN runtime_turns AS turn ON turn.turn_id = event.turn_id
+    ORDER BY turn.conversation_id, event.persisted_at DESC, event.event_sequence DESC
+  `).all(), 'conversation_id');
+  const interactionStateByTurn = new Map(database.prepare(`
+    SELECT turn_id,
+      MAX(CASE WHEN state = 'delivery_unknown' OR handoff_state = 'delivery_unknown'
+        THEN 1 ELSE 0 END) AS delivery_unknown,
+      MAX(CASE WHEN state IN (
+        'pending', 'answer_committed', 'answer_delivering', 'delivery_unknown'
+      ) THEN 1 ELSE 0 END) AS blocking
+    FROM runtime_interactions
+    WHERE turn_id IS NOT NULL
+    GROUP BY turn_id
+  `).all().map((row) => [row.turn_id, row]));
+  const unknownRecoveryTurns = new Set(database.prepare(`
+    SELECT turn_id FROM runtime_execution_recoveries WHERE side_effect_status = 'unknown'
+  `).all().map(({ turn_id: turnId }) => turnId));
+  const backgroundWorkConversations = new Set(database.prepare(`
+    SELECT DISTINCT workspace.holder_conversation_id
+    FROM runtime_workspace_leases AS workspace
+    LEFT JOIN runtime_workspace_background_work AS background
+      ON background.workspace_lease_id = workspace.workspace_lease_id
+    WHERE workspace.state IN ('active', 'uncertain')
+      AND (background.background_work_id IS NULL OR background.state IN ('active', 'unknown'))
+  `).all().map(({ holder_conversation_id: conversationId }) => conversationId));
 
-  const items = residents.map((row) => {
+  const items = candidates.map((row) => {
     const activeTurnId = row.active_turn_id ?? null;
-    const lineage = latestLineage(database, row.conversation_id, row.active_lineage_id ?? null);
-    const attempt = latestAttempt(database, row.conversation_id, activeTurnId);
+    const lineage = row.active_lineage_id === null
+      ? latestLineageByConversation.get(row.conversation_id)
+      : lineageById.get(row.active_lineage_id);
+    const attempt = activeTurnId === null
+      ? latestAttemptByConversation.get(row.conversation_id)
+      : attemptsByTurn.get(activeTurnId)?.[0];
     if (!lineage || !attempt || typeof attempt.executor_instance_id !== 'string') {
-      throw new TypeError('resident executor identity is incomplete');
+      throw new TypeError('executor identity is incomplete');
     }
-    const queue = database.prepare(`
-      SELECT COUNT(*) AS count
-      FROM runtime_turn_queue
-      WHERE conversation_id = ? AND status = 'queued'
-    `).get(row.conversation_id).count;
-    const queuedWait = database.prepare(`
-      SELECT wait_reason
-      FROM runtime_turn_queue
-      WHERE conversation_id = ? AND status = 'queued'
-      ORDER BY priority DESC, queue_sequence ASC
-      LIMIT 1
-    `).get(row.conversation_id)?.wait_reason ?? null;
-    const lastEvent = database.prepare(`
-      SELECT event_id, persisted_at
-      FROM runtime_normalized_events AS event
-      JOIN runtime_turns AS turn ON turn.turn_id = event.turn_id
-      WHERE turn.conversation_id = ?
-      ORDER BY event.persisted_at DESC, event.event_sequence DESC
-      LIMIT 1
-    `).get(row.conversation_id);
-    const unknownInteraction = activeTurnId === null ? undefined : database.prepare(`
-      SELECT 1
-      FROM runtime_interactions
-      WHERE turn_id = ? AND (state = 'delivery_unknown' OR handoff_state = 'delivery_unknown')
-      LIMIT 1
-    `).get(activeTurnId);
-    const unknownRecovery = activeTurnId === null ? undefined : database.prepare(`
-      SELECT 1
-      FROM runtime_execution_recoveries
-      WHERE turn_id = ? AND side_effect_status = 'unknown'
-      LIMIT 1
-    `).get(activeTurnId);
-    const blocking = activeTurnId === null ? undefined : database.prepare(`
-      SELECT 1
-      FROM runtime_interactions
-      WHERE turn_id = ?
-        AND state IN ('pending', 'answer_committed', 'answer_delivering', 'delivery_unknown')
-      LIMIT 1
-    `).get(activeTurnId);
+    const queue = queueByConversation.get(row.conversation_id) ?? [];
+    const lastEvent = latestEvents.get(row.conversation_id);
+    const interactionState = interactionStateByTurn.get(activeTurnId);
+    const unknownInteraction = interactionState?.delivery_unknown === 1;
+    const unknownRecovery = unknownRecoveryTurns.has(activeTurnId);
+    const blocking = interactionState?.blocking === 1;
     const exactFence = exactActiveFence(row, attempt, serviceInstanceId, generatedAt);
     const sideEffectUnknown = attempt.side_effect_status === 'unknown'
-      || unknownInteraction !== undefined
-      || unknownRecovery !== undefined;
+      || unknownInteraction
+      || unknownRecovery;
     let health;
     if (sideEffectUnknown || ['redirecting', 'recovering'].includes(row.active_state)) {
       health = 'degraded';
     } else if (['starting', 'running'].includes(row.active_state)) {
       health = exactFence ? 'healthy' : 'unknown';
     } else if (row.active_state === 'waiting_user') {
-      health = exactFence && blocking !== undefined ? 'healthy' : 'unknown';
+      health = exactFence && blocking ? 'healthy' : 'unknown';
     } else {
-      health = row.owner_service_instance_id === serviceInstanceId
+      health = row.resident_conversation_id !== null
+        && row.owner_service_instance_id === serviceInstanceId
         && row.owner_expires_at !== null
         && row.owner_expires_at > generatedAt
         ? 'healthy'
-        : 'unknown';
+        : 'offline';
     }
-    const blockingWork = database.prepare(`
-      SELECT 1
-      FROM runtime_turns
-      WHERE conversation_id = ?
-        AND state IN ('queued', 'starting', 'running', 'waiting_user', 'redirecting', 'recovering')
-      UNION ALL
-      SELECT 1
-      FROM runtime_workspace_leases AS workspace
-      LEFT JOIN runtime_workspace_background_work AS background
-        ON background.workspace_lease_id = workspace.workspace_lease_id
-      WHERE workspace.holder_conversation_id = ?
-        AND workspace.state IN ('active', 'uncertain')
-        AND (background.background_work_id IS NULL OR background.state IN ('active', 'unknown'))
-      LIMIT 1
-    `).get(row.conversation_id, row.conversation_id);
-    const waitReason = unknownInteraction !== undefined
+    const resident = row.resident_conversation_id !== null;
+    const blockingWork = activeTurnId !== null
+      || queue.length > 0
+      || backgroundWorkConversations.has(row.conversation_id);
+    const waitReason = unknownInteraction
       ? 'interaction_delivery_unknown'
-      : unknownRecovery !== undefined
+      : unknownRecovery
         ? 'recovery_decision'
-        : queuedWait;
+        : queue[0]?.wait_reason ?? null;
     return publicItem({
       conversation_key: {
         region: row.region,
         tenant_id: row.tenant_id,
-        bot_id: row.bot_id,
+        bot_id: row.conversation_bot_id,
         chat_type: row.chat_type,
         chat_id: row.chat_id,
         native_thread_or_topic_id: row.native_thread_or_topic_id,
@@ -267,19 +271,19 @@ function collectExecutors(database, serviceInstanceId, generatedAt) {
       conversation_id: row.conversation_id,
       executor_version: Math.max(
         1,
-        row.owner_epoch,
+        row.owner_epoch ?? 0,
         row.active_turn_version ?? 0,
         attempt.attempt_no ?? 0,
       ),
-      provider: row.provider,
+      provider: attempt.provider ?? lineage.provider ?? row.resident_provider,
       lineage_id: lineage.lineage_id,
       provider_native_id: lineage.provider_native_id,
       executor_instance_id: attempt.executor_instance_id,
       health,
-      resident: true,
-      evictable: blockingWork === undefined,
+      resident,
+      evictable: resident && !blockingWork,
       active_turn_id: activeTurnId,
-      queue_length: queue,
+      queue_length: queue.length,
       wait_reason: waitReason,
       last_event_id: lastEvent?.event_id ?? null,
       last_event_at: lastEvent?.persisted_at ?? null,
@@ -316,30 +320,29 @@ function collectTurns(database) {
   const rows = database.prepare(`
     SELECT * FROM runtime_turns ORDER BY created_at, turn_id
   `).all();
+  const attemptsByTurn = groupBy(database.prepare(`
+    SELECT * FROM runtime_provider_attempts
+    ORDER BY turn_id, attempt_no DESC
+  `).all(), 'turn_id');
+  const latestEventByTurn = firstBy(database.prepare(`
+    SELECT turn_id, event_json
+    FROM runtime_normalized_events
+    ORDER BY turn_id, event_sequence DESC
+  `).all(), 'turn_id');
+  const executionRecoveryByTurn = new Map(database.prepare(`
+    SELECT turn_id, side_effect_status, error_json
+    FROM runtime_execution_recoveries
+  `).all().map((row) => [row.turn_id, row]));
+  const stopIncidentByTurn = new Map(database.prepare(`
+    SELECT turn_id, side_effect_status, error_json
+    FROM runtime_provider_stop_incidents
+  `).all().map((row) => [row.turn_id, row]));
   const items = rows.map((row) => {
-    const attempts = database.prepare(`
-      SELECT * FROM runtime_provider_attempts
-      WHERE turn_id = ?
-      ORDER BY attempt_no DESC
-    `).all(row.turn_id);
-    const latestEventRow = database.prepare(`
-      SELECT event_json
-      FROM runtime_normalized_events
-      WHERE turn_id = ?
-      ORDER BY event_sequence DESC
-      LIMIT 1
-    `).get(row.turn_id);
+    const attempts = attemptsByTurn.get(row.turn_id) ?? [];
+    const latestEventRow = latestEventByTurn.get(row.turn_id);
     const latestEvent = parseJson(latestEventRow?.event_json, 'normalized event');
-    const executionRecovery = database.prepare(`
-      SELECT side_effect_status, error_json
-      FROM runtime_execution_recoveries
-      WHERE turn_id = ?
-    `).get(row.turn_id);
-    const stopIncident = database.prepare(`
-      SELECT side_effect_status, error_json
-      FROM runtime_provider_stop_incidents
-      WHERE turn_id = ?
-    `).get(row.turn_id);
+    const executionRecovery = executionRecoveryByTurn.get(row.turn_id);
+    const stopIncident = stopIncidentByTurn.get(row.turn_id);
     const errorSource = latestEvent?.error
       ?? attempts[0]?.error_json
       ?? executionRecovery?.error_json
@@ -408,26 +411,32 @@ function collectInteractions(database) {
 }
 
 function collectWorkspaceLeases(database) {
-  const waiters = database.prepare(`
+  const waiterCounts = new Map();
+  for (const { wait_detail_json: detail } of database.prepare(`
     SELECT wait_detail_json
     FROM runtime_turn_queue
     WHERE status = 'queued' AND wait_reason = 'workspace_lease'
       AND wait_detail_json IS NOT NULL
-  `).all().map(({ wait_detail_json: detail }) => parseJson(detail, 'workspace waiter'));
+  `).all()) {
+    const holderTurnId = parseJson(detail, 'workspace waiter')?.holder_turn_id;
+    if (typeof holderTurnId === 'string') {
+      waiterCounts.set(holderTurnId, (waiterCounts.get(holderTurnId) ?? 0) + 1);
+    }
+  }
   const rows = database.prepare(`
     SELECT *
     FROM runtime_workspace_leases
     WHERE state IN ('active', 'uncertain')
     ORDER BY workspace_root, lease_epoch, workspace_lease_id
   `).all();
+  const backgroundByLease = firstBy(database.prepare(`
+    SELECT workspace_lease_id, background_work_id
+    FROM runtime_workspace_background_work
+    WHERE state IN ('active', 'unknown')
+    ORDER BY workspace_lease_id, background_work_id
+  `).all(), 'workspace_lease_id');
   const items = rows.map((row) => {
-    const background = database.prepare(`
-      SELECT background_work_id
-      FROM runtime_workspace_background_work
-      WHERE workspace_lease_id = ? AND state IN ('active', 'unknown')
-      ORDER BY background_work_id
-      LIMIT 1
-    `).get(row.workspace_lease_id);
+    const background = backgroundByLease.get(row.workspace_lease_id);
     return publicItem({
       workspace_root: row.workspace_root,
       mode: row.mode === 'writable' ? 'write' : 'read',
@@ -436,9 +445,7 @@ function collectWorkspaceLeases(database) {
       holder_background_work_id: background?.background_work_id ?? null,
       expires_at: row.lease_expires_at,
       epoch: row.lease_epoch,
-      waiter_count: waiters.filter(
-        (detail) => detail?.holder_turn_id === row.holder_turn_id,
-      ).length,
+      waiter_count: waiterCounts.get(row.holder_turn_id) ?? 0,
     });
   });
   return Object.freeze({ complete: true, items: Object.freeze(items), error: null });
@@ -488,30 +495,26 @@ function collectOutbox(database, generatedAt) {
 }
 
 function collectAuditSummary(database) {
-  const queries = Object.freeze([
-    ['permission', `SELECT committed_at FROM runtime_permission_audit`],
-    ['interaction', `SELECT created_at AS committed_at FROM runtime_interaction_audit`],
-    ['recovery', `
-      SELECT created_at AS committed_at FROM runtime_execution_recoveries
+  const items = database.prepare(`
+    SELECT category, COUNT(*) AS count, MAX(committed_at) AS last_committed_at
+    FROM (
+      SELECT 'permission' AS category, committed_at FROM runtime_permission_audit
       UNION ALL
-      SELECT created_at AS committed_at FROM runtime_reply_mapping_recoveries
-    `],
-    ['runtime_control', `
-      SELECT committed_at FROM runtime_stop_controls
+      SELECT 'interaction', created_at FROM runtime_interaction_audit
       UNION ALL
-      SELECT committed_at FROM runtime_steer_controls
-    `],
-    ['provider_diagnostic', `
-      SELECT observed_at AS committed_at FROM runtime_provider_event_diagnostics
-    `],
-  ]);
-  const items = queries.flatMap(([category, source]) => {
-    const row = database.prepare(`
-      SELECT COUNT(*) AS count, MAX(committed_at) AS last_committed_at
-      FROM (${source})
-    `).get();
-    return row.count === 0 ? [] : [publicItem({ category, ...row })];
-  });
+      SELECT 'recovery', created_at FROM runtime_execution_recoveries
+      UNION ALL
+      SELECT 'recovery', created_at FROM runtime_reply_mapping_recoveries
+      UNION ALL
+      SELECT 'runtime_control', committed_at FROM runtime_stop_controls
+      UNION ALL
+      SELECT 'runtime_control', committed_at FROM runtime_steer_controls
+      UNION ALL
+      SELECT 'provider_diagnostic', observed_at FROM runtime_provider_event_diagnostics
+    )
+    GROUP BY category
+    ORDER BY category
+  `).all().map(publicItem);
   return Object.freeze({ complete: true, items: Object.freeze(items), error: null });
 }
 
@@ -604,15 +607,26 @@ export function createRuntimeSnapshotPublisher({
   }
   const registeredAt = requireTimestamp('startedAt', startedAt ?? now());
   initializeRuntimePersistence(database);
-  database.prepare(`
-    INSERT OR IGNORE INTO runtime_observability_instances (
-      service_instance_id, host_id, started_at, service_version,
-      snapshot_version, last_reconciliation_at, created_at, updated_at
-    ) VALUES (?, ?, ?, 1, 0, NULL, ?, ?)
-  `).run(serviceInstanceId, hostId, registeredAt, registeredAt, registeredAt);
-  const registered = database.prepare(`
-    SELECT host_id FROM runtime_observability_instances WHERE service_instance_id = ?
+  let registered = database.prepare(`
+    SELECT * FROM runtime_observability_instances WHERE service_instance_id = ?
   `).get(serviceInstanceId);
+  if (registered === undefined) {
+    database.prepare(`
+      INSERT INTO runtime_observability_instances (
+        service_instance_id, host_id, started_at, service_version,
+        snapshot_version, last_reconciliation_at, created_at, updated_at
+      ) VALUES (?, ?, ?, 1, 0, NULL, ?, ?)
+    `).run(serviceInstanceId, hostId, registeredAt, registeredAt, registeredAt);
+    registered = database.prepare(`
+      SELECT * FROM runtime_observability_instances WHERE service_instance_id = ?
+    `).get(serviceInstanceId);
+  }
+  requireTimestamp('registered started_at', registered.started_at);
+  requireTimestamp('registered created_at', registered.created_at);
+  requireTimestamp('registered updated_at', registered.updated_at);
+  if (registered.last_reconciliation_at !== null) {
+    requireTimestamp('registered last_reconciliation_at', registered.last_reconciliation_at);
+  }
   if (registered.host_id !== hostId) {
     throw new TypeError('serviceInstanceId is already registered to another host identity');
   }
@@ -629,21 +643,21 @@ export function createRuntimeSnapshotPublisher({
   }
 
   function publish() {
-    const publishTransaction = database.transaction(() => {
-      const generatedAt = requireTimestamp('snapshot time', now());
-      const snapshotId = requireNonEmptyString(
-        'snapshot id',
-        generateId('observability-snapshot'),
-      );
-      const advanced = database.prepare(`
-        UPDATE runtime_observability_instances
-        SET snapshot_version = snapshot_version + 1, updated_at = ?
-        WHERE service_instance_id = ?
-      `).run(generatedAt, serviceInstanceId);
-      if (advanced.changes !== 1) throw new Error('observability service instance is unavailable');
+    const generatedAt = requireTimestamp('snapshot time', now());
+    const snapshotId = requireNonEmptyString(
+      'snapshot id',
+      generateId('observability-snapshot'),
+    );
+    const readSnapshot = database.transaction(() => {
       const instance = database.prepare(`
         SELECT * FROM runtime_observability_instances WHERE service_instance_id = ?
       `).get(serviceInstanceId);
+      if (instance === undefined) throw new Error('observability service instance is unavailable');
+      requireTimestamp('registered started_at', instance.started_at);
+      requireTimestamp('registered updated_at', instance.updated_at);
+      if (instance.last_reconciliation_at !== null) {
+        requireTimestamp('registered last_reconciliation_at', instance.last_reconciliation_at);
+      }
       const failures = [];
       const collected = {
         executors: collect(
@@ -652,6 +666,16 @@ export function createRuntimeSnapshotPublisher({
           failures,
         ),
         turns: collect('turns', () => collectTurns(database), failures),
+      };
+      let serviceState = {};
+      let serviceComplete = true;
+      try {
+        serviceState = getServiceState() ?? {};
+      } catch {
+        failures.push('service');
+        serviceComplete = false;
+      }
+      Object.assign(collected, {
         interactions: collect('interactions', () => collectInteractions(database), failures),
         workspace_leases: collect(
           'workspace_leases',
@@ -664,23 +688,25 @@ export function createRuntimeSnapshotPublisher({
           () => collectAuditSummary(database),
           failures,
         ),
+      });
+      const validationInstance = {
+        ...instance,
+        snapshot_version: Math.max(1, instance.snapshot_version + 1),
       };
       for (const [name, value] of Object.entries(collected)) {
         if (value === null) continue;
         try {
-          validateSection({ name, value, instance, snapshotId, generatedAt });
+          validateSection({
+            name,
+            value,
+            instance: validationInstance,
+            snapshotId,
+            generatedAt,
+          });
         } catch {
           failures.push(name);
           collected[name] = null;
         }
-      }
-      let serviceState = {};
-      let serviceComplete = true;
-      try {
-        serviceState = getServiceState() ?? {};
-      } catch {
-        failures.push('service');
-        serviceComplete = false;
       }
       const error = failures.length === 0 ? null : createDegradedError(snapshotId, generatedAt);
       const sections = Object.fromEntries(Object.entries(collected).map(([name, value]) => [
@@ -703,20 +729,34 @@ export function createRuntimeSnapshotPublisher({
         last_reconciliation_at: instance.last_reconciliation_at,
         error: serviceComplete ? null : error,
       });
-      const snapshot = {
+      return { service, sections, error };
+    }).deferred();
+
+    const publishVersion = database.transaction(() => {
+      const advanced = database.prepare(`
+        UPDATE runtime_observability_instances
+        SET snapshot_version = snapshot_version + 1, updated_at = ?
+        WHERE service_instance_id = ?
+      `).run(generatedAt, serviceInstanceId);
+      if (advanced.changes !== 1) throw new Error('observability service instance is unavailable');
+      return database.prepare(`
+        SELECT snapshot_version FROM runtime_observability_instances
+        WHERE service_instance_id = ?
+      `).get(serviceInstanceId).snapshot_version;
+    }).immediate();
+
+    const snapshot = {
         contract: 'zylos.observability-snapshot',
         contract_version: '1.0',
         snapshot_id: snapshotId,
         core_service_instance_id: serviceInstanceId,
         generated_at: generatedAt,
-        snapshot_version: instance.snapshot_version,
-        service,
-        ...sections,
-        error,
-      };
-      return validateObservabilitySnapshot(snapshot, { occurredAt: generatedAt }).forwarded;
-    });
-    return publishTransaction.immediate();
+        snapshot_version: publishVersion,
+        service: readSnapshot.service,
+        ...readSnapshot.sections,
+        error: readSnapshot.error,
+    };
+    return validateObservabilitySnapshot(snapshot, { occurredAt: generatedAt }).forwarded;
   }
 
   return Object.freeze({ publish, recordReconciliation });

@@ -235,10 +235,11 @@ contracts do not maintain a second compatibility path around the public kernel.
   payloads.
   Core publishes this contract from the real runtime store through
   `createRuntimeSnapshotPublisher` (`runtime/observability/snapshot-publisher.js`) and the executor
-  service's `publishObservabilitySnapshot()` surface. Snapshot-version allocation and all durable
-  aggregate reads share one SQLite transaction; reopening the same service instance continues its
-  persisted sequence. A failed collection is replaced by `complete=false` plus the same top-level
-  degraded error, never by an apparently successful empty collection.
+  service's `publishObservabilitySnapshot()` surface. Durable aggregates are batch-projected from
+  one WAL read transaction, while a separate short write transaction allocates the next snapshot
+  version without holding a writer reservation during collection. Reopening the same service
+  instance continues its persisted sequence. A failed collection is replaced by `complete=false`
+  plus the same top-level degraded error, never by an apparently successful empty collection.
 - `validateControlRequest`, `validateControlResult`, and the two control schema descriptors
   define the registered caller namespace, transport-injected actor/auth context, versioned
   capability grants and scopes, discriminated action targets, mutation CAS, and asynchronous
