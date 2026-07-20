@@ -18,7 +18,6 @@ import { upgradeComponent, uninstallComponent, infoComponent, listComponents, se
 import { addComponent } from './commands/add.js';
 import { initCommand } from './commands/init.js';
 import { configCommand } from './commands/config.js';
-import { attachCommand } from './commands/attach.js';
 import { doctorCommand } from './commands/doctor.js';
 import { shellCommand } from './commands/shell.js';
 import { runtimeCommand } from './commands/runtime.js';
@@ -28,7 +27,6 @@ const commands = {
   // Environment setup
   init: initCommand,
   config: configCommand,
-  attach: attachCommand,
   doctor: doctorCommand,
   shell: shellCommand,
   runtime: runtimeCommand,
@@ -92,22 +90,21 @@ Setup:
   config              Show all configuration
   config get <key>    Get a config value
   config set <key> <value>  Set a config value
-  attach              Attach to the Claude tmux session
   doctor              Diagnose and repair Zylos installation
                       --check   Diagnose only, no repairs
   shell               Interactive CLI mode (REPL)
   runtime <name>      Switch agent runtime (claude|codex)
-  runtime status      Show currently configured runtime
+  runtime status      Show active Core executor provider and identity
   migrate-instructions  Analyze/migrate legacy mixed instructions (dry-run by default)
                       --apply  Create durable backup and activate split instructions
                       --user-content <file>  User-only content for conservative C-class migration
 
 Service Management:
-  status              Show system status
-  logs [type]         Show logs (activity|scheduler|caddy|pm2)
-  start               Start all services
-  stop                Stop all services
-  restart             Restart all services
+  status              Show authoritative Core executor health
+  logs [type]         Show executor or PM2 logs
+  start               Start the executor service
+  stop                Gracefully stop the executor service
+  restart             Restart and verify a new Core service identity
 
 Component Management:
   add <target>        Add a component
@@ -133,7 +130,7 @@ Examples:
   zylos init
   zylos config set protocol http
   zylos status
-  zylos logs activity
+  zylos logs executor
 
   zylos add telegram
   zylos add telegram@0.2.0

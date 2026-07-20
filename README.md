@@ -37,7 +37,7 @@ Supports Claude Code (Anthropic) and Codex (OpenAI). Fully compatible with the [
 curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/install.sh | bash
 ```
 
-This installs everything you need (git, tmux, Node.js, zylos CLI) and automatically runs `zylos init` to set up your agent.
+This installs the required tools (git, Node.js, PM2, the Zylos CLI, and the selected provider prerequisite), then runs `zylos init` to start the Core executor service.
 
 <details>
 <summary>Non-interactive install (Docker, CI/CD, headless servers)</summary>
@@ -50,11 +50,7 @@ All `zylos init` flags can be passed directly through the install script. The sc
 curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/install.sh | bash -s -- \
   -y \
   --setup-token sk-ant-oat01-xxx \
-  --timezone Asia/Shanghai \
-  --domain agent.example.com \
-  --https \
-  --caddy \
-  --web-password MySecurePass123
+  --timezone Asia/Shanghai
 ```
 
 **When is non-interactive mode active?**
@@ -74,10 +70,6 @@ Automatically when no TTY is available — e.g. Docker containers (without `-it`
 | `--base-url <url>` | Custom API base URL for Claude Code | — |
 | `--codex-base-url <url>` | Custom API base URL for Codex | — |
 | `--timezone <tz>` | [IANA timezone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones), e.g. `Asia/Shanghai`, `America/New_York`, `Europe/London` | System default |
-| `--domain <domain>` | Domain for Caddy reverse proxy, e.g. `agent.example.com` | None |
-| `--https` / `--no-https` | Enable or disable HTTPS | `--https` when domain is set |
-| `--caddy` / `--no-caddy` | Install or skip Caddy web server | Install |
-| `--web-password <pass>` | Web console password | Auto-generated |
 
 **Environment variables:**
 
@@ -91,9 +83,6 @@ Flags can also be set via environment variables during `zylos init`. Resolution 
 | `ANTHROPIC_BASE_URL` | `--base-url` |
 | `OPENAI_API_KEY` | `--codex-api-key` |
 | `OPENAI_BASE_URL` | `--codex-base-url` |
-| `ZYLOS_DOMAIN` | `--domain` |
-| `ZYLOS_PROTOCOL` (`https` or `http`) | `--https` / `--no-https` |
-| `ZYLOS_WEB_PASSWORD` | `--web-password` |
 
 CI, Kubernetes, and shared E2E environments should also provide `GITHUB_TOKEN`
 so `zylos add` and `zylos upgrade` use GitHub's authenticated API quota instead
@@ -141,13 +130,12 @@ zylos init
 ```bash
 docker run -d --name zylos \
   -e CLAUDE_CODE_OAUTH_TOKEN=YOUR_TOKEN_HERE \
-  -p 3456:3456 \
   -v zylos-data:/home/zylos/zylos \
   -v claude-config:/home/zylos/.claude \
   ghcr.io/zylos-ai/zylos-core:latest
 ```
 
-Open `http://localhost:3456` to access the web console. Find your password with `docker logs zylos | grep -A2 "Web Console"`. See the [Docker Deployment Guide](docs/docker.md) for Docker Compose setup, environment variables, Synology NAS instructions, and more.
+Use `docker exec zylos zylos status` to read authoritative Core health. See the [Docker Deployment Guide](docs/docker.md) for Docker Compose setup, environment variables, Synology NAS instructions, and more.
 
 </details>
 
@@ -187,19 +175,16 @@ This works from Windows, ChromeOS, or any platform that can run Claude Code loca
 > ```
 
 `zylos init` is idempotent and supports both interactive and non-interactive modes. It will:
-1. Install missing tools (tmux, git, PM2, Claude Code or Codex)
+1. Install missing tools (git, PM2, and the Claude or Codex provider prerequisite)
 2. Set up authentication (Claude: browser login, API key, or [setup token](https://code.claude.com/docs/en/authentication); Codex: API key or device auth)
 3. Create the `~/zylos/` directory with memory, skills, and services
-4. Start all background services and launch your AI agent in a tmux session
+4. Start the long-lived Core executor service
 
 **Talk to your agent:**
 
 ```bash
 # Interactive CLI — the simplest way to chat
 zylos shell
-
-# Or attach to the Claude tmux session (Ctrl+B d to detach)
-zylos attach
 
 # Or add a messaging channel
 zylos add telegram
@@ -226,12 +211,12 @@ graph TB
         C4["C4 Comm Bridge<br/>(unified gateway · SQLite audit)"]
         MEM["Memory<br/>(Inside Out architecture)"]
         SCH["Scheduler<br/>(autonomous task dispatch)"]
-        AM["Activity Monitor<br/>(guardian · heartbeat · auto-recovery)"]
+        AM["Executor Service<br/>(health · control · recovery)"]
         HTTP["HTTP Layer<br/>(Caddy · file sharing · HTTPS)"]
     end
 
     subgraph Brain["🧠 AI Runtime — The Brain"]
-        CC["Claude Code / Codex<br/>(in tmux session)"]
+        CC["Claude Agent SDK / Codex<br/>(official app-server)"]
     end
 
     TG & LK & WC --> C4
@@ -247,7 +232,7 @@ graph TB
 | C4 Comm Bridge | Unified message gateway with audit trail | SQLite, priority queue |
 | Memory | Persistent identity and context across restarts | Inside Out tiered architecture |
 | Scheduler | Autonomous task dispatch while you are away | Cron, NL input, idle-gating |
-| Activity Monitor | Crash recovery, heartbeat, health checks | PM2, multi-layer protection |
+| Executor Service | Durable execution, health, control, and recovery | Core SQLite, PM2 supervision |
 | HTTP Layer | Web access, file sharing, component routes | Caddy, auto-HTTPS |
 
 ---
@@ -352,7 +337,6 @@ Your Zylos agent can then communicate with any OpenClaw agent on the same HXA-Co
 
 ```bash
 zylos init                    # Set up Zylos environment
-zylos attach                  # Attach to the agent tmux session
 zylos runtime <name>          # Switch AI runtime (claude or codex)
 zylos doctor                  # Diagnose and auto-repair installation
 zylos status                  # Check running services

@@ -63,7 +63,7 @@ export function logHookTiming(hookName, durationMs) {
  * Log C4 delivery failure.
  * @param {string} itemType - 'control' or 'conversation'
  * @param {number|string} itemId - message/control ID
- * @param {string} reason - failure reason (e.g. 'TMUX_PASTE_FAILED', 'paste_error')
+ * @param {string} reason - failure reason
  * @param {object} [extra] - optional extra context
  */
 export function logDeliveryFailure(itemType, itemId, reason, extra = {}) {
@@ -75,29 +75,6 @@ export function logDeliveryFailure(itemType, itemId, reason, extra = {}) {
       ? ' ' + Object.entries(extra).map(([k, v]) => `${k}=${v}`).join(' ')
       : '';
     fs.appendFileSync(filePath, `[${ts}] type=${itemType} id=${itemId} reason=${reason}${extraStr}\n`);
-    rotateIfNeeded(filePath);
-  } catch {
-    // Best effort
-  }
-}
-
-/**
- * Save tmux capture on separator detection failure.
- * @param {string} capture - raw tmux pane content
- * @param {string} context - e.g. 'separator-fail-attempt-1'
- */
-const MAX_CAPTURE_LENGTH = 8192; // Truncate large captures to prevent disk bloat
-
-export function saveTmuxCapture(capture, context) {
-  try {
-    ensureDir();
-    const filePath = path.join(DIAG_DIR, 'tmux-captures.log');
-    const ts = new Date().toISOString().replace('T', ' ').substring(0, 19);
-    const separator = '\u2500'.repeat(60);
-    const truncated = capture.length > MAX_CAPTURE_LENGTH
-      ? `[...truncated ${capture.length - MAX_CAPTURE_LENGTH} bytes]\n` + capture.slice(-MAX_CAPTURE_LENGTH)
-      : capture;
-    fs.appendFileSync(filePath, `\n[${ts}] context=${context}\n${separator}\n${truncated}\n${separator}\n`);
     rotateIfNeeded(filePath);
   } catch {
     // Best effort

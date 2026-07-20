@@ -5,10 +5,10 @@
   "description": "Autonomous AI Agent Infrastructure",
   "main": "cli/zylos.js",
   "bin": {
-    "zylos": "./cli/zylos.js"
+    "zylos": "./cli/launcher.js"
   },
   "scripts": {
-    "postinstall": "node scripts/postinstall.js || true",
+    "postinstall": "node scripts/postinstall.js",
     "pretest": "node scripts/install-skill-deps.js",
     "test": "npm run test:jest && npm run test:node",
     "test:jest": "node --experimental-vm-modules node_modules/.bin/jest",

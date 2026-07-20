@@ -1,4 +1,3 @@
-import fs from 'fs';
 import path from 'path';
 import os from 'os';
 
@@ -32,18 +31,6 @@ export const CONTENT_PREVIEW_CHARS = 100;
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 
-// Read active runtime from config.json to dispatch to the correct tmux session.
-// Defaults to 'claude' when config is absent or runtime is unset.
-function _readConfig() {
-  try {
-    return JSON.parse(fs.readFileSync(path.join(ZYLOS_DIR, '.zylos', 'config.json'), 'utf8'));
-  } catch {
-    return {};
-  }
-}
-const _cfg = _readConfig();
-export const ACTIVE_RUNTIME = _cfg.runtime === 'codex' ? 'codex' : 'claude';
-export const TMUX_SESSION = ACTIVE_RUNTIME === 'codex' ? 'codex-main' : 'claude-main';
 export const DATA_DIR = path.join(ZYLOS_DIR, 'comm-bridge');
 export const DB_PATH = path.join(DATA_DIR, 'c4.db');
 export const ACTIVITY_MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
@@ -61,4 +48,3 @@ export const CHECKPOINT_THRESHOLD = 15;
 export const SESSION_INIT_RECENT_COUNT = 6;  // max conversations returned by session-init when above threshold
 
 export const STALE_STATUS_THRESHOLD = 5000; // ms
-export const TMUX_MISSING_WARN_THRESHOLD = 30;

@@ -18,6 +18,30 @@ crashed same-host owner, then atomically writes
 self-upgrade launcher and its installed finalizer now fail closed unconditionally; they contain no
 executable upgrade route. A live lock owner is never displaced merely because its lock is old.
 
+The executor service writes the installed orchestration inputs to
+`runtime/upgrade-plans/<upgrade_id>.json` before attaching the Global26 run. On every daemon start,
+it queries Core SQLite for the oldest resumable run and reconstructs the same snapshot, release,
+legacy-source, and target-health adapters before normal turn polling begins. A missing or
+conflicting plan fails closed. A committed run retains its plan until post-commit cleanup is
+durably recorded; a rolled-back run resumes only the restored release. The active-release launcher
+then lets the supervisor restart from the exact durable release pointer, preventing old and new
+runtime paths from executing concurrently.
+
+The one-time exact-base bootstrap also requires the installed channel prerequisite to atomically
+publish `runtime/channel-authority.json` before the installer runs. It uses contract
+`zylos.channel-authority`, schema version 1, and exactly one authenticated-event scope per migrated
+channel. Each scope records `channel`, `region`, `tenant_id`, `bot_id`, `verified_at`,
+`verification_source`, and `provider_instance_id`; Feishu requires region `cn` and Lark requires
+region `global`. Core copies the validated non-secret facts and their canonical SHA-256 into the
+durable upgrade plan before fencing the old source. A missing, changed, duplicate, or mismatched
+scope fails before source mutation. Provider execution activity is a separate plan fact and never
+selects or synthesizes a user reply target.
+Core accepts the prerequisite artifact only at the exact owner-only
+`$ZYLOS_DIR/runtime/channel-authority.json` path. It opens without following a final symlink and
+derives ownership, parsed facts, raw hash, and canonical hash from the same file descriptor. The
+bootstrap copies those facts into its fsync-backed manifest, so recovery never depends on the
+external prerequisite file after preparation.
+
 External adapter effects use `upgrade_id:step_key` as their idempotency key and take a durable
 SQLite claim before invocation. The coordinator renews the claim while the adapter is live; only a
 genuinely expired claim can be replayed by a new coordinator. The snapshot adapter

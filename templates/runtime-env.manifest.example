@@ -1,4 +1,4 @@
-# runtime-env.manifest — Clean environment configuration for tmux agent sessions.
+# runtime-env.manifest — Clean environment configuration for executor providers.
 #
 # This file controls which variables are injected into the agent runtime
 # in clean env mode (default). It does NOT affect compat mode (ZYLOS_CLEAN_ENV=false).

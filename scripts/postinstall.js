@@ -20,13 +20,17 @@ import { execFileSync } from 'node:child_process';
 import { smartSync, formatMergeResult } from '../cli/lib/smart-merge.js';
 import { copyTree } from '../cli/lib/fs-utils.js';
 import { generateManifest, saveManifest, saveOriginals } from '../cli/lib/manifest.js';
+import {
+  cleanupRetiredRuntimeSkillArtifacts,
+  isRetiredRuntimeSkill,
+} from '../runtime/migration/legacy-lifecycle-artifacts.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(process.env.HOME, 'zylos');
 const SKILLS_DIR = path.join(ZYLOS_DIR, '.claude', 'skills');
 const CORE_SKILLS_SRC = path.join(__dirname, '..', 'skills');
 
-function syncSkills() {
+function syncSkills({ strict = false } = {}) {
   if (!fs.existsSync(CORE_SKILLS_SRC)) {
     // No skills bundled — shouldn't happen in a normal install
     return;
@@ -36,11 +40,13 @@ function syncSkills() {
   let added = 0;
   let updated = 0;
   let unchanged = 0;
+  const failures = [];
   const backupBase = path.join(os.tmpdir(), `zylos-postinstall-backup-${Date.now()}`);
 
   const entries = fs.readdirSync(CORE_SKILLS_SRC, { withFileTypes: true });
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
+    if (isRetiredRuntimeSkill(entry.name)) continue;
 
     const srcDir = path.join(CORE_SKILLS_SRC, entry.name);
     const destDir = path.join(SKILLS_DIR, entry.name);
@@ -56,6 +62,7 @@ function syncSkills() {
         added++;
       } catch (err) {
         console.log(`  Warning: Failed to sync ${entry.name}: ${err.message}`);
+        failures.push(err);
       }
       continue;
     }
@@ -80,7 +87,14 @@ function syncSkills() {
       }
     } catch (err) {
       console.log(`  Warning: Failed to update ${entry.name}: ${err.message}`);
+      failures.push(err);
     }
+  }
+
+  cleanupRetiredRuntimeSkillArtifacts({ skillsDir: SKILLS_DIR });
+
+  if (strict && failures.length > 0) {
+    throw new AggregateError(failures, 'Strict Core skill synchronization failed.');
   }
 
   if (added > 0 || updated > 0 || unchanged > 0) {
@@ -88,7 +102,7 @@ function syncSkills() {
   }
 }
 
-function syncSettings() {
+function syncSettings({ strict = false } = {}) {
   const syncHooks = path.join(__dirname, '..', 'cli', 'lib', 'sync-settings-hooks.js');
   const templateSettings = path.join(__dirname, '..', 'templates', '.claude', 'settings.json');
 
@@ -103,12 +117,16 @@ function syncSettings() {
     });
   } catch (err) {
     console.log(`  Warning: Failed to sync settings hooks: ${err.message}`);
+    if (strict) throw err;
   }
 }
 
-function main() {
+export function main() {
   // CI: skip everything
   if (process.env.CI) return;
+  // Release preparation must allow dependency lifecycle scripts such as
+  // native addon builds while preventing Zylos installation mutations.
+  if (process.env.ZYLOS_PACKAGE_PREPARE === '1') return;
 
   // Zylos must be initialized — .claude/ directory exists after `zylos init`
   const claudeDir = path.join(ZYLOS_DIR, '.claude');
@@ -116,20 +134,28 @@ function main() {
     console.log('Zylos not initialized. Run "zylos init" to set up.');
     return;
   }
+  const installedEcosystem = path.join(ZYLOS_DIR, 'pm2', 'ecosystem.config.cjs');
+  if (fs.existsSync(installedEcosystem)
+    && !fs.readFileSync(installedEcosystem, 'utf8').includes('zylos-executor')) {
+    throw new Error(
+      'A legacy Zylos installation requires the one-time executor migration installer; package postinstall will not mutate it.',
+    );
+  }
 
   const isSelfUpgrade = !!process.env.ZYLOS_SKIP_POSTINSTALL;
+  const strict = process.env.ZYLOS_POSTINSTALL_STRICT === '1';
 
   if (!isSelfUpgrade) {
     // Fresh install or manual `npm install -g` — sync skills
     // During self-upgrade, step 5 handles skill sync with smart merge
-    syncSkills();
+    syncSkills({ strict });
   }
 
   // Settings sync ALWAYS runs when zylos is initialized.
   // During self-upgrade this is defense-in-depth: the old version's step 8
   // may lack knowledge of new config fields. This postinstall is the only
   // code path where the newly installed version's logic executes.
-  syncSettings();
+  syncSettings({ strict });
 }
 
 main();
