@@ -63,11 +63,32 @@
       "then": {
         "required": ["schedule"],
         "properties": {
-          "channel": { "const": "scheduler" },
-          "chat_type": { "const": "synthetic" },
-          "native_thread_or_topic_id": { "type": "null" },
           "actor": { "properties": { "type": { "const": "scheduler" } } }
         },
+        "allOf": [{
+          "if": {
+            "properties": {
+              "schedule": {
+                "properties": { "bound_conversation": { "const": true } },
+                "required": ["bound_conversation"]
+              }
+            },
+            "required": ["schedule"]
+          },
+          "then": {
+            "properties": {
+              "channel": { "not": { "const": "scheduler" } },
+              "chat_type": { "not": { "const": "synthetic" } }
+            }
+          },
+          "else": {
+            "properties": {
+              "channel": { "const": "scheduler" },
+              "chat_type": { "const": "synthetic" },
+              "native_thread_or_topic_id": { "type": "null" }
+            }
+          }
+        }],
         "not": { "required": ["legacy"] }
       }
     },

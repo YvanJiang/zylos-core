@@ -61,6 +61,7 @@ function initSchema() {
       -- Reply Configuration
       reply_channel TEXT DEFAULT NULL,          -- reply channel (e.g., 'telegram')
       reply_endpoint TEXT DEFAULT NULL,         -- reply endpoint (e.g., user ID)
+      bound_conversation_json TEXT DEFAULT NULL,
 
       -- Retry Logic (reserved, not currently used)
       -- Implicit retry is handled via miss_threshold: tasks stay pending
@@ -106,6 +107,11 @@ function initSchema() {
       updated_at INTEGER
     );
   `);
+
+  const columns = new Set(db.prepare('PRAGMA table_info(tasks)').all().map(({ name }) => name));
+  if (!columns.has('bound_conversation_json')) {
+    db.exec('ALTER TABLE tasks ADD COLUMN bound_conversation_json TEXT DEFAULT NULL');
+  }
 
 }
 
