@@ -200,7 +200,8 @@
         "schedule_id": { "$ref": "#/$defs/opaque_id" },
         "task_id": { "$ref": "#/$defs/opaque_id" },
         "occurrence_id": { "$ref": "#/$defs/opaque_id" },
-        "bound_conversation": { "type": "boolean" }
+        "bound_conversation": { "type": "boolean" },
+        "notification_text": { "type": "string", "minLength": 1 }
       },
       "additionalProperties": true
     },

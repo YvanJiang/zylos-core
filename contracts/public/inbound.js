@@ -159,6 +159,9 @@ function validateSchedule(schedule, occurredAt) {
   validateOpaqueId('schedule.task_id', schedule.task_id, { occurredAt });
   validateOpaqueId('schedule.occurrence_id', schedule.occurrence_id, { occurredAt });
   requireBoolean('schedule.bound_conversation', schedule.bound_conversation, { occurredAt });
+  if (Object.hasOwn(schedule, 'notification_text')) {
+    requireDisplayString('schedule.notification_text', schedule.notification_text, { occurredAt });
+  }
 }
 
 function validateLegacy(legacy, occurredAt) {

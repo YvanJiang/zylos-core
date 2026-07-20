@@ -6,7 +6,7 @@ import test from 'node:test';
 
 import Database from 'better-sqlite3';
 
-import { enqueueScheduledTask } from '../runtime.js';
+import { enqueueMissedScheduledTaskNotice, enqueueScheduledTask } from '../runtime.js';
 
 test('the scheduler daemon admission seam persists one synthetic Core turn across a retry', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-scheduler-runtime-'));
@@ -53,6 +53,39 @@ test('the scheduler daemon admission seam persists one synthetic Core turn acros
     chat_type: 'group',
     chat_id: 'group-runtime-queue',
   });
+  database.close();
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test('a missed occurrence persists one idempotent Core delivery notice instead of catch-up work', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-scheduler-runtime-'));
+  const database = new Database(path.join(directory, 'c4.db'));
+  const task = {
+    id: 'task-missed-notice', name: 'Daily report', prompt: 'Run the report.',
+    next_run_at: 1_784_304_000,
+  };
+  const notice = 'Scheduled task "Daily report" missed its occurrence and was skipped to avoid catch-up replay.';
+  const ids = new Map();
+  const first = enqueueMissedScheduledTaskNotice(database, task, notice, {
+    now: () => '2026-07-20T00:00:01.000Z',
+    generateId(kind) {
+      const next = (ids.get(kind) ?? 0) + 1;
+      ids.set(kind, next);
+      return `${kind}-missed-notice-${next}`;
+    },
+  });
+  const replayed = enqueueMissedScheduledTaskNotice(database, task, notice, {
+    now: () => '2026-07-20T00:00:02.000Z',
+    generateId: () => { throw new Error('a missed notice retry must not allocate Core IDs'); },
+  });
+
+  assert.equal(first.status, 'accepted');
+  assert.deepEqual(replayed, { ...first, deduplicated: true });
+  const command = JSON.parse(database.prepare(`
+    SELECT command_json FROM runtime_outbox WHERE turn_id = ?
+  `).get(first.turn_id).command_json);
+  assert.equal(command.render_model.text, notice);
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM runtime_turns').get().count, 1);
   database.close();
   fs.rmSync(directory, { recursive: true, force: true });
 });

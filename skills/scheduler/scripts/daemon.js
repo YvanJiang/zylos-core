@@ -6,7 +6,7 @@
 
 import { getDb, cleanupHistory, now } from './database.js';
 import { getNextRun } from './cron-utils.js';
-import { dispatchScheduledTask } from './runtime.js';
+import { dispatchMissedScheduledTaskNotice, dispatchScheduledTask } from './runtime.js';
 import { decideScheduledOccurrence } from '../../../runtime/scheduler/scheduler-queue.js';
 import { formatTime } from './time-utils.js';
 import { loadTimezone } from './tz.js';
@@ -115,6 +115,25 @@ function processCompletedTasks() {
   _processCompletedTasks(db);
 }
 
+function missedTaskNotice(task) {
+  return `Scheduled task "${task.name}" missed its occurrence and was skipped to avoid catch-up replay.`;
+}
+
+function persistMissedTaskNotice(task) {
+  const notice = missedTaskNotice(task);
+  try {
+    const admission = dispatchMissedScheduledTaskNotice(task, notice);
+    if (admission.status === 'rejected') {
+      console.error(`Missed-task notice for ${task.id} was rejected by the durable queue: ${admission.error.user_message}`);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.error(`Failed to persist missed-task notice for ${task.id}: ${error.message}`);
+    return false;
+  }
+}
+
 /**
  * Check for missed tasks (past due but still pending)
  * - Recurring and interval occurrences beyond miss_threshold are skipped once.
@@ -143,6 +162,7 @@ function handleMissedTasks() {
     if (decision.status === 'skipped') {
       // The occurrence is stale; move to the next schedule without catch-up replay.
       console.log(`[${new Date().toISOString()}] Task ${task.id} (${task.name}) missed its occurrence; recording only the next schedule.`);
+      if (!persistMissedTaskNotice(task)) continue;
       db.prepare(`
         UPDATE tasks
         SET last_error = 'Missed scheduled occurrence was skipped to avoid catch-up replay.', updated_at = ?
@@ -193,6 +213,7 @@ async function mainLoop() {
         if (decision.status === 'skipped') {
           // Skip this task
           console.log(`[${new Date().toISOString()}] Task ${task.id} (${task.name}) missed its occurrence; avoiding catch-up replay.`);
+          if (!persistMissedTaskNotice(task)) continue;
 
           if (task.type === 'one-time') {
             // One-time tasks: mark as failed

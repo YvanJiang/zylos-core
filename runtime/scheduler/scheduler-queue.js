@@ -52,6 +52,9 @@ export function createScheduledOccurrenceEnvelope(occurrence) {
   const scheduleId = requireNonEmptyString('schedule_id', occurrence.schedule_id);
   const taskId = requireNonEmptyString('task_id', occurrence.task_id);
   const occurrenceId = requireNonEmptyString('occurrence_id', occurrence.occurrence_id);
+  const notificationText = occurrence.notification_text === undefined
+    ? null
+    : requireNonEmptyString('notification_text', occurrence.notification_text);
   const bound = createBoundConversationIdentity(occurrence);
   const identity = bound ?? {
     channel: 'scheduler',
@@ -95,6 +98,7 @@ export function createScheduledOccurrenceEnvelope(occurrence) {
       task_id: taskId,
       occurrence_id: occurrenceId,
       bound_conversation: bound !== null,
+      ...(notificationText === null ? {} : { notification_text: notificationText }),
     },
   };
   return validateInboundEnvelope(envelope).forwarded;

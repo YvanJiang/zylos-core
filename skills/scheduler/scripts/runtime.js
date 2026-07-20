@@ -32,7 +32,7 @@ function timestampFromSeconds(seconds) {
   return new Date(seconds * 1_000).toISOString();
 }
 
-function taskOccurrence(task, receivedAt) {
+function taskOccurrence(task, receivedAt, { notificationText = null } = {}) {
   const scheduledAt = timestampFromSeconds(task.next_run_at);
   let boundConversation = null;
   if (task.bound_conversation_json !== null && task.bound_conversation_json !== undefined) {
@@ -45,14 +45,17 @@ function taskOccurrence(task, receivedAt) {
   return {
     schedule_id: task.id,
     task_id: task.id,
-    occurrence_id: `${task.id}:${task.next_run_at}`,
-    prompt: `[Scheduled Task: ${task.id}] ${task.prompt}\n\n---- After completing this task, run: ~/zylos/.claude/skills/scheduler/scripts/cli.js done ${task.id}`,
+    occurrence_id: notificationText === null
+      ? `${task.id}:${task.next_run_at}`
+      : `${task.id}:${task.next_run_at}:missed-notice`,
+    prompt: notificationText ?? `[Scheduled Task: ${task.id}] ${task.prompt}\n\n---- After completing this task, run: ~/zylos/.claude/skills/scheduler/scripts/cli.js done ${task.id}`,
     occurred_at: scheduledAt,
     received_at: receivedAt,
     region: process.env.ZYLOS_REGION ?? 'global',
     tenant_id: process.env.ZYLOS_TENANT_ID ?? 'default',
     bot_id: process.env.ZYLOS_BOT_ID ?? 'zylos',
     bound_conversation: boundConversation,
+    ...(notificationText === null ? {} : { notification_text: notificationText }),
   };
 }
 
@@ -65,10 +68,28 @@ export function enqueueScheduledTask(database, task, {
   return acceptScheduledOccurrence(database, taskOccurrence(task, now()), options);
 }
 
+export function enqueueMissedScheduledTaskNotice(database, task, notificationText, {
+  now = () => new Date().toISOString(),
+  generateId,
+  maxQueuedTurns,
+} = {}) {
+  const options = { now, ...(generateId ? { generateId } : {}), ...(maxQueuedTurns ? { maxQueuedTurns } : {}) };
+  return acceptScheduledOccurrence(database, taskOccurrence(task, now(), { notificationText }), options);
+}
+
 export function dispatchScheduledTask(task, options = {}) {
   const database = new Database(options.databasePath ?? CORE_DATABASE_PATH);
   try {
     return enqueueScheduledTask(database, task, options);
+  } finally {
+    database.close();
+  }
+}
+
+export function dispatchMissedScheduledTaskNotice(task, notificationText, options = {}) {
+  const database = new Database(options.databasePath ?? CORE_DATABASE_PATH);
+  try {
+    return enqueueMissedScheduledTaskNotice(database, task, notificationText, options);
   } finally {
     database.close();
   }

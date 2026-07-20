@@ -752,7 +752,7 @@ export function acceptNormalInbound(
       text: queueFull
         ? queueFullError.user_message
         : (envelope.source.kind === 'scheduler'
-          ? 'Scheduled occurrence queued.'
+          ? (envelope.schedule.notification_text ?? 'Scheduled occurrence queued.')
           : 'Message received.'),
       error: queueFullError,
       terminal: queueFull,
