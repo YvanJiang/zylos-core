@@ -464,14 +464,14 @@ function migrateInteractionControlStorage(database) {
         DROP TABLE runtime_interaction_answers_issue16;
         DROP TABLE runtime_interactions_issue16;
       `);
+      const violations = database.prepare('PRAGMA foreign_key_check').all();
+      if (violations.length > 0) {
+        throw new Error('Interaction control storage migration violated foreign keys.');
+      }
     });
     migrate.immediate();
   } finally {
     database.pragma('foreign_keys = ON');
-  }
-  const violations = database.prepare('PRAGMA foreign_key_check').all();
-  if (violations.length > 0) {
-    throw new Error('Interaction control storage migration violated foreign keys.');
   }
 }
 

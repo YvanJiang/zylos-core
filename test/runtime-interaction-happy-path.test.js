@@ -1324,6 +1324,90 @@ describe('runtime interaction happy path', () => {
     database.close();
   });
 
+  test('rolls back a Core-owned recovery handoff when its acknowledgement cannot commit', () => {
+    const database = openTestDatabase();
+    const { store, turnContext } = createRunningTurn(database, 'recovery-control-rollback');
+    const original = store.requestInteraction(turnContext, {
+      provider_interaction_ref: 'provider-recovery-control-rollback',
+      tool_use_id: 'tool-recovery-control-rollback',
+      kind: 'tool_approval',
+      prompt: 'Allow the original answer?',
+      choices: [],
+      authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+      allowed_sources: ['card_action'],
+    });
+    const committed = store.commitInteractionAnswer(
+      interactionAnswer(original, 'recovery-control-rollback-original'),
+    );
+    const claimed = store.claimInteractionHandoff(committed.handoff_id);
+    const sending = store.markInteractionHandoffSendStarted(claimed);
+    store.markInteractionHandoffDeliveryUnknown(sending);
+    const unknown = store.getInteractionHandoffForRecovery(committed.handoff_id);
+    store.releaseRecoveringExecutorOwnership(turnContext);
+    const replacementInteraction = {
+      kind: 'recovery_decision',
+      prompt: 'Choose how to continue after uncertain delivery.',
+      choices: [],
+      authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+      allowed_sources: ['card_action'],
+    };
+    const disposition = {
+      action: 'establish_interaction',
+      replacement_interaction: replacementInteraction,
+    };
+    const resolution = store.resolveInteractionHandoffDisposition(
+      unknown,
+      disposition,
+      {
+        decision_id: 'decision-recovery-control-rollback',
+        authorized: true,
+        actor_id: 'operations-user-123',
+        capability: 'interaction.handoff.resolve',
+        scope: {
+          conversation_id: original.conversation_id,
+          turn_id: original.turn_id,
+          handoff_id: committed.handoff_id,
+          action: disposition.action,
+          replacement_interaction: replacementInteraction,
+        },
+        policy_id: 'recovery-policy-1',
+        policy_version: 1,
+        authorized_at: '2026-07-19T07:02:00Z',
+      },
+    );
+    const replacementRequest = JSON.parse(database.prepare(`
+      SELECT request_json FROM runtime_interactions WHERE interaction_id = ?
+    `).get(resolution.replacement_interaction_id).request_json);
+    const answer = store.commitInteractionAnswer(
+      interactionAnswer(replacementRequest, 'recovery-control-rollback'),
+    );
+    const delivery = store.claimInteractionHandoff(answer.handoff_id);
+    const before = readInteractionAuthority(database, original.turn_id);
+    database.exec(`
+      CREATE TRIGGER force_recovery_control_audit_failure
+      BEFORE INSERT ON runtime_interaction_audit
+      WHEN NEW.interaction_id = '${replacementRequest.interaction_id}'
+      BEGIN
+        SELECT RAISE(ABORT, 'forced recovery control audit failure');
+      END;
+    `);
+
+    expect(() => store.completeRecoveryControlHandoff(delivery))
+      .toThrow(/forced recovery control audit failure/);
+    expect(readInteractionAuthority(database, original.turn_id)).toEqual(before);
+    const persistedHandoff = JSON.parse(database.prepare(`
+      SELECT record_json FROM runtime_interaction_handoffs WHERE handoff_id = ?
+    `).get(answer.handoff_id).record_json);
+    expect(persistedHandoff).toMatchObject({
+      state: 'delivering',
+      last_send_started_at: null,
+      provider_acked_at: null,
+      side_effect_status: 'none',
+    });
+
+    database.close();
+  });
+
   test('uses iterator return to prove isolation when a failed handler has no abort primitive', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'service-handler-no-abort');

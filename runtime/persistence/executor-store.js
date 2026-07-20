@@ -3625,6 +3625,31 @@ export function createExecutorStore({
     return result;
   }
 
+  function completeRecoveryControlHandoff(delivery) {
+    const complete = database.transaction(() => {
+      if (
+        delivery?.request?.parent_type !== 'recovery_control'
+        || delivery?.handoff?.parent_type !== 'recovery_control'
+      ) {
+        conflict(
+          'provider_context_invalid',
+          'Only a Core-owned recovery control may use atomic local completion.',
+        );
+      }
+      const sendingDelivery = markInteractionHandoffSendStarted(delivery);
+      const acknowledgement = acknowledgeInteractionHandoff({
+        status: 'accepted',
+        handoff_id: sendingDelivery.handoff.handoff_id,
+        provider_attempt_id: null,
+        handoff_attempt_id: sendingDelivery.handoff.handoff_attempt_id,
+        handoff_attempt_no: sendingDelivery.handoff.handoff_attempt_no,
+        lease_epoch: null,
+      });
+      return { acknowledgement, sendingDelivery };
+    });
+    return complete.immediate();
+  }
+
   function getInteractionHandoffForRecovery(handoffId) {
     const row = database.prepare(`
       SELECT interaction.handoff_version, interaction.request_json,
@@ -4592,6 +4617,7 @@ export function createExecutorStore({
     claimNextQueuedTurn,
     claimInteractionHandoff,
     commitInteractionAnswer,
+    completeRecoveryControlHandoff,
     markProviderFailure,
     markProviderStopUnknown,
     heartbeatOwnedResidents,
