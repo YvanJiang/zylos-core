@@ -128,6 +128,7 @@ describe('normal C4 callers use durable Core contracts', () => {
     for (const [channel, endpoint, messageId] of [
       ['web-console', 'console', 'web-owned-message'],
       ['shell', '/tmp/disposable-shell.sock', 'shell-owned-message'],
+      ['shell', '/tmp/other-disposable-shell.sock', 'other-shell-owned-message'],
     ]) {
       const accepted = run(receiveCli, [
         '--channel', channel,
@@ -151,6 +152,19 @@ describe('normal C4 callers use durable Core contracts', () => {
     const webCommand = owner.claimNext();
     assert.equal(webCommand.target.channel, 'web-console');
     assert.equal(owner.claimNext(), null);
+    assert.equal(database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_outbox WHERE status = 'pending'
+    `).get().count, 2);
+
+    const shellOwner = createOutboxService({
+      database,
+      channel: 'shell',
+      targetChatId: '/tmp/disposable-shell.sock',
+      serviceInstanceId: 'shell-owner-fixture',
+      now: () => '2026-07-21T00:10:01.000Z',
+    });
+    assert.equal(shellOwner.claimNext().target.chat_id, '/tmp/disposable-shell.sock');
+    assert.equal(shellOwner.claimNext(), null);
     assert.equal(database.prepare(`
       SELECT COUNT(*) AS count FROM runtime_outbox WHERE status = 'pending'
     `).get().count, 1);

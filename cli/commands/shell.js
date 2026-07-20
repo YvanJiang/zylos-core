@@ -89,6 +89,7 @@ export async function shellCommand() {
   const deliveryOwner = createOutboxService({
     database,
     channel: 'shell',
+    targetChatId: socketPath,
     serviceInstanceId: `shell-${process.pid}`,
     renderer: createChannelNeutralTextRenderer({
       async sendText(delivery) {

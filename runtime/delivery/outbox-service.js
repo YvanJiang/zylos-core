@@ -245,6 +245,7 @@ export function createOutboxService({
   renderer,
   serviceInstanceId,
   channel = null,
+  targetChatId = null,
   now = () => new Date().toISOString(),
   generateId = defaultGenerateId,
   leaseDurationMs = 10_000,
@@ -258,6 +259,10 @@ export function createOutboxService({
   }
   if (channel !== null && (typeof channel !== 'string' || channel.length === 0)) {
     throw new TypeError('channel must be a non-empty string or null');
+  }
+  if (targetChatId !== null
+    && (typeof targetChatId !== 'string' || targetChatId.length === 0)) {
+    throw new TypeError('targetChatId must be a non-empty string or null');
   }
   if (typeof generateId !== 'function') {
     throw new TypeError('generateId must be a function');
@@ -307,10 +312,19 @@ export function createOutboxService({
             AND active.lease_expires_at > ?
         )
         AND (? IS NULL OR json_extract(candidate.command_json, '$.target.channel') = ?)
+        AND (? IS NULL OR json_extract(candidate.command_json, '$.target.chat_id') = ?)
         ORDER BY candidate.priority DESC, candidate.created_at ASC,
           candidate.aggregate_version ASC, candidate.outbox_id ASC
         LIMIT 1
-      `).get(claimedAt, claimedAt, claimedAt, channel, channel);
+      `).get(
+        claimedAt,
+        claimedAt,
+        claimedAt,
+        channel,
+        channel,
+        targetChatId,
+        targetChatId,
+      );
       if (!row) return null;
 
       const deliveryAttemptNo = row.attempt_count + 1;
