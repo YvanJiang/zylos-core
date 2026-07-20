@@ -24,6 +24,16 @@ observability snapshot; local age or host liveness never abandons an occurrence.
 There is no caller-controlled completion command. Core terminal turn state is
 the sole completion authority.
 
+## Bound Conversations
+
+`--bound-conversation-json` must contain the complete durable channel identity:
+`channel`, `chat_type`, `chat_id`, `native_thread_or_topic_id`, `message_id`,
+and `root_message_id`. For a native thread, the last three values are all
+non-null: `message_id` is the exact reply-target message and
+`root_message_id` is the immutable thread root. Outside a thread, the native
+thread ID and root message ID are null. The scheduler never queries a latest
+message or falls back to the parent chat.
+
 ## Timezone
 
 Timezone resolution is `~/zylos/.env` then `process.env.TZ`, then `UTC`. Times

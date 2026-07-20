@@ -42,10 +42,9 @@ Server binds to `127.0.0.1` by default for security.
 ## Architecture
 
 ```
-Browser ──► Web Console Server ──► C4 Bridge ──► Claude
-                  │
-                  ▼
-               SQLite (c4.db)
+Browser ──► Core ingress ──► conversation executor ──► Core outbox
+   ▲                                                    │
+   └──────── Web Console channel owner ◄────────────────┘
 ```
 
 ## API Endpoints
@@ -56,7 +55,7 @@ Browser ──► Web Console Server ──► C4 Bridge ──► Claude
 | `/api/conversations/recent` | GET | Get recent conversation history |
 | `/api/upload` | POST | Upload one attachment for the next message |
 | `/api/send` | POST | Send message to Claude |
-| `/api/media/:messageId` | GET | Download/render an outbound media message |
+| `/api/media/:messageId` | GET | Retired legacy endpoint; always fails closed |
 | `/api/poll?since_id=N` | GET | Poll for new messages |
 | `/api/health` | GET | Server health check |
 
@@ -68,7 +67,8 @@ Browser ──► Web Console Server ──► C4 Bridge ──► Claude
 ├── package.json
 ├── scripts/
 │   ├── server.js      # Express API server
-│   └── send.js        # CLI message sender
+│   ├── core-outbox-owner.js # Channel-scoped renderer/delivery owner
+│   └── send.js        # Retired fail-closed direct-send command
 └── public/
     ├── index.html     # Chat UI
     ├── styles.css     # Styling
@@ -99,8 +99,7 @@ To enable password protection (recommended when exposing externally):
 - Message polling every 2 seconds
 - Auto-resizing input
 - Browser file/image upload via attach button, drag/drop, and paste
-- Inline rendering for image replies sent as `[MEDIA:image]/absolute/path`
-- Download chips for file replies sent as `[MEDIA:file]/absolute/path`
+- Durable provider-neutral text fallback rendered from Core outbox commands
 - Mobile-friendly responsive design
 - Dark theme
 
@@ -113,14 +112,8 @@ Browser uploads are stored under `~/zylos/web-console/media/` and delivered to t
 [attachment:file /Users/howard/zylos/web-console/media/wc-...pdf name="report.pdf" 1.2MB]
 ```
 
-Agent replies can include one media marker as normal current-turn output:
-
-```text
-[MEDIA:image]/absolute/path/to/image.png
-[MEDIA:file]/absolute/path/to/report.pdf
-```
-
-Core persists the reply in its durable outbox. The web-console channel owner
-renders it; the agent never invokes a direct send script.
-
-The browser only requests media by C4 message id. The server rechecks the row is an outbound web-console console message, resolves the target with `realpath`, and serves only paths under `ZYLOS_DIR` or `/tmp`.
+Core persists replies in its durable outbox. The Web Console channel owner
+claims only `web-console` commands, renders the text model, delivers to a
+connected browser, and records the fenced result. The agent never invokes a
+direct send script. Rich outbound media needs an explicit future Core contract;
+the retired marker-based legacy endpoint fails closed.

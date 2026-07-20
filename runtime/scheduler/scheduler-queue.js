@@ -36,12 +36,19 @@ function createBoundConversationIdentity(occurrence) {
       || bound.native_thread_or_topic_id.length === 0)) {
     throw new TypeError('bound_conversation.native_thread_or_topic_id must be a string or null');
   }
+  if (bound.chat_type === 'thread') {
+    requireNonEmptyString('bound_conversation.native_thread_or_topic_id', bound.native_thread_or_topic_id);
+    requireNonEmptyString('bound_conversation.root_message_id', bound.root_message_id);
+  } else if (bound.root_message_id !== null && bound.root_message_id !== undefined) {
+    throw new TypeError('bound_conversation.root_message_id must be null outside a thread');
+  }
   return {
     channel: requireNonEmptyString('bound_conversation.channel', bound.channel),
     chat_type: requireNonEmptyString('bound_conversation.chat_type', bound.chat_type),
     chat_id: requireNonEmptyString('bound_conversation.chat_id', bound.chat_id),
     native_thread_or_topic_id: bound.native_thread_or_topic_id,
     message_id: requireNonEmptyString('bound_conversation.message_id', bound.message_id),
+    root_message_id: bound.root_message_id ?? null,
   };
 }
 
@@ -91,7 +98,11 @@ export function createScheduledOccurrenceEnvelope(occurrence) {
       text: requireNonEmptyString('prompt', occurrence.prompt),
       attachments: [],
     },
-    reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+    reply: {
+      root_message_id: bound?.root_message_id ?? null,
+      parent_message_id: null,
+      reply_to_message_id: null,
+    },
     source: { kind: 'scheduler', source_ref: `schedule:${scheduleId}:${occurrenceId}` },
     schedule: {
       schedule_id: scheduleId,

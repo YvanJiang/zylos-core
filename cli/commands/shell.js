@@ -13,11 +13,26 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { bold, dim, cyan } from '../lib/colors.js';
+import { createOutboxService } from '../../runtime/delivery/outbox-service.js';
+import { createChannelNeutralTextRenderer } from '../../runtime/compatibility/c4-channel-fallback.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const C4_RECEIVE = path.join(ZYLOS_DIR, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-receive.js');
+const CORE_DATABASE_PATH = path.join(ZYLOS_DIR, 'comm-bridge', 'c4.db');
+
+function deliverToSocket(socketPath, message) {
+  return new Promise((resolve, reject) => {
+    const client = net.createConnection({ path: socketPath }, () => client.end(message));
+    client.once('error', reject);
+    client.once('close', () => resolve());
+  });
+}
 
 export async function shellCommand() {
+  const { default: Database } = await import(new URL(
+    '../../skills/comm-bridge/node_modules/better-sqlite3/lib/index.js',
+    import.meta.url,
+  ));
   const socketPath = path.join(os.tmpdir(), `zylos-shell-${process.pid}.sock`);
 
   // Clean up stale socket files from previous sessions (e.g. kill -9)
@@ -66,12 +81,50 @@ export async function shellCommand() {
     process.exit(1);
   });
 
+  fs.mkdirSync(path.dirname(CORE_DATABASE_PATH), { recursive: true });
+  const database = new Database(CORE_DATABASE_PATH);
+  database.pragma('journal_mode = WAL');
+  database.pragma('busy_timeout = 5000');
+  database.pragma('foreign_keys = ON');
+  const deliveryOwner = createOutboxService({
+    database,
+    channel: 'shell',
+    serviceInstanceId: `shell-${process.pid}`,
+    renderer: createChannelNeutralTextRenderer({
+      async sendText(delivery) {
+        if (delivery.target.chat_id !== socketPath) {
+          throw new Error('Shell delivery target does not match this shell owner.');
+        }
+        await deliverToSocket(socketPath, delivery.text);
+        return { platform_message_id: `shell:${delivery.delivery_id}` };
+      },
+    }),
+  });
+  let deliveryInFlight = false;
+  async function drainDeliveries() {
+    if (deliveryInFlight) return;
+    deliveryInFlight = true;
+    try {
+      for (let count = 0; count < 20; count += 1) {
+        const result = await deliveryOwner.dispatchNext();
+        if (result.status === 'idle') break;
+      }
+    } catch (error) {
+      console.error(`Shell delivery owner: ${error.message}`);
+    } finally {
+      deliveryInFlight = false;
+    }
+  }
+  const deliveryTimer = setInterval(() => { drainDeliveries(); }, 250);
+
   // Cleanup on exit (guard against double invocation)
   let cleaned = false;
   function cleanup() {
     if (cleaned) return;
     cleaned = true;
+    clearInterval(deliveryTimer);
     server.close();
+    database.close();
     try { fs.unlinkSync(socketPath); } catch {}
   }
   process.on('SIGINT', () => { cleanup(); process.exit(0); });
@@ -117,7 +170,7 @@ export async function shellCommand() {
 
     // Send message via C4
     try {
-      execFileSync('node', [
+      execFileSync(process.execPath, [
         C4_RECEIVE,
         '--channel', 'shell',
         '--endpoint', socketPath,

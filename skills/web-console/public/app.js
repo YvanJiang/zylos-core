@@ -166,18 +166,22 @@ class ZylosConsole {
     this.statusDot.className = 'status-dot';
 
     switch (status.state) {
-      case 'busy':
-        this.statusDot.classList.add('busy');
-        this.statusText.textContent = 'Claude is busy';
-        break;
-      case 'idle':
+      case 'healthy':
         this.statusDot.classList.add('online');
-        this.statusText.textContent = 'Claude is ready';
+        this.statusText.textContent = 'Zylos is healthy';
+        break;
+      case 'degraded':
+        this.statusDot.classList.add('busy');
+        this.statusText.textContent = 'Zylos is degraded';
         break;
       case 'offline':
-      case 'stopped':
         this.statusDot.classList.add('offline');
-        this.statusText.textContent = 'Claude is offline';
+        this.statusText.textContent = 'Zylos is offline';
+        break;
+      case 'unknown':
+      case 'unavailable':
+        this.statusDot.classList.add('offline');
+        this.statusText.textContent = 'Zylos status is unavailable';
         break;
       default:
         this.statusText.textContent = 'Unknown status';

@@ -6,6 +6,8 @@ import assert from 'node:assert/strict';
 import { afterEach, describe, test } from '@jest/globals';
 
 import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/index.js';
+import { createOutboxService } from '../runtime/delivery/outbox-service.js';
+import { createWebConsoleOutboxOwner } from '../skills/web-console/scripts/core-outbox-owner.js';
 
 const receiveCli = path.resolve('skills/comm-bridge/scripts/c4-receive.js');
 const sendCli = path.resolve('skills/comm-bridge/scripts/c4-send.js');
@@ -111,5 +113,99 @@ describe('normal C4 callers use durable Core contracts', () => {
     assert.equal(result.status, 2);
     assert.match(result.stderr, /durable Core outbox/i);
     assert.equal(fs.existsSync(marker), false);
+  });
+
+  test('c4-send also rejects hidden record-only channels without creating a legacy database', () => {
+    const { zylosDir, env } = fixture();
+    const result = run(sendCli, ['void', 'session-handoff'], env, 'hidden global note');
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /durable Core outbox/i);
+    assert.equal(fs.existsSync(path.join(zylosDir, 'comm-bridge', 'c4.db')), false);
+  });
+
+  test('a channel delivery owner cannot claim another channel outbox lane', () => {
+    const { zylosDir, env } = fixture();
+    for (const [channel, endpoint, messageId] of [
+      ['web-console', 'console', 'web-owned-message'],
+      ['shell', '/tmp/disposable-shell.sock', 'shell-owned-message'],
+    ]) {
+      const accepted = run(receiveCli, [
+        '--channel', channel,
+        '--endpoint', endpoint,
+        '--message-id', messageId,
+        '--actor-id', 'fixture-user',
+        '--occurred-at', '2026-07-21T00:10:00.000Z',
+        '--content', `message for ${channel}`,
+        '--json',
+      ], env);
+      assert.equal(accepted.status, 0, accepted.stderr);
+    }
+
+    const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
+    const owner = createOutboxService({
+      database,
+      channel: 'web-console',
+      serviceInstanceId: 'web-console-owner-fixture',
+      now: () => '2026-07-21T00:10:01.000Z',
+    });
+    const webCommand = owner.claimNext();
+    assert.equal(webCommand.target.channel, 'web-console');
+    assert.equal(owner.claimNext(), null);
+    assert.equal(database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_outbox WHERE status = 'pending'
+    `).get().count, 1);
+    database.close();
+  });
+
+  test('the Web Console owner renders, delivers, and fences its Core outbox result', async () => {
+    const { zylosDir, env } = fixture();
+    const acceptedProcess = run(receiveCli, [
+      '--channel', 'web-console', '--endpoint', 'console',
+      '--message-id', 'web-owner-round-trip', '--actor-id', 'fixture-user',
+      '--occurred-at', '2026-07-21T00:20:00.000Z', '--content', 'owner round trip', '--json',
+    ], env);
+    assert.equal(acceptedProcess.status, 0, acceptedProcess.stderr);
+    const accepted = JSON.parse(acceptedProcess.stdout.trim());
+    const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
+    const dormantOwner = createWebConsoleOutboxOwner({
+      database,
+      clients: new Set(),
+      serviceInstanceId: 'web-console-owner-no-consumers',
+      broadcast: () => { throw new Error('a dormant owner must not broadcast'); },
+    });
+    assert.deepEqual(await dormantOwner.drain(), { status: 'no_consumers', delivered: 0 });
+    assert.equal(database.prepare(`
+      SELECT status FROM runtime_outbox WHERE turn_id = ?
+    `).get(accepted.turn_id).status, 'pending');
+    const browserDeliveries = [];
+    const owner = createWebConsoleOutboxOwner({
+      database,
+      clients: new Set([{}]),
+      serviceInstanceId: 'web-console-owner-round-trip',
+      now: () => '2026-07-21T00:20:01.000Z',
+      broadcast(type, messages) {
+        browserDeliveries.push({ type, messages });
+        return 1;
+      },
+    });
+    assert.deepEqual(await owner.drain(), { status: 'delivered', delivered: 1 });
+    assert.equal(browserDeliveries[0].type, 'messages');
+    assert.match(browserDeliveries[0].messages[0].content, /Message received/);
+    assert.equal(database.prepare(`
+      SELECT status FROM runtime_outbox WHERE turn_id = ?
+    `).get(accepted.turn_id).status, 'delivered');
+    assert.equal(database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_message_mappings WHERE turn_id = ?
+    `).get(accepted.turn_id).count, 1);
+    database.close();
+  });
+
+  test('shell and web-console describe Core outbox owners, not direct model sends', () => {
+    const shellSkill = fs.readFileSync(path.resolve('skills/shell/SKILL.md'), 'utf8');
+    const shellCli = fs.readFileSync(path.resolve('cli/commands/shell.js'), 'utf8');
+    const webServer = fs.readFileSync(path.resolve('skills/web-console/scripts/server.js'), 'utf8');
+    assert.doesNotMatch(shellSkill, /Claude responds via `c4-send`|send\.js connects/i);
+    assert.match(shellCli, /createOutboxService|createChannelNeutralTextRenderer/);
+    assert.match(webServer, /createWebConsoleOutboxOwner/);
   });
 });

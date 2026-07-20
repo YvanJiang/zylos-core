@@ -23,8 +23,14 @@ export function recordScheduledAdmission(db, task, admission, {
   if (!admission || !['accepted', 'rejected'].includes(admission.status)) {
     throw new TypeError('admission must be an accepted or rejected Core result');
   }
-  if (typeof admission.turn_id !== 'string' || admission.turn_id.length === 0) {
-    throw new TypeError('admission.turn_id must be a non-empty string');
+  if (admission.status === 'accepted'
+    && (typeof admission.turn_id !== 'string' || admission.turn_id.length === 0)) {
+    throw new TypeError('an accepted admission.turn_id must be a non-empty string');
+  }
+  if (admission.status === 'rejected'
+    && admission.turn_id !== null
+    && (typeof admission.turn_id !== 'string' || admission.turn_id.length === 0)) {
+    throw new TypeError('a rejected admission.turn_id must be a non-empty string or null');
   }
   const occurrence = occurrenceId(task);
   if (task.status === 'running'

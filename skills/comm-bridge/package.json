@@ -3,9 +3,8 @@
   "version": "0.1.0",
   "type": "module",
   "description": "Zylos0 Core - C4 Communication Bridge",
-  "main": "scripts/c4-db.js",
+  "main": "scripts/c4-receive.js",
   "scripts": {
-    "init": "node scripts/c4-db.js init",
     "test": "node --test scripts/__tests__/*.test.js"
   },
   "keywords": ["zylos", "ai-agent", "communication"],

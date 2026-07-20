@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, test } from 'node:test';
 
 import Database from 'better-sqlite3';
@@ -14,8 +16,8 @@ const fixtures = JSON.parse(fs.readFileSync(
   'utf8',
 ));
 
-function database() {
-  const db = new Database(':memory:');
+function database(filename = ':memory:') {
+  const db = new Database(filename);
   db.exec(`
     CREATE TABLE tasks (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, prompt TEXT NOT NULL,
@@ -107,6 +109,41 @@ describe('scheduler Core admission and reconciliation', () => {
     assert.equal(db.prepare("SELECT status FROM tasks WHERE id = 'task-A'").get().status, 'running');
     assert.equal(db.prepare("SELECT status FROM task_history WHERE task_id = 'task-A'").get().status, 'started');
     db.close();
+  });
+
+  test('persists a terminal idempotency conflict without inventing a turn id', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'scheduler-conflict-'));
+    const filename = path.join(directory, 'scheduler.db');
+    const db = database(filename);
+    const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get('task-A');
+    assert.equal(recordScheduledAdmission(db, task, {
+      status: 'rejected',
+      turn_id: null,
+      error: { user_message: 'The occurrence payload conflicts with its durable identity.' },
+    }, { now: () => 10 }), false);
+    assert.deepEqual(db.prepare(`
+      SELECT status, current_occurrence_id, current_turn_id, last_core_state, last_error
+      FROM tasks WHERE id = 'task-A'
+    `).get(), {
+      status: 'failed',
+      current_occurrence_id: 'task-A:100',
+      current_turn_id: null,
+      last_core_state: 'failed',
+      last_error: 'The occurrence payload conflicts with its durable identity.',
+    });
+    assert.deepEqual(db.prepare(`
+      SELECT occurrence_id, turn_id, status FROM task_history
+    `).get(), { occurrence_id: 'task-A:100', turn_id: null, status: 'failed' });
+    db.close();
+    const restarted = new Database(filename);
+    const terminalTask = restarted.prepare('SELECT * FROM tasks WHERE id = ?').get('task-A');
+    assert.equal(recordScheduledAdmission(restarted, terminalTask, {
+      status: 'rejected', turn_id: null,
+      error: { user_message: 'The occurrence payload conflicts with its durable identity.' },
+    }, { now: () => 11 }), false);
+    assert.equal(restarted.prepare('SELECT COUNT(*) AS count FROM task_history').get().count, 1);
+    restarted.close();
+    fs.rmSync(directory, { recursive: true, force: true });
   });
 
   test('terminalizes once only when the canonical turn is terminal', () => {

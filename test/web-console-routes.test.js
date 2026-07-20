@@ -6,6 +6,8 @@ import { spawn } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, test } from '@jest/globals';
 import Database from '../skills/web-console/node_modules/better-sqlite3/lib/index.js';
 import WebSocket from '../skills/web-console/node_modules/ws/wrapper.mjs';
+import { acceptCompatibilityInbound } from '../runtime/compatibility/c4-channel-fallback.js';
+import { createWebConsoleOutboxOwner } from '../skills/web-console/scripts/core-outbox-owner.js';
 
 const SERVER_PATH = path.resolve('skills/web-console/scripts/server.js');
 const SQLITE_MODULE = path.resolve('skills/web-console/node_modules/better-sqlite3/lib/index.js');
@@ -250,7 +252,7 @@ describe('web-console attachment routes', () => {
     expect(queuedRows[0].content).toContain('name="report.txt" 3B]');
   });
 
-  test('GET /api/media/:messageId serves only revalidated media rows', async () => {
+  test('GET /api/media/:messageId fails closed for retired legacy media rows', async () => {
     ctx = await startServer();
     const imagePath = path.join(ctx.root, 'out.png');
     fs.writeFileSync(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
@@ -270,18 +272,9 @@ describe('web-console attachment routes', () => {
     const escapeId = insert.run('out', 'web-console', 'console', `[MEDIA:file]${escapePath}`, new Date().toISOString()).lastInsertRowid;
     db.close();
 
-    const image = await fetch(`${ctx.baseUrl}/api/media/${imageId}`);
-    expect(image.status).toBe(200);
-    expect(image.headers.get('content-type')).toBe('image/png');
-    expect(image.headers.get('content-disposition')).toBe('inline; filename="out.png"');
-
-    const file = await fetch(`${ctx.baseUrl}/api/media/${fileId}`);
-    expect(file.status).toBe(200);
-    expect(file.headers.get('content-type')).toBe('application/octet-stream');
-    expect(file.headers.get('content-disposition')).toBe('attachment; filename="out.txt"');
-    expect(await file.text()).toBe('download');
-
-    for (const id of [999999, inRowId, wrongChannelId, wrongEndpointId, notMediaId, escapeId]) {
+    for (const id of [
+      999999, imageId, fileId, inRowId, wrongChannelId, wrongEndpointId, notMediaId, escapeId,
+    ]) {
       const res = await fetch(`${ctx.baseUrl}/api/media/${id}`);
       expect(res.status).toBe(404);
     }
@@ -315,7 +308,7 @@ describe('web-console attachment routes', () => {
     expect(traversal.status).toBe(404);
   });
 
-  test('display queries exclude void channel rows (#689)', async () => {
+  test('display queries ignore every retired legacy conversation row', async () => {
     ctx = await startServer();
 
     const db = new Database(ctx.dbPath);
@@ -325,27 +318,59 @@ describe('web-console attachment routes', () => {
     insert.run('out', 'void', 'session-handoff', 'internal handoff summary', new Date().toISOString());
     db.close();
 
-    // /api/conversations/recent is scoped to web-console — void rows never appear.
+    // History is projected only from delivered Core outbox commands.
     const recentRes = await fetch(`${ctx.baseUrl}/api/conversations/recent?limit=50`);
     expect(recentRes.status).toBe(200);
     const recentContents = (await recentRes.json()).map((row) => row.content);
-    expect(recentContents).toContain('visible console message');
-    expect(recentContents).toContain('null endpoint stays visible');
-    expect(recentContents).not.toContain('internal handoff summary');
+    expect(recentContents).toEqual([]);
 
     // The parameterized channel query must not expose void even when asked directly.
     const voidRes = await fetch(`${ctx.baseUrl}/api/conversations?channel=void&limit=50`);
     expect(voidRes.status).toBe(200);
     expect(await voidRes.json()).toEqual([]);
 
-    // Default channel query still returns web-console traffic.
+    // A legacy table cannot become a fallback for the default query.
     const defaultRes = await fetch(`${ctx.baseUrl}/api/conversations?limit=50`);
     const defaultContents = (await defaultRes.json()).map((row) => row.content);
-    expect(defaultContents).toContain('visible console message');
-    expect(defaultContents).not.toContain('internal handoff summary');
+    expect(defaultContents).toEqual([]);
   });
 
-  test('GET /api/conversations/recent includes inbound image href', async () => {
+  test('conversation history projects canonical Core inbound and delivered outbox facts', async () => {
+    ctx = await startServer();
+    const db = new Database(ctx.dbPath);
+    const accepted = acceptCompatibilityInbound(db, {
+      inbound_event_id: 'web-history-event', trace_id: 'web-history-trace',
+      occurred_at: '2026-07-21T01:00:00.000Z', received_at: '2026-07-21T01:00:00.000Z',
+      region: 'global', tenant_id: 'web-history-tenant', channel: 'web-console',
+      bot_id: 'zylos', chat_type: 'dm', chat_id: 'console',
+      native_thread_or_topic_id: null, message_id: 'web-history-message',
+      actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
+      content: { kind: 'text', text: 'canonical inbound text', attachments: [] },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source_ref: 'web-history-source',
+    }, { now: () => '2026-07-21T01:00:00.000Z' });
+    const owner = createWebConsoleOutboxOwner({
+      database: db,
+      clients: new Set([{}]),
+      serviceInstanceId: 'web-history-owner',
+      now: () => '2026-07-21T01:00:01.000Z',
+      broadcast: () => 1,
+    });
+    expect(await owner.drain()).toEqual({ status: 'delivered', delivered: 1 });
+    expect(db.prepare('SELECT status FROM runtime_outbox WHERE turn_id = ?')
+      .get(accepted.turn_id).status).toBe('delivered');
+    db.close();
+
+    const response = await fetch(`${ctx.baseUrl}/api/conversations/recent?limit=10`);
+    expect(response.status).toBe(200);
+    const history = await response.json();
+    expect(history.map(({ direction, content }) => ({ direction, content }))).toEqual([
+      { direction: 'in', content: 'canonical inbound text' },
+      { direction: 'out', content: 'Message received.' },
+    ]);
+  });
+
+  test('GET /api/conversations/recent does not project retired inbound rows', async () => {
     ctx = await startServer();
     const mediaDir = path.join(ctx.root, 'web-console', 'media');
     const imgFile = path.join(mediaDir, 'wc-uploaded.png');
@@ -360,11 +385,6 @@ describe('web-console attachment routes', () => {
 
     const res = await fetch(`${ctx.baseUrl}/api/conversations/recent?limit=10`);
     const conversations = await res.json();
-    const last = conversations.at(-1);
-
-    expect(last.content).toBe('hello');
-    expect(last.attachments).toHaveLength(1);
-    expect(last.attachments[0].kind).toBe('image');
-    expect(last.attachments[0].href).toBe('/api/inbound-media/wc-uploaded.png');
+    expect(conversations).toEqual([]);
   });
 });

@@ -1,15 +1,6 @@
-# c4-send.js — Record-only Audit Interface
+# c4-send.js — Retired Fail-Closed Interface
 
-Normal outbound messages are durable Core outbox operations and cannot be sent
-through this command. External channel arguments fail closed before any channel
-script can run.
-
-The only supported form records an explicit session-handoff audit message:
-
-```bash
-printf '%s\n' '<handoff audit text>' | \
-  node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js void
-```
-
-The `void` record is not dispatchable and has no delivery target. It exists only
-for the isolated handoff record flow.
+All invocations fail closed. Normal outbound messages are durable Core outbox
+operations consumed by a channel delivery owner. Internal lifecycle notes are
+written to explicit durable lifecycle or memory state, not a hidden global C4
+record.

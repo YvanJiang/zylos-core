@@ -145,6 +145,29 @@ describe('scheduler conversation queue admission', () => {
     database.close();
   });
 
+  test('persists both native thread anchors in the scheduled delivery target', () => {
+    const { database } = openTestDatabase();
+    const accepted = acceptScheduledOccurrence(database, occurrence('thread-bound', {
+      bound_conversation: {
+        channel: 'telegram', chat_type: 'thread', chat_id: 'group-1',
+        native_thread_or_topic_id: 'topic-1', message_id: 'reply-target-message-1',
+        root_message_id: 'root-message-1',
+      },
+    }), {
+      now: () => '2026-07-20T01:10:00.000Z',
+      generateId: deterministicIds('thread-bound'),
+    });
+    const command = JSON.parse(database.prepare(`
+      SELECT command_json FROM runtime_outbox WHERE turn_id = ?
+    `).get(accepted.turn_id).command_json);
+    expect(command.target).toMatchObject({
+      native_thread_or_topic_id: 'topic-1',
+      native_thread_root_message_id: 'root-message-1',
+      native_thread_reply_target_message_id: 'reply-target-message-1',
+    });
+    database.close();
+  });
+
   test('persists queue-full scheduled work and its visible explanation atomically', () => {
     const { database } = openTestDatabase();
     acceptScheduledOccurrence(database, occurrence('first'), {

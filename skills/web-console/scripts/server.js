@@ -21,19 +21,17 @@ import { fileURLToPath } from 'url';
 import {
   MAX_ATTACHMENTS,
   buildAnnotatedContent,
-  classifyConversationMessage,
   contentDisposition,
   generateStoredFileName,
-  parseMediaContent,
   resolveAllowedPathSync,
   sanitizeDisplayName,
   sniffImage,
-  splitContentAndAttachments,
   uploadKind
 } from './attachment-utils.js';
 import { openDb, SessionStore, PersistentUploadRegistry } from './db.js';
 import { readExecutorObservability } from '../../../runtime/observability/executor-snapshot-client.js';
 import { projectRuntimeHealth } from '../../../runtime/observability/health-projection.js';
+import { createWebConsoleOutboxOwner } from './core-outbox-owner.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -136,25 +134,13 @@ const upload = multer({
 // Initialize database connection
 let db;
 try {
-  // Verify database file exists
-  if (!fs.existsSync(DB_PATH)) {
-    console.error(`Database not found: ${DB_PATH}`);
-    console.error('Make sure comm-bridge is initialized first (run c4-db.js init)');
-    process.exit(1);
-  }
-
+  fs.mkdirSync(DB_DIR, { recursive: true });
   db = new Database(DB_PATH, { readonly: false });
-
-  // Verify schema exists
-  const tableCheck = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'").get();
-  if (!tableCheck) {
-    console.error('Database schema not initialized');
-    console.error('Run: node ~/zylos/.claude/skills/comm-bridge/scripts/c4-db.js init');
-    process.exit(1);
-  }
+  db.pragma('journal_mode = WAL');
+  db.pragma('busy_timeout = 5000');
+  db.pragma('foreign_keys = ON');
 } catch (err) {
   console.error(`Failed to open database: ${err.message}`);
-  console.error('Make sure comm-bridge is initialized first');
   process.exit(1);
 }
 
@@ -168,85 +154,92 @@ let lastMessageId = 0;
 /**
  * Read provider-neutral Core runtime health.
  */
+let cachedStatus = null;
+let cachedStatusUntil = 0;
+let statusReadInFlight = null;
+
 async function readStatus() {
-  try {
-    return projectRuntimeHealth(await readExecutorObservability({ zylosDir: ZYLOS_DIR }));
-  } catch (err) {
-    return {
-      contract: 'zylos.observability-health-projection',
-      contract_version: '1.0',
-      state: 'unavailable',
-      service: null,
-      executors: null,
-      turns: null,
-      outbox: null,
-      error: { code: 'executor_observability_unavailable', user_message: err.message },
-    };
-  }
-}
-
-/**
- * Strip internal routing info from message content for display
- */
-function stripLegacyDirectRoute(content) {
-  // Historical display sanitization only. The corresponding direct route is
-  // not importable or executable from the normal runtime.
-  const idx = content.indexOf(' ---- reply via:');
-  if (idx !== -1) {
-    return content.substring(0, idx);
-  }
-  return content;
-}
-
-/**
- * Clean message for display (strip internal routing info)
- */
-function cleanMessageForDisplay(msg) {
-  const cleaned = {
-    ...msg,
-    content: stripLegacyDirectRoute(msg.content)
-  };
-  const classified = classifyConversationMessage(cleaned);
-  if (classified.kind === 'media') return classified;
-  if (cleaned.direction === 'in') {
-    const parsed = splitContentAndAttachments(cleaned.content);
-    if (parsed.attachments.length > 0) {
-      return {
-        ...cleaned,
-        content: parsed.content,
-        attachments: parsed.attachments.map((attachment) => {
-          const result = {
-            kind: attachment.kind,
-            name: attachment.name,
-            size_label: attachment.sizeLabel
-          };
-          const basename = path.basename(attachment.path || '');
-          if (basename && attachment.path === path.join(MEDIA_DIR, basename)) {
-            result.href = `/api/inbound-media/${encodeURIComponent(basename)}`;
-          }
-          return result;
-        })
+  if (cachedStatus !== null && Date.now() < cachedStatusUntil) return cachedStatus;
+  if (statusReadInFlight !== null) return statusReadInFlight;
+  statusReadInFlight = (async () => {
+    try {
+      cachedStatus = projectRuntimeHealth(
+        await readExecutorObservability({ zylosDir: ZYLOS_DIR }),
+      );
+    } catch (err) {
+      cachedStatus = {
+        contract: 'zylos.observability-health-projection',
+        contract_version: '1.0',
+        state: 'unavailable',
+        service: null,
+        executors: null,
+        turns: null,
+        outbox: null,
+        error: { code: 'executor_observability_unavailable', user_message: err.message },
       };
     }
+    cachedStatusUntil = Date.now() + 2000;
+    return cachedStatus;
+  })();
+  try {
+    return await statusReadInFlight;
+  } finally {
+    statusReadInFlight = null;
   }
-  return cleaned;
 }
 
 /**
- * Get new messages since given ID
+ * Read delivered Web Console text from the authoritative Core outbox.
  */
+function getCoreMessages({
+  channel = 'web-console', sinceId = 0, limit = 100, latest = false,
+} = {}) {
+  if (channel !== 'web-console') return [];
+  const ordering = latest ? 'DESC' : 'ASC';
+  const rows = db.prepare(`
+    WITH displayed AS (
+      SELECT event.rowid * 2 AS id, 'in' AS direction,
+        json_extract(inbound.envelope_json, '$.channel') AS channel,
+        conversation.chat_id AS endpoint_id,
+        json_extract(inbound.envelope_json, '$.content.text') AS content,
+        inbound.committed_at AS timestamp
+      FROM runtime_inbound_events AS inbound
+      JOIN runtime_turns AS turn ON turn.inbound_event_id = inbound.inbound_event_id
+      JOIN runtime_conversations AS conversation
+        ON conversation.conversation_id = turn.conversation_id
+      JOIN runtime_normalized_events AS event
+        ON event.turn_id = turn.turn_id AND event.event_sequence = 1
+      WHERE json_extract(inbound.envelope_json, '$.channel') = 'web-console'
+      UNION ALL
+      SELECT event.rowid * 2 + 1 AS id, 'out' AS direction,
+        'web-console' AS channel,
+        json_extract(outbox.command_json, '$.target.chat_id') AS endpoint_id,
+        json_extract(outbox.command_json, '$.render_model.text') AS content,
+        COALESCE(
+          json_extract(outbox.result_json, '$.delivered_at'),
+          outbox.updated_at,
+          outbox.created_at
+        ) AS timestamp
+      FROM runtime_outbox AS outbox
+      JOIN runtime_normalized_events AS event
+        ON event.turn_id = outbox.turn_id
+       AND event.event_sequence = CAST(
+         json_extract(outbox.command_json, '$.event_sequence_through') AS INTEGER
+       )
+      WHERE outbox.status = 'delivered'
+        AND json_extract(outbox.command_json, '$.target.channel') = 'web-console'
+    )
+    SELECT id, direction, channel, endpoint_id, content, timestamp
+    FROM displayed
+    WHERE id > ?
+    ORDER BY id ${ordering}
+    LIMIT ?
+  `).all(sinceId, limit);
+  return latest ? rows.reverse() : rows;
+}
+
 function getNewMessages(sinceId) {
-  try {
-    const stmt = db.prepare(`
-      SELECT id, direction, channel, endpoint_id, content, timestamp
-      FROM conversations
-      WHERE channel = 'web-console' AND id > ?
-      ORDER BY timestamp ASC
-    `);
-    return stmt.all(sinceId).map(cleanMessageForDisplay);
-  } catch (err) {
-    return [];
-  }
+  return getCoreMessages({ sinceId, limit: 100 });
 }
 
 /**
@@ -254,11 +247,28 @@ function getNewMessages(sinceId) {
  */
 function broadcast(type, data) {
   const message = JSON.stringify({ type, data });
+  let delivered = 0;
   for (const client of clients) {
     if (client.readyState === 1) { // WebSocket.OPEN
       client.send(message);
+      delivered += 1;
     }
   }
+  return delivered;
+}
+
+const deliveryOwner = createWebConsoleOutboxOwner({
+  database: db,
+  clients,
+  serviceInstanceId: `web-console-${process.pid}`,
+  broadcast,
+  onDeliveredMessage(message) {
+    lastMessageId = Math.max(lastMessageId, message.id);
+  },
+});
+
+async function drainWebOutbox() {
+  await deliveryOwner.drain();
 }
 
 function normalizeAttachmentIds(value) {
@@ -382,26 +392,11 @@ function jsonError(res, err) {
   });
 }
 
-function getMediaRow(messageId) {
-  const row = db.prepare(`
-    SELECT id, direction, channel, endpoint_id, content, timestamp
-    FROM conversations
-    WHERE id = ?
-  `).get(messageId);
-
-  if (!row || row.direction !== 'out' || row.channel !== 'web-console' || row.endpoint_id !== 'console') {
-    return null;
-  }
-
-  const media = parseMediaContent(row.content);
-  if (!media) return null;
-  return { row, media };
-}
-
 /**
  * Check for status changes and new messages
  */
 async function checkUpdates() {
+  if (clients.size === 0) return;
   // Check status changes
   const currentStatus = await readStatus();
   if (!lastStatus || currentStatus.snapshot_id !== lastStatus.snapshot_id
@@ -409,6 +404,8 @@ async function checkUpdates() {
     lastStatus = currentStatus;
     broadcast('status', currentStatus);
   }
+
+  await drainWebOutbox();
 
   // Check for new messages
   const newMessages = getNewMessages(lastMessageId);
@@ -418,19 +415,29 @@ async function checkUpdates() {
   }
 }
 
-// Start update checker (every 500ms for responsiveness)
+// Poll only while there are consumers. This bounds snapshot work and avoids
+// advancing durable observability snapshots for an unused console.
 let updateInFlight = false;
 setInterval(() => {
-  if (updateInFlight) return;
+  if (clients.size === 0 || updateInFlight) return;
   updateInFlight = true;
   checkUpdates().catch(() => {}).finally(() => { updateInFlight = false; });
-}, 500);
+}, 2000);
 
 // Initialize lastMessageId
 try {
-  const stmt = db.prepare(`SELECT MAX(id) as maxId FROM conversations WHERE channel = 'web-console'`);
-  const result = stmt.get();
-  lastMessageId = result?.maxId || 0;
+  const result = db.prepare(`
+    SELECT MAX(event.rowid * 2 + 1) AS maxId
+    FROM runtime_outbox AS outbox
+    JOIN runtime_normalized_events AS event
+      ON event.turn_id = outbox.turn_id
+     AND event.event_sequence = CAST(
+       json_extract(outbox.command_json, '$.event_sequence_through') AS INTEGER
+     )
+    WHERE outbox.status = 'delivered'
+      AND json_extract(outbox.command_json, '$.target.channel') = 'web-console'
+  `).get();
+  lastMessageId = result?.maxId ?? 0;
 } catch (err) {
   // Ignore
 }
@@ -456,6 +463,7 @@ wss.on('connection', (ws, req) => {
   readStatus().then((status) => {
     if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'status', data: status }));
   }).catch(() => {});
+  checkUpdates().catch(() => {});
 
   // Handle client messages
   ws.on('message', async (data) => {
@@ -514,19 +522,7 @@ app.get('/api/conversations', (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
     const channel = req.query.channel || 'web-console';
-
-    // channel is caller-controlled; 'void' is the internal record-only
-    // channel (#689) and must never reach a display surface.
-    const stmt = db.prepare(`
-      SELECT id, direction, channel, endpoint_id, content, timestamp
-      FROM conversations
-      WHERE channel = ? AND channel != 'void'
-      ORDER BY timestamp DESC
-      LIMIT ?
-    `);
-
-    const conversations = stmt.all(channel, limit).map(cleanMessageForDisplay);
-    res.json(conversations.reverse());
+    res.json(getCoreMessages({ channel, limit, latest: true }));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -539,16 +535,7 @@ app.get('/api/conversations/recent', (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 100;
 
-    const stmt = db.prepare(`
-      SELECT id, direction, channel, endpoint_id, content, timestamp
-      FROM conversations
-      WHERE channel = 'web-console'
-      ORDER BY timestamp DESC
-      LIMIT ?
-    `);
-
-    const conversations = stmt.all(limit).map(cleanMessageForDisplay);
-    res.json(conversations.reverse());
+    res.json(getCoreMessages({ limit, latest: true }));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -615,41 +602,7 @@ app.post('/api/send', (req, res) => {
  * Serve an outbound media row by message id
  */
 app.get('/api/media/:messageId', (req, res) => {
-  try {
-    const messageId = Number.parseInt(req.params.messageId, 10);
-    if (!Number.isSafeInteger(messageId)) return res.sendStatus(404);
-
-    const result = getMediaRow(messageId);
-    if (!result) return res.sendStatus(404);
-
-    const allowedPath = resolveAllowedPathSync(result.media.path, [ZYLOS_DIR, '/tmp']);
-    if (!allowedPath) {
-      console.warn(`Blocked web-console media path outside allowlist: ${result.media.path}`);
-      return res.sendStatus(404);
-    }
-
-    let stat;
-    try {
-      stat = fs.statSync(allowedPath);
-    } catch {
-      return res.sendStatus(404);
-    }
-    if (!stat.isFile()) return res.sendStatus(404);
-
-    const fd = fs.openSync(allowedPath, 'r');
-    const head = Buffer.alloc(Math.min(16, stat.size));
-    fs.readSync(fd, head, 0, head.length, 0);
-    fs.closeSync(fd);
-
-    const image = result.media.media_type === 'image' ? sniffImage(head) : null;
-    const disposition = image ? 'inline' : 'attachment';
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Content-Type', image?.mime || 'application/octet-stream');
-    res.setHeader('Content-Disposition', contentDisposition(disposition, result.media.name));
-    res.sendFile(allowedPath);
-  } catch {
-    res.sendStatus(404);
-  }
+  res.sendStatus(404);
 });
 
 /**
