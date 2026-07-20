@@ -322,10 +322,12 @@ export function createExecutorService({
     getServiceState: () => ({
       degraded: residentHeartbeatFailure !== null
         || workspaceHeartbeatFailure !== null
+        || workspaceRecoveryFlight !== null
         || lifecycle === 'close_failed',
+      offline: !started || lifecycle === 'closed',
       maintenance: false,
       draining: lifecycle === 'closing',
-      reconciling: false,
+      reconciling: workspaceRecoveryFlight !== null,
     }),
   });
 

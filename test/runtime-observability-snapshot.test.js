@@ -340,6 +340,21 @@ function seedUnknownRuntimeState(database) {
       '2026-07-20T08:00:03Z',
     );
     database.prepare(`
+      INSERT INTO runtime_provider_stop_incidents (
+        incident_id, turn_id, attempt_id, attempt_no, lease_epoch,
+        provider_stop_status, side_effect_status, disposition,
+        error_json, outbox_id, created_at
+      ) VALUES (?, ?, ?, 1, 14, 'uncertain', 'unknown',
+        'manual_recovery_required', ?, ?, ?)
+    `).run(
+      'provider-stop-incident-observability-A',
+      'turn-observability-A',
+      'attempt-observability-A',
+      unknownError,
+      'outbox-observability-A',
+      '2026-07-20T08:00:03Z',
+    );
+    database.prepare(`
       INSERT INTO runtime_permission_audit (
         audit_id, action, actor_id, source, scope_json, policy_revision,
         reason, redacted_context_json, committed_at
@@ -370,17 +385,26 @@ describe('Core runtime observability snapshot publisher', () => {
       generateId: deterministicIds('production-surface'),
     });
 
-    const snapshot = service.publishObservabilitySnapshot();
-    expect(validateObservabilitySnapshot(snapshot).known).toMatchObject({
+    const beforeStart = service.publishObservabilitySnapshot();
+    expect(validateObservabilitySnapshot(beforeStart).known).toMatchObject({
       core_service_instance_id: 'core-service-production-surface',
       snapshot_version: 1,
       service: {
         host_id: 'core-service-production-surface',
-        health: 'healthy',
+        health: 'offline',
       },
     });
 
+    service.start();
+    expect(service.publishObservabilitySnapshot()).toMatchObject({
+      snapshot_version: 2,
+      service: { health: 'healthy' },
+    });
     await service.close();
+    expect(service.publishObservabilitySnapshot()).toMatchObject({
+      snapshot_version: 3,
+      service: { health: 'offline' },
+    });
     database.close();
   });
 
@@ -674,6 +698,11 @@ describe('Core runtime observability snapshot publisher', () => {
       category: 'permission',
       count: 1,
       last_committed_at: '2026-07-20T08:00:02Z',
+    });
+    expect(snapshot.audit_summary.items).toContainEqual({
+      category: 'provider_stop',
+      count: 1,
+      last_committed_at: '2026-07-20T08:00:03Z',
     });
     expect(JSON.stringify(snapshot)).not.toContain('sk-private-answer-value');
 

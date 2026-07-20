@@ -529,6 +529,8 @@ function collectAuditSummary(database) {
       SELECT 'provider_diagnostic', observed_at FROM runtime_provider_event_diagnostics
       UNION ALL
       SELECT 'scheduler', committed_at FROM runtime_scheduler_occurrences
+      UNION ALL
+      SELECT 'provider_stop', created_at FROM runtime_provider_stop_incidents
     )
     GROUP BY category
     ORDER BY category
@@ -588,7 +590,8 @@ function validateSection({
   return value;
 }
 
-function deriveServiceHealth(sections, serviceDegraded) {
+function deriveServiceHealth(sections, serviceDegraded, serviceOffline) {
+  if (serviceOffline) return 'offline';
   if (serviceDegraded || Object.values(sections).some((section) => section.complete === false)) {
     return 'degraded';
   }
@@ -737,6 +740,7 @@ export function createRuntimeSnapshotPublisher({
         health: deriveServiceHealth(
           sections,
           !serviceComplete || serviceState.degraded === true,
+          serviceState.offline === true,
         ),
         maintenance: serviceState.maintenance === true,
         draining: serviceState.draining === true,
