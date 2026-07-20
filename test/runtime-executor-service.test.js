@@ -474,6 +474,58 @@ describe('runtime executor service', () => {
     database.close();
   });
 
+  test('retains a foreign exact lease only until expiry even with persisted controllable evidence', () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'foreign-lease-reconciliation');
+    const foreignStore = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-foreign-lease-owner',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('foreign-lease-owner'),
+    });
+    const foreignContext = foreignStore.claimNextQueuedTurn();
+    foreignStore.recordProviderRuntimeEvidence(foreignContext, {
+      runtime_instance_id: 'foreign-codex-app-server-runtime',
+      handle_kind: 'codex_app_server_connection',
+      controllable: true,
+    });
+    foreignStore.transitionTurn(foreignContext, 'starting', 'running');
+
+    let currentTime = '2026-07-19T07:01:05Z';
+    const reconcilingStore = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-reconciler',
+      now: () => currentTime,
+      generateId: deterministicIds('foreign-lease-reconciler'),
+    });
+
+    expect(reconcilingStore.reconcileNonterminalTurns([], 'sweep_reconciliation'))
+      .toMatchObject({
+        inspected: 1,
+        healthy: 0,
+        waiting_decision: 0,
+        results: [{ turn_id: accepted.turn_id, status: 'foreign_lease_retained' }],
+      });
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'running' });
+
+    currentTime = '2026-07-19T07:01:11Z';
+    expect(reconcilingStore.reconcileNonterminalTurns([], 'sweep_reconciliation'))
+      .toMatchObject({
+        inspected: 1,
+        healthy: 0,
+        waiting_decision: 1,
+        results: [{ turn_id: accepted.turn_id, status: 'waiting_decision' }],
+      });
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
+    database.close();
+  });
+
   test('safely retries one turn at most three times with new attempts and lease epochs', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'safe-provider-retry');
@@ -514,12 +566,18 @@ describe('runtime executor service', () => {
       generateId: deterministicIds('safe-provider-retry'),
       providerRetryBaseDelayMs: 1_000,
       providerRetryJitterRatio: 0,
-      waitForProviderRetry: async (delayMs) => {
-        backoffs.push(delayMs);
-        currentTimeMs += delayMs;
-      },
     });
 
+    for (const expectedBackoff of [1_000, 2_000, 4_000]) {
+      const scheduled = await service.runNext();
+      expect(scheduled).toMatchObject({
+        status: 'retry_scheduled',
+        turn_id: accepted.turn_id,
+        retry: { backoff_ms: expectedBackoff },
+      });
+      backoffs.push(scheduled.retry.backoff_ms);
+      currentTimeMs += scheduled.retry.backoff_ms;
+    }
     await expect(service.runNext()).resolves.toMatchObject({
       status: 'completed',
       turn_id: accepted.turn_id,
@@ -595,9 +653,17 @@ describe('runtime executor service', () => {
       now: () => new Date(currentTimeMs).toISOString(),
       generateId: deterministicIds('provider-retry-exhausted'),
       providerRetryJitterRatio: 0,
-      waitForProviderRetry: async (delayMs) => { currentTimeMs += delayMs; },
     });
 
+    for (const expectedBackoff of [1_000, 2_000, 4_000]) {
+      const scheduled = await service.runNext();
+      expect(scheduled).toMatchObject({
+        status: 'retry_scheduled',
+        turn_id: accepted.turn_id,
+        retry: { backoff_ms: expectedBackoff },
+      });
+      currentTimeMs += scheduled.retry.backoff_ms;
+    }
     await expect(service.runNext()).resolves.toMatchObject({
       status: 'failed',
       turn_id: accepted.turn_id,
@@ -618,6 +684,60 @@ describe('runtime executor service', () => {
         error: expect.objectContaining({ code: 'delivery_transient', retryable: true }),
       }),
     ]);
+    database.close();
+  });
+
+  test('returns a turn-bound retry schedule before another service claims the retry', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'provider-retry-handoff');
+    let currentTimeMs = Date.parse('2026-07-19T07:01:00Z');
+    const firstService = createExecutorService({
+      database,
+      adapter: {
+        async *execute() {
+          const error = new Error('private transient provider failure');
+          error.providerError = {
+            code: 'delivery_transient',
+            category: 'provider',
+            retryable: true,
+            side_effect_status: 'none',
+            user_message: 'The provider is temporarily unavailable.',
+          };
+          throw error;
+        },
+      },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-provider-retry-handoff-first',
+      now: () => new Date(currentTimeMs).toISOString(),
+      generateId: deterministicIds('provider-retry-handoff-first'),
+      providerRetryJitterRatio: 0,
+    });
+    const secondService = createExecutorService({
+      database,
+      adapter: { async *execute() {} },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-provider-retry-handoff-second',
+      now: () => new Date(currentTimeMs).toISOString(),
+      generateId: deterministicIds('provider-retry-handoff-second'),
+      providerRetryJitterRatio: 0,
+    });
+
+    const scheduled = await firstService.runNext();
+    expect(scheduled).toMatchObject({
+      status: 'retry_scheduled',
+      turn_id: accepted.turn_id,
+      attempt_no: 1,
+      lease_epoch: 1,
+      retry: { backoff_ms: 1_000 },
+    });
+    currentTimeMs += scheduled.retry.backoff_ms;
+    await expect(secondService.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: accepted.turn_id,
+      attempt_no: 2,
+      lease_epoch: 2,
+    });
+    await expect(firstService.runNext()).resolves.toMatchObject({ status: 'idle' });
     database.close();
   });
 
@@ -651,30 +771,34 @@ describe('runtime executor service', () => {
       now: () => new Date(currentTimeMs).toISOString(),
       generateId: deterministicIds('stale-provider-attempt-diagnostics'),
       providerRetryJitterRatio: 0,
-      waitForProviderRetry: async (delayMs) => {
-        staleResults.push(staleCallbacks.bindProviderNativeId('stale-native-id'));
-        staleResults.push(staleCallbacks.reportProviderState({
-          state: 'started',
-          provider_native_id: null,
-        }));
-        staleResults.push(staleCallbacks.reportRuntimeEvidence({
-          runtime_instance_id: 'stale-runtime',
-          handle_kind: 'stale_handle',
-          controllable: true,
-        }));
-        staleResults.push(staleCallbacks.reportProviderFailure({
-          providerError: {
-            code: 'side_effect_unknown',
-            category: 'provider',
-            retryable: false,
-            side_effect_status: 'unknown',
-            user_message: 'This stale failure is diagnostic only.',
-          },
-        }));
-        currentTimeMs += delayMs;
-      },
     });
 
+    const scheduled = await service.runNext();
+    expect(scheduled).toMatchObject({
+      status: 'retry_scheduled',
+      turn_id: accepted.turn_id,
+      retry: { backoff_ms: 1_000 },
+    });
+    staleResults.push(staleCallbacks.bindProviderNativeId('stale-native-id'));
+    staleResults.push(staleCallbacks.reportProviderState({
+      state: 'started',
+      provider_native_id: null,
+    }));
+    staleResults.push(staleCallbacks.reportRuntimeEvidence({
+      runtime_instance_id: 'stale-runtime',
+      handle_kind: 'stale_handle',
+      controllable: true,
+    }));
+    staleResults.push(staleCallbacks.reportProviderFailure({
+      providerError: {
+        code: 'side_effect_unknown',
+        category: 'provider',
+        retryable: false,
+        side_effect_status: 'unknown',
+        user_message: 'This stale failure is diagnostic only.',
+      },
+    }));
+    currentTimeMs += scheduled.retry.backoff_ms;
     await expect(service.runNext()).resolves.toMatchObject({
       status: 'completed',
       turn_id: accepted.turn_id,
@@ -726,9 +850,6 @@ describe('runtime executor service', () => {
       serviceInstanceId: `executor-service-nonretry-${code}`,
       now: () => '2026-07-19T07:01:00Z',
       generateId: deterministicIds(`nonretry-${code}`),
-      waitForProviderRetry: async () => {
-        throw new Error('ineligible retry attempted');
-      },
     });
 
     await expect(service.runNext()).resolves.toMatchObject({

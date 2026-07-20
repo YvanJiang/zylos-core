@@ -7654,21 +7654,17 @@ export function createExecutorStore({
           && context.attempt.attempt_id === candidate.attempt_id
           && context.attempt.attempt_no === candidate.attempt_no
           && context.attempt.lease_epoch === candidate.lease_epoch;
-        const durableAttemptIdentity = candidate.service_instance_id === candidate.lease_owner
-          && (
-            candidate.lease_owner !== serviceInstanceId
-            || (
-              exactLocalFence
-              && context.executor_instance_id === candidate.executor_instance_id
-            )
-          );
-        const durableLease = durableAttemptIdentity
+        const exactLeaseFence = candidate.service_instance_id === candidate.lease_owner
           && candidate.lease_turn_id === candidate.turn_id
           && candidate.lease_attempt_id === candidate.attempt_id
           && candidate.lease_attempt_no === candidate.attempt_no
           && candidate.lease_epoch_current === candidate.lease_epoch
           && candidate.lease_expires_at !== null
           && candidate.lease_expires_at > reconciledAt;
+        const exactLocalIdentity = candidate.service_instance_id === serviceInstanceId
+          && candidate.lease_owner === serviceInstanceId
+          && exactLocalFence
+          && context.executor_instance_id === candidate.executor_instance_id;
         const durableRuntimeEvidence = evidence !== null
           && evidence.runtime_instance_id === candidate.runtime_instance_id
           && typeof evidence.runtime_instance_id === 'string'
@@ -7676,8 +7672,15 @@ export function createExecutorStore({
           && typeof evidence.handle_kind === 'string'
           && evidence.handle_kind.length > 0
           && evidence.controllable === true;
-        if (durableLease && durableRuntimeEvidence) {
+        if (exactLocalIdentity && exactLeaseFence && durableRuntimeEvidence) {
           results.push({ turn_id: candidate.turn_id, status: 'healthy' });
+          continue;
+        }
+        if (
+          exactLeaseFence
+          && candidate.lease_owner !== serviceInstanceId
+        ) {
+          results.push({ turn_id: candidate.turn_id, status: 'foreign_lease_retained' });
           continue;
         }
         if (candidate.state === 'waiting_user' && candidate.has_blocking_interaction === 1) {

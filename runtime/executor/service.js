@@ -137,7 +137,6 @@ export function createExecutorService({
   providerRetryBaseDelayMs = 1_000,
   providerRetryJitterRatio = 0.2,
   providerRetryRandom = Math.random,
-  waitForProviderRetry = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
   maxResidentExecutorsPerBot = 20,
   setTimeoutFn = setTimeout,
   clearTimeoutFn = clearTimeout,
@@ -182,9 +181,6 @@ export function createExecutorService({
   }
   if (typeof providerRetryRandom !== 'function') {
     throw new TypeError('providerRetryRandom must be a function');
-  }
-  if (typeof waitForProviderRetry !== 'function') {
-    throw new TypeError('waitForProviderRetry must be a function');
   }
   if (!Number.isFinite(residentLeaseDurationMs) || residentLeaseDurationMs <= 0) {
     throw new TypeError('residentLeaseDurationMs must be a positive finite number');
@@ -651,14 +647,14 @@ export function createExecutorService({
         const baseBackoff = providerRetryBaseDelayMs * (2 ** (attemptNo - 1));
         const jitterFactor = 1 + ((providerRetryRandom() * 2) - 1) * providerRetryJitterRatio;
         const backoffMs = Math.max(0, Math.round(baseBackoff * jitterFactor));
-        persist(() => store.scheduleProviderRetry(turnContext, normalizedError, backoffMs));
+        const retry = persist(
+          () => store.scheduleProviderRetry(turnContext, normalizedError, backoffMs),
+        );
         activeRun.durableSettled = true;
         refresh();
         cleanupActiveRun(activeRun);
         reschedulePendingInteractionDeadlines();
-        await waitForProviderRetry(backoffMs);
-        if (lifecycle !== 'open') return resultFor(activeRun, 'service_closing');
-        return runNext();
+        return resultFor(activeRun, 'retry_scheduled', { retry });
       }
       if (isSafeProviderRetry(normalizedError) && attemptNo === 4) {
         persist(() => store.exhaustProviderRetries(turnContext, normalizedError));
