@@ -57,6 +57,9 @@ const RUNTIME_SCHEMA = `
     provider TEXT CHECK (provider IS NULL OR provider IN ('claude', 'codex')),
     provider_native_id TEXT,
     provider_native_id_bound_at TEXT,
+    provider_native_state TEXT NOT NULL DEFAULT 'unknown'
+      CHECK (provider_native_state IN ('unknown', 'valid', 'invalid')),
+    recovery_of_lineage_id TEXT REFERENCES runtime_lineages(lineage_id),
     CHECK (
       (provider IS NULL AND provider_native_id IS NULL AND provider_native_id_bound_at IS NULL)
       OR (provider IS NOT NULL AND provider_native_id IS NOT NULL
@@ -517,6 +520,49 @@ const RUNTIME_SCHEMA = `
     created_at TEXT NOT NULL,
     PRIMARY KEY (region, tenant_id, channel, bot_id, platform_message_id)
   );
+
+  CREATE TABLE IF NOT EXISTS runtime_reply_mapping_recoveries (
+    recovery_id TEXT PRIMARY KEY,
+    turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
+    mapping_id TEXT NOT NULL UNIQUE,
+    source_platform_message_id TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK (
+      reason IN (
+        'mapping_missing',
+        'mapping_corrupt',
+        'mapping_unbound',
+        'provider_lineage_invalid'
+      )
+    ),
+    candidate_lineage_id TEXT REFERENCES runtime_lineages(lineage_id),
+    side_effect_status TEXT NOT NULL
+      CHECK (side_effect_status IN ('none', 'known', 'unknown')),
+    state TEXT NOT NULL CHECK (
+      state IN (
+        'queued',
+        'notice_pending',
+        'native_recovery_claimed',
+        'native_recovery_not_applicable',
+        'waiting_decision',
+        'bound',
+        'rejected',
+        'failed'
+      )
+    ),
+    notice_event_sequence INTEGER CHECK (
+      notice_event_sequence IS NULL OR notice_event_sequence > 0
+    ),
+    native_recovery_attempt_count INTEGER NOT NULL DEFAULT 0
+      CHECK (native_recovery_attempt_count IN (0, 1)),
+    native_recovery_attempt_id TEXT,
+    native_recovery_status TEXT,
+    native_recovery_result_json TEXT,
+    native_recovery_owner_service_instance_id TEXT,
+    native_recovery_claim_expires_at TEXT,
+    bound_lineage_id TEXT REFERENCES runtime_lineages(lineage_id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
 `;
 
 const OUTBOX_V2_SCHEMA = `CREATE TABLE runtime_outbox ${OUTBOX_TABLE_SCHEMA};`;
@@ -953,6 +999,12 @@ export function initializeRuntimePersistence(database) {
   );
   addColumnIfMissing(
     database,
+    'runtime_lineages',
+    'recovery_of_lineage_id',
+    'TEXT REFERENCES runtime_lineages(lineage_id)',
+  );
+  addColumnIfMissing(
+    database,
     'runtime_turns',
     'lease_epoch',
     'INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0)',
@@ -971,6 +1023,48 @@ export function initializeRuntimePersistence(database) {
     'INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1))',
   );
   addColumnIfMissing(database, 'runtime_turn_queue', 'wait_reason', 'TEXT');
+  addColumnIfMissing(
+    database,
+    'runtime_reply_mapping_recoveries',
+    'notice_event_sequence',
+    'INTEGER CHECK (notice_event_sequence IS NULL OR notice_event_sequence > 0)',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_reply_mapping_recoveries',
+    'native_recovery_attempt_id',
+    'TEXT',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_reply_mapping_recoveries',
+    'native_recovery_status',
+    'TEXT',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_reply_mapping_recoveries',
+    'native_recovery_result_json',
+    'TEXT',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_reply_mapping_recoveries',
+    'native_recovery_owner_service_instance_id',
+    'TEXT',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_reply_mapping_recoveries',
+    'native_recovery_claim_expires_at',
+    'TEXT',
+  );
+  addColumnIfMissing(
+    database,
+    'runtime_reply_mapping_recoveries',
+    'bound_lineage_id',
+    'TEXT REFERENCES runtime_lineages(lineage_id)',
+  );
   addColumnIfMissing(database, 'runtime_executor_residents', 'owner_service_instance_id', 'TEXT');
   addColumnIfMissing(
     database,
@@ -992,6 +1086,12 @@ export function initializeRuntimePersistence(database) {
   );
   addColumnIfMissing(database, 'runtime_lineages', 'provider_native_id', 'TEXT');
   addColumnIfMissing(database, 'runtime_lineages', 'provider_native_id_bound_at', 'TEXT');
+  addColumnIfMissing(
+    database,
+    'runtime_lineages',
+    'provider_native_state',
+    "TEXT NOT NULL DEFAULT 'unknown' CHECK (provider_native_state IN ('unknown', 'valid', 'invalid'))",
+  );
   addColumnIfMissing(
     database,
     'runtime_delivery_lanes',
@@ -1062,6 +1162,87 @@ export function initializeRuntimePersistence(database) {
       ON runtime_outbox(status, next_attempt_at, priority, created_at);
     CREATE INDEX IF NOT EXISTS runtime_outbox_lane
       ON runtime_outbox(lane_key, aggregate_version, status);
+    CREATE INDEX IF NOT EXISTS runtime_reply_mapping_recovery_dispatch
+      ON runtime_reply_mapping_recoveries(state, created_at);
+    CREATE INDEX IF NOT EXISTS runtime_reply_mapping_recovery_source
+      ON runtime_reply_mapping_recoveries(source_platform_message_id, state);
+
+    DROP TRIGGER IF EXISTS runtime_bound_message_mapping_immutable;
+    CREATE TRIGGER runtime_bound_message_mapping_immutable
+    BEFORE UPDATE ON runtime_message_mappings
+    WHEN OLD.binding_state = 'bound'
+    BEGIN
+      SELECT RAISE(ABORT, 'bound reply mapping is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_bound_message_mapping_delete_immutable
+    BEFORE DELETE ON runtime_message_mappings
+    WHEN OLD.binding_state = 'bound'
+    BEGIN
+      SELECT RAISE(ABORT, 'bound reply mapping cannot be deleted');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_bound_recovery_turn_lineage_immutable
+    BEFORE UPDATE OF lineage_id ON runtime_turns
+    WHEN NEW.lineage_id IS NOT OLD.lineage_id AND EXISTS (
+      SELECT 1 FROM runtime_reply_mapping_recoveries AS recovery
+      WHERE recovery.turn_id = OLD.turn_id AND recovery.state = 'bound'
+        AND recovery.bound_lineage_id = OLD.lineage_id
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'bound recovery turn lineage is immutable');
+    END;
+
+    DROP TRIGGER IF EXISTS runtime_bound_delivery_lane_mapping_immutable;
+    CREATE TRIGGER runtime_bound_delivery_lane_mapping_immutable
+    BEFORE UPDATE OF mapping_json ON runtime_delivery_lanes
+    WHEN json_extract(OLD.mapping_json, '$.binding_state') = 'bound' AND (
+      json_extract(NEW.mapping_json, '$.conversation_id')
+        IS NOT json_extract(OLD.mapping_json, '$.conversation_id')
+      OR json_extract(NEW.mapping_json, '$.turn_id')
+        IS NOT json_extract(OLD.mapping_json, '$.turn_id')
+      OR json_extract(NEW.mapping_json, '$.lineage_id')
+        IS NOT json_extract(OLD.mapping_json, '$.lineage_id')
+      OR json_extract(NEW.mapping_json, '$.binding_state')
+        IS NOT json_extract(OLD.mapping_json, '$.binding_state')
+      OR json_extract(NEW.mapping_json, '$.reason')
+        IS NOT json_extract(OLD.mapping_json, '$.reason')
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'bound delivery lane mapping is immutable');
+    END;
+
+    DROP TRIGGER IF EXISTS runtime_bound_outbox_mapping_immutable;
+    CREATE TRIGGER runtime_bound_outbox_mapping_immutable
+    BEFORE UPDATE OF command_json ON runtime_outbox
+    WHEN json_extract(OLD.command_json, '$.mapping.binding_state') = 'bound' AND (
+      json_extract(NEW.command_json, '$.mapping.mapping_id')
+        IS NOT json_extract(OLD.command_json, '$.mapping.mapping_id')
+      OR json_extract(NEW.command_json, '$.mapping.lineage_id')
+        IS NOT json_extract(OLD.command_json, '$.mapping.lineage_id')
+      OR json_extract(NEW.command_json, '$.mapping.binding_state')
+        IS NOT json_extract(OLD.command_json, '$.mapping.binding_state')
+      OR json_extract(NEW.command_json, '$.mapping.mapping_version')
+        IS NOT json_extract(OLD.command_json, '$.mapping.mapping_version')
+      OR json_extract(NEW.command_json, '$.mapping.conversation_id')
+        IS NOT json_extract(OLD.command_json, '$.mapping.conversation_id')
+      OR json_extract(NEW.command_json, '$.mapping.turn_id')
+        IS NOT json_extract(OLD.command_json, '$.mapping.turn_id')
+      OR json_extract(NEW.command_json, '$.mapping.reason')
+        IS NOT json_extract(OLD.command_json, '$.mapping.reason')
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'bound outbox mapping is immutable');
+    END;
+
+    DROP TRIGGER IF EXISTS runtime_bound_reply_recovery_immutable;
+    CREATE TRIGGER runtime_bound_reply_recovery_immutable
+    BEFORE UPDATE ON runtime_reply_mapping_recoveries
+    WHEN OLD.state = 'bound'
+    BEGIN
+      SELECT RAISE(ABORT, 'bound reply recovery is immutable');
+    END;
+
     CREATE UNIQUE INDEX IF NOT EXISTS runtime_turns_one_redirect_per_turn
       ON runtime_turns(redirected_from_turn_id)
       WHERE redirected_from_turn_id IS NOT NULL;

@@ -8,6 +8,7 @@ import {
   createNormalizedEventStreamState,
   INTERACTION_ANSWER_SCHEMA_V1,
   resolveIdempotencyReplay,
+  resolveProvisionalMappingBinding,
   validateInteractionAnswer,
   validateInteractionAnswerAgainstRequest,
   validateInteractionAnswerResult,
@@ -44,7 +45,7 @@ const CANONICAL_TRANSITIONS = Object.freeze({
   ]),
   redirecting: Object.freeze(['interrupted']),
   waiting_user: Object.freeze(['running', 'recovering', 'stopped', 'timed_out', 'failed']),
-  recovering: Object.freeze(['running', 'waiting_user', 'stopped', 'failed', 'interrupted']),
+  recovering: Object.freeze(['starting', 'running', 'waiting_user', 'stopped', 'failed', 'interrupted']),
 });
 
 const TERMINAL_STATES = new Set([
@@ -134,6 +135,13 @@ function assertMainCardReplyMapping(database, answer, request, replyToMessageId)
     context.bot_id,
     replyToMessageId,
   );
+  const isPendingRecoveryReply = request.parent_type === 'recovery_control'
+    && request.lineage_id === null
+    && mapping?.binding_state === 'pending'
+    && mapping?.lineage_id === null
+    && mapping?.conversation_id === request.conversation_id
+    && mapping?.turn_id === request.turn_id;
+  if (isPendingRecoveryReply) return;
   if (
     !mapping
     || mapping.binding_state !== 'bound'
@@ -413,6 +421,149 @@ function transitionInTransaction(database, {
   return event;
 }
 
+function transitionAttemptlessInTransaction(database, {
+  turnId,
+  fromState,
+  toState,
+  occurredAt,
+  generateId,
+  reasonCode,
+  error = null,
+}) {
+  if (!CANONICAL_TRANSITIONS[fromState]?.includes(toState)) {
+    conflict('illegal_transition', `Canonical transition ${fromState} -> ${toState} is not allowed.`);
+  }
+  const turn = loadTurn(database, turnId);
+  if (
+    turn.state !== fromState
+    || turn.attempt_id !== null
+    || turn.attempt_no !== null
+    || turn.lease_epoch !== null
+  ) {
+    conflict('stale_attempt', 'The attemptless recovery transition lost its turn fence.');
+  }
+  const event = buildEvent({
+    turn,
+    lastEvent: loadLastEvent(database, turnId),
+    fence: null,
+    provider: null,
+    descriptor: {
+      kind: 'turn_state_changed',
+      phase: toState,
+      payload: {
+        from_state: fromState,
+        to_state: toState,
+        reason_code: reasonCode,
+      },
+      provider_native_id: null,
+      error,
+    },
+    occurredAt,
+    generateId,
+  });
+  const updated = database.prepare(`
+    UPDATE runtime_turns
+    SET state = ?, turn_version = ?, committed_at = ?
+    WHERE turn_id = ? AND state = ?
+      AND attempt_id IS NULL AND attempt_no IS NULL AND lease_epoch IS NULL
+  `).run(
+    toState,
+    event.turn_version,
+    event.persisted_at,
+    turn.turn_id,
+    fromState,
+  );
+  if (updated.changes !== 1) {
+    conflict('stale_attempt', 'The attemptless recovery transition changed concurrently.');
+  }
+  persistEvent(database, turn, event, generateId);
+  return event;
+}
+
+function appendAttemptlessEventInTransaction(database, {
+  turnId,
+  state,
+  descriptor,
+  occurredAt,
+  generateId,
+}) {
+  const turn = loadTurn(database, turnId);
+  if (
+    turn.state !== state
+    || turn.attempt_id !== null
+    || turn.attempt_no !== null
+    || turn.lease_epoch !== null
+  ) {
+    conflict('stale_attempt', 'The attemptless recovery event lost its turn fence.');
+  }
+  const event = buildEvent({
+    turn,
+    lastEvent: loadLastEvent(database, turnId),
+    fence: null,
+    provider: null,
+    descriptor,
+    occurredAt,
+    generateId,
+  });
+  const updated = database.prepare(`
+    UPDATE runtime_turns
+    SET turn_version = ?, committed_at = ?
+    WHERE turn_id = ? AND state = ? AND turn_version = ?
+      AND attempt_id IS NULL AND attempt_no IS NULL AND lease_epoch IS NULL
+  `).run(
+    event.turn_version,
+    event.persisted_at,
+    turn.turn_id,
+    state,
+    turn.turn_version,
+  );
+  if (updated.changes !== 1) {
+    conflict('stale_attempt', 'The attemptless recovery event changed concurrently.');
+  }
+  persistEvent(database, turn, event, generateId);
+  return event;
+}
+
+function persistInteractionLifecycleEventInTransaction(database, {
+  turn,
+  state,
+  descriptor,
+  fence,
+  provider,
+  occurredAt,
+  generateId,
+  staleMessage,
+}) {
+  if (turn.attempt_id === null) {
+    if (turn.lineage_id === null) return { turn_version: turn.turn_version };
+    return appendAttemptlessEventInTransaction(database, {
+      turnId: turn.turn_id,
+      state,
+      descriptor,
+      occurredAt,
+      generateId,
+    });
+  }
+  const event = buildEvent({
+    turn,
+    lastEvent: loadLastEvent(database, turn.turn_id),
+    fence,
+    provider,
+    descriptor,
+    occurredAt,
+    generateId,
+  });
+  commitTurnEvent(database, {
+    turn,
+    event,
+    fence,
+    nextState: state,
+    staleMessage,
+    generateId,
+  });
+  return event;
+}
+
 export function createExecutorStore({
   database,
   provider,
@@ -600,7 +751,21 @@ export function createExecutorStore({
       JOIN runtime_turns AS turn ON turn.turn_id = queue.turn_id
       JOIN runtime_conversations AS conversation
         ON conversation.conversation_id = turn.conversation_id
-      WHERE queue.status = 'queued' AND turn.state = 'queued'
+      WHERE queue.status = 'queued'
+        AND turn.lineage_id IS NOT NULL
+        AND (
+          turn.state = 'queued'
+          OR (
+            turn.state = 'recovering'
+            AND EXISTS (
+              SELECT 1
+              FROM runtime_reply_mapping_recoveries AS recovery
+              WHERE recovery.turn_id = turn.turn_id
+                AND recovery.state = 'bound'
+                AND recovery.bound_lineage_id = turn.lineage_id
+            )
+          )
+        )
         AND NOT EXISTS (
           SELECT 1
           FROM runtime_turn_queue AS earlier
@@ -622,6 +787,813 @@ export function createExecutorStore({
         )
       ORDER BY turn.created_at ASC, turn.conversation_id ASC, queue.queue_sequence ASC
     `).all();
+  }
+
+  function claimNextReplyMappingRecoveryNotice() {
+    const claim = database.transaction(() => {
+      const claimAt = now();
+      const existing = database.prepare(`
+        SELECT recovery.turn_id, recovery.notice_event_sequence,
+          queue.wait_reason,
+          EXISTS (
+            SELECT 1
+            FROM runtime_projection_snapshots AS projection
+            JOIN runtime_outbox AS outbox
+              ON outbox.outbox_id = projection.materialized_outbox_id
+            WHERE projection.turn_id = recovery.turn_id
+              AND projection.event_sequence_through >= recovery.notice_event_sequence
+              AND outbox.status = 'delivered'
+          ) AS notice_delivered
+        FROM runtime_reply_mapping_recoveries AS recovery
+        JOIN runtime_turns AS turn ON turn.turn_id = recovery.turn_id
+        JOIN runtime_turn_queue AS queue ON queue.turn_id = recovery.turn_id
+        WHERE recovery.state IN (
+            'notice_pending',
+            'native_recovery_claimed',
+            'native_recovery_not_applicable'
+          )
+          AND (
+            (recovery.state = 'notice_pending' AND turn.state = 'starting')
+            OR (
+              recovery.state IN ('native_recovery_claimed', 'native_recovery_not_applicable')
+              AND turn.state = 'recovering'
+            )
+          )
+          AND turn.lineage_id IS NULL
+          AND turn.attempt_id IS NULL AND turn.attempt_no IS NULL
+          AND turn.lease_epoch IS NULL
+          AND queue.status = 'claimed'
+          AND (
+            recovery.state = 'notice_pending'
+            OR recovery.native_recovery_claim_expires_at IS NULL
+            OR recovery.native_recovery_claim_expires_at <= ?
+          )
+        ORDER BY turn.created_at ASC, turn.conversation_id ASC,
+          queue.queue_sequence ASC
+        LIMIT 1
+      `).get(claimAt);
+      if (existing) {
+        return {
+          status: 'lineage_resolution_pending',
+          turn_id: existing.turn_id,
+          wait_reason: existing.wait_reason,
+          notice_event_sequence: existing.notice_event_sequence,
+          notice_delivered: existing.notice_delivered === 1,
+        };
+      }
+
+      const candidate = database.prepare(`
+        SELECT recovery.turn_id
+        FROM runtime_reply_mapping_recoveries AS recovery
+        JOIN runtime_turns AS turn ON turn.turn_id = recovery.turn_id
+        JOIN runtime_turn_queue AS queue ON queue.turn_id = recovery.turn_id
+        WHERE recovery.state = 'queued'
+          AND turn.state = 'queued' AND turn.lineage_id IS NULL
+          AND turn.attempt_id IS NULL AND turn.attempt_no IS NULL
+          AND turn.lease_epoch IS NULL
+          AND queue.status = 'queued'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM runtime_turn_queue AS earlier
+            WHERE earlier.conversation_id = queue.conversation_id
+              AND (
+                earlier.priority > queue.priority
+                OR (
+                  earlier.priority = queue.priority
+                  AND earlier.queue_sequence < queue.queue_sequence
+                )
+              )
+              AND earlier.status IN ('queued', 'claimed')
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM runtime_executor_leases AS lease
+            WHERE lease.conversation_id = queue.conversation_id
+              AND lease.lease_owner IS NOT NULL
+          )
+        ORDER BY turn.created_at ASC, turn.conversation_id ASC,
+          queue.priority DESC, queue.queue_sequence ASC
+        LIMIT 1
+      `).get();
+      if (!candidate) return null;
+
+      const claimedAt = now();
+      const queueUpdate = database.prepare(`
+        UPDATE runtime_turn_queue
+        SET status = 'claimed', wait_reason = 'reply_mapping_notice_delivery'
+        WHERE turn_id = ? AND status = 'queued'
+          AND wait_reason = 'lineage_resolution_pending'
+      `).run(candidate.turn_id);
+      if (queueUpdate.changes !== 1) {
+        conflict('stale_attempt', 'The reply-mapping recovery queue claim changed concurrently.');
+      }
+      const event = transitionAttemptlessInTransaction(database, {
+        turnId: candidate.turn_id,
+        fromState: 'queued',
+        toState: 'starting',
+        occurredAt: claimedAt,
+        generateId,
+        reasonCode: 'reply_mapping_recovery_notice',
+      });
+      const recoveryUpdate = database.prepare(`
+        UPDATE runtime_reply_mapping_recoveries
+        SET state = 'notice_pending', notice_event_sequence = ?, updated_at = ?
+        WHERE turn_id = ? AND state = 'queued' AND notice_event_sequence IS NULL
+      `).run(event.event_sequence, claimedAt, candidate.turn_id);
+      if (recoveryUpdate.changes !== 1) {
+        conflict('stale_attempt', 'The reply-mapping notice fence changed concurrently.');
+      }
+      return {
+        status: 'lineage_resolution_pending',
+        turn_id: candidate.turn_id,
+        wait_reason: 'reply_mapping_notice_delivery',
+        notice_event_sequence: event.event_sequence,
+        notice_delivered: false,
+      };
+    });
+    return claim.immediate();
+  }
+
+  function beginReplyMappingRecovery(turnId, { allowNativeRecovery }) {
+    const begin = database.transaction(() => {
+      const recovery = database.prepare(`
+        SELECT recovery.*, turn.conversation_id, turn.state AS turn_state,
+          turn.lineage_id AS turn_lineage_id, queue.status AS queue_status,
+          queue.wait_reason,
+          candidate.provider AS candidate_provider,
+          candidate.provider_native_id AS candidate_provider_native_id
+        FROM runtime_reply_mapping_recoveries AS recovery
+        JOIN runtime_turns AS turn ON turn.turn_id = recovery.turn_id
+        JOIN runtime_turn_queue AS queue ON queue.turn_id = recovery.turn_id
+        LEFT JOIN runtime_lineages AS candidate
+          ON candidate.lineage_id = recovery.candidate_lineage_id
+         AND candidate.conversation_id = turn.conversation_id
+        WHERE recovery.turn_id = ?
+      `).get(turnId);
+      if (!recovery) conflict('mapping_missing', `Reply-mapping recovery ${turnId} does not exist.`);
+      if (recovery.state === 'bound') {
+        return {
+          status: 'bound',
+          recovery_id: recovery.recovery_id,
+          turn_id: recovery.turn_id,
+          lineage_id: recovery.bound_lineage_id,
+        };
+      }
+      if (recovery.state === 'native_recovery_claimed') {
+        const claimedAt = now();
+        if (
+          recovery.native_recovery_owner_service_instance_id !== null
+          && recovery.native_recovery_claim_expires_at !== null
+          && recovery.native_recovery_claim_expires_at > claimedAt
+        ) {
+          return {
+            status: 'native_recovery_in_flight',
+            recovery_id: recovery.recovery_id,
+            turn_id: recovery.turn_id,
+            reason: recovery.reason,
+          };
+        }
+        const takeover = database.prepare(`
+          UPDATE runtime_reply_mapping_recoveries
+          SET native_recovery_owner_service_instance_id = ?,
+            native_recovery_claim_expires_at = ?, updated_at = ?
+          WHERE recovery_id = ? AND state = 'native_recovery_claimed'
+            AND native_recovery_attempt_id = ?
+            AND (
+              native_recovery_claim_expires_at IS NULL
+              OR native_recovery_claim_expires_at <= ?
+            )
+        `).run(
+          serviceInstanceId,
+          residentOwnerExpiresAt(claimedAt),
+          claimedAt,
+          recovery.recovery_id,
+          recovery.native_recovery_attempt_id,
+          claimedAt,
+        );
+        if (takeover.changes !== 1) {
+          conflict('stale_attempt', 'The native recovery ownership fence changed concurrently.');
+        }
+        return {
+          status: 'native_recovery_lost',
+          recovery_id: recovery.recovery_id,
+          turn_id: recovery.turn_id,
+          reason: recovery.reason,
+          candidate_lineage_id: recovery.candidate_lineage_id,
+          native_recovery_attempt_id: recovery.native_recovery_attempt_id,
+          native_recovery_attempt_no: 1,
+        };
+      }
+      if (recovery.state === 'native_recovery_not_applicable') {
+        const claimedAt = now();
+        if (
+          recovery.native_recovery_owner_service_instance_id !== null
+          && recovery.native_recovery_claim_expires_at !== null
+          && recovery.native_recovery_claim_expires_at > claimedAt
+        ) {
+          return {
+            status: 'native_recovery_in_flight',
+            recovery_id: recovery.recovery_id,
+            turn_id: recovery.turn_id,
+            reason: recovery.reason,
+          };
+        }
+        const takeover = database.prepare(`
+          UPDATE runtime_reply_mapping_recoveries
+          SET native_recovery_owner_service_instance_id = ?,
+            native_recovery_claim_expires_at = ?, updated_at = ?
+          WHERE recovery_id = ? AND state = 'native_recovery_not_applicable'
+            AND (
+              native_recovery_claim_expires_at IS NULL
+              OR native_recovery_claim_expires_at <= ?
+            )
+        `).run(
+          serviceInstanceId,
+          residentOwnerExpiresAt(claimedAt),
+          claimedAt,
+          recovery.recovery_id,
+          claimedAt,
+        );
+        if (takeover.changes !== 1) {
+          conflict('stale_attempt', 'The fallback recovery ownership fence changed concurrently.');
+        }
+        return {
+          status: 'native_recovery_not_applicable',
+          recovery_id: recovery.recovery_id,
+          turn_id: recovery.turn_id,
+          reason: recovery.reason,
+          candidate_lineage_id: recovery.candidate_lineage_id,
+          side_effect_status: recovery.side_effect_status,
+        };
+      }
+      if (recovery.state !== 'notice_pending') {
+        conflict('illegal_transition', `Reply-mapping recovery is ${recovery.state}.`);
+      }
+      const delivered = database.prepare(`
+        SELECT projection.materialized_outbox_id AS outbox_id
+        FROM runtime_projection_snapshots AS projection
+        JOIN runtime_outbox AS outbox
+          ON outbox.outbox_id = projection.materialized_outbox_id
+        WHERE projection.turn_id = ?
+          AND projection.event_sequence_through >= ?
+          AND outbox.status = 'delivered'
+        ORDER BY projection.event_sequence_through ASC
+        LIMIT 1
+      `).get(recovery.turn_id, recovery.notice_event_sequence);
+      if (!delivered) {
+        conflict(
+          'notification_pending',
+          'Reply-mapping recovery must wait for a delivered user notice.',
+        );
+      }
+      if (
+        recovery.turn_state !== 'starting'
+        || recovery.turn_lineage_id !== null
+        || recovery.queue_status !== 'claimed'
+      ) {
+        conflict('stale_attempt', 'The delivered reply-mapping notice lost its turn fence.');
+      }
+      const occurredAt = now();
+      transitionAttemptlessInTransaction(database, {
+        turnId: recovery.turn_id,
+        fromState: 'starting',
+        toState: 'recovering',
+        occurredAt,
+        generateId,
+        reasonCode: 'reply_mapping_recovery_started',
+      });
+      if (recovery.side_effect_status === 'unknown') {
+        const turn = loadTurn(database, recovery.turn_id);
+        const envelope = JSON.parse(turn.envelope_json);
+        if (envelope.actor?.authenticated !== true) {
+          conflict('authorization_denied', 'Recovery decisions require an authenticated actor.');
+        }
+        const interaction = {
+          contract: 'zylos.interaction-request',
+          contract_version: '1.0',
+          trace_id: envelope.trace_id,
+          interaction_id: generateId('interaction'),
+          conversation_id: recovery.conversation_id,
+          turn_id: recovery.turn_id,
+          lineage_id: null,
+          control_id: recovery.recovery_id,
+          parent_type: 'recovery_control',
+          tool_use_id: null,
+          ordinal: 1,
+          kind: 'recovery_decision',
+          prompt: 'Associated work may have unknown side effects. Continue with a new recovery lineage?',
+          choices: [
+            { choice_id: 'approve', label: 'Continue recovery' },
+            { choice_id: 'deny', label: 'Stop recovery' },
+          ],
+          authorized_subjects: [{
+            type: 'actor',
+            actor_id: envelope.actor.actor_id,
+          }],
+          allowed_sources: [
+            'main_card_reply',
+            ...(['feishu', 'lark'].includes(envelope.channel) ? ['card_action'] : []),
+          ],
+          runtime_fence: null,
+          state: 'pending',
+          version: 1,
+          handoff_state: 'not_started',
+          created_at: occurredAt,
+          expires_at: new Date(
+            Date.parse(occurredAt) + interactionTimeoutMs,
+          ).toISOString(),
+          card_delivery_id: null,
+        };
+        validateInteractionRequest(interaction, { occurredAt });
+        database.prepare(`
+          INSERT INTO runtime_interactions (
+            interaction_id, conversation_id, turn_id, lineage_id, parent_type, parent_id,
+            ordinal, state, version, handoff_state, handoff_version, request_json,
+            created_at, updated_at
+          ) VALUES (?, ?, ?, NULL, 'recovery_control', ?, 1, 'pending', 1,
+            'not_started', NULL, ?, ?, ?)
+        `).run(
+          interaction.interaction_id,
+          interaction.conversation_id,
+          interaction.turn_id,
+          interaction.control_id,
+          JSON.stringify(interaction),
+          occurredAt,
+          occurredAt,
+        );
+        appendAttemptlessEventInTransaction(database, {
+          turnId: recovery.turn_id,
+          state: 'recovering',
+          occurredAt,
+          generateId,
+          descriptor: {
+            kind: 'recovery_waiting_decision',
+            phase: 'recovering',
+            payload: {
+              recovery_id: recovery.recovery_id,
+              recovery_of_turn_id: null,
+              recovery_of_lineage_id: recovery.candidate_lineage_id,
+              side_effect_status: 'unknown',
+              interaction_id: interaction.interaction_id,
+              ordinal: interaction.ordinal,
+              interaction_version: interaction.version,
+              handoff_version: null,
+              kind: interaction.kind,
+              prompt: interaction.prompt,
+              choices: structuredClone(interaction.choices),
+              allowed_sources: [...interaction.allowed_sources],
+            },
+            error: createContractError({
+              code: 'side_effect_unknown',
+              category: 'provider',
+              retryable: false,
+              sideEffectStatus: 'unknown',
+              userMessage: 'Recovery is waiting for an authorized decision.',
+              occurredAt,
+            }),
+          },
+        });
+        database.prepare(`
+          UPDATE runtime_turn_queue
+          SET wait_reason = 'reply_mapping_recovery_decision'
+          WHERE turn_id = ? AND status = 'claimed'
+        `).run(recovery.turn_id);
+        database.prepare(`
+          UPDATE runtime_reply_mapping_recoveries
+          SET state = 'waiting_decision', updated_at = ?
+          WHERE recovery_id = ? AND state = 'notice_pending'
+        `).run(occurredAt, recovery.recovery_id);
+        return {
+          status: 'waiting_decision',
+          recovery_id: recovery.recovery_id,
+          turn_id: recovery.turn_id,
+          reason: recovery.reason,
+          side_effect_status: 'unknown',
+          interaction_id: interaction.interaction_id,
+        };
+      }
+
+      const canAttemptNative = allowNativeRecovery === true
+        && recovery.candidate_lineage_id !== null
+        && recovery.candidate_provider === provider
+        && recovery.candidate_provider_native_id !== null;
+      if (!canAttemptNative) {
+        const claimed = database.prepare(`
+          UPDATE runtime_reply_mapping_recoveries
+          SET state = 'native_recovery_not_applicable',
+            native_recovery_status = 'not_applicable',
+            native_recovery_owner_service_instance_id = ?,
+            native_recovery_claim_expires_at = ?, updated_at = ?
+          WHERE recovery_id = ? AND state = 'notice_pending'
+            AND native_recovery_attempt_count = 0
+        `).run(
+          serviceInstanceId,
+          residentOwnerExpiresAt(occurredAt),
+          occurredAt,
+          recovery.recovery_id,
+        );
+        if (claimed.changes !== 1) {
+          conflict('version_conflict', 'The fallback recovery claim changed concurrently.');
+        }
+        database.prepare(`
+          UPDATE runtime_turn_queue
+          SET wait_reason = 'reply_mapping_recovery_binding'
+          WHERE turn_id = ? AND status = 'claimed'
+        `).run(recovery.turn_id);
+        return {
+          status: 'native_recovery_not_applicable',
+          recovery_id: recovery.recovery_id,
+          turn_id: recovery.turn_id,
+          reason: recovery.reason,
+          candidate_lineage_id: recovery.candidate_lineage_id,
+          side_effect_status: recovery.side_effect_status,
+        };
+      }
+
+      const nativeRecoveryAttemptId = generateId('native-recovery-attempt');
+      const claimed = database.prepare(`
+        UPDATE runtime_reply_mapping_recoveries
+        SET state = 'native_recovery_claimed',
+          native_recovery_status = 'claimed',
+          native_recovery_attempt_count = 1,
+          native_recovery_attempt_id = ?,
+          native_recovery_owner_service_instance_id = ?,
+          native_recovery_claim_expires_at = ?, updated_at = ?
+        WHERE recovery_id = ? AND state = 'notice_pending'
+          AND native_recovery_attempt_count = 0
+      `).run(
+        nativeRecoveryAttemptId,
+        serviceInstanceId,
+        residentOwnerExpiresAt(occurredAt),
+        occurredAt,
+        recovery.recovery_id,
+      );
+      if (claimed.changes !== 1) {
+        conflict('version_conflict', 'The native reply-mapping recovery attempt was already claimed.');
+      }
+      database.prepare(`
+        UPDATE runtime_turn_queue
+        SET wait_reason = 'reply_mapping_native_recovery'
+        WHERE turn_id = ? AND status = 'claimed'
+      `).run(recovery.turn_id);
+      return {
+        status: 'native_recovery_claimed',
+        recovery_id: recovery.recovery_id,
+        turn_id: recovery.turn_id,
+        reason: recovery.reason,
+        side_effect_status: recovery.side_effect_status,
+        native_recovery_attempt_id: nativeRecoveryAttemptId,
+        native_recovery_attempt_no: 1,
+        candidate: {
+          lineage_id: recovery.candidate_lineage_id,
+          provider: recovery.candidate_provider,
+          provider_native_id: recovery.candidate_provider_native_id,
+        },
+      };
+    });
+    return begin.immediate();
+  }
+
+  function completeReplyMappingRecovery(claim, nativeResult) {
+    const complete = database.transaction(() => {
+      const completedAt = now();
+      const recovery = database.prepare(`
+        SELECT recovery.*, turn.conversation_id, turn.state AS turn_state,
+          turn.lineage_id AS turn_lineage_id
+        FROM runtime_reply_mapping_recoveries AS recovery
+        JOIN runtime_turns AS turn ON turn.turn_id = recovery.turn_id
+        WHERE recovery.recovery_id = ? AND recovery.turn_id = ?
+      `).get(claim?.recovery_id, claim?.turn_id);
+      if (!recovery) conflict('mapping_missing', 'The reply-mapping recovery claim is stale.');
+      if (recovery.state === 'bound') {
+        if (claim?.lineage_id === recovery.bound_lineage_id || claim?.lineage_id === undefined) {
+          return {
+            status: 'duplicate',
+            turn_id: recovery.turn_id,
+            lineage_id: recovery.bound_lineage_id,
+          };
+        }
+        conflict('version_conflict', 'A bound reply mapping cannot change lineage.');
+      }
+      if (
+        ['rejected', 'failed'].includes(recovery.state)
+        && ['cancelled', 'stopped', 'failed'].includes(recovery.turn_state)
+      ) {
+        return {
+          status: 'stopped',
+          recovery_id: recovery.recovery_id,
+          turn_id: recovery.turn_id,
+        };
+      }
+      if (
+        !['native_recovery_claimed', 'native_recovery_not_applicable'].includes(recovery.state)
+        || recovery.turn_state !== 'recovering'
+        || recovery.turn_lineage_id !== null
+      ) {
+        conflict('stale_attempt', 'The reply-mapping recovery lost its binding fence.');
+      }
+
+      if (recovery.native_recovery_owner_service_instance_id !== serviceInstanceId) {
+        conflict('stale_attempt', 'The reply-mapping recovery owner no longer matches this fence.');
+      }
+      if (
+        recovery.native_recovery_claim_expires_at === null
+        || recovery.native_recovery_claim_expires_at <= completedAt
+      ) {
+        conflict('stale_attempt', 'The reply-mapping recovery claim lease expired.');
+      }
+      if (
+        claim?.recovery_id !== recovery.recovery_id
+        || claim?.turn_id !== recovery.turn_id
+      ) {
+        conflict('stale_attempt', 'The reply-mapping recovery claim identity is stale.');
+      }
+
+      let nativeRecovered = false;
+      if (recovery.state === 'native_recovery_claimed') {
+        if (
+          claim?.native_recovery_attempt_id !== recovery.native_recovery_attempt_id
+          || claim?.native_recovery_attempt_no !== 1
+        ) {
+          conflict('stale_attempt', 'The native recovery claim attempt is stale.');
+        }
+        if (!['recovered', 'failed', 'lost'].includes(nativeResult?.status)) {
+          conflict('provider_context_invalid', 'Native recovery returned an invalid terminal status.');
+        }
+        if (
+          nativeResult.recovery_id !== recovery.recovery_id
+          || nativeResult.native_recovery_attempt_id !== recovery.native_recovery_attempt_id
+          || nativeResult.native_recovery_attempt_no !== 1
+        ) {
+          conflict('provider_context_invalid', 'Native recovery returned a mismatched attempt fence.');
+        }
+        if (nativeResult.status === 'recovered') {
+          if (
+            nativeResult.lineage_id !== recovery.candidate_lineage_id
+            || nativeResult.provider !== provider
+            || typeof nativeResult.provider_native_id !== 'string'
+            || nativeResult.provider_native_id.length === 0
+            || nativeResult.side_effect_status !== 'none'
+          ) {
+            conflict('provider_context_invalid', 'Native recovery returned a different lineage identity.');
+          }
+          nativeRecovered = true;
+        }
+      } else {
+        if (!['not_applicable', 'authorized_fallback'].includes(nativeResult?.status)) {
+          conflict('provider_context_invalid', 'Fallback recovery returned an invalid terminal status.');
+        }
+        if (nativeResult.recovery_id !== recovery.recovery_id) {
+          conflict('provider_context_invalid', 'Fallback recovery returned a mismatched recovery identity.');
+        }
+      }
+
+      let lineageId;
+      let recoveryProviderInput = null;
+      if (nativeRecovered) {
+        const candidate = database.prepare(`
+          SELECT lineage_id, provider, provider_native_id
+          FROM runtime_lineages
+          WHERE lineage_id = ? AND conversation_id = ?
+        `).get(recovery.candidate_lineage_id, recovery.conversation_id);
+        if (
+          !candidate
+          || candidate.provider !== nativeResult.provider
+          || candidate.provider_native_id !== nativeResult.provider_native_id
+        ) {
+          conflict('provider_context_invalid', 'Native recovery returned a different lineage identity.');
+        }
+        database.prepare(`
+          UPDATE runtime_lineages
+          SET provider_native_state = 'valid'
+          WHERE lineage_id = ? AND conversation_id = ?
+            AND provider = ? AND provider_native_id = ?
+        `).run(
+          candidate.lineage_id,
+          recovery.conversation_id,
+          nativeResult.provider,
+          nativeResult.provider_native_id,
+        );
+        lineageId = candidate.lineage_id;
+      } else {
+        lineageId = generateId('lineage');
+        database.prepare(`
+          INSERT INTO runtime_lineages (
+            lineage_id, conversation_id, lineage_kind, is_default, created_at,
+            recovery_of_lineage_id
+          ) VALUES (?, ?, 'recovery', 0, ?, ?)
+        `).run(
+          lineageId,
+          recovery.conversation_id,
+          completedAt,
+          recovery.candidate_lineage_id,
+        );
+        const recoveryTurn = database.prepare(`
+          SELECT turn.queue_sequence, inbound.envelope_json
+          FROM runtime_turns AS turn
+          JOIN runtime_inbound_events AS inbound
+            ON inbound.inbound_event_id = turn.inbound_event_id
+          WHERE turn.turn_id = ? AND turn.conversation_id = ?
+        `).get(recovery.turn_id, recovery.conversation_id);
+        const currentEnvelope = JSON.parse(recoveryTurn.envelope_json);
+        const priorRows = database.prepare(`
+          SELECT inbound.envelope_json
+          FROM runtime_turns AS turn
+          JOIN runtime_inbound_events AS inbound
+            ON inbound.inbound_event_id = turn.inbound_event_id
+          WHERE turn.conversation_id = ? AND turn.queue_sequence < ?
+          ORDER BY turn.queue_sequence DESC
+          LIMIT 6
+        `).all(recovery.conversation_id, recoveryTurn.queue_sequence).reverse();
+        const priorTexts = priorRows
+          .map(({ envelope_json: envelopeJson }) => JSON.parse(envelopeJson).content?.text)
+          .filter((text) => typeof text === 'string' && text.length > 0);
+        const currentText = currentEnvelope.content?.text ?? '';
+        const handoffText = [
+          '[Zylos recovery handoff]',
+          'The native provider lineage could not be recovered uniquely. Continue in this new lineage.',
+          'Existing Zylos memory and runtime instructions remain authoritative.',
+          ...(priorTexts.length > 0
+            ? ['Recent durable C4 context:', ...priorTexts.map((text) => `- ${text}`)]
+            : []),
+          'Current user request:',
+          currentText,
+        ].join('\n').slice(0, 16_000);
+        recoveryProviderInput = {
+          kind: 'text',
+          text: handoffText,
+          attachments: Array.isArray(currentEnvelope.content?.attachments)
+            ? structuredClone(currentEnvelope.content.attachments)
+            : [],
+        };
+      }
+
+      const lane = database.prepare(`
+        SELECT lane_key, mapping_json
+        FROM runtime_delivery_lanes
+        WHERE turn_id = ?
+      `).get(recovery.turn_id);
+      if (!lane) conflict('mapping_missing', 'The provisional delivery lane does not exist.');
+      const currentLaneMapping = JSON.parse(lane.mapping_json);
+      const binding = resolveProvisionalMappingBinding(currentLaneMapping, {
+        authority: 'core',
+        mapping_id: currentLaneMapping.mapping_id,
+        expected_mapping_version: currentLaneMapping.mapping_version,
+        lineage_id: lineageId,
+      }, { occurredAt: completedAt });
+      if (binding.status !== 'bound') {
+        conflict(binding.error?.code ?? 'version_conflict', binding.error?.user_message ?? 'Mapping binding failed.');
+      }
+
+      const messageRows = database.prepare(`
+        SELECT mapping_id, conversation_id, turn_id, lineage_id,
+          binding_state, mapping_version, reason
+        FROM runtime_message_mappings
+        WHERE turn_id = ? AND binding_state = 'pending' AND lineage_id IS NULL
+      `).all(recovery.turn_id);
+      if (messageRows.length === 0) {
+        conflict('notification_pending', 'No delivered provisional mapping is available to bind.');
+      }
+      for (const mapping of messageRows) {
+        const mapped = resolveProvisionalMappingBinding(mapping, {
+          authority: 'core',
+          mapping_id: mapping.mapping_id,
+          expected_mapping_version: mapping.mapping_version,
+          lineage_id: lineageId,
+        }, { occurredAt: completedAt });
+        if (mapped.status !== 'bound') {
+          conflict(mapped.error?.code ?? 'version_conflict', mapped.error?.user_message ?? 'Mapping binding failed.');
+        }
+        const updated = database.prepare(`
+          UPDATE runtime_message_mappings
+          SET lineage_id = ?, binding_state = 'bound', mapping_version = ?
+          WHERE mapping_id = ? AND lineage_id IS NULL
+            AND binding_state = 'pending' AND mapping_version = ?
+        `).run(
+          lineageId,
+          mapped.mapping.mapping_version,
+          mapping.mapping_id,
+          mapping.mapping_version,
+        );
+        if (updated.changes !== 1) {
+          conflict('version_conflict', 'A provisional platform mapping changed concurrently.');
+        }
+      }
+
+      const turnUpdate = database.prepare(`
+        UPDATE runtime_turns
+        SET lineage_id = ?, provider_input_json = ?, committed_at = ?
+        WHERE turn_id = ? AND state = 'recovering' AND lineage_id IS NULL
+          AND provider_input_json IS NULL
+          AND attempt_id IS NULL AND attempt_no IS NULL AND lease_epoch IS NULL
+      `).run(
+        lineageId,
+        recoveryProviderInput === null ? null : JSON.stringify(recoveryProviderInput),
+        completedAt,
+        recovery.turn_id,
+      );
+      const laneUpdate = database.prepare(`
+        UPDATE runtime_delivery_lanes
+        SET mapping_json = ?, updated_at = ?
+        WHERE lane_key = ? AND mapping_json = ?
+      `).run(
+        JSON.stringify(binding.mapping),
+        completedAt,
+        lane.lane_key,
+        lane.mapping_json,
+      );
+      if (turnUpdate.changes !== 1 || laneUpdate.changes !== 1) {
+        conflict('version_conflict', 'The provisional turn or delivery projection changed concurrently.');
+      }
+
+      appendAttemptlessEventInTransaction(database, {
+        turnId: recovery.turn_id,
+        state: 'recovering',
+        occurredAt: completedAt,
+        generateId,
+        descriptor: {
+          kind: 'recovery_finished',
+          phase: 'recovering',
+          payload: {
+            recovery_id: recovery.recovery_id,
+            recovery_of_turn_id: null,
+            recovery_of_lineage_id: recovery.candidate_lineage_id,
+            side_effect_status: recovery.side_effect_status,
+          },
+        },
+      });
+
+      const pendingCommands = database.prepare(`
+        SELECT outbox_id, command_json
+        FROM runtime_outbox
+        WHERE turn_id = ? AND status IN ('pending', 'retry_wait')
+      `).all(recovery.turn_id);
+      for (const row of pendingCommands) {
+        const command = JSON.parse(row.command_json);
+        if (command.mapping?.binding_state !== 'pending') continue;
+        const commandBinding = resolveProvisionalMappingBinding(command.mapping, {
+          authority: 'core',
+          mapping_id: command.mapping.mapping_id,
+          expected_mapping_version: command.mapping.mapping_version,
+          lineage_id: lineageId,
+        }, { occurredAt: completedAt });
+        if (commandBinding.status !== 'bound') {
+          conflict(
+            commandBinding.error?.code ?? 'version_conflict',
+            commandBinding.error?.user_message ?? 'Pending delivery binding failed.',
+          );
+        }
+        const nextCommand = { ...command, mapping: commandBinding.mapping };
+        validateDeliveryCommand(nextCommand, { occurredAt: completedAt });
+        const updated = database.prepare(`
+          UPDATE runtime_outbox
+          SET command_json = ?, updated_at = ?
+          WHERE outbox_id = ? AND command_json = ?
+            AND status IN ('pending', 'retry_wait')
+        `).run(JSON.stringify(nextCommand), completedAt, row.outbox_id, row.command_json);
+        if (updated.changes !== 1) {
+          conflict('version_conflict', 'A pending delivery projection changed concurrently.');
+        }
+      }
+
+      const recoveryUpdate = database.prepare(`
+        UPDATE runtime_reply_mapping_recoveries
+        SET state = 'bound', bound_lineage_id = ?,
+          native_recovery_status = ?, native_recovery_result_json = ?, updated_at = ?
+        WHERE recovery_id = ? AND state = ? AND bound_lineage_id IS NULL
+          AND native_recovery_owner_service_instance_id = ?
+          AND native_recovery_claim_expires_at > ?
+      `).run(
+        lineageId,
+        nativeRecovered
+          ? 'recovered'
+          : (recovery.state === 'native_recovery_claimed'
+            ? (nativeResult?.status ?? 'failed')
+            : (recovery.native_recovery_status ?? 'not_applicable')),
+        JSON.stringify(nativeResult ?? { status: 'not_applicable' }),
+        completedAt,
+        recovery.recovery_id,
+        recovery.state,
+        serviceInstanceId,
+        completedAt,
+      );
+      const queueUpdate = database.prepare(`
+        UPDATE runtime_turn_queue
+        SET status = 'queued', wait_reason = NULL
+        WHERE turn_id = ? AND status = 'claimed'
+      `).run(recovery.turn_id);
+      if (recoveryUpdate.changes !== 1 || queueUpdate.changes !== 1) {
+        conflict('version_conflict', 'The reply-mapping binding lost its recovery queue fence.');
+      }
+      return {
+        status: 'bound',
+        recovery_id: recovery.recovery_id,
+        turn_id: recovery.turn_id,
+        lineage_id: lineageId,
+        native_recovery_status: nativeRecovered ? 'recovered' : 'fallback_created',
+      };
+    });
+    return complete.immediate();
   }
 
   function markCapacityWaitInTransaction(turnId, occurredAt) {
@@ -691,14 +1663,22 @@ export function createExecutorStore({
   }
 
   function heartbeatOwnedResidents() {
-    if (provider !== 'claude') return 0;
     const heartbeatAt = now();
-    const heartbeat = database.prepare(`
-      UPDATE runtime_executor_residents
-      SET owner_expires_at = ?
-      WHERE provider = 'claude' AND owner_service_instance_id = ?
-    `).run(residentOwnerExpiresAt(heartbeatAt), serviceInstanceId);
-    return heartbeat.changes;
+    const expiresAt = residentOwnerExpiresAt(heartbeatAt);
+    const residentHeartbeat = provider === 'claude'
+      ? database.prepare(`
+        UPDATE runtime_executor_residents
+        SET owner_expires_at = ?
+        WHERE provider = 'claude' AND owner_service_instance_id = ?
+      `).run(expiresAt, serviceInstanceId).changes
+      : 0;
+    const recoveryHeartbeat = database.prepare(`
+      UPDATE runtime_reply_mapping_recoveries
+      SET native_recovery_claim_expires_at = ?, updated_at = ?
+      WHERE state IN ('native_recovery_claimed', 'native_recovery_not_applicable')
+        AND native_recovery_owner_service_instance_id = ?
+    `).run(expiresAt, heartbeatAt, serviceInstanceId).changes;
+    return residentHeartbeat + recoveryHeartbeat;
   }
 
   function reconcileExpiredResidents() {
@@ -861,7 +1841,21 @@ export function createExecutorStore({
         SELECT turn.turn_id
         FROM runtime_turn_queue AS queue
         JOIN runtime_turns AS turn ON turn.turn_id = queue.turn_id
-        WHERE queue.status = 'queued' AND turn.state = 'queued'
+        WHERE queue.status = 'queued'
+          AND turn.lineage_id IS NOT NULL
+          AND (
+            turn.state = 'queued'
+            OR (
+              turn.state = 'recovering'
+              AND EXISTS (
+                SELECT 1
+                FROM runtime_reply_mapping_recoveries AS recovery
+                WHERE recovery.turn_id = turn.turn_id
+                  AND recovery.state = 'bound'
+                  AND recovery.bound_lineage_id = turn.lineage_id
+              )
+            )
+          )
           AND (? IS NULL OR queue.conversation_id = ?)
           AND NOT EXISTS (
             SELECT 1
@@ -952,12 +1946,13 @@ export function createExecutorStore({
       const turnUpdate = database.prepare(`
         UPDATE runtime_turns
         SET attempt_id = ?, attempt_no = ?, lease_epoch = ?
-        WHERE turn_id = ? AND state = 'queued' AND attempt_id IS NULL
+        WHERE turn_id = ? AND state = ? AND attempt_id IS NULL
       `).run(
         fence.attempt_id,
         fence.attempt_no,
         fence.lease_epoch,
         current.turn_id,
+        current.state,
       );
       const queueUpdate = database.prepare(`
         UPDATE runtime_turn_queue
@@ -969,7 +1964,7 @@ export function createExecutorStore({
       }
       transitionInTransaction(database, {
         turnId: current.turn_id,
-        fromState: 'queued',
+        fromState: current.state,
         toState: 'starting',
         fence,
         provider,
@@ -1332,7 +2327,7 @@ export function createExecutorStore({
       if (toState === 'stopped') {
         turn = settleBlockingInteractionsForStop(turnContext, turn, occurredAt);
       }
-      return transitionInTransaction(database, {
+      const event = transitionInTransaction(database, {
         turnId: turnContext.turn_id,
         fromState,
         toState,
@@ -1344,6 +2339,15 @@ export function createExecutorStore({
         error,
         reasonCode: reasonCode ?? undefined,
       });
+      if (toState === 'failed' && error?.code === 'provider_context_invalid') {
+        database.prepare(`
+          UPDATE runtime_lineages
+          SET provider_native_state = 'invalid'
+          WHERE lineage_id = ? AND conversation_id = ?
+            AND provider = ? AND provider_native_id IS NOT NULL
+        `).run(turn.lineage_id, turn.conversation_id, provider);
+      }
+      return event;
     });
     return transition.immediate();
   }
@@ -2400,6 +3404,16 @@ export function createExecutorStore({
     if (turnUpdate.changes !== 1 || queueUpdate.changes !== 1) {
       conflict('version_conflict', 'The stop cutoff lost a queued turn compare-and-swap.');
     }
+    const recoveryUpdate = database.prepare(`
+      UPDATE runtime_reply_mapping_recoveries
+      SET state = 'rejected', native_recovery_status = 'stopped',
+        native_recovery_owner_service_instance_id = NULL,
+        native_recovery_claim_expires_at = NULL, updated_at = ?
+      WHERE turn_id = ? AND state = 'queued' AND bound_lineage_id IS NULL
+    `).run(cancelledAt, turn.turn_id);
+    if (turn.lineage_id === null && recoveryUpdate.changes !== 1) {
+      conflict('version_conflict', 'The stop cutoff lost its queued recovery fence.');
+    }
     persistEvent(database, turn, event, generateId);
     return event;
   }
@@ -2494,6 +3508,7 @@ export function createExecutorStore({
         LIMIT 1
       `).get(conversationId);
       let activeTurn = null;
+      let attemptlessRecoveryStopped = false;
       let steering = null;
       let activeSteerUpdate = null;
       if (activeRow) {
@@ -2508,7 +3523,86 @@ export function createExecutorStore({
             lease_epoch: turn.lease_epoch,
           },
         };
-        if (previousState === 'redirecting') {
+        const attemptlessRecovery = turn.lineage_id === null
+          && turn.attempt_id === null
+          && database.prepare(`
+            SELECT 1
+            FROM runtime_reply_mapping_recoveries
+            WHERE turn_id = ?
+              AND state IN (
+                'notice_pending', 'native_recovery_claimed',
+                'native_recovery_not_applicable', 'waiting_decision'
+              )
+              AND bound_lineage_id IS NULL
+          `).get(turn.turn_id) !== undefined;
+        if (attemptlessRecovery) {
+          const interactionRows = database.prepare(`
+            SELECT interaction_id, state, version, request_json
+            FROM runtime_interactions
+            WHERE turn_id = ? AND parent_type = 'recovery_control'
+              AND state = 'pending'
+          `).all(turn.turn_id);
+          for (const interaction of interactionRows) {
+            const request = JSON.parse(interaction.request_json);
+            const cancelledRequest = {
+              ...request,
+              state: 'cancelled',
+              version: request.version + 1,
+            };
+            validateInteractionRequest(cancelledRequest, { occurredAt: stoppedAt });
+            const cancelled = database.prepare(`
+              UPDATE runtime_interactions
+              SET state = 'cancelled', version = ?, request_json = ?, updated_at = ?
+              WHERE interaction_id = ? AND state = 'pending' AND version = ?
+            `).run(
+              cancelledRequest.version,
+              JSON.stringify(cancelledRequest),
+              stoppedAt,
+              interaction.interaction_id,
+              interaction.version,
+            );
+            if (cancelled.changes !== 1) {
+              conflict('version_conflict', 'The stop lost its recovery decision fence.');
+            }
+          }
+          const terminalEvent = transitionAttemptlessInTransaction(database, {
+            turnId: turn.turn_id,
+            fromState: previousState,
+            toState: 'stopped',
+            occurredAt: stoppedAt,
+            generateId,
+            reasonCode: 'conversation_stopped',
+          });
+          const queueUpdate = database.prepare(`
+            UPDATE runtime_turn_queue
+            SET status = 'stopped', wait_reason = NULL
+            WHERE turn_id = ? AND status = 'claimed'
+          `).run(turn.turn_id);
+          const recoveryUpdate = database.prepare(`
+            UPDATE runtime_reply_mapping_recoveries
+            SET state = 'rejected', native_recovery_status = 'stopped',
+              native_recovery_owner_service_instance_id = NULL,
+              native_recovery_claim_expires_at = NULL, updated_at = ?
+            WHERE turn_id = ?
+              AND state IN (
+                'notice_pending', 'native_recovery_claimed',
+                'native_recovery_not_applicable', 'waiting_decision'
+              )
+              AND bound_lineage_id IS NULL
+          `).run(stoppedAt, turn.turn_id);
+          if (queueUpdate.changes !== 1 || recoveryUpdate.changes !== 1) {
+            conflict('version_conflict', 'The stop lost its active recovery fence.');
+          }
+          activeTurn = {
+            turn_id: turn.turn_id,
+            previous_state: previousState,
+            previous_version: turn.turn_version,
+            state: 'stopped',
+            turn_version: terminalEvent.turn_version,
+            attempt: { ...turnContext.attempt },
+          };
+          attemptlessRecoveryStopped = true;
+        } else if (previousState === 'redirecting') {
           const steerRow = database.prepare(`
             SELECT steer_id, stop_barrier_id, result_json
             FROM runtime_steer_controls
@@ -2643,8 +3737,10 @@ export function createExecutorStore({
         active_turn: activeTurn,
         cancelled_turn_ids: cancelledTurnIds,
         steering,
-        provider_stop_status: activeTurn?.state === 'stopped' ? 'pending' : 'not_applicable',
-        lease_released: activeTurn === null,
+        provider_stop_status: activeTurn?.state === 'stopped' && !attemptlessRecoveryStopped
+          ? 'pending'
+          : 'not_applicable',
+        lease_released: activeTurn === null || attemptlessRecoveryStopped,
         provider_stop_updated_at: stoppedAt,
         committed_at: stoppedAt,
         deduplicated: false,
@@ -2875,6 +3971,17 @@ export function createExecutorStore({
       }
       if (turn.provider !== null || turn.provider_native_id !== null) {
         if (turn.provider === provider && turn.provider_native_id === providerNativeId) {
+          database.prepare(`
+            UPDATE runtime_lineages
+            SET provider_native_state = 'valid'
+            WHERE lineage_id = ? AND conversation_id = ?
+              AND provider = ? AND provider_native_id = ?
+          `).run(
+            turn.lineage_id,
+            turn.conversation_id,
+            provider,
+            providerNativeId,
+          );
           return Object.freeze({
             provider,
             provider_native_id: providerNativeId,
@@ -2889,7 +3996,8 @@ export function createExecutorStore({
       const boundAt = now();
       const updated = database.prepare(`
         UPDATE runtime_lineages
-        SET provider = ?, provider_native_id = ?, provider_native_id_bound_at = ?
+        SET provider = ?, provider_native_id = ?, provider_native_id_bound_at = ?,
+          provider_native_state = 'valid'
         WHERE lineage_id = ? AND conversation_id = ?
           AND provider IS NULL AND provider_native_id IS NULL
       `).run(
@@ -3367,12 +4475,7 @@ export function createExecutorStore({
         committedAt,
       );
 
-      const event = buildEvent({
-        turn,
-        lastEvent: loadLastEvent(database, turn.turn_id),
-        fence,
-        provider,
-        descriptor: {
+      const eventDescriptor = {
           kind: 'interaction_answer_committed',
           phase: expectedTurnState,
           payload: {
@@ -3381,17 +4484,16 @@ export function createExecutorStore({
             interaction_version: updatedRequest.version,
             handoff_version: 1,
           },
-        },
+        };
+      const event = persistInteractionLifecycleEventInTransaction(database, {
+        turn,
+        state: expectedTurnState,
+        descriptor: eventDescriptor,
+        fence,
+        provider,
         occurredAt: committedAt,
         generateId,
-      });
-      commitTurnEvent(database, {
-        turn,
-        event,
-        fence,
-        nextState: expectedTurnState,
         staleMessage: 'The interaction answer commit lost its turn fence.',
-        generateId,
       });
       const result = {
         contract: 'zylos.interaction-answer-result',
@@ -3569,6 +4671,52 @@ export function createExecutorStore({
         userMessage: 'The interaction expired before an answer was committed.',
         occurredAt: expiredAt,
       });
+      const replyMappingRecovery = !isProviderInteraction
+        ? database.prepare(`
+          SELECT recovery_id
+          FROM runtime_reply_mapping_recoveries
+          WHERE recovery_id = ? AND turn_id = ? AND state = 'waiting_decision'
+            AND bound_lineage_id IS NULL
+        `).get(request.control_id, request.turn_id)
+        : null;
+      if (replyMappingRecovery) {
+        const recoveryUpdate = database.prepare(`
+          UPDATE runtime_reply_mapping_recoveries
+          SET state = 'rejected', native_recovery_status = 'expired', updated_at = ?
+          WHERE recovery_id = ? AND state = 'waiting_decision'
+            AND bound_lineage_id IS NULL
+        `).run(expiredAt, replyMappingRecovery.recovery_id);
+        if (recoveryUpdate.changes !== 1) {
+          conflict('version_conflict', 'The expired recovery decision changed concurrently.');
+        }
+        const terminalEvent = transitionAttemptlessInTransaction(database, {
+          turnId: request.turn_id,
+          fromState: 'recovering',
+          toState: 'stopped',
+          occurredAt: expiredAt,
+          generateId,
+          reasonCode: 'reply_mapping_recovery_decision_expired',
+        });
+        const queueUpdate = database.prepare(`
+          UPDATE runtime_turn_queue
+          SET status = 'stopped', wait_reason = NULL
+          WHERE turn_id = ? AND status = 'claimed'
+            AND wait_reason = 'reply_mapping_recovery_decision'
+        `).run(request.turn_id);
+        if (queueUpdate.changes !== 1) {
+          conflict('stale_attempt', 'The expired recovery decision lost its queue fence.');
+        }
+        return {
+          status: 'expired',
+          newly_expired: true,
+          interaction_id: request.interaction_id,
+          interaction_version: updatedRequest.version,
+          turn_id: request.turn_id,
+          turn_state: 'stopped',
+          turn_version: terminalEvent.turn_version,
+          attempt: fence,
+        };
+      }
       const expirationEvent = buildEvent({
         turn,
         lastEvent: loadLastEvent(database, turn.turn_id),
@@ -4162,12 +5310,7 @@ export function createExecutorStore({
         'The interaction handoff claim lost its state/version fence.',
       );
 
-      const event = buildEvent({
-        turn,
-        lastEvent: loadLastEvent(database, turn.turn_id),
-        fence,
-        provider,
-        descriptor: {
+      const eventDescriptor = {
           kind: 'interaction_answer_handoff_started',
           phase: expectedTurnState,
           payload: {
@@ -4176,17 +5319,16 @@ export function createExecutorStore({
             interaction_version: updatedRequest.version,
             handoff_version: nextHandoffVersion,
           },
-        },
+        };
+      persistInteractionLifecycleEventInTransaction(database, {
+        turn,
+        state: expectedTurnState,
+        descriptor: eventDescriptor,
+        fence,
+        provider,
         occurredAt: claimedAt,
         generateId,
-      });
-      commitTurnEvent(database, {
-        turn,
-        event,
-        fence,
-        nextState: expectedTurnState,
         staleMessage: 'The interaction handoff claim lost its durable turn fence.',
-        generateId,
       });
       return {
         request: updatedRequest,
@@ -4891,12 +6033,7 @@ export function createExecutorStore({
       const currentPhase = isProviderHandoff
         ? (remainsBlocked ? 'waiting_user' : 'running')
         : 'recovering';
-      const event = buildEvent({
-        turn: currentTurn,
-        lastEvent: loadLastEvent(database, turn.turn_id),
-        fence,
-        provider,
-        descriptor: {
+      const eventDescriptor = {
           kind: 'interaction_answered',
           phase: currentPhase,
           payload: {
@@ -4907,17 +6044,16 @@ export function createExecutorStore({
             state: 'answered',
             handoff_state: 'accepted',
           },
-        },
+        };
+      const event = persistInteractionLifecycleEventInTransaction(database, {
+        turn: currentTurn,
+        state: currentPhase,
+        descriptor: eventDescriptor,
+        fence,
+        provider,
         occurredAt: acknowledgedAt,
         generateId,
-      });
-      commitTurnEvent(database, {
-        turn: currentTurn,
-        event,
-        fence,
-        nextState: currentPhase,
         staleMessage: 'The handler acknowledgement lost its durable turn fence.',
-        generateId,
       });
       return {
         status: acknowledgement.status,
@@ -4961,7 +6097,95 @@ export function createExecutorStore({
         handoff_attempt_no: sendingDelivery.handoff.handoff_attempt_no,
         lease_epoch: null,
       });
-      return { acknowledgement, sendingDelivery };
+      const replyMappingRecovery = database.prepare(`
+        SELECT recovery_id, turn_id, state
+        FROM runtime_reply_mapping_recoveries
+        WHERE recovery_id = ? AND turn_id = ?
+      `).get(
+        delivery.request.control_id,
+        delivery.request.turn_id,
+      );
+      let recoveryResolution = null;
+      if (replyMappingRecovery) {
+        if (
+          delivery.request.kind !== 'recovery_decision'
+          || replyMappingRecovery.state !== 'waiting_decision'
+        ) {
+          conflict('stale_attempt', 'The reply-mapping recovery decision lost its recovery fence.');
+        }
+        const decision = delivery.answer.value?.kind === 'decision'
+          ? delivery.answer.value.decision
+          : delivery.answer.value?.choice_id;
+        if (!['approve', 'deny'].includes(decision)) {
+          conflict('provider_context_invalid', 'A recovery decision must approve or deny.');
+        }
+        const decidedAt = now();
+        if (decision === 'deny') {
+          const recoveryUpdate = database.prepare(`
+            UPDATE runtime_reply_mapping_recoveries
+            SET state = 'rejected', native_recovery_status = 'rejected', updated_at = ?
+            WHERE recovery_id = ? AND state = 'waiting_decision'
+              AND bound_lineage_id IS NULL
+          `).run(decidedAt, replyMappingRecovery.recovery_id);
+          if (recoveryUpdate.changes !== 1) {
+            conflict('version_conflict', 'The recovery rejection changed concurrently.');
+          }
+          transitionAttemptlessInTransaction(database, {
+            turnId: replyMappingRecovery.turn_id,
+            fromState: 'recovering',
+            toState: 'stopped',
+            occurredAt: decidedAt,
+            generateId,
+            reasonCode: 'reply_mapping_recovery_rejected',
+          });
+          const queueUpdate = database.prepare(`
+            UPDATE runtime_turn_queue
+            SET status = 'stopped', wait_reason = NULL
+            WHERE turn_id = ? AND status = 'claimed'
+          `).run(replyMappingRecovery.turn_id);
+          if (queueUpdate.changes !== 1) {
+            conflict('stale_attempt', 'The recovery rejection lost its queue fence.');
+          }
+          recoveryResolution = {
+            status: 'rejected',
+            recovery_id: replyMappingRecovery.recovery_id,
+            turn_id: replyMappingRecovery.turn_id,
+          };
+        } else {
+          const recoveryUpdate = database.prepare(`
+            UPDATE runtime_reply_mapping_recoveries
+            SET state = 'native_recovery_not_applicable',
+              native_recovery_status = 'authorized_fallback',
+              native_recovery_owner_service_instance_id = ?,
+              native_recovery_claim_expires_at = ?, updated_at = ?
+            WHERE recovery_id = ? AND state = 'waiting_decision'
+              AND native_recovery_attempt_count = 0 AND bound_lineage_id IS NULL
+          `).run(
+            serviceInstanceId,
+            residentOwnerExpiresAt(decidedAt),
+            decidedAt,
+            replyMappingRecovery.recovery_id,
+          );
+          const queueUpdate = database.prepare(`
+            UPDATE runtime_turn_queue
+            SET wait_reason = 'reply_mapping_recovery_binding'
+            WHERE turn_id = ? AND status = 'claimed'
+              AND wait_reason = 'reply_mapping_recovery_decision'
+          `).run(replyMappingRecovery.turn_id);
+          if (recoveryUpdate.changes !== 1 || queueUpdate.changes !== 1) {
+            conflict('version_conflict', 'The recovery confirmation lost its decision fence.');
+          }
+          recoveryResolution = completeReplyMappingRecovery({
+            recovery_id: replyMappingRecovery.recovery_id,
+            turn_id: replyMappingRecovery.turn_id,
+          }, {
+            status: 'authorized_fallback',
+            recovery_id: replyMappingRecovery.recovery_id,
+            side_effect_status: 'unknown',
+          });
+        }
+      }
+      return { acknowledgement, sendingDelivery, recovery_resolution: recoveryResolution };
     });
     return complete.immediate();
   }
@@ -4972,8 +6196,8 @@ export function createExecutorStore({
       if (delivery.request.parent_type !== 'recovery_control') {
         return { acknowledgement: null, delivery };
       }
-      const { acknowledgement } = completeRecoveryControlHandoff(delivery);
-      return { acknowledgement, delivery: null };
+      const completed = completeRecoveryControlHandoff(delivery);
+      return { ...completed, delivery: null };
     });
     return begin.immediate();
   }
@@ -5943,11 +7167,14 @@ export function createExecutorStore({
     assertCurrentFence,
     beginSteer,
     beginInteractionHandoff,
+    beginReplyMappingRecovery,
     bindProviderNativeId,
+    claimNextReplyMappingRecoveryNotice,
     claimNextQueuedTurn,
     claimInteractionHandoff,
     completeSteer,
     commitInteractionAnswer,
+    completeReplyMappingRecovery,
     markProviderFailure,
     markProviderStopUnknown,
     heartbeatOwnedResidents,

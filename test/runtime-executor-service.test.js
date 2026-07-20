@@ -1551,6 +1551,14 @@ describe('runtime executor service', () => {
         lineage_id, conversation_id, lineage_kind, is_default, created_at
       ) VALUES (?, ?, 'normal', 0, ?)
     `).run(alternateLineageId, first.conversation_id, first.committed_at);
+    const historical = acceptNormalInbound(database, normalEnvelope('fifo-historical'), {
+      now: () => '2026-07-19T07:10:00.500Z',
+      generateId: deterministicIds('inbound-fifo-historical'),
+    });
+    database.prepare(`
+      UPDATE runtime_turns SET lineage_id = ?, state = 'completed' WHERE turn_id = ?
+    `).run(alternateLineageId, historical.turn_id);
+    database.prepare('DELETE FROM runtime_turn_queue WHERE turn_id = ?').run(historical.turn_id);
     database.prepare(`
       INSERT INTO runtime_message_mappings (
         region, tenant_id, channel, bot_id, platform_message_id,
@@ -1564,7 +1572,7 @@ describe('runtime executor service', () => {
       firstEnvelope.bot_id,
       'model-message-fifo-alternate',
       first.conversation_id,
-      first.turn_id,
+      historical.turn_id,
       alternateLineageId,
       'mapping-fifo-alternate',
       first.committed_at,

@@ -433,6 +433,11 @@ describe('acceptNormalInbound', () => {
       ) VALUES (?, ?, 'normal', 0, ?)
     `).run(alternateLineageId, first.conversation_id, first.committed_at);
     database.prepare(`
+      UPDATE runtime_turns
+      SET lineage_id = ?
+      WHERE turn_id = ?
+    `).run(alternateLineageId, first.turn_id);
+    database.prepare(`
       INSERT INTO runtime_message_mappings (
         region, tenant_id, channel, bot_id, platform_message_id,
         conversation_id, turn_id, lineage_id, binding_state, reason,

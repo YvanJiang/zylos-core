@@ -1139,6 +1139,19 @@ describe('Claude conversation executor', () => {
         lineage_id, conversation_id, lineage_kind, is_default, created_at
       ) VALUES (?, ?, 'normal', 0, ?)
     `).run(alternateLineageId, first.conversation_id, first.committed_at);
+    const historical = acceptNormalInbound(
+      database,
+      normalEnvelope('claude-lineage-historical'),
+      {
+        now: () => '2026-07-19T09:01:30.500Z',
+        generateId: deterministicIds('inbound-claude-lineage-historical'),
+      },
+    );
+    database.prepare(`
+      UPDATE runtime_turns SET lineage_id = ?, state = 'completed' WHERE turn_id = ?
+    `).run(alternateLineageId, historical.turn_id);
+    database.prepare('DELETE FROM runtime_turn_queue WHERE turn_id = ?')
+      .run(historical.turn_id);
     database.prepare(`
       INSERT INTO runtime_message_mappings (
         region, tenant_id, channel, bot_id, platform_message_id,
@@ -1152,7 +1165,7 @@ describe('Claude conversation executor', () => {
       firstEnvelope.bot_id,
       'model-message-claude-alternate',
       first.conversation_id,
-      first.turn_id,
+      historical.turn_id,
       alternateLineageId,
       'mapping-claude-alternate',
       first.committed_at,
