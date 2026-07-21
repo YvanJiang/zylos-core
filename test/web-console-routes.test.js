@@ -549,9 +549,11 @@ describe('web-console attachment routes', () => {
     coreDb.close();
 
     const mailboxDb = new Database(path.join(ctx.root, 'web-console', 'web-console.db'));
-    new DeliveryMailbox(mailboxDb, {
+    const mailbox = new DeliveryMailbox(mailboxDb, {
       region: 'global', tenantId: 'default', botId: 'zylos',
-    }).projectInbound({
+    });
+    const scopedFirstDeliveryId = `scope:${mailbox.scopeKey}:${firstDeliveryId}`;
+    mailbox.projectInbound({
       inboundEventId: 'identity-first-inbound', endpointId: 'console',
       content: 'stale first projection', timestamp: '2026-07-21T00:00:00.000Z',
     });
@@ -560,16 +562,21 @@ describe('web-console attachment routes', () => {
     const response = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
     expect(response.status).toBe(200);
     const messages = await response.json();
-    expect(messages.filter(({ delivery_id: deliveryId }) => deliveryId === firstDeliveryId))
-      .toEqual([]);
     expect(messages.filter(({ direction }) => direction === 'out')).toEqual([]);
     expect(messages.filter(({ direction }) => direction === 'in').map(({ content }) => content))
       .toEqual(['stale first projection', 'safe second inbound']);
+    const verifyMailboxDb = new Database(path.join(ctx.root, 'web-console', 'web-console.db'));
+    const firstMailboxDelivery = verifyMailboxDb.prepare(`
+      SELECT id FROM delivery_mailbox
+      WHERE delivery_id = ? AND region = 'global' AND tenant_id = 'default' AND bot_id = 'zylos'
+    `).get(scopedFirstDeliveryId);
+    verifyMailboxDb.close();
+    expect(firstMailboxDelivery).toBeUndefined();
     const verifyDb = new Database(ctx.dbPath);
     const firstDelivery = verifyDb.prepare(`
       SELECT status, result_json, lease_expires_at FROM runtime_outbox
-      WHERE json_extract(command_json, '$.mapping.turn_id') = ?
-    `).get(first.turn_id);
+      WHERE delivery_id = ?
+    `).get(firstDeliveryId);
     verifyDb.close();
     expect(firstDelivery).toMatchObject({ status: 'delivering', result_json: null });
     expect(firstDelivery.lease_expires_at).not.toBeNull();
