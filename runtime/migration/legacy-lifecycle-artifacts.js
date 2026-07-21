@@ -115,8 +115,26 @@ function isObsoleteInstalledHook(command, root, homeDir) {
   });
 }
 
+function isContainedPath(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!relative.startsWith(`..${path.sep}`)
+    && relative !== '..' && !path.isAbsolute(relative));
+}
+
 function cleanupObsoleteHooksInFile(file, root, homeDir, removed) {
   try {
+    const stat = fs.lstatSync(file);
+    if (stat.isSymbolicLink()) {
+      throw new Error(`Refusing to follow symlinked hook configuration: ${file}`);
+    }
+    if (!stat.isFile()) {
+      throw new Error(`Refusing to rewrite unexpected hook configuration type: ${file}`);
+    }
+    const realRoot = fs.realpathSync(root);
+    const realParent = fs.realpathSync(path.dirname(file));
+    if (!isContainedPath(realRoot, realParent)) {
+      throw new Error(`Refusing to rewrite hook configuration outside installation root: ${file}`);
+    }
     const document = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (Array.isArray(document)) {
       const retained = document.filter((hook) => !isObsoleteInstalledHook(hook?.command, root, homeDir));
