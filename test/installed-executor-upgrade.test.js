@@ -652,7 +652,9 @@ describe('installed executor production upgrade owner', () => {
         currentReleaseRef: 'release-A',
         provider: 'codex',
         execFileSyncFn: (file) => (file === 'pm2' ? '[]' : ''),
-        targetHealthProofTimeoutMs: 50,
+        // Allow the child to reach its PID proof before exercising the
+        // timeout/reap path; a 50ms budget can expire during Node startup.
+        targetHealthProofTimeoutMs: 500,
         targetHealthTerminationGraceMs: 50,
       });
       operation = handler({
@@ -660,7 +662,7 @@ describe('installed executor production upgrade owner', () => {
         target: { release: 'release-B', downloaded_source: downloadedSource },
       });
 
-      const result = await settleWithin(operation, 300, { blocked: true });
+      const result = await settleWithin(operation, 1_200, { blocked: true });
       expect(result).toMatchObject({ success: false, state: 'rolled_back' });
       childPid = Number(fs.readFileSync(pidFile, 'utf8'));
       await waitForProcessExit(childPid);
