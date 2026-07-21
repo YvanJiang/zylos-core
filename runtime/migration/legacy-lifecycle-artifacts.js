@@ -101,7 +101,18 @@ function obsoleteInstalledHookPaths(root, homeDir) {
 function isObsoleteInstalledHook(command, root, homeDir) {
   if (typeof command !== 'string') return false;
   const normalized = command.replaceAll('\\', '/');
-  return obsoleteInstalledHookPaths(root, homeDir).some((ownedPath) => normalized.includes(ownedPath));
+  return obsoleteInstalledHookPaths(root, homeDir).some((ownedPath) => {
+    let offset = normalized.indexOf(ownedPath);
+    while (offset !== -1) {
+      const before = normalized[offset - 1] ?? '';
+      const after = normalized[offset + ownedPath.length] ?? '';
+      const beginsToken = offset === 0 || /[\s'"`([{:;,|&]/.test(before);
+      const endsToken = after === '' || /[\s'"`)]\},:;|&]/.test(after);
+      if (beginsToken && endsToken) return true;
+      offset = normalized.indexOf(ownedPath, offset + ownedPath.length);
+    }
+    return false;
+  });
 }
 
 function cleanupObsoleteHooksInFile(file, root, homeDir, removed) {

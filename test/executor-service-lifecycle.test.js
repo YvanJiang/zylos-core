@@ -764,6 +764,10 @@ describe('one-time lifecycle cleanup', () => {
           event: 'PostToolUse',
           command: `node \${HOME}/${relativeRoot}/.claude/skills/zylos-memory/scripts/session-start-inject.js`,
         },
+        {
+          event: 'SessionStart',
+          command: `node ~/${relativeRoot}/.codex/skills/activity-monitor/scripts/session-start-orchestrator.js.bak`,
+        },
         { event: 'SessionStart', command: 'node retained-flat-hook.js' },
     ]));
 
@@ -773,6 +777,10 @@ describe('one-time lifecycle cleanup', () => {
       homeDir,
     })).toEqual({ removed: [codexHooks] });
     expect(JSON.parse(fs.readFileSync(codexHooks, 'utf8'))).toEqual([
+      {
+        event: 'SessionStart',
+        command: `node ~/${relativeRoot}/.codex/skills/activity-monitor/scripts/session-start-orchestrator.js.bak`,
+      },
       { event: 'SessionStart', command: 'node retained-flat-hook.js' },
     ]);
   });
