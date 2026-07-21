@@ -13,7 +13,10 @@ import {
   assertDurableDeliveryTarget,
   resolveDeliveryCommandVersionForTarget,
 } from '../persistence/delivery-target-identity.js';
-import { initializeRuntimePersistence } from '../persistence/schema.js';
+import {
+  initializeRuntimePersistence,
+  quarantineUnverifiableOutboxClaims,
+} from '../persistence/schema.js';
 
 const DELIVERY_RETRY_DELAYS_MS = Object.freeze([2_000, 4_000, 8_000]);
 
@@ -302,6 +305,7 @@ export function createOutboxService({
 
   function claimNext() {
     const claim = database.transaction(() => {
+      quarantineUnverifiableOutboxClaims(database);
       const claimedAt = now();
       const claimedAtEpochMs = parseAuthorityEpochMs(claimedAt);
       const row = database.prepare(`
@@ -341,14 +345,6 @@ export function createOutboxService({
           )
         )
         AND (
-          candidate.status IN ('pending', 'delivering')
-          OR (
-            candidate.status = 'retry_wait'
-            AND snapshot.command_json = candidate.command_json
-            AND snapshot.command_hash = candidate.claimed_command_hash
-          )
-        )
-        AND (
           candidate.predecessor_delivery_id IS NULL
           OR EXISTS (
             SELECT 1
@@ -361,9 +357,14 @@ export function createOutboxService({
           SELECT 1
           FROM runtime_outbox AS active
           WHERE active.lane_key = candidate.lane_key
-            AND active.status = 'delivering'
             AND active.outbox_id != candidate.outbox_id
-            AND active.lease_expires_epoch_ms > ?
+            AND (
+              active.status = 'delivery_unknown'
+              OR (
+                active.status = 'delivering'
+                AND active.lease_expires_epoch_ms > ?
+              )
+            )
         )
         AND (? IS NULL OR json_extract(candidate.command_json, '$.target.channel') = ?)
         AND (? IS NULL OR json_extract(candidate.command_json, '$.target.chat_id') = ?)

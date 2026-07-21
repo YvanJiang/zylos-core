@@ -232,7 +232,16 @@ describe('normal product paths have no retired runtime authority', () => {
       /sourceCommandJson = row\.status === 'pending'[\s\S]*row\.snapshot_command_json/,
     );
     expect(outboxSource).toMatch(
-      /snapshot\.command_json = candidate\.command_json[\s\S]*snapshot\.command_hash = candidate\.claimed_command_hash/,
+      /quarantineUnverifiableOutboxClaims\(database\)[\s\S]*const claimedAt = now\(\)/,
+    );
+    expect(schemaSource).toMatch(
+      /WHERE outbox\.status IN \('delivering', 'retry_wait'\)/,
+    );
+    expect(schemaSource).toMatch(
+      /row\.snapshot_command_json === row\.command_json[\s\S]*row\.snapshot_command_hash === row\.claimed_command_hash/,
+    );
+    expect(outboxSource).toMatch(
+      /active\.status = 'delivery_unknown'[\s\S]*active\.status = 'delivering'/,
     );
     expect(outboxSource).toMatch(
       /snapshot\.command_json = \? AND snapshot\.command_hash = \?/,

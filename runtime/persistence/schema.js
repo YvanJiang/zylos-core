@@ -1509,10 +1509,10 @@ function backfillOutboxLeaseEpochs(database) {
   }
 }
 
-function quarantineUnverifiableOutboxClaims(database) {
-  const quarantine = database.transaction(() => {
+export function quarantineUnverifiableOutboxClaims(database) {
+  const quarantine = () => {
     const rows = database.prepare(`
-      SELECT outbox.outbox_id, outbox.delivery_attempt_id,
+      SELECT outbox.outbox_id, outbox.status, outbox.delivery_attempt_id,
         outbox.delivery_attempt_no, outbox.outbox_lease_epoch,
         outbox.lease_owner, outbox.command_json, outbox.claimed_command_hash,
         outbox.last_attempt_at, outbox.created_at,
@@ -1525,14 +1525,14 @@ function quarantineUnverifiableOutboxClaims(database) {
         AND snapshot.delivery_attempt_id = outbox.delivery_attempt_id
         AND snapshot.delivery_attempt_no = outbox.delivery_attempt_no
         AND snapshot.outbox_lease_epoch = outbox.outbox_lease_epoch
-      WHERE outbox.status = 'delivering'
+      WHERE outbox.status IN ('delivering', 'retry_wait')
     `).all();
     const update = database.prepare(`
       UPDATE runtime_outbox
       SET status = 'delivery_unknown', next_attempt_at = NULL,
         last_error_json = COALESCE(last_error_json, ?),
         updated_at = COALESCE(updated_at, last_attempt_at, created_at)
-      WHERE outbox_id = ? AND status = 'delivering'
+      WHERE outbox_id = ? AND status = ?
         AND delivery_attempt_id IS ? AND delivery_attempt_no IS ?
         AND outbox_lease_epoch = ? AND lease_owner IS ?
         AND command_json = ? AND claimed_command_hash IS ?
@@ -1542,7 +1542,7 @@ function quarantineUnverifiableOutboxClaims(database) {
         ? null
         : crypto.createHash('sha256').update(row.snapshot_command_json).digest('hex');
       const verified = row.snapshot_command_json !== null
-        && row.snapshot_lease_owner === row.lease_owner
+        && (row.status === 'retry_wait' || row.snapshot_lease_owner === row.lease_owner)
         && row.snapshot_command_json === row.command_json
         && row.snapshot_command_hash === row.claimed_command_hash
         && snapshotHash === row.snapshot_command_hash;
@@ -1558,6 +1558,7 @@ function quarantineUnverifiableOutboxClaims(database) {
           occurred_at: occurredAt,
         }),
         row.outbox_id,
+        row.status,
         row.delivery_attempt_id,
         row.delivery_attempt_no,
         row.outbox_lease_epoch,
@@ -1566,8 +1567,9 @@ function quarantineUnverifiableOutboxClaims(database) {
         row.claimed_command_hash,
       );
     }
-  });
-  quarantine.immediate();
+  };
+  if (database.inTransaction) return quarantine();
+  return database.transaction(quarantine).immediate();
 }
 
 function backfillDeliveryLanes(database) {

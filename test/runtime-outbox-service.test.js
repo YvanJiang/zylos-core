@@ -332,6 +332,135 @@ describe('durable outbox service', () => {
     reopened.close();
   });
 
+  test('quarantines a jointly altered retry_wait claim across restart', async () => {
+    const database = openTestDatabase();
+    const databasePath = database.name;
+    acceptNormalInbound(database, normalEnvelope('altered-retry-restart'), {
+      now: () => '2026-07-19T09:30:00Z',
+      generateId: deterministicIds('altered-retry-restart'),
+    });
+    let ownerTime = '2026-07-19T09:30:01Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'altered-retry-restart-owner',
+      now: () => ownerTime,
+      generateId: deterministicIds('altered-retry-restart-owner'),
+    });
+    const originalCommand = owner.claimNext();
+    ownerTime = '2026-07-19T09:30:02Z';
+    expect(owner.recordResult(retryableFailure(originalCommand, ownerTime))).toEqual({
+      status: 'applied', outbox_status: 'retry_wait',
+    });
+    const changedCommand = structuredClone(originalCommand);
+    changedCommand.render_model.text = 'altered retry after authoritative result';
+    const changedJson = JSON.stringify(changedCommand);
+    database.prepare(`
+      UPDATE runtime_outbox SET command_json = ?, claimed_command_hash = ?
+      WHERE outbox_id = ?
+    `).run(
+      changedJson,
+      crypto.createHash('sha256').update(changedJson).digest('hex'),
+      originalCommand.outbox_id,
+    );
+    database.close();
+
+    const reopened = new Database(databasePath);
+    let sideEffects = 0;
+    const contender = createOutboxService({
+      database: reopened,
+      renderer: {
+        async deliver(command) {
+          sideEffects += 1;
+          return retryableFailure(command, '2026-07-19T09:30:05Z');
+        },
+      },
+      serviceInstanceId: 'altered-retry-restart-contender',
+      now: () => '2026-07-19T09:30:05Z',
+      generateId: deterministicIds('altered-retry-restart-contender'),
+    });
+
+    await expect(contender.dispatchNext()).resolves.toEqual({ status: 'idle' });
+    await expect(contender.dispatchNext()).resolves.toEqual({ status: 'idle' });
+    expect(sideEffects).toBe(0);
+    expect(reopened.prepare(`
+      SELECT status, attempt_count, delivery_attempt_id, outbox_lease_epoch,
+        lease_owner, result_json
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(originalCommand.outbox_id)).toEqual({
+      status: 'delivery_unknown',
+      attempt_count: 1,
+      delivery_attempt_id: originalCommand.delivery_attempt_id,
+      outbox_lease_epoch: originalCommand.outbox_lease_epoch,
+      lease_owner: null,
+      result_json: JSON.stringify(retryableFailure(originalCommand, ownerTime)),
+    });
+    expect(reopened.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_outbox_claim_snapshots
+      WHERE outbox_id = ?
+    `).get(originalCommand.outbox_id).count).toBe(1);
+    reopened.close();
+  });
+
+  test('quarantines retry_wait tampering that occurs after service initialization', async () => {
+    const database = openTestDatabase();
+    const databasePath = database.name;
+    acceptNormalInbound(database, normalEnvelope('altered-retry-after-init'), {
+      now: () => '2026-07-19T09:35:00Z',
+      generateId: deterministicIds('altered-retry-after-init'),
+    });
+    let ownerTime = '2026-07-19T09:35:01Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'altered-retry-after-init-owner',
+      now: () => ownerTime,
+      generateId: deterministicIds('altered-retry-after-init-owner'),
+    });
+    const originalCommand = owner.claimNext();
+    ownerTime = '2026-07-19T09:35:02Z';
+    owner.recordResult(retryableFailure(originalCommand, ownerTime));
+    database.close();
+
+    const reopened = new Database(databasePath);
+    let sideEffects = 0;
+    const contender = createOutboxService({
+      database: reopened,
+      renderer: {
+        async deliver(command) {
+          sideEffects += 1;
+          return retryableFailure(command, '2026-07-19T09:35:05Z');
+        },
+      },
+      serviceInstanceId: 'altered-retry-after-init-contender',
+      now: () => '2026-07-19T09:35:05Z',
+      generateId: deterministicIds('altered-retry-after-init-contender'),
+    });
+    const changedCommand = structuredClone(originalCommand);
+    changedCommand.priority = 999;
+    const changedJson = JSON.stringify(changedCommand);
+    reopened.prepare(`
+      UPDATE runtime_outbox SET command_json = ?, claimed_command_hash = ?
+      WHERE outbox_id = ?
+    `).run(
+      changedJson,
+      crypto.createHash('sha256').update(changedJson).digest('hex'),
+      originalCommand.outbox_id,
+    );
+
+    await expect(contender.dispatchNext()).resolves.toEqual({ status: 'idle' });
+    await expect(contender.dispatchNext()).resolves.toEqual({ status: 'idle' });
+    expect(sideEffects).toBe(0);
+    expect(reopened.prepare(`
+      SELECT status, attempt_count FROM runtime_outbox WHERE outbox_id = ?
+    `).get(originalCommand.outbox_id)).toEqual({
+      status: 'delivery_unknown', attempt_count: 1,
+    });
+    expect(reopened.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_outbox_claim_snapshots
+      WHERE outbox_id = ?
+    `).get(originalCommand.outbox_id).count).toBe(1);
+    reopened.close();
+  });
+
   test('keeps later lane projections staged behind a delivery_unknown barrier', () => {
     const database = openTestDatabase();
     const accepted = acceptNormalInbound(database, normalEnvelope('unknown-lane-barrier'), {
