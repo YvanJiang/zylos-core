@@ -22,5 +22,53 @@
     });
   }
 
-  root.ZylosMailboxCursor = Object.freeze({ acceptScope });
+  function resetScopedClientState(client, revokeObjectUrl = (url) => URL.revokeObjectURL(url)) {
+    client.messagesContainer.replaceChildren();
+    client.pendingMessages.clear();
+    for (const request of client.pendingUploads.values()) request.abort();
+    client.pendingUploads.clear();
+    for (const attachment of client.pendingAttachments) {
+      if (typeof attachment?.previewUrl === 'string') revokeObjectUrl(attachment.previewUrl);
+    }
+    client.pendingAttachments = [];
+    client.messageInput.value = '';
+    client.updateAttachmentTray();
+    client.showEmptyState();
+  }
+
+  function isCurrentGeneration(expectedGeneration, currentGeneration) {
+    return Number.isSafeInteger(expectedGeneration)
+      && expectedGeneration >= 0
+      && expectedGeneration === currentGeneration;
+  }
+
+  function acceptScopedResponse(state, nextScope, requestGeneration, onReset = null) {
+    const scopeGeneration = state?.scopeGeneration;
+    if (!Number.isSafeInteger(scopeGeneration) || scopeGeneration < 0) {
+      throw new TypeError('Invalid mailbox scope generation.');
+    }
+    if (!isCurrentGeneration(requestGeneration, scopeGeneration)) {
+      return Object.freeze({
+        accepted: false,
+        reset: false,
+        cursorScope: state.cursorScope,
+        lastMessageId: state.lastMessageId,
+        scopeGeneration,
+      });
+    }
+    const accepted = acceptScope(state, nextScope, onReset);
+    const changed = state.cursorScope !== accepted.cursorScope;
+    return Object.freeze({
+      accepted: true,
+      ...accepted,
+      scopeGeneration: scopeGeneration + (changed ? 1 : 0),
+    });
+  }
+
+  root.ZylosMailboxCursor = Object.freeze({
+    acceptScope,
+    acceptScopedResponse,
+    isCurrentGeneration,
+    resetScopedClientState,
+  });
 }(globalThis));

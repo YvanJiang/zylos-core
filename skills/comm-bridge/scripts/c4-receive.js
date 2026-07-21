@@ -63,7 +63,7 @@ function parseArgs(args) {
     const field = valueOptions.get(argument);
     if (field === undefined) return { error: `Unknown option: ${argument}`, json: parsed.json };
     const value = args[index + 1];
-    if (value === undefined || value.startsWith('--')) {
+    if (value === undefined) {
       return { error: `${argument} requires a value`, json: parsed.json };
     }
     parsed[field] = value;

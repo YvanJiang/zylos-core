@@ -16,11 +16,15 @@ class ZylosConsole {
 
     this.lastMessageId = 0;
     this.cursorScope = null;
+    this.scopeGeneration = 0;
+    this.connectionGeneration = 0;
+    this.pollInFlight = null;
     this.ws = null;
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 10;
     this.pendingMessages = new Map(); // Track messages being sent
     this.pendingAttachments = [];
+    this.pendingUploads = new Map();
     this.maxAttachments = 20;
     this.timezone = timezone || null;
 
@@ -72,14 +76,19 @@ class ZylosConsole {
     console.log('Connecting to WebSocket:', wsUrl);
 
     try {
-      this.ws = new WebSocket(wsUrl);
+      const connectionGeneration = ++this.connectionGeneration;
+      const socket = new WebSocket(wsUrl);
+      this.ws = socket;
 
-      this.ws.onopen = () => {
+      socket.onopen = () => {
+        if (!globalThis.ZylosMailboxCursor.isCurrentGeneration(
+          connectionGeneration, this.connectionGeneration,
+        ) || this.ws !== socket) return;
         console.log('WebSocket connected');
         this.reconnectAttempts = 0;
         if (this.pollInterval) clearInterval(this.pollInterval);
         if (this.statusInterval) clearInterval(this.statusInterval);
-        this.ws.send(JSON.stringify({
+        socket.send(JSON.stringify({
           type: 'subscribe',
           since_id: this.lastMessageId,
           cursor_scope: this.cursorScope,
@@ -87,7 +96,10 @@ class ZylosConsole {
         this.updateConnectionStatus(true);
       };
 
-      this.ws.onmessage = (event) => {
+      socket.onmessage = (event) => {
+        if (!globalThis.ZylosMailboxCursor.isCurrentGeneration(
+          connectionGeneration, this.connectionGeneration,
+        ) || this.ws !== socket) return;
         try {
           const msg = JSON.parse(event.data);
           this.handleWebSocketMessage(msg);
@@ -96,13 +108,20 @@ class ZylosConsole {
         }
       };
 
-      this.ws.onclose = () => {
+      socket.onclose = () => {
+        if (!globalThis.ZylosMailboxCursor.isCurrentGeneration(
+          connectionGeneration, this.connectionGeneration,
+        ) || this.ws !== socket) return;
+        this.ws = null;
         console.log('WebSocket disconnected');
         this.updateConnectionStatus(false);
-        this.scheduleReconnect();
+        this.scheduleReconnect(connectionGeneration);
       };
 
-      this.ws.onerror = (err) => {
+      socket.onerror = (err) => {
+        if (!globalThis.ZylosMailboxCursor.isCurrentGeneration(
+          connectionGeneration, this.connectionGeneration,
+        ) || this.ws !== socket) return;
         console.error('WebSocket error:', err);
         this.updateConnectionStatus(false);
       };
@@ -112,12 +131,16 @@ class ZylosConsole {
     }
   }
 
-  scheduleReconnect() {
+  scheduleReconnect(connectionGeneration = this.connectionGeneration) {
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
       const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts - 1), 30000);
       console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
-      setTimeout(() => this.connectWebSocket(), delay);
+      setTimeout(() => {
+        if (globalThis.ZylosMailboxCursor.isCurrentGeneration(
+          connectionGeneration, this.connectionGeneration,
+        )) this.connectWebSocket();
+      }, delay);
     } else {
       console.error('Max reconnect attempts reached, falling back to polling');
       this.startPolling();
@@ -126,7 +149,14 @@ class ZylosConsole {
 
   startPolling() {
     // Fallback to HTTP polling if WebSocket fails
-    this.pollInterval = setInterval(() => this.pollMessages(), 2000);
+    if (this.pollInterval) clearInterval(this.pollInterval);
+    this.pollInterval = setInterval(() => {
+      if (this.pollInFlight !== null) return;
+      const activePoll = this.pollMessages().finally(() => {
+        if (this.pollInFlight === activePoll) this.pollInFlight = null;
+      });
+      this.pollInFlight = activePoll;
+    }, 2000);
     this.statusInterval = setInterval(() => this.updateStatusViaHttp(), 5000);
   }
 
@@ -137,7 +167,7 @@ class ZylosConsole {
         break;
 
       case 'messages':
-        if (Array.isArray(msg.data)) {
+        if (this.applyMailboxScope(msg.cursor_scope).accepted && Array.isArray(msg.data)) {
           this.clearEmptyState();
           msg.data.forEach((m) => this.addMessage(m, true));
           if (msg.data.length > 0) {
@@ -174,18 +204,18 @@ class ZylosConsole {
     }
   }
 
-  applyMailboxScope(nextScope) {
-    const accepted = globalThis.ZylosMailboxCursor.acceptScope({
+  applyMailboxScope(nextScope, requestGeneration = this.scopeGeneration) {
+    const accepted = globalThis.ZylosMailboxCursor.acceptScopedResponse({
       cursorScope: this.cursorScope,
       lastMessageId: this.lastMessageId,
-    }, nextScope, () => {
-      this.messagesContainer.replaceChildren();
-      this.pendingMessages.clear();
-      this.showEmptyState();
-    });
+      scopeGeneration: this.scopeGeneration,
+    }, nextScope, requestGeneration,
+    () => globalThis.ZylosMailboxCursor.resetScopedClientState(this));
+    if (!accepted.accepted) return accepted;
     this.cursorScope = accepted.cursorScope;
     this.lastMessageId = accepted.lastMessageId;
-    return accepted.reset;
+    this.scopeGeneration = accepted.scopeGeneration;
+    return accepted;
   }
 
   mailboxPollUrl() {
@@ -231,16 +261,25 @@ class ZylosConsole {
     try {
       let loaded = false;
       while (true) {
+        const requestGeneration = this.scopeGeneration;
         const response = await fetch(this.mailboxPollUrl());
+        if (!globalThis.ZylosMailboxCursor.isCurrentGeneration(
+          requestGeneration, this.scopeGeneration,
+        )) return;
         if (response.status === 409) {
           const reset = await response.json();
-          this.applyMailboxScope(reset.cursor_scope);
+          if (!this.applyMailboxScope(reset.cursor_scope, requestGeneration).accepted) return;
           loaded = false;
           continue;
         }
         if (!response.ok) throw new Error(`Conversation load failed (${response.status})`);
-        this.applyMailboxScope(response.headers.get('x-zylos-mailbox-cursor-scope'));
         const conversations = await response.json();
+        if (!globalThis.ZylosMailboxCursor.isCurrentGeneration(
+          requestGeneration, this.scopeGeneration,
+        )) return;
+        if (!this.applyMailboxScope(
+          response.headers.get('x-zylos-mailbox-cursor-scope'), requestGeneration,
+        ).accepted) return;
         if (conversations.length === 0) break;
 
         loaded = true;
@@ -267,15 +306,24 @@ class ZylosConsole {
   // HTTP fallback methods
   async pollMessages() {
     try {
+      const requestGeneration = this.scopeGeneration;
       const response = await fetch(this.mailboxPollUrl());
+      if (!globalThis.ZylosMailboxCursor.isCurrentGeneration(
+        requestGeneration, this.scopeGeneration,
+      )) return;
       if (response.status === 409) {
         const reset = await response.json();
-        this.applyMailboxScope(reset.cursor_scope);
+        if (!this.applyMailboxScope(reset.cursor_scope, requestGeneration).accepted) return;
         return this.pollMessages();
       }
       if (!response.ok) throw new Error(`Message poll failed (${response.status})`);
-      this.applyMailboxScope(response.headers.get('x-zylos-mailbox-cursor-scope'));
       const messages = await response.json();
+      if (!globalThis.ZylosMailboxCursor.isCurrentGeneration(
+        requestGeneration, this.scopeGeneration,
+      )) return;
+      if (!this.applyMailboxScope(
+        response.headers.get('x-zylos-mailbox-cursor-scope'), requestGeneration,
+      ).accepted) return;
 
       if (messages.length > 0) {
         this.clearEmptyState();
@@ -327,6 +375,7 @@ class ZylosConsole {
     this.pendingAttachments = this.pendingAttachments.filter((item) => item.status !== 'ready');
     this.updateAttachmentTray();
     const attachmentIds = readyAttachments.map((item) => item.id);
+    const sendGeneration = this.scopeGeneration;
 
     try {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -347,6 +396,9 @@ class ZylosConsole {
         });
 
         const result = await response.json();
+        if (!globalThis.ZylosMailboxCursor.isCurrentGeneration(
+          sendGeneration, this.scopeGeneration,
+        )) return;
 
         if (result.success) {
           this.markMessageSent(tempId);
@@ -408,17 +460,26 @@ class ZylosConsole {
   }
 
   uploadAttachment(item) {
+    const uploadGeneration = this.scopeGeneration;
     const form = new FormData();
     form.append('file', item.file, item.name);
 
     const xhr = new XMLHttpRequest();
+    this.pendingUploads.set(item.localId, xhr);
     xhr.open('POST', `${this.basePath}/api/upload`);
     xhr.upload.addEventListener('progress', (event) => {
+      if (!globalThis.ZylosMailboxCursor.isCurrentGeneration(
+        uploadGeneration, this.scopeGeneration,
+      )) return;
       if (!event.lengthComputable) return;
       item.progress = Math.round((event.loaded / event.total) * 100);
       this.updateAttachmentTray();
     });
     xhr.addEventListener('load', () => {
+      this.pendingUploads.delete(item.localId);
+      if (!globalThis.ZylosMailboxCursor.isCurrentGeneration(
+        uploadGeneration, this.scopeGeneration,
+      )) return;
       let result = {};
       try {
         result = JSON.parse(xhr.responseText || '{}');
@@ -439,6 +500,10 @@ class ZylosConsole {
       this.updateAttachmentTray();
     });
     xhr.addEventListener('error', () => {
+      this.pendingUploads.delete(item.localId);
+      if (!globalThis.ZylosMailboxCursor.isCurrentGeneration(
+        uploadGeneration, this.scopeGeneration,
+      )) return;
       item.status = 'error';
       item.error = 'Upload failed';
       this.updateAttachmentTray();

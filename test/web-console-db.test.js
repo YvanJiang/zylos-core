@@ -84,8 +84,39 @@ describe('SessionStore', () => {
 });
 
 describe('PersistentUploadRegistry', () => {
+  test('creates scope-required upload rows and hides migrated legacy capabilities', () => {
+    const columns = Object.fromEntries(db.prepare('PRAGMA table_info(uploads)').all()
+      .map((column) => [column.name, column]));
+    for (const column of ['region', 'tenant_id', 'bot_id']) {
+      expect(columns[column].notnull).toBe(1);
+    }
+
+    const legacyPath = path.join(tempDir, 'legacy-uploads.db');
+    const legacy = new Database(legacyPath);
+    legacy.exec(`
+      CREATE TABLE uploads (
+        id TEXT PRIMARY KEY, session_token TEXT, path TEXT NOT NULL, name TEXT NOT NULL,
+        size INTEGER NOT NULL, size_label TEXT, mime TEXT, kind TEXT NOT NULL,
+        created_at INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO uploads VALUES (
+        'legacy-upload', 'shared-session', '/tmp/legacy.txt', 'legacy.txt',
+        6, '6B', 'text/plain', 'file', 0, 0
+      );
+    `);
+    legacy.close();
+    const migrated = openDb(legacyPath);
+    const registry = new PersistentUploadRegistry(migrated, TEST_MAILBOX_SCOPE);
+    expect(registry.getMany(['legacy-upload'], 'shared-session')).toEqual([]);
+    expect(registry.getForProjection('legacy-upload')).toBeNull();
+    expect(migrated.prepare(`
+      SELECT region, tenant_id, bot_id FROM uploads WHERE id = 'legacy-upload'
+    `).get()).toEqual({ region: null, tenant_id: null, bot_id: null });
+    migrated.close();
+  });
+
   test('add, getMany, consumeMany work like in-memory registry', () => {
-    const registry = new PersistentUploadRegistry(db, { ttlMs: 30000 });
+    const registry = new PersistentUploadRegistry(db, { ttlMs: 30000, ...TEST_MAILBOX_SCOPE });
     const entry = registry.add({
       sessionId: 's1',
       path: '/tmp/a.txt',
@@ -109,7 +140,7 @@ describe('PersistentUploadRegistry', () => {
   });
 
   test('restoreMany re-enables consumed entries', () => {
-    const registry = new PersistentUploadRegistry(db, { ttlMs: 30000 });
+    const registry = new PersistentUploadRegistry(db, { ttlMs: 30000, ...TEST_MAILBOX_SCOPE });
     const entry = registry.add({ sessionId: 's1', path: '/tmp/b.txt', name: 'b.txt', size: 50, kind: 'file' });
     const consumed = registry.consumeMany([entry.id], 's1');
 
@@ -119,7 +150,7 @@ describe('PersistentUploadRegistry', () => {
   });
 
   test('expired entries are cleaned up', () => {
-    const registry = new PersistentUploadRegistry(db, { ttlMs: 100 });
+    const registry = new PersistentUploadRegistry(db, { ttlMs: 100, ...TEST_MAILBOX_SCOPE });
     const entry = registry.add({ sessionId: 's1', path: '/tmp/c.txt', name: 'c.txt', size: 10, kind: 'file' });
 
     db.prepare('UPDATE uploads SET created_at = ? WHERE id = ?')
@@ -129,11 +160,34 @@ describe('PersistentUploadRegistry', () => {
   });
 
   test('persists uploads across registry instances', () => {
-    const reg1 = new PersistentUploadRegistry(db, { ttlMs: 30000 });
+    const reg1 = new PersistentUploadRegistry(db, { ttlMs: 30000, ...TEST_MAILBOX_SCOPE });
     const entry = reg1.add({ sessionId: 's1', path: '/tmp/d.txt', name: 'd.txt', size: 5, kind: 'file' });
 
-    const reg2 = new PersistentUploadRegistry(db, { ttlMs: 30000 });
+    const reg2 = new PersistentUploadRegistry(db, { ttlMs: 30000, ...TEST_MAILBOX_SCOPE });
     expect(reg2.getMany([entry.id], 's1')).toHaveLength(1);
+  });
+
+  test('fences lookup, consumption, restoration, and projection by Core mailbox scope', () => {
+    const scopeA = { region: 'global', tenantId: 'tenant-a', botId: 'bot-a' };
+    const scopeB = { region: 'global', tenantId: 'tenant-b', botId: 'bot-b' };
+    const registryA = new PersistentUploadRegistry(db, { ttlMs: 30000, ...scopeA });
+    const entry = registryA.add({
+      sessionId: 'shared-session', path: '/tmp/scoped.txt', name: 'scoped.txt',
+      size: 6, kind: 'file',
+    });
+    const consumed = registryA.consumeMany([entry.id], 'shared-session');
+    expect(consumed).toHaveLength(1);
+
+    const registryB = new PersistentUploadRegistry(db, { ttlMs: 30000, ...scopeB });
+    expect(registryB.getMany([entry.id], 'shared-session')).toEqual([]);
+    expect(registryB.consumeMany([entry.id], 'shared-session')).toBeNull();
+    expect(registryB.getForProjection(entry.id)).toBeNull();
+    registryB.restoreMany(consumed);
+    expect(registryA.getMany([entry.id], 'shared-session')).toEqual([]);
+
+    registryA.restoreMany(consumed);
+    expect(registryA.getMany([entry.id], 'shared-session'))
+      .toEqual([expect.objectContaining({ id: entry.id, name: 'scoped.txt' })]);
   });
 });
 

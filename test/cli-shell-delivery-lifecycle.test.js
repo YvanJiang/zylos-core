@@ -4,6 +4,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 import { describe, expect, test } from '@jest/globals';
+import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/index.js';
 
 import {
   createDeliveryDrain,
@@ -91,6 +92,65 @@ describe('shell Core outbox owner lifecycle', () => {
     expect(source).toMatch(
       /try \{\s*fs\.mkdirSync\(path\.dirname\(CORE_DATABASE_PATH\)[\s\S]*database = new Database[\s\S]*catch \(error\) \{[\s\S]*await shutdown\(\);/,
     );
+  });
+
+  test('normal shell ingress preserves option-like user text', async () => {
+    const root = fs.mkdtempSync('/tmp/zylos-shell-option-');
+    const socketDir = root;
+    const receivePath = path.join(
+      root, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-receive.js',
+    );
+    fs.mkdirSync(path.dirname(receivePath), { recursive: true });
+    fs.symlinkSync(path.resolve('skills/comm-bridge/scripts/c4-receive.js'), receivePath);
+
+    const child = spawn(process.execPath, ['cli/zylos.js', 'shell'], {
+      cwd: path.resolve('.'),
+      env: {
+        ...process.env, ZYLOS_DIR: root, TMPDIR: socketDir,
+        ZYLOS_TENANT_ID: 'shell-option-tenant',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let output = '';
+    child.stdout.on('data', (chunk) => { output += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { output += chunk.toString(); });
+    const close = new Promise((resolve) => child.once('close', resolve));
+
+    try {
+      const startDeadline = Date.now() + 3000;
+      while (!output.includes('you> ') && Date.now() < startDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(output).toContain('you> ');
+      child.stdin.write('--literal-shell-text\n');
+
+      const dbPath = path.join(root, 'comm-bridge', 'c4.db');
+      let content = null;
+      const ingressDeadline = Date.now() + 3000;
+      while (content === null && Date.now() < ingressDeadline) {
+        if (fs.existsSync(dbPath)) {
+          let shellDb;
+          try {
+            shellDb = new Database(dbPath);
+            const rows = shellDb.prepare('SELECT envelope_json FROM runtime_inbound_events').all();
+            const matching = rows.map(({ envelope_json: json }) => JSON.parse(json))
+              .find((envelope) => envelope.content?.text === '--literal-shell-text');
+            if (matching) content = matching.content.text;
+          } catch {
+            // The shell may have created the file but not finished its schema transaction yet.
+          } finally {
+            shellDb?.close();
+          }
+        }
+        if (content === null) await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      if (content === null) throw new Error(`shell did not persist option-like text: ${output}`);
+      expect(content).toBe('--literal-shell-text');
+    } finally {
+      if (child.exitCode === null) child.kill('SIGTERM');
+      await close;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('stop waits for the current fenced dispatch result and prevents another claim', async () => {

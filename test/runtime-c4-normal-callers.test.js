@@ -106,6 +106,23 @@ describe('normal C4 callers use durable Core contracts', () => {
     database.close();
   });
 
+  test('compatibility ingress preserves option-like user text as the content value', () => {
+    const { zylosDir, env } = fixture();
+    const result = run(receiveCli, [
+      '--channel', 'web-console', '--endpoint', 'console',
+      '--message-id', 'option-like-content', '--actor-id', 'local-console-user',
+      '--content', '--literal-text', '--json',
+    ], env);
+    assert.equal(result.status, 0, result.stderr);
+
+    const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
+    const envelope = JSON.parse(database.prepare(`
+      SELECT envelope_json FROM runtime_inbound_events WHERE inbound_event_id = ?
+    `).get('option-like-content').envelope_json);
+    database.close();
+    assert.equal(envelope.content.text, '--literal-text');
+  });
+
   test('compatibility ingress preserves validated public attachment facts', () => {
     const { zylosDir, env } = fixture();
     const attachments = [{

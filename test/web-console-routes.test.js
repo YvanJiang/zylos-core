@@ -246,6 +246,18 @@ describe('web-console attachment routes', () => {
     reopened.close();
   });
 
+  test('actual Web ingress preserves option-like normal text', async () => {
+    ctx = await startServer({ actualC4Receive: true, tenantId: 'option-text-tenant' });
+    const sent = await sendHttp(ctx, {
+      message: '--literal-web-text', message_id: 'option-like-web-text',
+    });
+    expect(sent.res.status).toBe(200);
+    const mailbox = await (await fetch(`${ctx.baseUrl}/api/poll?since_id=0`)).json();
+    expect(mailbox).toEqual(expect.arrayContaining([
+      expect.objectContaining({ direction: 'in', content: '--literal-web-text' }),
+    ]));
+  });
+
   test('actual Core ingress projects safe attachment metadata through the durable mailbox', async () => {
     ctx = await startServer({ actualC4Receive: true });
     const upload = await uploadFile(ctx, {
@@ -526,6 +538,28 @@ describe('web-console attachment routes', () => {
     expect(queuedRows).toHaveLength(1);
     expect(queuedRows[0].content).toContain('[attachment:file ');
     expect(queuedRows[0].content).toContain('name="report.txt" 3B]');
+  });
+
+  test('staged upload capabilities cannot cross tenant scope after same-database restart', async () => {
+    ctx = await startServer({ tenantId: 'upload-tenant-a' });
+    const sharedRoot = ctx.root;
+    const upload = await uploadFile(ctx, { name: 'scoped.txt', content: 'scope A' });
+    expect(upload.res.status).toBe(200);
+    await stopServer(ctx, { preserveRoot: true });
+
+    ctx = await startServer({ root: sharedRoot, tenantId: 'upload-tenant-b' });
+    const rejected = await sendHttp(ctx, {
+      message: 'must fail in B', attachments: [upload.body.id],
+    });
+    expect(rejected.res.status).toBe(400);
+    expect(rejected.body.error).toBe('invalid_attachment');
+    await stopServer(ctx, { preserveRoot: true });
+
+    ctx = await startServer({ root: sharedRoot, tenantId: 'upload-tenant-a' });
+    const accepted = await sendHttp(ctx, {
+      message: 'valid again in A', attachments: [upload.body.id],
+    });
+    expect(accepted.res.status).toBe(200);
   });
 
   test('GET /api/media/:messageId fails closed for retired legacy media rows', async () => {

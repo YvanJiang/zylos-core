@@ -30,6 +30,9 @@ function openDb(dbPath = DB_PATH) {
       size_label TEXT,
       mime TEXT,
       kind TEXT NOT NULL,
+      region TEXT NOT NULL,
+      tenant_id TEXT NOT NULL,
+      bot_id TEXT NOT NULL,
       created_at INTEGER NOT NULL,
       consumed INTEGER NOT NULL DEFAULT 0
     );
@@ -62,6 +65,18 @@ function openDb(dbPath = DB_PATH) {
   db.exec(`
     CREATE INDEX IF NOT EXISTS delivery_mailbox_scope_cursor
     ON delivery_mailbox (region, tenant_id, bot_id, channel, endpoint_id, id)
+  `);
+  const uploadColumns = new Set(
+    db.prepare('PRAGMA table_info(uploads)').all().map(({ name }) => name),
+  );
+  for (const column of ['region', 'tenant_id', 'bot_id']) {
+    if (!uploadColumns.has(column)) {
+      db.exec(`ALTER TABLE uploads ADD COLUMN ${column} TEXT`);
+    }
+  }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS uploads_scope_capability
+    ON uploads (region, tenant_id, bot_id, id, session_token, consumed)
   `);
   return db;
 }
@@ -274,17 +289,36 @@ export class SessionStore {
 }
 
 export class PersistentUploadRegistry {
-  constructor(db, { ttlMs = UPLOAD_TTL_MS } = {}) {
+  constructor(db, {
+    ttlMs = UPLOAD_TTL_MS, region, tenantId, botId,
+  } = {}) {
+    for (const [fieldName, value] of [
+      ['region', region], ['tenantId', tenantId], ['botId', botId],
+    ]) {
+      if (typeof value !== 'string' || value.length === 0) {
+        throw new TypeError(`${fieldName} must be a non-empty string`);
+      }
+    }
     this.db = db;
     this.ttlMs = ttlMs;
+    this.region = region;
+    this.tenantId = tenantId;
+    this.botId = botId;
     this._stmts = {
-      add: db.prepare(`INSERT INTO uploads (id, session_token, path, name, size, size_label, mime, kind, created_at, consumed)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`),
-      get: db.prepare('SELECT * FROM uploads WHERE id = ? AND consumed = 0'),
-      getStored: db.prepare('SELECT * FROM uploads WHERE id = ?'),
-      consume: db.prepare('UPDATE uploads SET consumed = 1 WHERE id = ? AND consumed = 0'),
-      restore: db.prepare('UPDATE uploads SET consumed = 0 WHERE id = ?'),
-      cleanup: db.prepare('DELETE FROM uploads WHERE consumed = 0 AND created_at < ?'),
+      add: db.prepare(`INSERT INTO uploads (
+        id, session_token, path, name, size, size_label, mime, kind,
+        region, tenant_id, bot_id, created_at, consumed
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`),
+      get: db.prepare(`SELECT * FROM uploads
+        WHERE id = ? AND region = ? AND tenant_id = ? AND bot_id = ? AND consumed = 0`),
+      getStored: db.prepare(`SELECT * FROM uploads
+        WHERE id = ? AND region = ? AND tenant_id = ? AND bot_id = ?`),
+      consume: db.prepare(`UPDATE uploads SET consumed = 1
+        WHERE id = ? AND region = ? AND tenant_id = ? AND bot_id = ? AND consumed = 0`),
+      restore: db.prepare(`UPDATE uploads SET consumed = 0
+        WHERE id = ? AND region = ? AND tenant_id = ? AND bot_id = ?`),
+      cleanup: db.prepare(`DELETE FROM uploads
+        WHERE region = ? AND tenant_id = ? AND bot_id = ? AND consumed = 0 AND created_at < ?`),
     };
   }
 
@@ -294,13 +328,15 @@ export class PersistentUploadRegistry {
     this._stmts.add.run(
       id, entry.sessionId || null, entry.path, entry.name,
       entry.size, entry.sizeLabel || null, entry.mime || null,
-      entry.kind, now
+      entry.kind, this.region, this.tenantId, this.botId, now
     );
     return { ...entry, id };
   }
 
   cleanup() {
-    this._stmts.cleanup.run(Date.now() - this.ttlMs);
+    this._stmts.cleanup.run(
+      this.region, this.tenantId, this.botId, Date.now() - this.ttlMs,
+    );
   }
 
   getMany(ids, sessionId) {
@@ -309,7 +345,7 @@ export class PersistentUploadRegistry {
     if (new Set(ids).size !== ids.length) return [];
     const results = [];
     for (const id of ids) {
-      const row = this._stmts.get.get(id);
+      const row = this._stmts.get.get(id, this.region, this.tenantId, this.botId);
       if (!row || row.session_token !== sessionId) return [];
       results.push({
         id: row.id,
@@ -329,19 +365,21 @@ export class PersistentUploadRegistry {
     const entries = this.getMany(ids, sessionId);
     if (entries.length !== ids.length) return null;
     for (const id of ids) {
-      this._stmts.consume.run(id);
+      this._stmts.consume.run(id, this.region, this.tenantId, this.botId);
     }
     return entries;
   }
 
   restoreMany(entries) {
     for (const entry of entries || []) {
-      if (entry?.id) this._stmts.restore.run(entry.id);
+      if (entry?.id) {
+        this._stmts.restore.run(entry.id, this.region, this.tenantId, this.botId);
+      }
     }
   }
 
   getForProjection(id) {
-    const row = this._stmts.getStored.get(id);
+    const row = this._stmts.getStored.get(id, this.region, this.tenantId, this.botId);
     if (!row) return null;
     return {
       id: row.id,

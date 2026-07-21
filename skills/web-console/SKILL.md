@@ -81,6 +81,10 @@ After a Core scope reconfiguration, HTTP returns `409 mailbox_cursor_scope_misma
 and WebSocket returns `cursor_reset`; clients must clear the prior view and reload
 from cursor zero in the returned opaque scope.
 
+Upload IDs are channel-private capabilities bound to the same exact Core
+region/tenant/bot scope and browser session. Scope changes clear the draft and
+staged attachments; an ID created in one scope is invalid in every other scope.
+
 ## Environment Variables
 
 | Variable | Default | Description |

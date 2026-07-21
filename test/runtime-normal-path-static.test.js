@@ -155,15 +155,38 @@ describe('normal product paths have no retired runtime authority', () => {
     expect(mailboxSource).toMatch(/region = \? AND tenant_id = \? AND bot_id = \?/);
     expect(mailboxSource).toMatch(/delivery_mailbox_scope_cursor/);
     expect(mailboxSource).toMatch(/mailbox_cursor_scope_required/);
-    expect(source).toMatch(/X-Zylos-Mailbox-Cursor-Scope|cursor_reset/);
+    expect(mailboxSource).toMatch(/uploads_scope_capability/);
+    expect(mailboxSource).toMatch(/region = \? AND tenant_id = \? AND bot_id = \?/);
+    expect(source).toMatch(/X-Zylos-Mailbox-Cursor-Scope/);
+    expect(source).toMatch(/cursor_reset/);
+    expect(source).toMatch(/type: 'messages', cursor_scope/);
+    expect(source).toMatch(/requestUpdate/);
+    expect(source).toMatch(/new PersistentUploadRegistry[\s\S]*CORE_REGION[\s\S]*CORE_TENANT_ID/);
     expect(source).not.toMatch(/getCoreMessages|event\.rowid|outbox_rowid|broadcast\('messages'/);
     expect(source).not.toMatch(/latest message|parent chat|c4-send/i);
-    expect(appSource).toMatch(/mailboxPollUrl|cursor_scope|replaceChildren/);
+    expect(appSource).toMatch(/mailboxPollUrl/);
+    expect(appSource).toMatch(/cursor_scope/);
+    expect(appSource).toMatch(/scopeGeneration/);
+    expect(appSource).toMatch(/connectionGeneration/);
+    expect(appSource).toMatch(/pollInFlight/);
     expect(appSource).not.toMatch(/conversations\/recent\?limit=100/);
-    expect(cursorSource).toMatch(/web-console-mailbox-v1|lastMessageId: reset \? 0/);
+    expect(cursorSource).toMatch(/web-console-mailbox-v1/);
+    expect(cursorSource).toMatch(/lastMessageId: reset \? 0/);
+    expect(cursorSource).toMatch(/acceptScopedResponse/);
+    expect(cursorSource).toMatch(/isCurrentGeneration/);
+    expect(cursorSource).toMatch(/pendingAttachments/);
+    expect(cursorSource).toMatch(/pendingUploads/);
     expect(indexSource.indexOf('mailbox-cursor.js')).toBeLessThan(indexSource.indexOf('app.js'));
     expect(reconciliationSource).toMatch(/safeAttachmentHref|attachmentKey/);
     expect(reconciliationSource).not.toMatch(/javascript:|https?:\/\/|latest|parent/i);
+  });
+
+  test('compatibility ingress accepts option-like text values without model or terminal routing', () => {
+    const source = fs.readFileSync(
+      path.resolve('skills/comm-bridge/scripts/c4-receive.js'), 'utf8',
+    );
+    expect(source).not.toMatch(/value\.startsWith\(['"]--/);
+    expect(source).toMatch(/value === undefined/);
   });
 
   test('the exact Node suite cannot execute retired provider-interface tests', () => {

@@ -99,7 +99,11 @@ const AUTH_ENABLED = AUTH_PASSWORD.length > 0;
 
 const wcDb = openDb();
 const sessionStore = new SessionStore(wcDb);
-const uploadRegistry = new PersistentUploadRegistry(wcDb);
+const uploadRegistry = new PersistentUploadRegistry(wcDb, {
+  region: CORE_REGION,
+  tenantId: CORE_TENANT_ID,
+  botId: CORE_BOT_ID,
+});
 const deliveryMailbox = new DeliveryMailbox(wcDb, {
   region: CORE_REGION,
   tenantId: CORE_TENANT_ID,
@@ -469,14 +473,16 @@ function jsonError(res, err) {
 /**
  * Check for status changes and new messages
  */
-async function checkUpdates() {
-  if (clients.size === 0) return;
+async function checkUpdates({ force = false } = {}) {
+  if (clients.size === 0 && !force) return;
   // Check status changes
-  const currentStatus = await readStatus();
-  if (!lastStatus || currentStatus.snapshot_id !== lastStatus.snapshot_id
-    || currentStatus.state !== lastStatus.state) {
-    lastStatus = currentStatus;
-    broadcast('status', currentStatus);
+  if (clients.size > 0) {
+    const currentStatus = await readStatus();
+    if (!lastStatus || currentStatus.snapshot_id !== lastStatus.snapshot_id
+      || currentStatus.state !== lastStatus.state) {
+      lastStatus = currentStatus;
+      broadcast('status', currentStatus);
+    }
   }
 
   function flushClient(client) {
@@ -485,7 +491,9 @@ async function checkUpdates() {
     const newMessages = getNewMessages(cursor.id, cursor.cursorScope);
     if (newMessages.length === 0 || client.readyState !== 1) return;
     try {
-      client.send(JSON.stringify({ type: 'messages', data: newMessages }));
+      client.send(JSON.stringify({
+        type: 'messages', cursor_scope: deliveryMailbox.cursorScope, data: newMessages,
+      }));
       clientCursors.set(client, {
         cursorScope: cursor.cursorScope,
         id: Math.max(cursor.id, ...newMessages.map(({ id }) => id)),
@@ -504,9 +512,14 @@ async function checkUpdates() {
 // Poll only while there are subscribed consumers. This bounds snapshot work
 // and avoids advancing durable observability snapshots for an unused console.
 let updateInFlight = null;
+function requestUpdate(options) {
+  if (updateInFlight !== null) return updateInFlight;
+  updateInFlight = checkUpdates(options).finally(() => { updateInFlight = null; });
+  return updateInFlight;
+}
 const updateTimer = setInterval(() => {
-  if (clients.size === 0 || updateInFlight !== null) return;
-  updateInFlight = checkUpdates().catch(() => {}).finally(() => { updateInFlight = null; });
+  if (clients.size === 0) return;
+  requestUpdate().catch(() => {});
 }, 2000);
 
 /**
@@ -529,7 +542,6 @@ wss.on('connection', (ws, req) => {
   readStatus().then((status) => {
     if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'status', data: status }));
   }).catch(() => {});
-  checkUpdates().catch(() => {});
 
   // Handle client messages
   ws.on('message', async (data) => {
@@ -537,6 +549,8 @@ wss.on('connection', (ws, req) => {
       const msg = JSON.parse(data);
 
       if (msg.type === 'subscribe') {
+        clients.delete(ws);
+        clientCursors.delete(ws);
         const sinceId = Number(msg.since_id);
         if (!Number.isSafeInteger(sinceId) || sinceId < 0) {
           ws.close(1008, 'Invalid durable projection cursor');
@@ -560,7 +574,7 @@ wss.on('connection', (ws, req) => {
         ws.send(JSON.stringify({
           type: 'subscribed', cursor_scope: deliveryMailbox.cursorScope,
         }));
-        checkUpdates().catch(() => {});
+        requestUpdate().catch(() => {});
       } else if (msg.type === 'send') {
         const tempId = msg.tempId; // Track client's temp ID
         try {
@@ -745,8 +759,7 @@ app.get('/api/poll', async (req, res) => {
       ? req.query.cursor_scope : null;
     // Fence the client's namespace before any projection or delivery work.
     deliveryMailbox.list({ sinceId, limit: 1, cursorScope });
-    syncCoreInbound();
-    await drainWebOutbox();
+    await requestUpdate({ force: true });
     setMailboxCursorScope(res);
     res.json(getNewMessages(sinceId, cursorScope));
   } catch (err) {
