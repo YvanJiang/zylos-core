@@ -563,11 +563,14 @@ describe('executor daemon resource ownership', () => {
   test('recovers a committed upgrade until postcommit cleanup is durable', async () => {
     const state = fixture();
     const events = [];
-    const database = {
-      close: () => events.push('database-close'),
-      prepare: (sql) => ({ get: () => (sql.includes('sqlite_master')
-        ? { present: 1 } : (sql.includes('SELECT run.upgrade_id') ? { upgrade_id: 'upgrade-pending' } : undefined)) }),
-    };
+    state.database.exec(`
+      CREATE TABLE runtime_upgrade_runs (upgrade_id TEXT, scope_kind TEXT, bot_id TEXT, state TEXT, state_version INTEGER, created_at TEXT);
+      CREATE TABLE runtime_upgrade_events (upgrade_id TEXT, step_key TEXT);
+      INSERT INTO runtime_upgrade_runs VALUES ('upgrade-pending', 'installation', NULL, 'committed', 1, '2026-07-21T00:00:00.000Z');
+    `);
+    const database = state.database;
+    const close = database.close.bind(database);
+    database.close = () => { events.push('database-close'); close(); };
     const handler = async () => ({ state: 'committed' });
     handler.resumeBlocking = async () => { events.push('upgrade-resume'); return { state: 'committed' }; };
     const daemon = await runExecutorDaemon({
@@ -584,11 +587,13 @@ describe('executor daemon resource ownership', () => {
     fs.mkdirSync(path.join(state.directory, 'runtime', 'upgrade-plans'), { recursive: true });
     fs.writeFileSync(path.join(state.directory, 'runtime', 'upgrade-plans', 'finished.json'), '{}\n');
     const events = [];
-    const database = {
-      close: () => events.push('database-close'),
-      prepare: (sql) => ({ get: () => (sql.includes('sqlite_master')
-        ? { present: 1 } : (sql.includes('SELECT state') ? { state: 'rolled_back' } : undefined)) }),
-    };
+    state.database.exec(`
+      CREATE TABLE runtime_upgrade_runs (upgrade_id TEXT, scope_kind TEXT, bot_id TEXT, state TEXT, state_version INTEGER, created_at TEXT);
+      CREATE TABLE runtime_upgrade_events (upgrade_id TEXT, step_key TEXT);
+      INSERT INTO runtime_upgrade_runs VALUES ('finished', 'installation', NULL, 'committed', 1, '2026-07-21T00:00:00.000Z');
+      INSERT INTO runtime_upgrade_events VALUES ('finished', 'postcommit-cleanup');
+    `);
+    const database = state.database;
     const host = { closed: Promise.resolve(), async start() { events.push('host-start'); }, async close() {} };
     const daemon = await runExecutorDaemon({
       zylosDir: state.directory, Database: function DatabaseFixture() { return database; },
