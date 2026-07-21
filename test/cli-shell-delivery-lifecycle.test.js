@@ -41,6 +41,15 @@ describe('shell Core outbox owner lifecycle', () => {
     }
   });
 
+  test('revalidates the full Core claim immediately before a shell socket delivery', () => {
+    const source = fs.readFileSync(path.resolve('cli/commands/shell.js'), 'utf8');
+    expect(source).toMatch(
+      /beforeSend\(command\)[\s\S]*deliveryOwner\.assertCurrentClaim\(command\)/,
+    );
+    expect(source.indexOf('beforeSend(command)'))
+      .toBeLessThan(source.indexOf('await deliverToSocket(socketPath, delivery.text)'));
+  });
+
   test('routes fatal socket errors through the same awaited shutdown fence', () => {
     const source = fs.readFileSync(path.resolve('cli/commands/shell.js'), 'utf8');
     const listenerStart = source.indexOf("server.on('error'");

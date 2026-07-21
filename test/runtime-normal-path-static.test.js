@@ -24,6 +24,7 @@ const normalRuntimeFiles = [
   'skills/zylos-memory/SKILL.md',
   'cli/commands/init.js',
   'cli/commands/add.js',
+  'cli/commands/shell.js',
   'cli/lib/components.js',
   'runtime/observability/executor-snapshot-client.js',
   'runtime/observability/health-projection.js',

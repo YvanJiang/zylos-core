@@ -91,7 +91,7 @@ function renderText(command) {
 
 export function createChannelNeutralTextRenderer({
   sendText,
-  beforeSend = () => {},
+  beforeSend,
   now = () => new Date().toISOString(),
 }) {
   if (typeof sendText !== 'function') {

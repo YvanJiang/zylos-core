@@ -202,7 +202,8 @@ export async function shellCommand() {
     database.pragma('journal_mode = WAL');
     database.pragma('busy_timeout = 5000');
     database.pragma('foreign_keys = ON');
-    const deliveryOwner = createOutboxService({
+    let deliveryOwner;
+    deliveryOwner = createOutboxService({
       database,
       channel: 'shell',
       targetChatId: socketPath,
@@ -211,6 +212,9 @@ export async function shellCommand() {
       targetBotId: CORE_BOT_ID,
       serviceInstanceId,
       renderer: createChannelNeutralTextRenderer({
+        beforeSend(command) {
+          deliveryOwner.assertCurrentClaim(command);
+        },
         async sendText(delivery) {
           if (delivery.target.chat_id !== socketPath) {
             throw new Error('Shell delivery target does not match this shell owner.');
