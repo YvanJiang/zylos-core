@@ -387,9 +387,15 @@ describe('DeliveryMailbox', () => {
       inboundEventId: 'inbound-attachment', endpointId: 'console', content: 'report',
       attachments: [attachment], timestamp: '2026-07-21T00:00:00.000Z',
     });
+    expect(mailbox.hasInboundEvent('inbound-attachment')).toBe(true);
+    expect(mailbox.hasInboundEvent('missing-inbound')).toBe(false);
+    expect(new DeliveryMailbox(db, {
+      region: 'global', tenantId: 'other-tenant', botId: 'test-bot',
+    }).hasInboundEvent('inbound-attachment')).toBe(false);
     db.close();
     db = openDb(dbPath);
     const reopened = new DeliveryMailbox(db, TEST_MAILBOX_SCOPE);
+    expect(reopened.hasInboundEvent('inbound-attachment')).toBe(true);
     expect(reopened.list()).toEqual([
       expect.objectContaining({ content: 'report', attachments: [attachment] }),
     ]);

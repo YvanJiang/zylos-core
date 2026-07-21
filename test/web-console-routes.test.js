@@ -437,7 +437,20 @@ describe('web-console attachment routes', () => {
 
     const firstPoll = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
     expect(firstPoll.status).toBe(200);
-    expect((await firstPoll.json()).some(({ content }) => content.includes('never display'))).toBe(false);
+    const firstMessages = await firstPoll.json();
+    expect(firstMessages.some(({ content }) => content.includes('never display'))).toBe(false);
+    expect(firstMessages.some(({ direction }) => direction === 'out')).toBe(false);
+    const retryDb = new Database(ctx.dbPath);
+    const unsafeDelivery = retryDb.prepare(`
+      SELECT outbox.status, outbox.result_json, outbox.lease_expires_at
+      FROM runtime_outbox AS outbox
+      JOIN runtime_turns AS turn ON turn.turn_id = outbox.turn_id
+      WHERE turn.inbound_event_id = 'unsafe-web-attachment'
+    `).get();
+    retryDb.close();
+    expect(unsafeDelivery.status).toBe('delivering');
+    expect(unsafeDelivery.result_json).toBeNull();
+    expect(unsafeDelivery.lease_expires_at).not.toBeNull();
 
     const sent = await sendHttp(ctx, {
       message: 'safe display',

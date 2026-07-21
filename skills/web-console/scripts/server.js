@@ -289,6 +289,22 @@ function requireMailboxMutationScope(cursorScope) {
   deliveryMailbox.assertCursorScope(cursorScope);
 }
 
+function projectInboundForDelivery(delivery) {
+  syncCoreInbound();
+  const source = db.prepare(`
+    SELECT outbox.turn_id, turn.inbound_event_id
+    FROM runtime_outbox AS outbox
+    LEFT JOIN runtime_turns AS turn ON turn.turn_id = outbox.turn_id
+    WHERE outbox.delivery_id = ?
+  `).get(delivery.delivery_id);
+  if (!source) throw new Error('The Core outbox delivery source is missing.');
+  if (source.turn_id === null) return;
+  if (typeof source.inbound_event_id !== 'string'
+    || !deliveryMailbox.hasInboundEvent(source.inbound_event_id)) {
+    throw new Error('The mapped Core inbound is not durably projected for this delivery.');
+  }
+}
+
 function parseProjectionCursor(value) {
   if (value === undefined) return 0;
   const cursor = Number(value);
@@ -337,8 +353,8 @@ const deliveryOwner = createWebConsoleOutboxOwner({
   tenantId: CORE_TENANT_ID,
   botId: CORE_BOT_ID,
   serviceInstanceId: `web-console-${SERVICE_BIRTH_ID}`,
-  projectInbound() {
-    syncCoreInbound();
+  projectInbound(_message, delivery) {
+    projectInboundForDelivery(delivery);
   },
   deliverMessage(message, delivery) {
     return deliveryMailbox.deliver({
@@ -512,7 +528,11 @@ async function checkUpdates({ force = false } = {}) {
 
   syncCoreInbound();
   for (const client of clients) flushClient(client);
-  await drainWebOutbox();
+  try {
+    await drainWebOutbox();
+  } catch (error) {
+    console.error(`Web Console outbox delivery remains retryable: ${error.message}`);
+  }
   for (const client of clients) flushClient(client);
 }
 

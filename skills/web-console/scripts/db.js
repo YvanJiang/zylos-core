@@ -248,6 +248,15 @@ export class DeliveryMailbox {
     });
   }
 
+  hasInboundEvent(inboundEventId) {
+    if (typeof inboundEventId !== 'string' || inboundEventId.length === 0) return false;
+    const row = this._bySource.get(
+      `scope:${this.scopeKey}:inbound:${inboundEventId}`,
+      this.region, this.tenantId, this.botId,
+    );
+    return row?.direction === 'in';
+  }
+
   deliver({ deliveryId, endpointId, content, timestamp }) {
     if (typeof deliveryId !== 'string' || deliveryId.length === 0) {
       throw new TypeError('deliveryId must be a non-empty string');
