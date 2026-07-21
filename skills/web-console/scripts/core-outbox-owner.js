@@ -57,9 +57,9 @@ export function createWebConsoleOutboxOwner({
     now,
     renderer: {
       async deliver(command) {
-        owner.assertCurrentClaim(command);
+        owner.assertCurrentClaim(command, { sideEffectBoundary: false });
         await projectInbound(command);
-        owner.assertCurrentClaim(command);
+        owner.assertCurrentClaim(command, { sideEffectBoundary: false });
         return textRenderer.deliver(command);
       },
     },

@@ -8,10 +8,54 @@ import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/inde
 
 import {
   createDeliveryDrain,
+  createShellOutboxOwner,
   createShellRuntimeIdentity,
 } from '../cli/commands/shell.js';
+import { acceptCompatibilityInbound } from '../runtime/compatibility/c4-channel-fallback.js';
 
 describe('shell Core outbox owner lifecycle', () => {
+  test('an expired shell claim cannot reach the non-idempotent socket boundary', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'shell-expired-claim-'));
+    const database = new Database(path.join(root, 'c4.db'));
+    const socketPath = path.join(root, 'disposable-shell.sock');
+    acceptCompatibilityInbound(database, {
+      inbound_event_id: 'shell-expired-inbound', trace_id: 'shell-expired-trace',
+      occurred_at: '2026-07-21T01:00:00.000Z', received_at: '2026-07-21T01:00:00.000Z',
+      region: 'global', tenant_id: 'default', channel: 'shell', bot_id: 'zylos',
+      chat_type: 'dm', chat_id: socketPath, native_thread_or_topic_id: null,
+      message_id: 'shell-expired-message',
+      actor: { type: 'user', actor_id: 'shell-user', authenticated: true, roles: [] },
+      content: { kind: 'text', text: 'expired shell delivery', attachments: [] },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source_ref: 'shell-expired-source',
+    }, { now: () => '2026-07-21T01:00:00.000Z' });
+    const times = ['2026-07-21T01:00:01.000Z', '2026-07-21T01:00:12.000Z'];
+    let socketWrites = 0;
+    const owner = createShellOutboxOwner({
+      database,
+      socketPath,
+      serviceInstanceId: 'shell-expired-owner',
+      region: 'global',
+      tenantId: 'default',
+      botId: 'zylos',
+      now: () => times.shift() ?? '2026-07-21T01:00:12.000Z',
+      leaseDurationMs: 10_000,
+      async sendToSocket() {
+        socketWrites += 1;
+      },
+    });
+
+    await expect(owner.dispatchNext()).rejects.toThrow('delivery claim is stale');
+    expect(socketWrites).toBe(0);
+    expect(database.prepare(`
+      SELECT status, result_json, lease_owner FROM runtime_outbox
+    `).get()).toEqual({
+      status: 'delivering', result_json: null, lease_owner: 'shell-expired-owner',
+    });
+    database.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
   test('derives socket and owner identity from process birth UUID, never PID state', () => {
     const ids = ['birth-a', 'birth-b'];
     const first = createShellRuntimeIdentity({
@@ -44,10 +88,10 @@ describe('shell Core outbox owner lifecycle', () => {
   test('revalidates the full Core claim immediately before a shell socket delivery', () => {
     const source = fs.readFileSync(path.resolve('cli/commands/shell.js'), 'utf8');
     expect(source).toMatch(
-      /beforeSend\(command\)[\s\S]*deliveryOwner\.assertCurrentClaim\(command\)/,
+      /beforeSend\(command\)[\s\S]*owner\.assertCurrentClaim\(command\)/,
     );
     expect(source.indexOf('beforeSend(command)'))
-      .toBeLessThan(source.indexOf('await deliverToSocket(socketPath, delivery.text)'));
+      .toBeLessThan(source.indexOf('await sendToSocket(socketPath, delivery.text)'));
   });
 
   test('routes fatal socket errors through the same awaited shutdown fence', () => {

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, test } from '@jest/globals';
 import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/index.js';
 
 import { createIdempotencyKey } from '../contracts/public/index.js';
+import { createChannelNeutralTextRenderer } from '../runtime/compatibility/c4-channel-fallback.js';
 import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { createExecutorStore } from '../runtime/persistence/executor-store.js';
 import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
@@ -355,6 +356,182 @@ describe('durable outbox service', () => {
       },
       mappings: [],
     });
+    database.close();
+  });
+
+  test('refuses an expired claim before the renderer can create a side effect', async () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('expired-pre-action'), {
+      now: () => '2026-07-19T08:40:00Z',
+      generateId: deterministicIds('expired-pre-action'),
+    });
+    const times = ['2026-07-19T08:40:01Z', '2026-07-19T08:40:12Z'];
+    let sideEffects = 0;
+    const outbox = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-expired-pre-action',
+      now: () => times.shift() ?? '2026-07-19T08:40:12Z',
+      generateId: deterministicIds('delivery-expired-pre-action'),
+      leaseDurationMs: 10_000,
+      renderer: {
+        async deliver(command) {
+          sideEffects += 1;
+          return deliveredResult(command, '2026-07-19T08:40:12Z');
+        },
+      },
+    });
+
+    await expect(outbox.dispatchNext()).rejects.toThrow('delivery claim is stale');
+    expect(sideEffects).toBe(0);
+    expect(database.prepare(`
+      SELECT status, result_json, lease_owner, lease_expires_at
+      FROM runtime_outbox
+    `).get()).toEqual({
+      status: 'delivering',
+      result_json: null,
+      lease_owner: 'delivery-expired-pre-action',
+      lease_expires_at: '2026-07-19T08:40:11.000Z',
+    });
+    database.close();
+  });
+
+  test('does not reclaim an expired claim after its pre-action fence starts', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('pre-action-reclaim-barrier'), {
+      now: () => '2026-07-19T08:50:00Z',
+      generateId: deterministicIds('pre-action-reclaim-barrier'),
+    });
+    let ownerTime = '2026-07-19T08:50:01Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-pre-action-owner',
+      now: () => ownerTime,
+      generateId: deterministicIds('delivery-pre-action-owner'),
+      leaseDurationMs: 10_000,
+    });
+    const command = owner.claimNext();
+    ownerTime = '2026-07-19T08:50:05Z';
+    owner.assertCurrentClaim(command);
+
+    const contender = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-pre-action-contender',
+      now: () => '2026-07-19T08:50:16Z',
+      generateId: deterministicIds('delivery-pre-action-contender'),
+      leaseDurationMs: 10_000,
+    });
+    expect(contender.claimNext()).toBeNull();
+    expect(database.prepare(`
+      SELECT status, attempt_count, outbox_lease_epoch, lease_owner,
+        lease_expires_at, pre_action_fenced_at
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(command.outbox_id)).toEqual({
+      status: 'delivering',
+      attempt_count: 1,
+      outbox_lease_epoch: 1,
+      lease_owner: 'delivery-pre-action-owner',
+      lease_expires_at: '2026-07-19T08:50:15.000Z',
+      pre_action_fenced_at: '2026-07-19T08:50:05Z',
+    });
+    database.close();
+  });
+
+  test('keeps an expired post-action result unconfirmed and blocks automatic replay', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('expired-result-unknown'), {
+      now: () => '2026-07-19T09:00:00Z',
+      generateId: deterministicIds('expired-result-unknown'),
+    });
+    let ownerTime = '2026-07-19T09:00:01Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-expired-result-owner',
+      now: () => ownerTime,
+      generateId: deterministicIds('delivery-expired-result-owner'),
+      leaseDurationMs: 10_000,
+    });
+    const command = owner.claimNext();
+    ownerTime = '2026-07-19T09:00:05Z';
+    owner.assertCurrentClaim(command);
+    ownerTime = '2026-07-19T09:00:16Z';
+
+    expect(owner.recordResult(deliveredResult(command, '2026-07-19T09:00:14Z')))
+      .toEqual({ status: 'stale' });
+    const contender = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-expired-result-contender',
+      now: () => '2026-07-19T09:00:17Z',
+      generateId: deterministicIds('delivery-expired-result-contender'),
+    });
+    expect(contender.claimNext()).toBeNull();
+    expect(database.prepare(`
+      SELECT status, result_json, attempt_count, outbox_lease_epoch, lease_owner,
+        lease_expires_at, pre_action_fenced_at
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(command.outbox_id)).toEqual({
+      status: 'delivering',
+      result_json: null,
+      attempt_count: 1,
+      outbox_lease_epoch: 1,
+      lease_owner: 'delivery-expired-result-owner',
+      lease_expires_at: '2026-07-19T09:00:15.000Z',
+      pre_action_fenced_at: '2026-07-19T09:00:05Z',
+    });
+    database.close();
+  });
+
+  test('a competing reclaim prevents a stale shell-style side effect and delivers once', async () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('competing-pre-action-reclaim'), {
+      now: () => '2026-07-19T09:10:00Z',
+      generateId: deterministicIds('competing-pre-action-reclaim'),
+    });
+    const firstOwner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-competing-first',
+      now: () => '2026-07-19T09:10:01Z',
+      generateId: deterministicIds('delivery-competing-first'),
+      leaseDurationMs: 10_000,
+    });
+    const staleCommand = firstOwner.claimNext();
+    const currentOwner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-competing-current',
+      now: () => '2026-07-19T09:10:12Z',
+      generateId: deterministicIds('delivery-competing-current'),
+      leaseDurationMs: 10_000,
+    });
+    const currentCommand = currentOwner.claimNext();
+    const sideEffects = [];
+    const firstRenderer = createChannelNeutralTextRenderer({
+      beforeSend(command) {
+        firstOwner.assertCurrentClaim(command);
+      },
+      async sendText(delivery) {
+        sideEffects.push(delivery.delivery_id);
+        return { platform_message_id: `shell:${delivery.delivery_id}` };
+      },
+      now: () => '2026-07-19T09:10:13Z',
+    });
+    await expect(firstRenderer.deliver(staleCommand)).rejects
+      .toThrow('delivery claim is stale');
+    expect(sideEffects).toEqual([]);
+
+    const currentRenderer = createChannelNeutralTextRenderer({
+      beforeSend(command) {
+        currentOwner.assertCurrentClaim(command);
+      },
+      async sendText(delivery) {
+        sideEffects.push(delivery.delivery_id);
+        return { platform_message_id: `shell:${delivery.delivery_id}` };
+      },
+      now: () => '2026-07-19T09:10:13Z',
+    });
+    const currentResult = await currentRenderer.deliver(currentCommand);
+    expect(currentOwner.recordResult(currentResult)).toEqual({
+      status: 'applied', outbox_status: 'delivered',
+    });
+    expect(sideEffects).toEqual([currentCommand.delivery_id]);
     database.close();
   });
 

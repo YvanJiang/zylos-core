@@ -162,6 +162,13 @@ describe('normal product paths have no retired runtime authority', () => {
     );
     expect(ownerSource).toMatch(/beforeSend\(command\)[\s\S]*assertCurrentClaim\(command\)/);
     expect(outboxSource).toMatch(/claimed_command_hash[\s\S]*assertCurrentClaim/);
+    expect(outboxSource).toMatch(
+      /pre_action_fenced_at = CASE WHEN \? = 1[\s\S]*COALESCE\(pre_action_fenced_at,[\s\S]*lease_expires_at IS NOT NULL AND lease_expires_at > \?/,
+    );
+    expect(outboxSource).toMatch(/candidate\.pre_action_fenced_at IS NULL/);
+    expect(outboxSource).toMatch(
+      /row\.lease_expires_at === null[\s\S]*row\.lease_expires_at <= appliedAt/,
+    );
     expect(source).toMatch(/source\.command_json !== JSON\.stringify\(command\)/);
     expect(source).toMatch(/command_outbox_id[\s\S]*command_turn_id/);
     expect(source).toMatch(/source\.turn_id !== command\.mapping\.turn_id/);

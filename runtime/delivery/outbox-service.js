@@ -308,6 +308,7 @@ export function createOutboxService({
             candidate.status = 'delivering'
             AND candidate.lease_expires_at IS NOT NULL
             AND candidate.lease_expires_at <= ?
+            AND candidate.pre_action_fenced_at IS NULL
           )
         )
         AND (
@@ -384,7 +385,8 @@ export function createOutboxService({
         SET status = 'delivering', attempt_count = ?, delivery_attempt_id = ?,
           delivery_attempt_no = ?, outbox_lease_epoch = ?, lease_owner = ?,
           lease_expires_at = ?, last_attempt_at = ?, next_attempt_at = NULL,
-          command_json = ?, claimed_command_hash = ?, updated_at = ?
+          pre_action_fenced_at = NULL, command_json = ?, claimed_command_hash = ?,
+          updated_at = ?
         WHERE outbox_id = ? AND status = ? AND attempt_count = ?
           AND outbox_lease_epoch = ?
       `).run(
@@ -409,29 +411,48 @@ export function createOutboxService({
     return claim.immediate();
   }
 
-  function assertCurrentClaim(command) {
+  function assertCurrentClaim(command, { sideEffectBoundary = true } = {}) {
     const commandJson = JSON.stringify(command);
     const claimedCommandHash = createCommandSnapshotHash(commandJson);
-    const row = database.prepare(`
-      SELECT status, delivery_id, aggregate_type, aggregate_id, turn_id, aggregate_version,
-        delivery_attempt_id, delivery_attempt_no, outbox_lease_epoch, lease_owner,
-        command_json, claimed_command_hash
-      FROM runtime_outbox
-      WHERE outbox_id = ?
-    `).get(command.outbox_id);
-    if (!row
-      || row.status !== 'delivering'
-      || row.delivery_id !== command.delivery_id
-      || row.aggregate_type !== command.aggregate_type
-      || row.aggregate_id !== command.aggregate_id
-      || row.turn_id !== command.mapping.turn_id
-      || row.aggregate_version !== command.aggregate_version
-      || row.delivery_attempt_id !== command.delivery_attempt_id
-      || row.delivery_attempt_no !== command.delivery_attempt_no
-      || row.outbox_lease_epoch !== command.outbox_lease_epoch
-      || row.lease_owner !== serviceInstanceId
-      || row.claimed_command_hash !== claimedCommandHash
-      || createCommandSnapshotHash(row.command_json) !== claimedCommandHash) {
+    const renew = database.transaction(() => {
+      const renewedAt = now();
+      const renewedLeaseExpiresAt = addMilliseconds(renewedAt, leaseDurationMs);
+      return database.prepare(`
+        UPDATE runtime_outbox
+        SET lease_expires_at = ?,
+          pre_action_fenced_at = CASE WHEN ? = 1
+            THEN COALESCE(pre_action_fenced_at, ?)
+            ELSE pre_action_fenced_at
+          END,
+          updated_at = ?
+        WHERE outbox_id = ? AND status = 'delivering'
+          AND delivery_id = ? AND aggregate_type = ? AND aggregate_id = ?
+          AND turn_id IS ? AND aggregate_version = ?
+          AND delivery_attempt_id = ? AND delivery_attempt_no = ?
+          AND outbox_lease_epoch = ? AND lease_owner = ?
+          AND command_json = ? AND claimed_command_hash = ?
+          AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+      `).run(
+        renewedLeaseExpiresAt,
+        sideEffectBoundary ? 1 : 0,
+        renewedAt,
+        renewedAt,
+        command.outbox_id,
+        command.delivery_id,
+        command.aggregate_type,
+        command.aggregate_id,
+        command.mapping.turn_id,
+        command.aggregate_version,
+        command.delivery_attempt_id,
+        command.delivery_attempt_no,
+        command.outbox_lease_epoch,
+        serviceInstanceId,
+        commandJson,
+        claimedCommandHash,
+        renewedAt,
+      );
+    });
+    if (renew.immediate().changes !== 1) {
       const error = new Error('The durable delivery claim is stale.');
       error.code = 'stale_delivery_claim';
       throw error;
@@ -441,8 +462,10 @@ export function createOutboxService({
 
   function recordResult(result) {
     const apply = database.transaction(() => {
+      const appliedAt = now();
       const row = database.prepare(`
         SELECT status, delivery_attempt_id, delivery_attempt_no, outbox_lease_epoch,
+          lease_owner, lease_expires_at, pre_action_fenced_at,
           command_json, claimed_command_hash, result_json,
           lane.target_json AS lane_target_json
           , lane.lane_key AS durable_lane_key, lane.turn_id AS lane_turn_id
@@ -479,6 +502,9 @@ export function createOutboxService({
       }
       if (
         row.status !== 'delivering'
+        || row.lease_owner !== serviceInstanceId
+        || row.lease_expires_at === null
+        || row.lease_expires_at <= appliedAt
         || !isCurrentFence(row, result)
         || !isCurrentIdentity(command, result)
       ) {
@@ -507,6 +533,8 @@ export function createOutboxService({
           WHERE outbox_id = ? AND status = 'delivering'
             AND delivery_attempt_id = ? AND delivery_attempt_no = ?
             AND outbox_lease_epoch = ?
+            AND lease_owner = ? AND lease_expires_at > ?
+            AND command_json = ? AND claimed_command_hash = ?
         `).run(
           outboxStatus,
           nextAttemptAt,
@@ -517,6 +545,10 @@ export function createOutboxService({
           result.delivery_attempt_id,
           result.delivery_attempt_no,
           result.outbox_lease_epoch,
+          serviceInstanceId,
+          appliedAt,
+          row.command_json,
+          row.claimed_command_hash,
         );
         if (updated.changes !== 1) return { status: 'stale' };
         if (outboxStatus === 'dead_letter' && terminalUpdate) {
@@ -565,6 +597,8 @@ export function createOutboxService({
         WHERE outbox_id = ? AND status = 'delivering'
           AND delivery_attempt_id = ? AND delivery_attempt_no = ?
           AND outbox_lease_epoch = ?
+          AND lease_owner = ? AND lease_expires_at > ?
+          AND command_json = ? AND claimed_command_hash = ?
       `).run(
         JSON.stringify(result),
         result.result_at,
@@ -572,6 +606,10 @@ export function createOutboxService({
         result.delivery_attempt_id,
         result.delivery_attempt_no,
         result.outbox_lease_epoch,
+        serviceInstanceId,
+        appliedAt,
+        row.command_json,
+        row.claimed_command_hash,
       );
       if (updated.changes !== 1) return { status: 'stale' };
       const laneKey = database.prepare(`
@@ -594,7 +632,7 @@ export function createOutboxService({
     if (!renderer) throw new Error('dispatchNext requires a renderer');
     const command = claimNext();
     if (!command) return { status: 'idle' };
-    assertCurrentClaim(command);
+    assertCurrentClaim(command, { sideEffectBoundary: false });
     const result = await renderer.deliver(command);
     return recordResult(result);
   }

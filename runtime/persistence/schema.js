@@ -27,6 +27,7 @@ const OUTBOX_TABLE_SCHEMA = `(
     outbox_lease_epoch INTEGER NOT NULL DEFAULT 0 CHECK (outbox_lease_epoch >= 0),
     lease_owner TEXT,
     lease_expires_at TEXT,
+    pre_action_fenced_at TEXT,
     last_attempt_at TEXT,
     next_attempt_at TEXT,
     last_error_json TEXT,
@@ -1144,6 +1145,7 @@ const OUTBOX_COLUMNS = Object.freeze([
   'outbox_lease_epoch',
   'lease_owner',
   'lease_expires_at',
+  'pre_action_fenced_at',
   'last_attempt_at',
   'next_attempt_at',
   'last_error_json',
@@ -2398,6 +2400,7 @@ export function initializeRuntimePersistence(database) {
   );
   addColumnIfMissing(database, 'runtime_outbox', 'lease_owner', 'TEXT');
   addColumnIfMissing(database, 'runtime_outbox', 'lease_expires_at', 'TEXT');
+  addColumnIfMissing(database, 'runtime_outbox', 'pre_action_fenced_at', 'TEXT');
   addColumnIfMissing(database, 'runtime_outbox', 'last_attempt_at', 'TEXT');
   addColumnIfMissing(database, 'runtime_outbox', 'next_attempt_at', 'TEXT');
   addColumnIfMissing(database, 'runtime_outbox', 'last_error_json', 'TEXT');

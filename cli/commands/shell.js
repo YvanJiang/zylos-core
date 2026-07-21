@@ -75,6 +75,47 @@ export function createDeliveryDrain({ dispatchNext, onError = () => {} }) {
   return Object.freeze({ drain, stop });
 }
 
+export function createShellOutboxOwner({
+  database,
+  socketPath,
+  serviceInstanceId,
+  region = CORE_REGION,
+  tenantId = CORE_TENANT_ID,
+  botId = CORE_BOT_ID,
+  now = () => new Date().toISOString(),
+  leaseDurationMs = 10_000,
+  sendToSocket = deliverToSocket,
+}) {
+  if (typeof sendToSocket !== 'function') {
+    throw new TypeError('sendToSocket must be a function');
+  }
+  let owner;
+  owner = createOutboxService({
+    database,
+    channel: 'shell',
+    targetChatId: socketPath,
+    targetRegion: region,
+    targetTenantId: tenantId,
+    targetBotId: botId,
+    serviceInstanceId,
+    now,
+    leaseDurationMs,
+    renderer: createChannelNeutralTextRenderer({
+      beforeSend(command) {
+        owner.assertCurrentClaim(command);
+      },
+      async sendText(delivery) {
+        if (delivery.target.chat_id !== socketPath) {
+          throw new Error('Shell delivery target does not match this shell owner.');
+        }
+        await sendToSocket(socketPath, delivery.text);
+        return { platform_message_id: `shell:${delivery.delivery_id}` };
+      },
+    }),
+  });
+  return owner;
+}
+
 export async function shellCommand() {
   const { default: Database } = await import(new URL(
     '../../skills/comm-bridge/node_modules/better-sqlite3/lib/index.js',
@@ -202,27 +243,10 @@ export async function shellCommand() {
     database.pragma('journal_mode = WAL');
     database.pragma('busy_timeout = 5000');
     database.pragma('foreign_keys = ON');
-    let deliveryOwner;
-    deliveryOwner = createOutboxService({
+    const deliveryOwner = createShellOutboxOwner({
       database,
-      channel: 'shell',
-      targetChatId: socketPath,
-      targetRegion: CORE_REGION,
-      targetTenantId: CORE_TENANT_ID,
-      targetBotId: CORE_BOT_ID,
+      socketPath,
       serviceInstanceId,
-      renderer: createChannelNeutralTextRenderer({
-        beforeSend(command) {
-          deliveryOwner.assertCurrentClaim(command);
-        },
-        async sendText(delivery) {
-          if (delivery.target.chat_id !== socketPath) {
-            throw new Error('Shell delivery target does not match this shell owner.');
-          }
-          await deliverToSocket(socketPath, delivery.text);
-          return { platform_message_id: `shell:${delivery.delivery_id}` };
-        },
-      }),
     });
     deliveryDrain = createDeliveryDrain({
       dispatchNext: () => deliveryOwner.dispatchNext(),
