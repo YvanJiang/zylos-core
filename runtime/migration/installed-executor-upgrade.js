@@ -672,7 +672,7 @@ export function createInstalledExecutorUpgradeHandler({
     if (registered.length > 0) {
       throw new Error('Legacy runtime registrations must remain removed after rollback.');
     }
-    return Object.freeze({ step_id: stepId, source_data_restored: true, restarted: false, restarted_at: now() });
+    return Object.freeze({ step_id: stepId, source_data_restored: true, restarted: true, restarted_at: now() });
   }
 
   async function executePlan(plan) {

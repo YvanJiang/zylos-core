@@ -18,6 +18,11 @@ import { prompt, promptYesNo, promptChoice, promptSecret } from '../lib/prompts.
 import { bold, dim, green, red, yellow, cyan, bgGreen, success, error, warn, heading } from '../lib/colors.js';
 import { commandExists } from '../lib/shell-utils.js';
 import { reconcileExecutorService } from '../lib/executor-service-lifecycle.js';
+import { reconcileLegacyServicesForExecutorStart } from '../../runtime/migration/installed-executor-upgrade.js';
+import {
+  cleanupRetiredRuntimeSkillArtifacts,
+  isRetiredRuntimeSkill,
+} from '../../runtime/migration/legacy-lifecycle-artifacts.js';
 import {
   activateFreshSplitInstructions,
   refreshSplitInstructions,
@@ -712,6 +717,8 @@ function syncCoreSkills() {
   const entries = fs.readdirSync(CORE_SKILLS_SRC, { withFileTypes: true });
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
+    if (isRetiredRuntimeSkill(entry.name)) continue;
+
     const srcDir = path.join(CORE_SKILLS_SRC, entry.name);
     const destDir = path.join(SKILLS_DIR, entry.name);
     const isNew = !fs.existsSync(destDir);
@@ -729,6 +736,8 @@ function syncCoreSkills() {
     }
   }
 
+  cleanupRetiredRuntimeSkillArtifacts({ skillsDir: SKILLS_DIR });
+
   return { installed, updated };
 }
 
@@ -741,6 +750,7 @@ function installSkillDependencies() {
   const entries = fs.readdirSync(SKILLS_DIR, { withFileTypes: true });
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
+    if (isRetiredRuntimeSkill(entry.name)) continue;
     const skillDir = path.join(SKILLS_DIR, entry.name);
     const pkgPath = path.join(skillDir, 'package.json');
     if (!fs.existsSync(pkgPath)) continue;
@@ -934,6 +944,8 @@ async function startCoreServices() {
   if (!fs.existsSync(ecosystemPath)) {
     throw new Error(`Executor service configuration is missing: ${ecosystemPath}`);
   }
+
+  reconcileLegacyServicesForExecutorStart({ zylosDir: ZYLOS_DIR });
 
   const result = requireHealthyExecutorStart(
     await reconcileExecutorService({

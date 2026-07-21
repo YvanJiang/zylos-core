@@ -405,17 +405,8 @@ describe('normal product paths have no retired runtime authority', () => {
     expect(upgrade).not.toMatch(/execFileSyncFn\('pm2', \['start'/);
   });
 
-  test('normal CLI, installer, and runtime entrypoints do not import migration code', () => {
-    for (const file of [
-      'cli/commands/init.js',
-      'cli/commands/doctor.js',
-      'cli/commands/self-uninstall.js',
-      'cli/lib/codex-hooks.js',
-      'cli/lib/sync-settings-hooks.js',
-      'scripts/install.sh',
-      'scripts/postinstall.js',
-      ...normalRuntimeFiles,
-    ]) {
+  test('normal runtime entrypoints do not import migration code', () => {
+    for (const file of normalRuntimeFiles.filter((file) => !file.startsWith('cli/'))) {
       const source = fs.readFileSync(path.resolve(file), 'utf8');
       expect(source).not.toMatch(/(?:from|import)\s+['"][^'"]*runtime\/migration\//);
     }

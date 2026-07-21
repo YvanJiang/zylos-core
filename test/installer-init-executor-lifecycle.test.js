@@ -7,6 +7,7 @@ import { describe, expect, test } from '@jest/globals';
 
 import { requireHealthyExecutorStart } from '../cli/commands/init.js';
 import { desiredClaudeHooks } from '../cli/lib/sync-settings-hooks.js';
+import { cleanupRetiredRuntimeSkillArtifacts } from '../runtime/migration/legacy-lifecycle-artifacts.js';
 import { inspectInstalledRuntime } from '../scripts/installed-runtime-inventory.js';
 
 describe('installer and init executor lifecycle', () => {
@@ -119,3 +120,21 @@ describe('installer and init executor lifecycle', () => {
     }
   });
 });
+  test('fresh skill deployment removes the retired dispatcher script from an isolated installation', () => {
+    const root = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-init-retired-script-'));
+    const skillsDir = path.join(root, '.claude', 'skills');
+    const retired = path.join(skillsDir, 'comm-bridge', 'scripts', 'c4-dispatcher.js');
+    fs.mkdirSync(path.dirname(retired), { recursive: true });
+    fs.writeFileSync(retired, 'must not ship');
+    try {
+      expect(cleanupRetiredRuntimeSkillArtifacts({ skillsDir })).toEqual({ removed: [retired] });
+      expect(fs.existsSync(retired)).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('init checks legacy ownership using the selected isolated ZYLOS_DIR', () => {
+    const initSource = fs.readFileSync(new URL('../cli/commands/init.js', import.meta.url), 'utf8');
+    expect(initSource).toContain('reconcileLegacyServicesForExecutorStart({ zylosDir: ZYLOS_DIR })');
+  });

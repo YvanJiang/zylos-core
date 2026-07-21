@@ -11,6 +11,55 @@ function requireZylosDir(zylosDir) {
   return path.resolve(zylosDir);
 }
 
+const RETIRED_RUNTIME_SKILLS = new Set(['activity-monitor']);
+
+const OBSOLETE_HOOK_BASE_KEYS = Object.freeze([
+  'skills/activity-monitor/scripts/context-monitor.js',
+  'skills/activity-monitor/scripts/hook-activity.js',
+  'skills/activity-monitor/scripts/hook-auth-prompt.js',
+  'skills/activity-monitor/scripts/session-start-orchestrator.js',
+  'skills/zylos-memory/scripts/session-start-inject.js',
+  'skills/comm-bridge/scripts/c4-session-init.js',
+  'skills/activity-monitor/scripts/session-foreground.js',
+  'skills/activity-monitor/scripts/session-start-prompt.js',
+]);
+
+export function obsoleteHookBaseKeys() {
+  return new Set(OBSOLETE_HOOK_BASE_KEYS);
+}
+
+export function isObsoleteProviderSessionHook(command, zylosDir) {
+  if (typeof command !== 'string' || command.length === 0) return false;
+  const installedPath = path.join(
+    requireZylosDir(zylosDir), '.claude', 'skills', 'activity-monitor',
+    'scripts', 'session-start-orchestrator.js',
+  );
+  return command.includes(installedPath) || command.includes('session-start-orchestrator.js');
+}
+
+export function isRetiredRuntimeSkill(skillName) {
+  return RETIRED_RUNTIME_SKILLS.has(skillName);
+}
+
+export function cleanupRetiredRuntimeSkillArtifacts({ skillsDir }) {
+  const root = requireZylosDir(skillsDir);
+  const artifacts = [
+    path.join(root, 'comm-bridge', 'scripts', 'c4-dispatcher.js'),
+    path.join(root, 'comm-bridge', 'scripts', 'tmux-input-state.js'),
+    path.join(root, 'comm-bridge', 'scripts', 'c4-control.js'),
+  ];
+  const removed = [];
+  for (const artifact of artifacts) {
+    try {
+      fs.unlinkSync(artifact);
+      removed.push(artifact);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
+  return Object.freeze({ removed: Object.freeze(removed) });
+}
+
 // These exact identifiers exist only for one-time post-commit cleanup. Nothing in
 // the normal runtime imports, dispatches, executes, or selects these artifacts.
 export function legacyLifecycleArtifactPaths(zylosDir) {
