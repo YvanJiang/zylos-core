@@ -139,6 +139,9 @@ describe('normal product paths have no retired runtime authority', () => {
     const outboxSource = fs.readFileSync(
       path.resolve('runtime/delivery/outbox-service.js'), 'utf8',
     );
+    const schemaSource = fs.readFileSync(
+      path.resolve('runtime/persistence/schema.js'), 'utf8',
+    );
     const shellSource = fs.readFileSync(path.resolve('cli/commands/shell.js'), 'utf8');
     const snapshotSource = fs.readFileSync(
       path.resolve('runtime/observability/snapshot-publisher.js'), 'utf8',
@@ -167,7 +170,10 @@ describe('normal product paths have no retired runtime authority', () => {
     expect(ownerSource).toMatch(/beforeSend\(command\)[\s\S]*assertCurrentClaim\(command\)/);
     expect(outboxSource).toMatch(/claimed_command_hash[\s\S]*assertCurrentClaim/);
     expect(outboxSource).toMatch(
-      /pre_action_fenced_at = CASE WHEN \? = 1[\s\S]*COALESCE\(pre_action_fenced_at,[\s\S]*lease_expires_at IS NOT NULL AND lease_expires_at > \?/,
+      /julianday\(candidate\.next_attempt_at\) <= julianday\(\?\)/,
+    );
+    expect(outboxSource).toMatch(
+      /pre_action_fenced_at = CASE WHEN \? = 1[\s\S]*COALESCE\(pre_action_fenced_at,[\s\S]*lease_expires_epoch_ms IS NOT NULL AND lease_expires_epoch_ms > \?/,
     );
     expect(outboxSource).toMatch(/candidate\.pre_action_fenced_at IS NULL/);
     expect(outboxSource).toMatch(/expiredClaimRecovery = 'fenced'/);
@@ -180,14 +186,21 @@ describe('normal product paths have no retired runtime authority', () => {
       /pre_action_fenced_at !== null[\s\S]*\? 'delivery_unknown'/,
     );
     expect(snapshotSource).toMatch(
-      /Date\.parse\(row\.lease_expires_at\) <= Date\.parse\(generatedAt\)/,
+      /row\.lease_expires_epoch_ms <= Date\.parse\(generatedAt\)/,
     );
     expect(snapshotSource).toMatch(
       /status === 'delivery_unknown'[\s\S]*return 'degraded'/,
     );
     expect(outboxSource).toMatch(
-      /row\.lease_expires_at === null[\s\S]*row\.lease_expires_at <= appliedAt/,
+      /row\.lease_expires_epoch_ms === null[\s\S]*row\.lease_expires_epoch_ms <= appliedAtEpochMs/,
     );
+    expect(outboxSource).toMatch(/INSERT INTO runtime_outbox_claim_snapshots/);
+    expect(outboxSource).toMatch(
+      /snapshot\.command_json = \? AND snapshot\.command_hash = \?/,
+    );
+    expect(schemaSource).toMatch(/runtime_outbox_claim_snapshot_update_immutable/);
+    expect(schemaSource).toMatch(/runtime_outbox_claim_snapshot_insert_once/);
+    expect(schemaSource).toMatch(/runtime_outbox_claim_snapshot_delete_immutable/);
     expect(source).toMatch(/source\.command_json !== JSON\.stringify\(command\)/);
     expect(source).toMatch(/command_outbox_id[\s\S]*command_turn_id/);
     expect(source).toMatch(/source\.turn_id !== command\.mapping\.turn_id/);

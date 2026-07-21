@@ -25,6 +25,14 @@ function addMilliseconds(timestamp, milliseconds) {
   return new Date(Date.parse(timestamp) + milliseconds).toISOString();
 }
 
+function parseAuthorityEpochMs(timestamp) {
+  const epochMs = Date.parse(timestamp);
+  if (!Number.isFinite(epochMs)) {
+    throw new TypeError('now() must return an RFC3339 timestamp');
+  }
+  return epochMs;
+}
+
 function createCommandSnapshotHash(commandJson) {
   return crypto.createHash('sha256').update(commandJson).digest('hex');
 }
@@ -295,6 +303,7 @@ export function createOutboxService({
   function claimNext() {
     const claim = database.transaction(() => {
       const claimedAt = now();
+      const claimedAtEpochMs = parseAuthorityEpochMs(claimedAt);
       const row = database.prepare(`
         SELECT candidate.outbox_id, candidate.status, candidate.attempt_count,
           candidate.outbox_lease_epoch, candidate.command_json,
@@ -307,11 +316,14 @@ export function createOutboxService({
         WHERE (
           (
             candidate.status IN ('pending', 'retry_wait')
-            AND (candidate.next_attempt_at IS NULL OR candidate.next_attempt_at <= ?)
+            AND (
+              candidate.next_attempt_at IS NULL
+              OR julianday(candidate.next_attempt_at) <= julianday(?)
+            )
           ) OR (
             candidate.status = 'delivering'
-            AND candidate.lease_expires_at IS NOT NULL
-            AND candidate.lease_expires_at <= ?
+            AND candidate.lease_expires_epoch_ms IS NOT NULL
+            AND candidate.lease_expires_epoch_ms <= ?
             AND (
               candidate.pre_action_fenced_at IS NULL
               OR ? = 'same_delivery_id'
@@ -333,7 +345,7 @@ export function createOutboxService({
           WHERE active.lane_key = candidate.lane_key
             AND active.status = 'delivering'
             AND active.outbox_id != candidate.outbox_id
-            AND active.lease_expires_at > ?
+            AND active.lease_expires_epoch_ms > ?
         )
         AND (? IS NULL OR json_extract(candidate.command_json, '$.target.channel') = ?)
         AND (? IS NULL OR json_extract(candidate.command_json, '$.target.chat_id') = ?)
@@ -345,9 +357,9 @@ export function createOutboxService({
         LIMIT 1
       `).get(
         claimedAt,
-        claimedAt,
+        claimedAtEpochMs,
         expiredClaimRecovery,
-        claimedAt,
+        claimedAtEpochMs,
         channel,
         channel,
         targetChatId,
@@ -386,13 +398,15 @@ export function createOutboxService({
       const commandJson = JSON.stringify(command);
       const claimedCommandHash = createCommandSnapshotHash(commandJson);
       const leaseExpiresAt = new Date(
-        Date.parse(claimedAt) + leaseDurationMs,
+        claimedAtEpochMs + leaseDurationMs,
       ).toISOString();
+      const leaseExpiresEpochMs = claimedAtEpochMs + leaseDurationMs;
       const updated = database.prepare(`
         UPDATE runtime_outbox
         SET status = 'delivering', attempt_count = ?, delivery_attempt_id = ?,
           delivery_attempt_no = ?, outbox_lease_epoch = ?, lease_owner = ?,
-          lease_expires_at = ?, last_attempt_at = ?, next_attempt_at = NULL,
+          lease_expires_at = ?, lease_expires_epoch_ms = ?,
+          last_attempt_at = ?, next_attempt_at = NULL,
           pre_action_fenced_at = NULL, command_json = ?, claimed_command_hash = ?,
           updated_at = ?
         WHERE outbox_id = ? AND status = ? AND attempt_count = ?
@@ -404,6 +418,7 @@ export function createOutboxService({
         outboxLeaseEpoch,
         serviceInstanceId,
         leaseExpiresAt,
+        leaseExpiresEpochMs,
         claimedAt,
         commandJson,
         claimedCommandHash,
@@ -414,6 +429,21 @@ export function createOutboxService({
         row.outbox_lease_epoch,
       );
       if (updated.changes !== 1) return null;
+      database.prepare(`
+        INSERT INTO runtime_outbox_claim_snapshots (
+          outbox_id, delivery_attempt_id, delivery_attempt_no, outbox_lease_epoch,
+          lease_owner, command_json, command_hash, claimed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        command.outbox_id,
+        deliveryAttemptId,
+        deliveryAttemptNo,
+        outboxLeaseEpoch,
+        serviceInstanceId,
+        commandJson,
+        claimedCommandHash,
+        claimedAt,
+      );
       return command;
     });
     return claim.immediate();
@@ -424,10 +454,12 @@ export function createOutboxService({
     const claimedCommandHash = createCommandSnapshotHash(commandJson);
     const renew = database.transaction(() => {
       const renewedAt = now();
-      const renewedLeaseExpiresAt = addMilliseconds(renewedAt, leaseDurationMs);
+      const renewedAtEpochMs = parseAuthorityEpochMs(renewedAt);
+      const renewedLeaseExpiresEpochMs = renewedAtEpochMs + leaseDurationMs;
+      const renewedLeaseExpiresAt = new Date(renewedLeaseExpiresEpochMs).toISOString();
       return database.prepare(`
         UPDATE runtime_outbox
-        SET lease_expires_at = ?,
+        SET lease_expires_at = ?, lease_expires_epoch_ms = ?,
           pre_action_fenced_at = CASE WHEN ? = 1
             THEN COALESCE(pre_action_fenced_at, ?)
             ELSE pre_action_fenced_at
@@ -439,9 +471,19 @@ export function createOutboxService({
           AND delivery_attempt_id = ? AND delivery_attempt_no = ?
           AND outbox_lease_epoch = ? AND lease_owner = ?
           AND command_json = ? AND claimed_command_hash = ?
-          AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+          AND lease_expires_epoch_ms IS NOT NULL AND lease_expires_epoch_ms > ?
+          AND EXISTS (
+            SELECT 1 FROM runtime_outbox_claim_snapshots AS snapshot
+            WHERE snapshot.outbox_id = runtime_outbox.outbox_id
+              AND snapshot.delivery_attempt_id = runtime_outbox.delivery_attempt_id
+              AND snapshot.delivery_attempt_no = runtime_outbox.delivery_attempt_no
+              AND snapshot.outbox_lease_epoch = runtime_outbox.outbox_lease_epoch
+              AND snapshot.lease_owner = runtime_outbox.lease_owner
+              AND snapshot.command_json = ? AND snapshot.command_hash = ?
+          )
       `).run(
         renewedLeaseExpiresAt,
+        renewedLeaseExpiresEpochMs,
         sideEffectBoundary ? 1 : 0,
         renewedAt,
         renewedAt,
@@ -457,7 +499,9 @@ export function createOutboxService({
         serviceInstanceId,
         commandJson,
         claimedCommandHash,
-        renewedAt,
+        renewedAtEpochMs,
+        commandJson,
+        claimedCommandHash,
       );
     });
     if (renew.immediate().changes !== 1) {
@@ -471,28 +515,37 @@ export function createOutboxService({
   function recordResult(result) {
     const apply = database.transaction(() => {
       const appliedAt = now();
+      const appliedAtEpochMs = parseAuthorityEpochMs(appliedAt);
       const row = database.prepare(`
-        SELECT status, delivery_attempt_id, delivery_attempt_no, outbox_lease_epoch,
-          lease_owner, lease_expires_at, pre_action_fenced_at,
-          command_json, claimed_command_hash, result_json,
+        SELECT outbox.status, outbox.delivery_attempt_id, outbox.delivery_attempt_no,
+          outbox.outbox_lease_epoch, outbox.lease_owner, outbox.lease_expires_at,
+          outbox.lease_expires_epoch_ms, outbox.pre_action_fenced_at,
+          outbox.command_json, outbox.claimed_command_hash, outbox.result_json,
+          snapshot.command_json AS claim_command_json,
+          snapshot.command_hash AS claim_command_hash,
+          snapshot.lease_owner AS claim_lease_owner,
           lane.target_json AS lane_target_json
           , lane.lane_key AS durable_lane_key, lane.turn_id AS lane_turn_id
           , lane.aggregate_type AS lane_aggregate_type
         FROM runtime_outbox AS outbox
         LEFT JOIN runtime_delivery_lanes AS lane ON lane.lane_key = outbox.lane_key
+        LEFT JOIN runtime_outbox_claim_snapshots AS snapshot
+          ON snapshot.outbox_id = outbox.outbox_id
+          AND snapshot.delivery_attempt_id = outbox.delivery_attempt_id
+          AND snapshot.delivery_attempt_no = outbox.delivery_attempt_no
+          AND snapshot.outbox_lease_epoch = outbox.outbox_lease_epoch
         WHERE outbox.outbox_id = ?
       `).get(result.outbox_id);
       if (!row) return { status: 'stale' };
-      if (row.result_json === JSON.stringify(result)) {
-        return { status: 'duplicate', outbox_status: row.status };
-      }
-      if (row.claimed_command_hash === null
-        || createCommandSnapshotHash(row.command_json) !== row.claimed_command_hash) {
+      if (row.claim_command_hash === null
+        || createCommandSnapshotHash(row.claim_command_json) !== row.claim_command_hash
+        || row.command_json !== row.claim_command_json
+        || row.claimed_command_hash !== row.claim_command_hash) {
         return { status: 'stale' };
       }
       let command;
       try {
-        command = JSON.parse(row.command_json);
+        command = JSON.parse(row.claim_command_json);
       } catch {
         return { status: 'stale' };
       }
@@ -508,13 +561,21 @@ export function createOutboxService({
           occurredAt: result.result_at,
         });
       }
+      const currentFence = isCurrentFence(row, result);
+      const currentIdentity = isCurrentIdentity(command, result);
+      if (row.result_json === JSON.stringify(result)) {
+        if (!currentFence || !currentIdentity) return { status: 'stale' };
+        validateDeliveryResult(result, { command, occurredAt: result.result_at });
+        return { status: 'duplicate', outbox_status: row.status };
+      }
       if (
         row.status !== 'delivering'
         || row.lease_owner !== serviceInstanceId
-        || row.lease_expires_at === null
-        || row.lease_expires_at <= appliedAt
-        || !isCurrentFence(row, result)
-        || !isCurrentIdentity(command, result)
+        || row.claim_lease_owner !== row.lease_owner
+        || row.lease_expires_epoch_ms === null
+        || row.lease_expires_epoch_ms <= appliedAtEpochMs
+        || !currentFence
+        || !currentIdentity
       ) {
         return { status: 'stale' };
       }
@@ -537,11 +598,12 @@ export function createOutboxService({
         const updated = database.prepare(`
           UPDATE runtime_outbox
           SET status = ?, lease_owner = NULL, lease_expires_at = NULL,
+            lease_expires_epoch_ms = NULL,
             next_attempt_at = ?, result_json = ?, last_error_json = ?, updated_at = ?
           WHERE outbox_id = ? AND status = 'delivering'
             AND delivery_attempt_id = ? AND delivery_attempt_no = ?
             AND outbox_lease_epoch = ?
-            AND lease_owner = ? AND lease_expires_at > ?
+            AND lease_owner = ? AND lease_expires_epoch_ms > ?
             AND command_json = ? AND claimed_command_hash = ?
         `).run(
           outboxStatus,
@@ -554,9 +616,9 @@ export function createOutboxService({
           result.delivery_attempt_no,
           result.outbox_lease_epoch,
           serviceInstanceId,
-          appliedAt,
-          row.command_json,
-          row.claimed_command_hash,
+          appliedAtEpochMs,
+          row.claim_command_json,
+          row.claim_command_hash,
         );
         if (updated.changes !== 1) return { status: 'stale' };
         if (outboxStatus === 'dead_letter' && terminalUpdate) {
@@ -601,11 +663,12 @@ export function createOutboxService({
       const updated = database.prepare(`
         UPDATE runtime_outbox
         SET status = 'delivered', lease_owner = NULL, lease_expires_at = NULL,
+          lease_expires_epoch_ms = NULL,
           result_json = ?, last_error_json = NULL, updated_at = ?
         WHERE outbox_id = ? AND status = 'delivering'
           AND delivery_attempt_id = ? AND delivery_attempt_no = ?
           AND outbox_lease_epoch = ?
-          AND lease_owner = ? AND lease_expires_at > ?
+          AND lease_owner = ? AND lease_expires_epoch_ms > ?
           AND command_json = ? AND claimed_command_hash = ?
       `).run(
         JSON.stringify(result),
@@ -615,9 +678,9 @@ export function createOutboxService({
         result.delivery_attempt_no,
         result.outbox_lease_epoch,
         serviceInstanceId,
-        appliedAt,
-        row.command_json,
-        row.claimed_command_hash,
+        appliedAtEpochMs,
+        row.claim_command_json,
+        row.claim_command_hash,
       );
       if (updated.changes !== 1) return { status: 'stale' };
       const laneKey = database.prepare(`

@@ -175,6 +175,7 @@ function supersedeOrdinaryPending(database, laneKey, updatedAt) {
   database.prepare(`
     UPDATE runtime_outbox
     SET status = 'superseded', lease_owner = NULL, lease_expires_at = NULL,
+      lease_expires_epoch_ms = NULL,
       updated_at = ?
     WHERE lane_key = ? AND supersedable = 1
       AND status IN ('pending', 'retry_wait')

@@ -296,7 +296,9 @@ zylos add lark
 Channels submit the standard authenticated inbound envelope and consume durable
 Core outbox commands. A channel adapter owns rendering and delivery results; it
 must use the explicit native-thread root and reply-target message facts and
-must never infer the latest message or fall back to a parent chat.
+must never infer the latest message or fall back to a parent chat. Each delivery
+attempt is fenced by a UTC-instant lease and an immutable full command snapshot;
+expired or altered claims cannot authorize rendering, delivery, or results.
 
 ---
 

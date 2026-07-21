@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 import { afterEach, describe, expect, test } from '@jest/globals';
 import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/index.js';
@@ -153,15 +154,17 @@ describe('durable outbox service', () => {
         aggregate_version INTEGER NOT NULL CHECK (aggregate_version > 0),
         status TEXT NOT NULL,
         command_json TEXT NOT NULL,
+        lease_expires_at TEXT,
         created_at TEXT NOT NULL,
         UNIQUE (aggregate_type, aggregate_id, aggregate_version)
       );
       INSERT INTO runtime_outbox (
         outbox_id, delivery_id, aggregate_type, aggregate_id,
-        aggregate_version, status, command_json, created_at
+        aggregate_version, status, command_json, lease_expires_at, created_at
       ) VALUES (
         'outbox-legacy', 'delivery-legacy', 'turn_main', 'turn-legacy',
-        7, 'dead_letter', '{}', '2026-07-19T07:00:00Z'
+        7, 'dead_letter', '{}', '2026-07-19T15:00:10+08:00',
+        '2026-07-19T07:00:00Z'
       );
     `);
 
@@ -169,7 +172,7 @@ describe('durable outbox service', () => {
 
     expect(database.prepare(`
       SELECT outbox_id, delivery_id, aggregate_version, status, attempt_count,
-        outbox_lease_epoch, supersedable, terminal
+        outbox_lease_epoch, lease_expires_epoch_ms, supersedable, terminal
       FROM runtime_outbox
       WHERE outbox_id = 'outbox-legacy'
     `).get()).toEqual({
@@ -179,6 +182,7 @@ describe('durable outbox service', () => {
       status: 'dead_letter',
       attempt_count: 0,
       outbox_lease_epoch: 0,
+      lease_expires_epoch_ms: Date.parse('2026-07-19T07:00:10Z'),
       supersedable: 0,
       terminal: 0,
     });
@@ -317,6 +321,212 @@ describe('durable outbox service', () => {
     });
     expect(readDeliveryAuthority(database, currentClaim.outbox_id)).toEqual(applied);
 
+    const alteredCommand = {
+      ...currentClaim,
+      priority: currentClaim.priority + 1,
+      render_model: { ...currentClaim.render_model, text: 'altered after result' },
+    };
+    const alteredCommandJson = JSON.stringify(alteredCommand);
+    database.prepare(`
+      UPDATE runtime_outbox SET command_json = ?, claimed_command_hash = ?
+      WHERE outbox_id = ?
+    `).run(
+      alteredCommandJson,
+      crypto.createHash('sha256').update(alteredCommandJson).digest('hex'),
+      currentClaim.outbox_id,
+    );
+    expect(secondService.recordResult(currentResult)).toEqual({ status: 'stale' });
+
+    database.close();
+  });
+
+  test('does not reclaim a live lease when the contender clock uses a positive offset', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('positive-offset-live-lease'), {
+      now: () => '2026-07-19T08:10:00Z',
+      generateId: deterministicIds('positive-offset-live-lease'),
+    });
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-positive-offset-owner',
+      now: () => '2026-07-19T08:10:01Z',
+      generateId: deterministicIds('delivery-positive-offset-owner'),
+      leaseDurationMs: 10_000,
+    });
+    const command = owner.claimNext();
+    const contender = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-positive-offset-contender',
+      now: () => '2026-07-19T16:10:06+08:00',
+      generateId: deterministicIds('delivery-positive-offset-contender'),
+      leaseDurationMs: 10_000,
+    });
+
+    expect(contender.claimNext()).toBeNull();
+    expect(database.prepare(`
+      SELECT attempt_count, outbox_lease_epoch, lease_owner
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(command.outbox_id)).toEqual({
+      attempt_count: 1,
+      outbox_lease_epoch: 1,
+      lease_owner: 'delivery-positive-offset-owner',
+    });
+    database.close();
+  });
+
+  test('does not claim a not-yet-due delivery when the owner clock uses a positive offset', () => {
+    const database = openTestDatabase();
+    const accepted = acceptNormalInbound(database, normalEnvelope('positive-offset-not-before'), {
+      now: () => '2026-07-19T08:15:00Z',
+      generateId: deterministicIds('positive-offset-not-before'),
+    });
+    database.prepare(`
+      UPDATE runtime_outbox SET next_attempt_at = ? WHERE turn_id = ?
+    `).run('2026-07-19T08:15:10Z', accepted.turn_id);
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-positive-offset-not-before',
+      now: () => '2026-07-19T16:15:05+08:00',
+      generateId: deterministicIds('delivery-positive-offset-not-before'),
+    });
+
+    expect(owner.claimNext()).toBeNull();
+    database.close();
+  });
+
+  test('reclaims an expired lease when the contender clock uses a negative offset', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('negative-offset-expired-lease'), {
+      now: () => '2026-07-19T08:20:00Z',
+      generateId: deterministicIds('negative-offset-expired-lease'),
+    });
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-negative-offset-owner',
+      now: () => '2026-07-19T08:20:01Z',
+      generateId: deterministicIds('delivery-negative-offset-owner'),
+      leaseDurationMs: 10_000,
+    });
+    const staleCommand = owner.claimNext();
+    const contender = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-negative-offset-contender',
+      now: () => '2026-07-19T03:20:12-05:00',
+      generateId: deterministicIds('delivery-negative-offset-contender'),
+      leaseDurationMs: 10_000,
+    });
+
+    expect(contender.claimNext()).toMatchObject({
+      outbox_id: staleCommand.outbox_id,
+      delivery_attempt_no: 2,
+      outbox_lease_epoch: 2,
+    });
+    database.close();
+  });
+
+  test('renews a live pre-action lease when the owner clock uses a positive offset', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('positive-offset-pre-action'), {
+      now: () => '2026-07-19T08:30:00Z',
+      generateId: deterministicIds('positive-offset-pre-action'),
+    });
+    let ownerTime = '2026-07-19T08:30:01Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-positive-offset-pre-action',
+      now: () => ownerTime,
+      generateId: deterministicIds('delivery-positive-offset-pre-action'),
+      leaseDurationMs: 10_000,
+    });
+    const command = owner.claimNext();
+    ownerTime = '2026-07-19T16:30:05+08:00';
+
+    expect(() => owner.assertCurrentClaim(command)).not.toThrow();
+    expect(database.prepare(`
+      SELECT lease_expires_at, lease_expires_epoch_ms, pre_action_fenced_at
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(command.outbox_id)).toEqual({
+      lease_expires_at: '2026-07-19T08:30:15.000Z',
+      lease_expires_epoch_ms: Date.parse('2026-07-19T08:30:15Z'),
+      pre_action_fenced_at: '2026-07-19T16:30:05+08:00',
+    });
+    database.close();
+  });
+
+  test('rejects an expired pre-action lease when the owner clock uses a negative offset', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('negative-offset-pre-action'), {
+      now: () => '2026-07-19T08:35:00Z',
+      generateId: deterministicIds('negative-offset-pre-action'),
+    });
+    let ownerTime = '2026-07-19T08:35:01Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-negative-offset-pre-action',
+      now: () => ownerTime,
+      generateId: deterministicIds('delivery-negative-offset-pre-action'),
+      leaseDurationMs: 10_000,
+    });
+    const command = owner.claimNext();
+    ownerTime = '2026-07-19T03:35:12-05:00';
+
+    expect(() => owner.assertCurrentClaim(command)).toThrow('delivery claim is stale');
+    database.close();
+  });
+
+  test('applies a live delivery result when the owner clock uses a positive offset', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('positive-offset-result'), {
+      now: () => '2026-07-19T08:40:00Z',
+      generateId: deterministicIds('positive-offset-result'),
+    });
+    let ownerTime = '2026-07-19T08:40:01Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-positive-offset-result',
+      now: () => ownerTime,
+      generateId: deterministicIds('delivery-positive-offset-result'),
+      leaseDurationMs: 10_000,
+    });
+    const command = owner.claimNext();
+    ownerTime = '2026-07-19T08:40:02Z';
+    owner.assertCurrentClaim(command);
+    ownerTime = '2026-07-19T16:40:05+08:00';
+
+    expect(owner.recordResult(deliveredResult(command, ownerTime))).toEqual({
+      status: 'applied', outbox_status: 'delivered',
+    });
+    database.close();
+  });
+
+  test('rejects an expired delivery result when the owner clock uses a negative offset', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('negative-offset-result'), {
+      now: () => '2026-07-19T08:45:00Z',
+      generateId: deterministicIds('negative-offset-result'),
+    });
+    let ownerTime = '2026-07-19T08:45:01Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-negative-offset-result',
+      now: () => ownerTime,
+      generateId: deterministicIds('delivery-negative-offset-result'),
+      leaseDurationMs: 10_000,
+    });
+    const command = owner.claimNext();
+    ownerTime = '2026-07-19T08:45:02Z';
+    owner.assertCurrentClaim(command);
+    ownerTime = '2026-07-19T03:45:13-05:00';
+
+    expect(owner.recordResult(deliveredResult(command, ownerTime))).toEqual({ status: 'stale' });
+    expect(database.prepare(`
+      SELECT status, result_json, pre_action_fenced_at
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(command.outbox_id)).toEqual({
+      status: 'delivering',
+      result_json: null,
+      pre_action_fenced_at: '2026-07-19T08:45:02Z',
+    });
     database.close();
   });
 
@@ -356,6 +566,124 @@ describe('durable outbox service', () => {
       },
       mappings: [],
     });
+    database.close();
+  });
+
+  test('rejects a jointly replaced command and hash after the side-effect fence across restart', () => {
+    const database = openTestDatabase();
+    const databasePath = database.name;
+    acceptNormalInbound(database, normalEnvelope('immutable-claim-snapshot'), {
+      now: () => '2026-07-19T09:00:00Z',
+      generateId: deterministicIds('immutable-claim-snapshot'),
+    });
+    let ownerTime = '2026-07-19T09:00:01Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-immutable-claim-snapshot',
+      now: () => ownerTime,
+      generateId: deterministicIds('delivery-immutable-claim-snapshot'),
+      leaseDurationMs: 10_000,
+    });
+    const command = owner.claimNext();
+    ownerTime = '2026-07-19T09:00:02Z';
+    owner.assertCurrentClaim(command);
+    const result = deliveredResult(command, '2026-07-19T09:00:03Z');
+    database.close();
+
+    const restartedDatabase = new Database(databasePath);
+    const persisted = restartedDatabase.prepare(`
+      SELECT command_json FROM runtime_outbox WHERE outbox_id = ?
+    `).get(command.outbox_id);
+    const changedCommand = JSON.parse(persisted.command_json);
+    changedCommand.render_model.text = 'jointly replaced after the external effect';
+    changedCommand.render_model.terminal = true;
+    changedCommand.priority = 999;
+    const changedJson = JSON.stringify(changedCommand);
+    const changedHash = crypto.createHash('sha256').update(changedJson).digest('hex');
+    restartedDatabase.prepare(`
+      UPDATE runtime_outbox
+      SET command_json = ?, claimed_command_hash = ?
+      WHERE outbox_id = ?
+    `).run(changedJson, changedHash, command.outbox_id);
+    const restartedOwner = createOutboxService({
+      database: restartedDatabase,
+      serviceInstanceId: 'delivery-immutable-claim-snapshot',
+      now: () => '2026-07-19T09:00:04Z',
+      generateId: deterministicIds('delivery-immutable-claim-snapshot-restart'),
+      leaseDurationMs: 10_000,
+    });
+
+    expect(restartedOwner.recordResult(result)).toEqual({ status: 'stale' });
+    expect(restartedDatabase.prepare(`
+      SELECT status, result_json, pre_action_fenced_at
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(command.outbox_id)).toEqual({
+      status: 'delivering',
+      result_json: null,
+      pre_action_fenced_at: '2026-07-19T09:00:02Z',
+    });
+    const contender = createOutboxService({
+      database: restartedDatabase,
+      serviceInstanceId: 'delivery-immutable-claim-contender',
+      now: () => '2026-07-19T09:00:13Z',
+      generateId: deterministicIds('delivery-immutable-claim-contender'),
+      leaseDurationMs: 10_000,
+    });
+    expect(contender.claimNext()).toBeNull();
+    restartedDatabase.close();
+  });
+
+  test('keeps the original per-attempt claim snapshot append-only while its outbox exists', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('append-only-claim-snapshot'), {
+      now: () => '2026-07-19T09:05:00Z',
+      generateId: deterministicIds('append-only-claim-snapshot'),
+    });
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-append-only-claim-snapshot',
+      now: () => '2026-07-19T09:05:01Z',
+      generateId: deterministicIds('delivery-append-only-claim-snapshot'),
+    });
+    const command = owner.claimNext();
+
+    expect(() => database.prepare(`
+      INSERT OR REPLACE INTO runtime_outbox_claim_snapshots (
+        outbox_id, delivery_attempt_id, delivery_attempt_no, outbox_lease_epoch,
+        lease_owner, command_json, command_hash, claimed_at
+      )
+      SELECT outbox_id, delivery_attempt_id, delivery_attempt_no, outbox_lease_epoch,
+        lease_owner, '{}', 'replacement', claimed_at
+      FROM runtime_outbox_claim_snapshots
+      WHERE outbox_id = ? AND outbox_lease_epoch = ?
+    `).run(command.outbox_id, command.outbox_lease_epoch)).toThrow(
+      'outbox claim snapshot is immutable',
+    );
+    expect(() => database.prepare(`
+      UPDATE runtime_outbox_claim_snapshots
+      SET command_json = '{}', command_hash = 'replacement'
+      WHERE outbox_id = ? AND outbox_lease_epoch = ?
+    `).run(command.outbox_id, command.outbox_lease_epoch)).toThrow(
+      'outbox claim snapshot is immutable',
+    );
+    expect(() => database.prepare(`
+      DELETE FROM runtime_outbox_claim_snapshots
+      WHERE outbox_id = ? AND outbox_lease_epoch = ?
+    `).run(command.outbox_id, command.outbox_lease_epoch)).toThrow(
+      'active outbox claim snapshot cannot be deleted',
+    );
+    expect(database.prepare(`
+      SELECT command_json, command_hash
+      FROM runtime_outbox_claim_snapshots
+      WHERE outbox_id = ? AND outbox_lease_epoch = ?
+    `).get(command.outbox_id, command.outbox_lease_epoch)).toEqual({
+      command_json: JSON.stringify(command),
+      command_hash: crypto.createHash('sha256').update(JSON.stringify(command)).digest('hex'),
+    });
+    database.prepare('DELETE FROM runtime_outbox WHERE outbox_id = ?').run(command.outbox_id);
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_outbox_claim_snapshots WHERE outbox_id = ?
+    `).get(command.outbox_id).count).toBe(0);
     database.close();
   });
 

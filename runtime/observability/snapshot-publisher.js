@@ -469,7 +469,8 @@ function collectWorkspaceLeases(database) {
 
 function collectOutbox(database, generatedAt) {
   const rows = database.prepare(`
-    SELECT status, command_json, created_at, lease_expires_at, pre_action_fenced_at
+    SELECT status, command_json, created_at, lease_expires_at,
+      lease_expires_epoch_ms, pre_action_fenced_at
     FROM runtime_outbox
     WHERE status IN ('pending', 'delivering', 'retry_wait', 'dead_letter')
     ORDER BY created_at, outbox_id
@@ -481,8 +482,8 @@ function collectOutbox(database, generatedAt) {
     requireNonEmptyString('outbox channel', channel);
     const status = row.status === 'delivering'
       && row.pre_action_fenced_at !== null
-      && row.lease_expires_at !== null
-      && Date.parse(row.lease_expires_at) <= Date.parse(generatedAt)
+      && row.lease_expires_epoch_ms !== null
+      && row.lease_expires_epoch_ms <= Date.parse(generatedAt)
       ? 'delivery_unknown'
       : row.status;
     const key = `${channel}\u0000${status}`;
