@@ -5,7 +5,11 @@
  */
 
 import { getDb, cleanupHistory, now } from './database.js';
-import { dispatchMissedScheduledTaskNotice, dispatchScheduledTask } from './runtime.js';
+import {
+  dispatchMissedScheduledTaskNotice,
+  dispatchScheduledTask,
+  recoverLegacyRunningTasksFromCore,
+} from './runtime.js';
 import { decideScheduledOccurrence } from '../../../runtime/scheduler/scheduler-queue.js';
 import { readExecutorObservability } from '../../../runtime/scheduler/scheduler-observability.js';
 import { loadTimezone } from './tz.js';
@@ -243,6 +247,7 @@ process.on('SIGTERM', () => {
 
 // Start the scheduler
 db = getDb();
+recoverLegacyRunningTasksFromCore(db);
 mainLoop().then(() => {
   console.log('Scheduler stopped');
   if (db) db.close();

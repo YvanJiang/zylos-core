@@ -51,6 +51,12 @@ function repositoryFiles() {
   }).split('\0').filter(Boolean).filter((file) => fs.existsSync(path.resolve(file)));
 }
 
+function isScannableText(file) {
+  return /\.(?:js|cjs|mjs|md|json|ya?ml|sh|env|sql)$/.test(file)
+    || ['Dockerfile', '.npmignore'].includes(path.basename(file))
+    || file.startsWith('test/integration/runtime/bin/');
+}
+
 const migrationOnlyRepositoryFiles = new Set([
   // Historical record: never imported, executed, packaged as an entrypoint, or dispatched.
   'CHANGELOG.md',
@@ -73,14 +79,16 @@ const migrationOnlyRepositoryFiles = new Set([
   'test/runtime-normal-path-static.test.js',
   'test/runtime-provider-neutral-health.test.js',
   'test/runtime-upgrade-coordinator.test.js',
+  'runtime/migration/installed-executor-upgrade.js',
+  'runtime/migration/legacy-lifecycle-artifacts.js',
+  'runtime/migration/legacy-provider-quiescence.js',
 ]);
 
 describe('normal product paths have no retired runtime authority', () => {
   test('the tracked repository contains retired identifiers only in isolated migration code or proofs', () => {
     const banned = /tmux|capture-pane|send-keys|paste-buffer|agent-status\.json|global[ _-]session|terminal injection|activity-monitor|c4-dispatcher|c4-control|c4-session-init/i;
     const violations = repositoryFiles()
-      .filter((file) => /\.(?:js|cjs|mjs|md|json|ya?ml|sh|env|sql)$/.test(file))
-      .filter((file) => !file.startsWith('runtime/migration/'))
+      .filter(isScannableText)
       .filter((file) => !migrationOnlyRepositoryFiles.has(file))
       .filter((file) => banned.test(fs.readFileSync(path.resolve(file), 'utf8')));
     expect(violations).toEqual([]);
@@ -135,6 +143,39 @@ describe('normal product paths have no retired runtime authority', () => {
     expect(runner).not.toMatch(/activity-monitor|cli', 'lib', 'runtime', '__tests__/);
   });
 
+  test('every local import selected by the exact Node suite resolves to a tracked source', () => {
+    const roots = [
+      'cli/lib/__tests__',
+      'skills/scheduler/scripts/__tests__',
+    ];
+    const tracked = new Set(repositoryFiles());
+    const missing = [];
+    const testFiles = [];
+    for (const root of roots) {
+      const pending = [root];
+      while (pending.length > 0) {
+        const directory = pending.pop();
+        for (const entry of fs.readdirSync(path.resolve(directory), { withFileTypes: true })) {
+          const file = path.join(directory, entry.name);
+          if (entry.isDirectory()) pending.push(file);
+          else if (entry.isFile() && entry.name.endsWith('.test.js')) testFiles.push(file);
+        }
+      }
+    }
+    for (const file of testFiles) {
+      const source = fs.readFileSync(path.resolve(file), 'utf8');
+      const imports = source.matchAll(/(?:from\s+|import\s*\()(['"])(\.{1,2}\/[^'"]+)\1/g);
+      for (const [, , specifier] of imports) {
+        const resolved = path.resolve(path.dirname(file), specifier);
+        const relative = path.relative(path.resolve('.'), resolved).split(path.sep).join('/');
+        if (!fs.existsSync(resolved) || !tracked.has(relative)) {
+          missing.push(`${file} -> ${specifier}`);
+        }
+      }
+    }
+    expect(missing).toEqual([]);
+  });
+
   test('retired executable implementations are absent from both repository and package payload', () => {
     const tracked = new Set(repositoryFiles());
     const files = packedFiles();
@@ -150,6 +191,10 @@ describe('normal product paths have no retired runtime authority', () => {
       'cli/lib/runtime/claude.js',
       'cli/lib/runtime/codex.js',
       'cli/lib/runtime/tmux-helpers.js',
+      'cli/lib/__tests__/claude-auth.test.js',
+      'cli/lib/__tests__/codex.test.js',
+      'runtime/migration/legacy-c4-runtime-config.js',
+      'runtime/migration/legacy-c4-diagnostic.js',
     ]) {
       expect([...tracked].some((file) => file === retired || file.startsWith(retired))).toBe(false);
       expect(files.some((file) => file === retired || file.startsWith(retired))).toBe(false);
@@ -160,11 +205,13 @@ describe('normal product paths have no retired runtime authority', () => {
     const migrationOnly = new Set([
       'scripts/bootstrap-executor-lifecycle.js',
       'scripts/installed-runtime-inventory.js',
+      'runtime/migration/installed-executor-upgrade.js',
+      'runtime/migration/legacy-lifecycle-artifacts.js',
+      'runtime/migration/legacy-provider-quiescence.js',
     ]);
     const banned = /tmux|capture-pane|send-keys|paste-buffer|global[ _-]session|terminal injection|agent-status\.json|input health|window health/i;
     const violations = packedFiles()
-      .filter((file) => /\.(?:js|cjs|mjs|md|json|ya?ml|sh)$/.test(file))
-      .filter((file) => !file.startsWith('runtime/migration/'))
+      .filter(isScannableText)
       .filter((file) => !migrationOnly.has(file))
       .filter((file) => banned.test(fs.readFileSync(path.resolve(file), 'utf8')));
     expect(violations).toEqual([]);

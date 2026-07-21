@@ -12,6 +12,150 @@ function occurrenceId(task) {
   return `${task.id}:${task.next_run_at}`;
 }
 
+function exactCoreOccurrence(coreDb, task, occurrence) {
+  let row;
+  try {
+    row = coreDb.prepare(`
+      SELECT occurrence.schedule_id, occurrence.occurrence_id, occurrence.task_id,
+             occurrence.turn_id, occurrence.status, occurrence.envelope_json,
+             turn.state AS turn_state, queue.wait_reason
+      FROM runtime_scheduler_occurrences AS occurrence
+      JOIN runtime_turns AS turn ON turn.turn_id = occurrence.turn_id
+      LEFT JOIN runtime_turn_queue AS queue ON queue.turn_id = occurrence.turn_id
+      WHERE occurrence.schedule_id = ? AND occurrence.occurrence_id = ?
+    `).get(task.id, occurrence);
+  } catch (error) {
+    if (error?.code === 'SQLITE_ERROR') return null;
+    throw error;
+  }
+  if (!row || row.status !== 'accepted' || row.task_id !== task.id) return null;
+  try {
+    const schedule = JSON.parse(row.envelope_json)?.schedule;
+    if (schedule?.schedule_id !== task.id
+      || schedule?.task_id !== task.id
+      || schedule?.occurrence_id !== occurrence) return null;
+  } catch {
+    return null;
+  }
+  return row;
+}
+
+/**
+ * Recover a pre-migration local `running` row only by adopting the exact
+ * durable Core occurrence. Absence or mismatch is a replay barrier: the task
+ * is paused for explicit operator reconfiguration and is never redispatched.
+ */
+export function recoverLegacyRunningTasks(schedulerDb, coreDb, {
+  now: clock = now,
+} = {}) {
+  const result = { adopted: 0, paused: 0, terminal: 0 };
+  const tasks = schedulerDb.prepare(`
+    SELECT * FROM tasks
+    WHERE status = 'running' AND current_turn_id IS NULL
+    ORDER BY updated_at ASC, id ASC
+  `).all();
+  for (const task of tasks) {
+    const occurrence = occurrenceId(task);
+    const core = exactCoreOccurrence(coreDb, task, occurrence);
+    const recordedAt = clock();
+    if (!core) {
+      const update = schedulerDb.prepare(`
+        UPDATE tasks
+        SET status = 'paused', requires_reconfiguration = 1,
+            current_occurrence_id = ?, current_turn_id = NULL,
+            last_core_state = 'unknown', core_wait_reason = NULL,
+            last_error = ?, updated_at = ?
+        WHERE id = ? AND status = 'running' AND current_turn_id IS NULL
+      `).run(
+        occurrence,
+        'Paused during migration: no exact admitted Core occurrence; replay is forbidden.',
+        recordedAt,
+        task.id,
+      );
+      result.paused += update.changes;
+      continue;
+    }
+    const recovery = schedulerDb.transaction(() => {
+      const update = schedulerDb.prepare(`
+        UPDATE tasks
+        SET current_occurrence_id = ?, current_turn_id = ?,
+            last_core_state = ?, core_wait_reason = ?, updated_at = ?
+        WHERE id = ? AND status = 'running' AND current_turn_id IS NULL
+      `).run(
+        occurrence,
+        core.turn_id,
+        core.turn_state,
+        core.wait_reason ?? null,
+        recordedAt,
+        task.id,
+      );
+      if (update.changes === 0) return null;
+      const existing = schedulerDb.prepare(`
+        SELECT 1 FROM task_history
+        WHERE task_id = ? AND occurrence_id = ? AND turn_id = ?
+        LIMIT 1
+      `).get(task.id, occurrence, core.turn_id);
+      if (!existing) {
+        schedulerDb.prepare(`
+          INSERT INTO task_history (
+            task_id, occurrence_id, turn_id, executed_at, status
+          ) VALUES (?, ?, ?, ?, 'started')
+        `).run(task.id, occurrence, core.turn_id, recordedAt);
+      }
+      const terminal = [
+        'completed', 'stopped', 'cancelled', 'interrupted', 'failed', 'timed_out',
+      ].includes(core.turn_state);
+      if (terminal) {
+        const taskStatus = task.requires_reconfiguration === 1
+          ? 'paused'
+          : (core.turn_state === 'completed'
+            ? 'completed'
+            : (task.type === 'one-time' ? 'failed' : 'completed'));
+        const historyStatus = core.turn_state === 'completed'
+          ? 'success'
+          : (core.turn_state === 'timed_out' ? 'timeout' : 'failed');
+        const terminalError = core.turn_state === 'completed'
+          ? task.last_error
+          : `Scheduled turn ${core.turn_state}.`;
+        schedulerDb.prepare(`
+          UPDATE tasks
+          SET status = ?, last_run_at = ?, last_core_state = ?,
+              core_wait_reason = NULL, last_error = ?, updated_at = ?
+          WHERE id = ? AND status = 'running' AND current_turn_id = ?
+        `).run(
+          taskStatus,
+          recordedAt,
+          core.turn_state,
+          terminalError,
+          recordedAt,
+          task.id,
+          core.turn_id,
+        );
+        schedulerDb.prepare(`
+          UPDATE task_history
+          SET status = ?, completed_at = ?,
+              duration_ms = (? - executed_at) * 1000, error = ?
+          WHERE task_id = ? AND occurrence_id = ? AND turn_id = ? AND status = 'started'
+        `).run(
+          historyStatus,
+          recordedAt,
+          recordedAt,
+          core.turn_state === 'completed' ? null : terminalError,
+          task.id,
+          occurrence,
+          core.turn_id,
+        );
+      }
+      return { terminal };
+    })();
+    if (recovery) {
+      result.adopted += 1;
+      if (recovery.terminal) result.terminal += 1;
+    }
+  }
+  return result;
+}
+
 export function scheduleMissedNoticeRetry(db, task, error, {
   now: clock = now,
 } = {}) {

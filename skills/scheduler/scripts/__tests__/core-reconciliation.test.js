@@ -8,6 +8,7 @@ import Database from 'better-sqlite3';
 
 import {
   recordScheduledAdmission,
+  recoverLegacyRunningTasks,
   reconcileRunningTasks,
 } from '../daemon-tasks.js';
 
@@ -58,6 +59,179 @@ function snapshot(state, { maintenance = false, error = null } = {}) {
 }
 
 describe('scheduler Core admission and reconciliation', () => {
+  test('adopts an exact durable Core occurrence after restart without replay or duplicate history', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'scheduler-adopt-'));
+    const schedulerPath = path.join(directory, 'scheduler.db');
+    const corePath = path.join(directory, 'core.db');
+    let scheduler = database(schedulerPath);
+    scheduler.prepare(`
+      UPDATE tasks SET status = 'running', requires_reconfiguration = 1
+      WHERE id = 'task-A'
+    `).run();
+    const core = new Database(corePath);
+    core.exec(`
+      CREATE TABLE runtime_scheduler_occurrences (
+        schedule_id TEXT NOT NULL, occurrence_id TEXT NOT NULL, task_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL, status TEXT NOT NULL, envelope_json TEXT NOT NULL,
+        PRIMARY KEY (schedule_id, occurrence_id)
+      );
+      CREATE TABLE runtime_turns (turn_id TEXT PRIMARY KEY, state TEXT NOT NULL);
+      CREATE TABLE runtime_turn_queue (turn_id TEXT PRIMARY KEY, wait_reason TEXT);
+    `);
+    core.prepare(`
+      INSERT INTO runtime_turns VALUES ('turn-adopted', 'queued')
+    `).run();
+    core.prepare(`
+      INSERT INTO runtime_turn_queue VALUES ('turn-adopted', 'queue')
+    `).run();
+    core.prepare(`
+      INSERT INTO runtime_scheduler_occurrences VALUES (?, ?, ?, ?, 'accepted', ?)
+    `).run(
+      'task-A', 'task-A:100', 'task-A', 'turn-adopted',
+      JSON.stringify({ schedule: {
+        schedule_id: 'task-A', occurrence_id: 'task-A:100', task_id: 'task-A',
+      } }),
+    );
+
+    assert.deepEqual(recoverLegacyRunningTasks(scheduler, core, { now: () => 10 }), {
+      adopted: 1, paused: 0, terminal: 0,
+    });
+    assert.deepEqual(scheduler.prepare(`
+      SELECT status, current_occurrence_id, current_turn_id, last_core_state,
+             core_wait_reason, requires_reconfiguration
+      FROM tasks WHERE id = 'task-A'
+    `).get(), {
+      status: 'running', current_occurrence_id: 'task-A:100', current_turn_id: 'turn-adopted',
+      last_core_state: 'queued', core_wait_reason: 'queue', requires_reconfiguration: 1,
+    });
+    assert.deepEqual(scheduler.prepare(`
+      SELECT occurrence_id, turn_id, status FROM task_history
+    `).get(), { occurrence_id: 'task-A:100', turn_id: 'turn-adopted', status: 'started' });
+    scheduler.close();
+    scheduler = new Database(schedulerPath);
+    assert.deepEqual(recoverLegacyRunningTasks(scheduler, core, { now: () => 20 }), {
+      adopted: 0, paused: 0, terminal: 0,
+    });
+    assert.equal(scheduler.prepare('SELECT COUNT(*) AS count FROM task_history').get().count, 1);
+
+    const maintenance = snapshot('queued', { maintenance: true });
+    maintenance.turns.items[0].turn_id = 'turn-adopted';
+    assert.deepEqual(reconcileRunningTasks(scheduler, maintenance, { now: () => 30 }), {
+      pending: 1, terminal: 0, unavailable: 0,
+    });
+    assert.equal(
+      scheduler.prepare("SELECT status FROM tasks WHERE id = 'task-A'").get().status,
+      'running',
+    );
+
+    const terminal = snapshot('completed');
+    terminal.turns.items[0].turn_id = 'turn-adopted';
+    assert.deepEqual(reconcileRunningTasks(scheduler, terminal, { now: () => 40 }), {
+      pending: 0, terminal: 1, unavailable: 0,
+    });
+    assert.deepEqual(scheduler.prepare(`
+      SELECT status, requires_reconfiguration, last_core_state
+      FROM tasks WHERE id = 'task-A'
+    `).get(), {
+      status: 'paused', requires_reconfiguration: 1, last_core_state: 'completed',
+    });
+    assert.equal(
+      scheduler.prepare("SELECT status FROM task_history WHERE task_id = 'task-A'").get().status,
+      'success',
+    );
+    scheduler.close();
+    core.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  test('settles an already-terminal durable Core occurrence during migration recovery', () => {
+    const scheduler = database();
+    scheduler.prepare(`
+      UPDATE tasks SET status = 'running', requires_reconfiguration = 1
+      WHERE id = 'task-A'
+    `).run();
+    const core = new Database(':memory:');
+    core.exec(`
+      CREATE TABLE runtime_scheduler_occurrences (
+        schedule_id TEXT NOT NULL, occurrence_id TEXT NOT NULL, task_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL, status TEXT NOT NULL, envelope_json TEXT NOT NULL,
+        PRIMARY KEY (schedule_id, occurrence_id)
+      );
+      CREATE TABLE runtime_turns (turn_id TEXT PRIMARY KEY, state TEXT NOT NULL);
+      CREATE TABLE runtime_turn_queue (turn_id TEXT PRIMARY KEY, wait_reason TEXT);
+      INSERT INTO runtime_turns VALUES ('turn-terminal', 'completed');
+    `);
+    core.prepare(`
+      INSERT INTO runtime_scheduler_occurrences VALUES (?, ?, ?, ?, 'accepted', ?)
+    `).run(
+      'task-A', 'task-A:100', 'task-A', 'turn-terminal',
+      JSON.stringify({ schedule: {
+        schedule_id: 'task-A', occurrence_id: 'task-A:100', task_id: 'task-A',
+      } }),
+    );
+
+    assert.deepEqual(recoverLegacyRunningTasks(scheduler, core, { now: () => 25 }), {
+      adopted: 1, paused: 0, terminal: 1,
+    });
+    assert.deepEqual(scheduler.prepare(`
+      SELECT status, current_turn_id, last_core_state, requires_reconfiguration
+      FROM tasks WHERE id = 'task-A'
+    `).get(), {
+      status: 'paused', current_turn_id: 'turn-terminal', last_core_state: 'completed',
+      requires_reconfiguration: 1,
+    });
+    assert.deepEqual(scheduler.prepare(`
+      SELECT status, completed_at FROM task_history WHERE task_id = 'task-A'
+    `).get(), { status: 'success', completed_at: 25 });
+    scheduler.close();
+    core.close();
+  });
+
+  for (const scenario of ['absent', 'mismatched', 'rejected']) {
+    test(`pauses a legacy running task when the durable Core occurrence is ${scenario}`, () => {
+      const scheduler = database();
+      scheduler.prepare("UPDATE tasks SET status = 'running' WHERE id = 'task-A'").run();
+      const core = new Database(':memory:');
+      core.exec(`
+        CREATE TABLE runtime_scheduler_occurrences (
+          schedule_id TEXT NOT NULL, occurrence_id TEXT NOT NULL, task_id TEXT NOT NULL,
+          turn_id TEXT, status TEXT NOT NULL, envelope_json TEXT NOT NULL,
+          PRIMARY KEY (schedule_id, occurrence_id)
+        );
+        CREATE TABLE runtime_turns (turn_id TEXT PRIMARY KEY, state TEXT NOT NULL);
+        CREATE TABLE runtime_turn_queue (turn_id TEXT PRIMARY KEY, wait_reason TEXT);
+      `);
+      if (scenario !== 'absent') {
+        core.prepare(`INSERT INTO runtime_turns VALUES ('turn-core', 'queued')`).run();
+        core.prepare(`
+          INSERT INTO runtime_scheduler_occurrences VALUES (?, ?, ?, 'turn-core', ?, ?)
+        `).run(
+          'task-A', 'task-A:100', scenario === 'mismatched' ? 'other-task' : 'task-A',
+          scenario === 'rejected' ? 'rejected' : 'accepted',
+          JSON.stringify({ schedule: {
+            schedule_id: 'task-A', occurrence_id: 'task-A:100',
+            task_id: scenario === 'mismatched' ? 'other-task' : 'task-A',
+          } }),
+        );
+      }
+      assert.deepEqual(recoverLegacyRunningTasks(scheduler, core, { now: () => 10 }), {
+        adopted: 0, paused: 1, terminal: 0,
+      });
+      const task = scheduler.prepare(`
+        SELECT status, requires_reconfiguration, current_occurrence_id,
+               current_turn_id, last_error FROM tasks WHERE id = 'task-A'
+      `).get();
+      assert.equal(task.status, 'paused');
+      assert.equal(task.requires_reconfiguration, 1);
+      assert.equal(task.current_occurrence_id, 'task-A:100');
+      assert.equal(task.current_turn_id, null);
+      assert.match(task.last_error, /exact admitted Core occurrence.*replay is forbidden/i);
+      assert.equal(scheduler.prepare('SELECT COUNT(*) AS count FROM task_history').get().count, 0);
+      scheduler.close();
+      core.close();
+    });
+  }
+
   test('records the accepted occurrence and turn atomically and replays without duplicate history', () => {
     const db = database();
     const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get('task-A');

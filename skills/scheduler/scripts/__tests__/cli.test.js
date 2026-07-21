@@ -148,6 +148,37 @@ describe('cli add', () => {
     });
   });
 
+  for (const [label, identity] of [
+    ['unknown chat type', {
+      channel: 'lark', chat_type: 'broadcast', chat_id: 'chat-bound',
+      native_thread_or_topic_id: null, message_id: 'message-bound', root_message_id: null,
+    }],
+    ['scheduler synthetic identity', {
+      channel: 'scheduler', chat_type: 'synthetic', chat_id: 'scheduler:task',
+      native_thread_or_topic_id: null, message_id: 'scheduler:message', root_message_id: null,
+    }],
+    ['native thread on a dm', {
+      channel: 'lark', chat_type: 'dm', chat_id: 'chat-bound',
+      native_thread_or_topic_id: 'thread-bound', message_id: 'message-bound', root_message_id: null,
+    }],
+  ]) {
+    it(`rejects ${label} as a bound conversation`, () => {
+      withTmpDir(({ dbPath, env }) => {
+        const result = cliRaw([
+          'add', 'invalid binding', '--cron', '0 2 * * *',
+          '--bound-conversation-json', JSON.stringify(identity),
+        ], env);
+        assert.notEqual(result.status, 0);
+        const db = new Database(dbPath);
+        try {
+          assert.equal(db.prepare('SELECT COUNT(*) AS count FROM tasks').get().count, 0);
+        } finally {
+          db.close();
+        }
+      });
+    });
+  }
+
   it('persists the complete canonical native-thread identity unchanged', () => {
     withTmpDir(({ dbPath, env }) => {
       const identity = {
@@ -248,7 +279,7 @@ describe('cli terminal authority', () => {
 });
 
 describe('cli pause and resume', () => {
-  it('pauses a pending task', () => {
+  it('refuses to resume a migrated task until conversation semantics are explicit', () => {
     withTmpDir(({ dbPath, env }) => {
       cli(['add', 'pause me', '--cron', '0 9 * * *'], env);
       const db = new Database(dbPath);
@@ -262,12 +293,24 @@ describe('cli pause and resume', () => {
           WHERE id = ?
         `).run(task.id);
 
-        cli(['resume', task.id], env);
-        const resumed = db.prepare(`
+        const refused = cliRaw(['resume', task.id], env);
+        assert.notEqual(refused.status, 0);
+        assert.match(refused.stderr, /reconfiguration.*required/i);
+        const stillPaused = db.prepare(`
           SELECT status, requires_reconfiguration, last_error FROM tasks WHERE id = ?
         `).get(task.id);
-        assert.deepEqual(resumed, {
+        assert.deepEqual(stillPaused, {
+          status: 'paused', requires_reconfiguration: 1, last_error: 'migration pause',
+        });
+
+        cli(['update', task.id, '--use-synthetic-conversation'], env);
+        cli(['resume', task.id], env);
+        assert.deepEqual(db.prepare(`
+          SELECT status, requires_reconfiguration, last_error, bound_conversation_json
+          FROM tasks WHERE id = ?
+        `).get(task.id), {
           status: 'pending', requires_reconfiguration: 0, last_error: null,
+          bound_conversation_json: null,
         });
       } finally {
         db.close();
@@ -301,6 +344,68 @@ describe('cli remove', () => {
 });
 
 describe('cli update', () => {
+  it('clears the migration fence only after validating a complete bound identity', () => {
+    withTmpDir(({ dbPath, env }) => {
+      cli(['add', 'migrated task', '--cron', '0 9 * * *'], env);
+      const db = new Database(dbPath);
+      try {
+        const task = db.prepare('SELECT id FROM tasks LIMIT 1').get();
+        db.prepare(`
+          UPDATE tasks SET status = 'paused', requires_reconfiguration = 1,
+            last_error = 'migration pause' WHERE id = ?
+        `).run(task.id);
+        const identity = {
+          channel: 'lark', chat_type: 'thread', chat_id: 'chat-bound',
+          native_thread_or_topic_id: 'thread-bound', message_id: 'reply-target-bound',
+          root_message_id: 'root-bound',
+        };
+        cli([
+          'update', task.id, '--bound-conversation-json', JSON.stringify(identity),
+        ], env);
+        assert.deepEqual(db.prepare(`
+          SELECT status, requires_reconfiguration, last_error, bound_conversation_json
+          FROM tasks WHERE id = ?
+        `).get(task.id), {
+          status: 'paused', requires_reconfiguration: 0, last_error: null,
+          bound_conversation_json: JSON.stringify(identity),
+        });
+        cli(['resume', task.id], env);
+        assert.equal(
+          db.prepare('SELECT status FROM tasks WHERE id = ?').get(task.id).status,
+          'pending',
+        );
+      } finally {
+        db.close();
+      }
+    });
+  });
+
+  it('rejects conflicting bound and synthetic reconfiguration choices', () => {
+    withTmpDir(({ dbPath, env }) => {
+      cli(['add', 'ordinary task', '--cron', '0 9 * * *'], env);
+      const db = new Database(dbPath);
+      try {
+        const task = db.prepare('SELECT id, updated_at FROM tasks LIMIT 1').get();
+        const identity = {
+          channel: 'lark', chat_type: 'dm', chat_id: 'chat-bound',
+          native_thread_or_topic_id: null, message_id: 'reply-target-bound',
+          root_message_id: null,
+        };
+        const result = cliRaw([
+          'update', task.id,
+          '--bound-conversation-json', JSON.stringify(identity),
+          '--use-synthetic-conversation',
+        ], env);
+        assert.notEqual(result.status, 0);
+        assert.deepEqual(
+          db.prepare('SELECT id, updated_at FROM tasks WHERE id = ?').get(task.id), task,
+        );
+      } finally {
+        db.close();
+      }
+    });
+  });
+
   it('updates task name', () => {
     withTmpDir(({ dbPath, env }) => {
       cli(['add', 'original', '--cron', '0 9 * * *'], env);

@@ -13,6 +13,9 @@ admitted occurrence; completion is reconciled from its durable Core turn.
 
 ## resume
 
-`cli.js resume <task-id>` returns a paused occurrence to pending.
+`cli.js resume <task-id>` returns a paused occurrence to pending. A task fenced
+by legacy-control migration refuses resume until an operator first runs
+`update --bound-conversation-json '<complete identity>'` or explicitly selects
+`update --use-synthetic-conversation`.
 
 All commands support an unambiguous partial task ID.

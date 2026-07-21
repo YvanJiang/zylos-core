@@ -138,7 +138,12 @@ function initSchema() {
     if (taskColumns.has('reply_channel')) predicates.push('reply_channel IS NOT NULL');
     if (taskColumns.has('reply_endpoint')) predicates.push('reply_endpoint IS NOT NULL');
     const assignments = [
-      "status = CASE WHEN status = 'running' THEN 'running' ELSE 'paused' END",
+      `status = CASE
+        WHEN status = 'running' THEN 'running'
+        WHEN status IN ('pending', 'paused') THEN 'paused'
+        WHEN status = 'completed' AND type IN ('recurring', 'interval') THEN 'paused'
+        ELSE status
+      END`,
       'requires_reconfiguration = 1',
       "last_error = 'Paused during migration: retired scheduler controls require explicit canonical reconfiguration.'",
     ];
@@ -147,7 +152,7 @@ function initSchema() {
     if (taskColumns.has('reply_endpoint')) assignments.push('reply_endpoint = NULL');
     db.prepare(`
       UPDATE tasks SET ${assignments.join(', ')}
-      WHERE status IN ('pending', 'running') AND (${predicates.join(' OR ')})
+      WHERE (${predicates.join(' OR ')})
     `).run();
   }
   const historyColumns = new Set(

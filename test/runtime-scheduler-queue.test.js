@@ -64,6 +64,7 @@ function occurrence(suffix, overrides = {}) {
     bound_conversation: {
       channel: 'telegram', chat_type: 'group', chat_id: 'group-1',
       native_thread_or_topic_id: null, message_id: 'schedule-anchor-1',
+      root_message_id: null,
     },
     ...overrides,
   };

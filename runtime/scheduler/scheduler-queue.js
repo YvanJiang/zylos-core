@@ -25,11 +25,19 @@ export function createBoundConversationIdentity(occurrence) {
   }
   const fields = [
     'channel', 'chat_type', 'chat_id', 'native_thread_or_topic_id', 'message_id',
+    'root_message_id',
   ];
   for (const field of fields) {
     if (!Object.hasOwn(bound, field)) {
       throw new TypeError(`bound_conversation.${field} is required`);
     }
+  }
+  const channel = requireNonEmptyString('bound_conversation.channel', bound.channel);
+  if (channel === 'scheduler') {
+    throw new TypeError('bound_conversation.channel must identify a real channel adapter');
+  }
+  if (!['dm', 'group', 'thread'].includes(bound.chat_type)) {
+    throw new TypeError('bound_conversation.chat_type must be dm, group, or thread');
   }
   if (bound.native_thread_or_topic_id !== null
     && (typeof bound.native_thread_or_topic_id !== 'string'
@@ -39,11 +47,13 @@ export function createBoundConversationIdentity(occurrence) {
   if (bound.chat_type === 'thread') {
     requireNonEmptyString('bound_conversation.native_thread_or_topic_id', bound.native_thread_or_topic_id);
     requireNonEmptyString('bound_conversation.root_message_id', bound.root_message_id);
-  } else if (bound.root_message_id !== null && bound.root_message_id !== undefined) {
-    throw new TypeError('bound_conversation.root_message_id must be null outside a thread');
+  } else if (bound.native_thread_or_topic_id !== null || bound.root_message_id !== null) {
+    throw new TypeError(
+      'bound_conversation native thread and root message ids must be null outside a thread',
+    );
   }
   return {
-    channel: requireNonEmptyString('bound_conversation.channel', bound.channel),
+    channel,
     chat_type: requireNonEmptyString('bound_conversation.chat_type', bound.chat_type),
     chat_id: requireNonEmptyString('bound_conversation.chat_id', bound.chat_id),
     native_thread_or_topic_id: bound.native_thread_or_topic_id,

@@ -1,8 +1,10 @@
 import { homedir } from 'os';
 import { join } from 'path';
+import { existsSync } from 'fs';
 import Database from 'better-sqlite3';
 
 import { acceptScheduledOccurrence } from '../../../runtime/scheduler/scheduler-queue.js';
+import { recoverLegacyRunningTasks } from './daemon-tasks.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || join(homedir(), 'zylos');
 const CORE_DATABASE_PATH = join(ZYLOS_DIR, 'comm-bridge', 'c4.db');
@@ -74,6 +76,20 @@ export function dispatchMissedScheduledTaskNotice(task, notificationText, option
   const database = new Database(options.databasePath ?? CORE_DATABASE_PATH);
   try {
     return enqueueMissedScheduledTaskNotice(database, task, notificationText, options);
+  } finally {
+    database.close();
+  }
+}
+
+export function recoverLegacyRunningTasksFromCore(schedulerDatabase, options = {}) {
+  const databasePath = options.databasePath ?? CORE_DATABASE_PATH;
+  // Startup recovery is read-only with respect to Core. Never create a second
+  // empty Core database merely because the configured path is absent.
+  const database = existsSync(databasePath)
+    ? new Database(databasePath, { readonly: true, fileMustExist: true })
+    : new Database(':memory:');
+  try {
+    return recoverLegacyRunningTasks(schedulerDatabase, database, options);
   } finally {
     database.close();
   }

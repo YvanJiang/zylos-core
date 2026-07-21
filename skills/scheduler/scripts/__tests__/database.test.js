@@ -111,6 +111,9 @@ describe('getDb', () => {
       ) VALUES
         ('legacy-idle', 'legacy idle', 'work', 'recurring', 'UTC', 100, 3, 'pending', 1, NULL, NULL, 1, 1),
         ('legacy-reply', 'legacy reply', 'work', 'recurring', 'UTC', 100, 3, 'running', 0, 'lark', 'chat-only', 1, 1),
+        ('legacy-paused', 'legacy paused', 'work', 'recurring', 'UTC', 100, 3, 'paused', 1, NULL, NULL, 1, 1),
+        ('legacy-completed', 'legacy completed', 'work', 'recurring', 'UTC', 100, 3, 'completed', 0, 'lark', 'chat-only', 1, 1),
+        ('legacy-one-time-done', 'legacy one-time done', 'work', 'one-time', 'UTC', 100, 3, 'completed', 1, NULL, NULL, 1, 1),
         ('canonical', 'canonical', 'work', 'recurring', 'UTC', 100, 3, 'pending', 0, NULL, NULL, 1, 1);
     `);
     legacy.close();
@@ -132,7 +135,25 @@ describe('getDb', () => {
           requires_reconfiguration: 0, last_error: null,
         },
         {
+          id: 'legacy-completed', status: 'paused', require_idle: 0,
+          reply_channel: null, reply_endpoint: null,
+          requires_reconfiguration: 1,
+          last_error: 'Paused during migration: retired scheduler controls require explicit canonical reconfiguration.',
+        },
+        {
           id: 'legacy-idle', status: 'paused', require_idle: 0,
+          reply_channel: null, reply_endpoint: null,
+          requires_reconfiguration: 1,
+          last_error: 'Paused during migration: retired scheduler controls require explicit canonical reconfiguration.',
+        },
+        {
+          id: 'legacy-one-time-done', status: 'completed', require_idle: 0,
+          reply_channel: null, reply_endpoint: null,
+          requires_reconfiguration: 1,
+          last_error: 'Paused during migration: retired scheduler controls require explicit canonical reconfiguration.',
+        },
+        {
+          id: 'legacy-paused', status: 'paused', require_idle: 0,
           reply_channel: null, reply_endpoint: null,
           requires_reconfiguration: 1,
           last_error: 'Paused during migration: retired scheduler controls require explicit canonical reconfiguration.',

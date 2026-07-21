@@ -19,7 +19,8 @@ function escapeLike(str) {
 
 const ALLOWED_UPDATE_COLUMNS = new Set([
   'name', 'prompt', 'priority', 'bound_conversation_json',
-  'miss_threshold', 'type', 'cron_expression', 'interval_seconds', 'next_run_at', 'timezone', 'updated_at'
+  'miss_threshold', 'type', 'cron_expression', 'interval_seconds', 'next_run_at', 'timezone',
+  'requires_reconfiguration', 'last_error', 'updated_at'
 ]);
 
 const HELP = `
@@ -50,6 +51,7 @@ Add Options:
 
 Update Options (same as Add, plus):
   --prompt "<prompt>"     Update task content
+  --use-synthetic-conversation  Explicitly use a scheduler-owned synthetic conversation
 
 Examples:
   ~/zylos/.claude/skills/scheduler/scripts/cli.js add "Say hello" --in "30 minutes"
@@ -79,7 +81,8 @@ function parseArgs(args) {
     'no-block-queue-until-idle',
     'require-idle',
     'no-require-idle',
-    'clear-reply'
+    'clear-reply',
+    'use-synthetic-conversation'
   ]);
 
   let i = 1;
@@ -323,7 +326,8 @@ function cmdResume(taskId) {
   }
 
   const tasks = db.prepare(`
-    SELECT id FROM tasks WHERE id LIKE ? ESCAPE '!' AND status = 'paused'
+    SELECT id, requires_reconfiguration FROM tasks
+    WHERE id LIKE ? ESCAPE '!' AND status = 'paused'
   `).all(escapeLike(taskId) + '%');
 
   if (tasks.length === 0) {
@@ -338,10 +342,18 @@ function cmdResume(taskId) {
     return;
   }
 
+  if (tasks[0].requires_reconfiguration === 1) {
+    console.error(
+      'Error: Scheduler migration reconfiguration is required before resume; '
+      + 'run update with --bound-conversation-json or --use-synthetic-conversation.',
+    );
+    process.exitCode = 2;
+    return;
+  }
+
   db.prepare(`
     UPDATE tasks
-    SET status = 'pending', requires_reconfiguration = 0,
-        last_error = NULL, updated_at = ?
+    SET status = 'pending', last_error = NULL, updated_at = ?
     WHERE id = ?
   `).run(now(), tasks[0].id);
 
@@ -496,18 +508,35 @@ function cmdUpdate(taskId, options) {
     updatedFields.push('priority');
   }
 
+  if (options['bound-conversation-json'] && options['use-synthetic-conversation']) {
+    console.error(
+      'Error: Choose either --bound-conversation-json or --use-synthetic-conversation.',
+    );
+    process.exitCode = 2;
+    return;
+  }
+
   if (options['bound-conversation-json']) {
     try {
       const parsed = JSON.parse(options['bound-conversation-json']);
       updates.bound_conversation_json = JSON.stringify(
         createBoundConversationIdentity({ bound_conversation: parsed }),
       );
+      updates.requires_reconfiguration = 0;
+      if (task.requires_reconfiguration === 1) updates.last_error = null;
       updatedFields.push('bound_conversation_json');
     } catch (error) {
       console.error(`Error: ${error.message}`);
       process.exitCode = 2;
       return;
     }
+  }
+
+  if (options['use-synthetic-conversation']) {
+    updates.bound_conversation_json = null;
+    updates.requires_reconfiguration = 0;
+    if (task.requires_reconfiguration === 1) updates.last_error = null;
+    updatedFields.push('synthetic_conversation');
   }
 
   // Update miss_threshold
@@ -624,6 +653,11 @@ function main() {
     console.error(
       `Error: --${retired} is retired; use --bound-conversation-json with a complete Core identity.`,
     );
+    process.exitCode = 2;
+    return;
+  }
+  if (options['use-synthetic-conversation'] && command !== 'update') {
+    console.error('Error: --use-synthetic-conversation is only valid for update.');
     process.exitCode = 2;
     return;
   }

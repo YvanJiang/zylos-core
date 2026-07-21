@@ -14,6 +14,7 @@ All `add` timing options (`--in`, `--at`, `--cron`, `--every`) plus:
 | `--prompt "<prompt>"` | Update task content |
 | `--priority <1-3>` | Update priority |
 | `--bound-conversation-json "<json>"` | Replace the complete durable Core conversation identity |
+| `--use-synthetic-conversation` | Explicitly select a scheduler-owned synthetic conversation |
 | `--miss-threshold <seconds>` | Update miss threshold |
 
 When the schedule is changed, the timezone column is automatically synced to the current configured TZ.
@@ -29,6 +30,9 @@ cli.js update task-abc --cron "0 10 * * *"
 
 # Replace the complete bound conversation identity
 cli.js update task-abc --bound-conversation-json '{"channel":"telegram","chat_type":"dm","chat_id":"user_123","native_thread_or_topic_id":null,"message_id":"message_456","root_message_id":null}'
+
+# Explicitly select the scheduler-owned synthetic conversation
+cli.js update task-abc --use-synthetic-conversation
 
 # Switch from cron to interval
 cli.js update task-abc --every "2 hours"

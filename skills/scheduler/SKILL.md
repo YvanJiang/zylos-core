@@ -34,6 +34,11 @@ non-null: `message_id` is the exact reply-target message and
 thread ID and root message ID are null. The scheduler never queries a latest
 message or falls back to the parent chat.
 
+Rows migrated from retired idle/reply controls remain fenced. Reconfigure them
+with `update --bound-conversation-json` or explicitly select the scheduler-owned
+synthetic conversation with `update --use-synthetic-conversation`; only then
+may `resume` make the next occurrence pending.
+
 ## Timezone
 
 Timezone resolution is `~/zylos/.env` then `process.env.TZ`, then `UTC`. Times
