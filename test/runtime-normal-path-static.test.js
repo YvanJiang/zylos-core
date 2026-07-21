@@ -425,7 +425,7 @@ describe('normal product paths have no retired runtime authority', () => {
   });
 
   test('normal runtime entrypoints do not import migration code', () => {
-    for (const file of normalRuntimeFiles.filter((file) => !file.startsWith('cli/'))) {
+    for (const file of normalRuntimeFiles) {
       const source = fs.readFileSync(path.resolve(file), 'utf8');
       expect(source).not.toMatch(/(?:from|import)\s+['"][^'"]*runtime\/migration\//);
     }

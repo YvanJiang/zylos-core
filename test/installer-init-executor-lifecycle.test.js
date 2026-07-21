@@ -134,7 +134,8 @@ describe('installer and init executor lifecycle', () => {
     }
   });
 
-  test('init checks legacy ownership using the selected isolated ZYLOS_DIR', () => {
+  test('init never imports or dispatches migration cleanup in the normal path', () => {
     const initSource = fs.readFileSync(new URL('../cli/commands/init.js', import.meta.url), 'utf8');
-    expect(initSource).toContain('reconcileLegacyServicesForExecutorStart({ zylosDir: ZYLOS_DIR })');
+    expect(initSource).not.toMatch(/runtime\/migration|reconcileLegacyServicesForExecutorStart/);
+    expect(initSource).toContain('startCoreServices({ freshInstallation: true })');
   });

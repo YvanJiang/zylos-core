@@ -81,6 +81,25 @@ export function cleanupObsoleteLifecycleArtifacts({ zylosDir, upgradeState }) {
     throw new Error('Obsolete lifecycle artifacts may be removed only after the upgrade is durably committed.');
   }
   const removed = [];
+  const codexHooks = path.join(root, '.codex', 'hooks.json');
+  try {
+    const document = JSON.parse(fs.readFileSync(codexHooks, 'utf8'));
+    if (document && typeof document === 'object' && !Array.isArray(document)) {
+      for (const [event, groups] of Object.entries(document.hooks ?? {})) {
+        if (!Array.isArray(groups)) continue;
+        document.hooks[event] = groups.map((group) => ({
+          ...group,
+          hooks: Array.isArray(group?.hooks)
+            ? group.hooks.filter((hook) => !String(hook?.command ?? '').includes('session-start-orchestrator.js'))
+            : group?.hooks,
+        })).filter((group) => !Array.isArray(group.hooks) || group.hooks.length > 0);
+      }
+      fs.writeFileSync(codexHooks, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
+      removed.push(codexHooks);
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
   for (const artifact of legacyLifecycleArtifactPaths(zylosDir)) {
     let stat;
     try {
