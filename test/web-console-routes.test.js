@@ -87,7 +87,13 @@ db.close();
   fs.writeFileSync(path.join(scriptDir, 'c4-send.js'), '');
 }
 
-async function startServer({ maxUploadMb = 20, actualC4Receive = false } = {}) {
+async function startServer({
+  maxUploadMb = 20,
+  actualC4Receive = false,
+  region = 'global',
+  tenantId = 'default',
+  botId = 'zylos',
+} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wc-routes-'));
   const dbPath = path.join(root, 'comm-bridge', 'c4.db');
   const skillsDir = path.join(root, 'skills');
@@ -108,7 +114,10 @@ async function startServer({ maxUploadMb = 20, actualC4Receive = false } = {}) {
       WEB_CONSOLE_SKILLS_DIR: actualC4Receive ? path.resolve('skills') : skillsDir,
       WEB_CONSOLE_PORT: String(port),
       WEB_CONSOLE_BIND: '127.0.0.1',
-      WEB_CONSOLE_MAX_UPLOAD_MB: String(maxUploadMb)
+      WEB_CONSOLE_MAX_UPLOAD_MB: String(maxUploadMb),
+      ZYLOS_REGION: region,
+      ZYLOS_TENANT_ID: tenantId,
+      ZYLOS_BOT_ID: botId,
     },
     stdio: ['ignore', 'pipe', 'pipe']
   });
@@ -188,6 +197,52 @@ afterEach(async () => {
 });
 
 describe('web-console attachment routes', () => {
+  test('actual mailbox and outbox ownership reject the same endpoint from another Core scope', async () => {
+    ctx = await startServer({
+      actualC4Receive: true,
+      region: 'global',
+      tenantId: 'tenant-local',
+      botId: 'bot-local',
+    });
+    const coreDb = new Database(ctx.dbPath);
+    const foreign = [
+      ['region-foreign', 'tenant-local', 'bot-local', 'region'],
+      ['global', 'tenant-foreign', 'bot-local', 'tenant'],
+      ['global', 'tenant-local', 'bot-foreign', 'bot'],
+    ].map(([region, tenantId, botId, suffix]) => acceptCompatibilityInbound(coreDb, {
+      inbound_event_id: `foreign-console-${suffix}`,
+      trace_id: `foreign-console-${suffix}-trace`,
+      occurred_at: '2026-07-21T00:00:00.000Z', received_at: '2026-07-21T00:00:00.000Z',
+      region, tenant_id: tenantId, channel: 'web-console', bot_id: botId,
+      chat_type: 'dm', chat_id: 'console', native_thread_or_topic_id: null,
+      message_id: `foreign-console-${suffix}-message`,
+      actor: { type: 'user', actor_id: 'foreign-user', authenticated: true, roles: [] },
+      content: {
+        kind: 'text', text: `foreign ${suffix} scope must stay hidden`, attachments: [],
+      },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source_ref: `foreign-console-${suffix}-source`,
+    }, { now: () => '2026-07-21T00:00:00.000Z' }));
+    coreDb.close();
+    const local = await sendHttp(ctx, {
+      message: 'local scope is visible', message_id: 'local-console-scope',
+    });
+    expect(local.res.status).toBe(200);
+
+    const response = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    expect(response.status).toBe(200);
+    const messages = await response.json();
+    expect(messages.some(({ content }) => content === 'local scope is visible')).toBe(true);
+    expect(messages.some(({ content }) => content.includes('must stay hidden'))).toBe(false);
+
+    const reopened = new Database(ctx.dbPath);
+    for (const accepted of foreign) {
+      expect(reopened.prepare('SELECT status FROM runtime_outbox WHERE turn_id = ?')
+        .get(accepted.turn_id).status).toBe('pending');
+    }
+    reopened.close();
+  });
+
   test('actual Core ingress projects safe attachment metadata through the durable mailbox', async () => {
     ctx = await startServer({ actualC4Receive: true });
     const upload = await uploadFile(ctx, {
@@ -331,7 +386,7 @@ describe('web-console attachment routes', () => {
     acceptCompatibilityInbound(coreDb, {
       inbound_event_id: 'unsafe-web-attachment', trace_id: 'unsafe-web-attachment-trace',
       occurred_at: '2026-07-21T00:00:00.000Z', received_at: '2026-07-21T00:00:00.000Z',
-      region: 'global', tenant_id: 'unsafe-web-tenant', channel: 'web-console',
+      region: 'global', tenant_id: 'default', channel: 'web-console',
       bot_id: 'zylos', chat_type: 'dm', chat_id: 'console',
       native_thread_or_topic_id: null, message_id: 'unsafe-web-message',
       actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
@@ -554,7 +609,7 @@ describe('web-console attachment routes', () => {
   });
 
   test('conversation history projects canonical Core inbound and delivered outbox facts', async () => {
-    ctx = await startServer();
+    ctx = await startServer({ tenantId: 'web-history-tenant' });
     const db = new Database(ctx.dbPath);
     const accepted = acceptCompatibilityInbound(db, {
       inbound_event_id: 'web-history-event', trace_id: 'web-history-trace',
@@ -586,7 +641,7 @@ describe('web-console attachment routes', () => {
   });
 
   test('mailbox projection preserves Core queue FIFO when accepted timestamps run backward', async () => {
-    ctx = await startServer();
+    ctx = await startServer({ tenantId: 'web-fifo-tenant' });
     const db = new Database(ctx.dbPath);
     const base = {
       region: 'global', tenant_id: 'web-fifo-tenant', channel: 'web-console',
@@ -619,7 +674,7 @@ describe('web-console attachment routes', () => {
   });
 
   test('HTTP polling consumes and renders the authoritative Core outbox without WebSocket clients', async () => {
-    ctx = await startServer();
+    ctx = await startServer({ tenantId: 'web-poll-tenant' });
     const db = new Database(ctx.dbPath);
     const accepted = acceptCompatibilityInbound(db, {
       inbound_event_id: 'web-poll-event', trace_id: 'web-poll-trace',
@@ -694,7 +749,7 @@ describe('web-console attachment routes', () => {
   });
 
   test('HTTP polling renders a durable security notice with no turn event', async () => {
-    ctx = await startServer();
+    ctx = await startServer({ tenantId: 'web-security-tenant' });
     const db = new Database(ctx.dbPath);
     const envelope = {
       contract: 'zylos.inbound-envelope', contract_version: '1.0',
@@ -737,7 +792,7 @@ describe('web-console attachment routes', () => {
   });
 
   test('WebSocket delivery projects the durable inbound before its outbox reply', async () => {
-    ctx = await startServer();
+    ctx = await startServer({ tenantId: 'web-ws-order-tenant' });
     const messages = [];
     const ws = new WebSocket(`ws://127.0.0.1:${ctx.port}/`);
     await new Promise((resolve, reject) => {
@@ -780,7 +835,7 @@ describe('web-console attachment routes', () => {
   });
 
   test('WebSocket clients advance independent durable projection cursors', async () => {
-    ctx = await startServer();
+    ctx = await startServer({ tenantId: 'web-cursor-tenant' });
     const seedDb = new Database(ctx.dbPath);
     acceptCompatibilityInbound(seedDb, {
       inbound_event_id: 'web-cursor-seed', trace_id: 'web-cursor-seed-trace',

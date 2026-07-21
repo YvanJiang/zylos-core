@@ -246,6 +246,9 @@ export function createOutboxService({
   serviceInstanceId,
   channel = null,
   targetChatId = null,
+  targetRegion = null,
+  targetTenantId = null,
+  targetBotId = null,
   now = () => new Date().toISOString(),
   generateId = defaultGenerateId,
   leaseDurationMs = 10_000,
@@ -263,6 +266,15 @@ export function createOutboxService({
   if (targetChatId !== null
     && (typeof targetChatId !== 'string' || targetChatId.length === 0)) {
     throw new TypeError('targetChatId must be a non-empty string or null');
+  }
+  for (const [fieldName, value] of [
+    ['targetRegion', targetRegion],
+    ['targetTenantId', targetTenantId],
+    ['targetBotId', targetBotId],
+  ]) {
+    if (value !== null && (typeof value !== 'string' || value.length === 0)) {
+      throw new TypeError(`${fieldName} must be a non-empty string or null`);
+    }
   }
   if (typeof generateId !== 'function') {
     throw new TypeError('generateId must be a function');
@@ -313,6 +325,9 @@ export function createOutboxService({
         )
         AND (? IS NULL OR json_extract(candidate.command_json, '$.target.channel') = ?)
         AND (? IS NULL OR json_extract(candidate.command_json, '$.target.chat_id') = ?)
+        AND (? IS NULL OR json_extract(candidate.command_json, '$.target.region') = ?)
+        AND (? IS NULL OR json_extract(candidate.command_json, '$.target.tenant_id') = ?)
+        AND (? IS NULL OR json_extract(candidate.command_json, '$.target.bot_id') = ?)
         ORDER BY candidate.priority DESC, candidate.created_at ASC,
           candidate.aggregate_version ASC, candidate.outbox_id ASC
         LIMIT 1
@@ -324,6 +339,12 @@ export function createOutboxService({
         channel,
         targetChatId,
         targetChatId,
+        targetRegion,
+        targetRegion,
+        targetTenantId,
+        targetTenantId,
+        targetBotId,
+        targetBotId,
       );
       if (!row) return null;
 

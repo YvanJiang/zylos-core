@@ -221,6 +221,57 @@ describe('normal C4 callers use durable Core contracts', () => {
     database.close();
   });
 
+  test('the Web Console owner cannot claim the same endpoint in another durable Core scope', async () => {
+    const { zylosDir, env } = fixture();
+    for (const [region, tenantId, botId, messageId] of [
+      ['global', 'tenant-c4', 'bot-c4', 'owned-web-scope'],
+      ['region-foreign', 'tenant-c4', 'bot-c4', 'foreign-web-region'],
+      ['global', 'tenant-foreign', 'bot-c4', 'foreign-web-tenant'],
+      ['global', 'tenant-c4', 'bot-foreign', 'foreign-web-bot'],
+    ]) {
+      const accepted = run(receiveCli, [
+        '--channel', 'web-console', '--endpoint', 'console',
+        '--message-id', messageId, '--actor-id', 'fixture-user',
+        '--occurred-at', '2026-07-21T00:10:00.000Z', '--content', messageId, '--json',
+      ], {
+        ...env, ZYLOS_REGION: region, ZYLOS_TENANT_ID: tenantId, ZYLOS_BOT_ID: botId,
+      });
+      assert.equal(accepted.status, 0, accepted.stderr);
+    }
+
+    const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
+    const lastAttempt = database.prepare(`
+      SELECT MAX(next_attempt_at) AS value FROM runtime_outbox
+    `).get().value;
+    const deliveries = [];
+    const owner = createWebConsoleOutboxOwner({
+      database,
+      region: 'global',
+      tenantId: 'tenant-c4',
+      botId: 'bot-c4',
+      serviceInstanceId: 'web-console-scoped-owner',
+      now: () => new Date(Date.parse(lastAttempt) + 1).toISOString(),
+      deliverMessage(message) {
+        deliveries.push(message);
+        return { platform_message_id: `scoped-mailbox:${message.delivery_id}` };
+      },
+    });
+    assert.deepEqual(await owner.drain({ limit: 10 }), { status: 'delivered', delivered: 1 });
+    assert.equal(deliveries.length, 1);
+    const states = database.prepare(`
+      SELECT status, command_json FROM runtime_outbox ORDER BY created_at, outbox_id
+    `).all().map(({ status, command_json: commandJson }) => ({
+      status, target: JSON.parse(commandJson).target,
+    }));
+    assert.equal(states.some(({ status, target }) => status === 'delivered'
+      && target.region === 'global' && target.tenant_id === 'tenant-c4'
+      && target.bot_id === 'bot-c4'), true);
+    assert.equal(states.filter(({ target }) => target.region !== 'global'
+      || target.tenant_id !== 'tenant-c4' || target.bot_id !== 'bot-c4')
+      .every(({ status }) => status === 'pending'), true);
+    database.close();
+  });
+
   test('the Web Console owner renders, delivers, and fences its Core outbox result', async () => {
     const { zylosDir, env } = fixture();
     const acceptedProcess = run(receiveCli, [
@@ -238,6 +289,9 @@ describe('normal C4 callers use durable Core contracts', () => {
     const claimTime = claimTimeFor(database, 'web-console', 'console');
     const owner = createWebConsoleOutboxOwner({
       database,
+      region: 'global',
+      tenantId: 'tenant-c4',
+      botId: 'bot-c4',
       serviceInstanceId: 'web-console-owner-round-trip',
       now: () => claimTime,
       deliverMessage(message, delivery) {

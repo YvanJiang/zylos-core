@@ -6,15 +6,28 @@ import { createOutboxService } from '../../../runtime/delivery/outbox-service.js
 export function createWebConsoleOutboxOwner({
   database,
   deliverMessage,
+  region,
+  tenantId,
+  botId,
   serviceInstanceId = `web-console-${crypto.randomUUID()}`,
   now = () => new Date().toISOString(),
 }) {
   if (typeof deliverMessage !== 'function') throw new TypeError('deliverMessage must be a function');
+  for (const [fieldName, value] of [
+    ['region', region], ['tenantId', tenantId], ['botId', botId],
+  ]) {
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new TypeError(`${fieldName} must be a non-empty string`);
+    }
+  }
 
   const owner = createOutboxService({
     database,
     channel: 'web-console',
     targetChatId: 'console',
+    targetRegion: region,
+    targetTenantId: tenantId,
+    targetBotId: botId,
     serviceInstanceId,
     now,
     renderer: createChannelNeutralTextRenderer({

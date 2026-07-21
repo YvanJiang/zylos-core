@@ -83,6 +83,9 @@ Browser ──► Core ingress ──► conversation executor ──► Core ou
 | `ZYLOS_WEB_PASSWORD` | (empty) | Set to enable password protection (also reads `WEB_CONSOLE_PASSWORD` as fallback) |
 | `WEB_CONSOLE_BIND` | 127.0.0.1 | Bind address |
 | `ZYLOS_DIR` | ~/zylos | Data directory |
+| `ZYLOS_REGION` | global | Exact durable Core region owned by this console |
+| `ZYLOS_TENANT_ID` | default | Exact durable Core tenant owned by this console |
+| `ZYLOS_BOT_ID` | zylos | Exact durable Core bot owned by this console |
 | `WEB_CONSOLE_MAX_UPLOAD_MB` | 20 | Max size per uploaded attachment |
 
 ## Authentication

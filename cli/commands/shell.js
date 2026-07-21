@@ -19,6 +19,9 @@ import { createChannelNeutralTextRenderer } from '../../runtime/compatibility/c4
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const C4_RECEIVE = path.join(ZYLOS_DIR, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-receive.js');
 const CORE_DATABASE_PATH = path.join(ZYLOS_DIR, 'comm-bridge', 'c4.db');
+const CORE_REGION = process.env.ZYLOS_REGION ?? 'global';
+const CORE_TENANT_ID = process.env.ZYLOS_TENANT_ID ?? 'default';
+const CORE_BOT_ID = process.env.ZYLOS_BOT_ID ?? 'zylos';
 
 function deliverToSocket(socketPath, message) {
   return new Promise((resolve, reject) => {
@@ -203,6 +206,9 @@ export async function shellCommand() {
       database,
       channel: 'shell',
       targetChatId: socketPath,
+      targetRegion: CORE_REGION,
+      targetTenantId: CORE_TENANT_ID,
+      targetBotId: CORE_BOT_ID,
       serviceInstanceId,
       renderer: createChannelNeutralTextRenderer({
         async sendText(delivery) {

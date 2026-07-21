@@ -60,6 +60,18 @@ const MEDIA_DIR = path.join(ZYLOS_DIR, 'web-console', 'media');
 const MAX_UPLOAD_MB = Number.parseInt(process.env.WEB_CONSOLE_MAX_UPLOAD_MB || '20', 10);
 const MAX_UPLOAD_BYTES = Math.max(1, MAX_UPLOAD_MB) * 1024 * 1024;
 const C4_SCRIPT_DIR = path.join(SKILLS_DIR, 'comm-bridge', 'scripts');
+const CORE_REGION = process.env.ZYLOS_REGION ?? 'global';
+const CORE_TENANT_ID = process.env.ZYLOS_TENANT_ID ?? 'default';
+const CORE_BOT_ID = process.env.ZYLOS_BOT_ID ?? 'zylos';
+for (const [fieldName, value] of [
+  ['ZYLOS_REGION', CORE_REGION],
+  ['ZYLOS_TENANT_ID', CORE_TENANT_ID],
+  ['ZYLOS_BOT_ID', CORE_BOT_ID],
+]) {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new TypeError(`${fieldName} must be a non-empty Core scope identifier`);
+  }
+}
 
 // Paths - __dirname is scripts/, public/ is one level up
 const SKILL_ROOT = path.join(__dirname, '..');
@@ -214,8 +226,11 @@ function syncCoreInbound() {
       ON conversation.conversation_id = turn.conversation_id
     WHERE json_extract(inbound.envelope_json, '$.channel') = 'web-console'
       AND conversation.chat_id = 'console'
+      AND json_extract(inbound.envelope_json, '$.region') = ?
+      AND json_extract(inbound.envelope_json, '$.tenant_id') = ?
+      AND json_extract(inbound.envelope_json, '$.bot_id') = ?
     ORDER BY conversation.conversation_id ASC, turn.queue_sequence ASC
-  `).all();
+  `).all(CORE_REGION, CORE_TENANT_ID, CORE_BOT_ID);
   for (const row of rows) {
     try {
       const envelope = JSON.parse(row.envelope_json);
@@ -288,6 +303,9 @@ function broadcast(type, data) {
 
 const deliveryOwner = createWebConsoleOutboxOwner({
   database: db,
+  region: CORE_REGION,
+  tenantId: CORE_TENANT_ID,
+  botId: CORE_BOT_ID,
   serviceInstanceId: `web-console-${SERVICE_BIRTH_ID}`,
   deliverMessage(message, delivery) {
     return deliveryMailbox.deliver({
