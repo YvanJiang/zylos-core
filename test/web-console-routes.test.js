@@ -477,6 +477,49 @@ describe('web-console attachment routes', () => {
     expect(JSON.stringify(messages)).not.toContain('attacker.invalid');
   });
 
+  test('a conflicting durable inbound projection cannot authorize its mapped reply', async () => {
+    ctx = await startServer({ actualC4Receive: true });
+    const coreDb = new Database(ctx.dbPath);
+    acceptCompatibilityInbound(coreDb, {
+      inbound_event_id: 'conflicting-web-inbound', trace_id: 'conflicting-web-trace',
+      occurred_at: '2026-07-21T00:00:00.000Z', received_at: '2026-07-21T00:00:00.000Z',
+      region: 'global', tenant_id: 'default', channel: 'web-console',
+      bot_id: 'zylos', chat_type: 'dm', chat_id: 'console',
+      native_thread_or_topic_id: null, message_id: 'conflicting-web-message',
+      actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
+      content: { kind: 'text', text: 'canonical Core inbound', attachments: [] },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source_ref: 'conflicting-web-source',
+    }, { now: () => '2026-07-21T00:00:00.000Z' });
+    coreDb.close();
+
+    const mailboxDb = new Database(path.join(ctx.root, 'web-console', 'web-console.db'));
+    new DeliveryMailbox(mailboxDb, {
+      region: 'global', tenantId: 'default', botId: 'zylos',
+    }).projectInbound({
+      inboundEventId: 'conflicting-web-inbound', endpointId: 'console',
+      content: 'stale conflicting projection', timestamp: '2026-07-21T00:00:00.000Z',
+    });
+    mailboxDb.close();
+
+    const response = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    expect(response.status).toBe(200);
+    const messages = await response.json();
+    expect(messages).toEqual([
+      expect.objectContaining({ direction: 'in', content: 'stale conflicting projection' }),
+    ]);
+    const retryDb = new Database(ctx.dbPath);
+    const delivery = retryDb.prepare(`
+      SELECT outbox.status, outbox.result_json, outbox.lease_expires_at
+      FROM runtime_outbox AS outbox
+      JOIN runtime_turns AS turn ON turn.turn_id = outbox.turn_id
+      WHERE turn.inbound_event_id = 'conflicting-web-inbound'
+    `).get();
+    retryDb.close();
+    expect(delivery).toMatchObject({ status: 'delivering', result_json: null });
+    expect(delivery.lease_expires_at).not.toBeNull();
+  });
+
   test('POST /api/upload stores a UUID-named file and returns metadata', async () => {
     ctx = await startServer();
     const { res, body } = await uploadFile(ctx, { name: '../bad name.txt', content: 'abc' });

@@ -223,7 +223,12 @@ async function readStatus() {
  * durable mailbox. The mailbox assigns visibility cursors only when a message
  * becomes observable to this channel.
  */
-function syncCoreInbound() {
+function syncCoreInbound(requiredInboundEventId = null) {
+  if (requiredInboundEventId !== null
+    && (typeof requiredInboundEventId !== 'string' || requiredInboundEventId.length === 0)) {
+    throw new TypeError('requiredInboundEventId must be a non-empty string or null');
+  }
+  let requiredProjected = false;
   const rows = db.prepare(`
     SELECT inbound.inbound_event_id, inbound.envelope_json,
       conversation.chat_id AS endpoint_id,
@@ -255,10 +260,15 @@ function syncCoreInbound() {
         attachments: projected.attachments,
         timestamp: row.timestamp,
       });
-    } catch {
+      if (row.inbound_event_id === requiredInboundEventId) requiredProjected = true;
+    } catch (error) {
+      if (row.inbound_event_id === requiredInboundEventId) throw error;
       // Channel-private attachment capabilities fail closed. Core retains the
       // authoritative event for reconciliation without exposing local paths.
     }
+  }
+  if (requiredInboundEventId !== null && !requiredProjected) {
+    throw new Error('The mapped Core inbound is outside this mailbox owner or unavailable.');
   }
 }
 
@@ -290,7 +300,6 @@ function requireMailboxMutationScope(cursorScope) {
 }
 
 function projectInboundForDelivery(delivery) {
-  syncCoreInbound();
   const source = db.prepare(`
     SELECT outbox.turn_id, turn.inbound_event_id
     FROM runtime_outbox AS outbox
@@ -298,7 +307,11 @@ function projectInboundForDelivery(delivery) {
     WHERE outbox.delivery_id = ?
   `).get(delivery.delivery_id);
   if (!source) throw new Error('The Core outbox delivery source is missing.');
-  if (source.turn_id === null) return;
+  if (source.turn_id === null) {
+    syncCoreInbound();
+    return;
+  }
+  syncCoreInbound(source.inbound_event_id);
   if (typeof source.inbound_event_id !== 'string'
     || !deliveryMailbox.hasInboundEvent(source.inbound_event_id)) {
     throw new Error('The mapped Core inbound is not durably projected for this delivery.');
