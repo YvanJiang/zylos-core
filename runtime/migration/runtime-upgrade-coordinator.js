@@ -825,6 +825,9 @@ export function createRuntimeUpgradeCoordinator({
       }
       if (sourceInvalidation !== null
         && loadEffect(upgradeId, 'legacy-source-reconciliation')?.state !== 'completed') {
+        if (legacySourceAdapter === null) {
+          return Object.freeze({ ...run, status: 'waiting_for_legacy_source_reconciliation' });
+        }
         const sourceRestore = loadEffect(upgradeId, 'legacy-source-restore');
         await performEffect(
           upgradeId,
