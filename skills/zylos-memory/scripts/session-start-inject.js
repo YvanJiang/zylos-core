@@ -11,28 +11,6 @@ import { fileURLToPath } from 'url';
 import { MEMORY_DIR } from './shared.js';
 import { formatSection } from '../../comm-bridge/scripts/session-format.js';
 
-let diagnosticModule;
-let diagnosticLoadAttempted = false;
-
-async function getDiagnosticModule() {
-  if (!diagnosticLoadAttempted) {
-    diagnosticLoadAttempted = true;
-    try {
-      diagnosticModule = await import('../../comm-bridge/scripts/c4-diagnostic.js');
-    } catch {
-      diagnosticModule = null;
-    }
-  }
-  return diagnosticModule;
-}
-
-async function logHookTimingSafe(name, durationMs) {
-  const module = await getDiagnosticModule();
-  if (module?.logHookTiming) {
-    module.logHookTiming(name, durationMs);
-  }
-}
-
 function readFileSafe(filePath) {
   try {
     if (!fs.existsSync(filePath)) {
@@ -78,13 +56,10 @@ export function injectMemory() {
 }
 
 async function runCli() {
-  const startMs = Date.now();
   try {
     process.stdout.write(injectMemory());
   } catch (err) {
     console.error(`session-start-inject error: ${err.message}`);
-  } finally {
-    await logHookTimingSafe('session-start-inject', Date.now() - startMs);
   }
 }
 

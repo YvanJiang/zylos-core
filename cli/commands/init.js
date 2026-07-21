@@ -17,12 +17,13 @@ import { generateManifest, saveMergeBaseline } from '../lib/manifest.js';
 import { prompt, promptYesNo, promptChoice, promptSecret } from '../lib/prompts.js';
 import { bold, dim, green, red, yellow, cyan, bgGreen, success, error, warn, heading } from '../lib/colors.js';
 import { commandExists } from '../lib/shell-utils.js';
-import { getActiveAdapter } from '../lib/runtime/index.js';
+import { reconcileExecutorService } from '../lib/executor-service-lifecycle.js';
+import { issueExecutorStartFence } from '../../runtime/executor/start-fence.js';
 import {
   activateFreshSplitInstructions,
   refreshSplitInstructions,
 } from '../lib/runtime/instruction-builder.js';
-import { deployManifestTemplate } from '../lib/runtime/tmux-env.js';
+import { deployManifestTemplate } from '../lib/runtime/runtime-env-manifest.js';
 import { runMigrations } from '../lib/migrate.js';
 import {
   installGlobalPackage,
@@ -518,137 +519,6 @@ function rollbackSetupToken() {
   delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
 }
 
-/**
- * Check if Claude bypass permissions needs first-time acceptance.
- * Returns true if bypass is enabled and hasn't been accepted yet.
- */
-function needsBypassAcceptance() {
-  // Check if bypass is disabled in .env
-  const envPath = path.join(ZYLOS_DIR, '.env');
-  try {
-    const content = fs.readFileSync(envPath, 'utf8');
-    const match = content.match(/^CLAUDE_BYPASS_PERMISSIONS=(.+)$/m);
-    if (match && match[1].trim() === 'false') return false;
-  } catch {}
-
-  // Check if already pre-accepted via settings.json
-  const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
-  try {
-    const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-    if (settings.skipDangerousModePermissionPrompt) return false;
-  } catch {}
-
-  // Check if already accepted (claude-main session with Claude running).
-  // 'claude-main' is intentional: this check is Claude-specific (bypass prompt is Claude-only).
-  try {
-    execSync('tmux has-session -t claude-main 2>/dev/null', { stdio: 'pipe' });
-    const paneContent = execSync('tmux capture-pane -t claude-main -p 2>/dev/null', { encoding: 'utf8' });
-    if (paneContent.includes('>') || paneContent.includes('Claude')) {
-      return false;
-    }
-  } catch {}
-
-  return true;
-}
-
-/**
- * Pre-accept Claude Code terms and bypass permissions prompt.
- * Writes acceptance state to config files so Claude starts without manual confirmation.
- */
-function preAcceptClaudeTerms() {
-  const homedir = os.homedir();
-  let changed = false;
-
-  // 1. Set hasCompletedOnboarding in ~/.claude.json
-  const claudeJsonPath = path.join(homedir, '.claude.json');
-  let claudeJson = {};
-  try {
-    claudeJson = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'));
-  } catch {}
-  if (!claudeJson.hasCompletedOnboarding) {
-    claudeJson.hasCompletedOnboarding = true;
-    fs.writeFileSync(claudeJsonPath, JSON.stringify(claudeJson, null, 2) + '\n');
-    changed = true;
-  }
-
-  // 2. Set skipDangerousModePermissionPrompt in ~/.claude/settings.json
-  const claudeDir = path.join(homedir, '.claude');
-  fs.mkdirSync(claudeDir, { recursive: true });
-  const settingsPath = path.join(claudeDir, 'settings.json');
-  let settings = {};
-  try {
-    settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-  } catch {}
-  if (!settings.skipDangerousModePermissionPrompt) {
-    settings.skipDangerousModePermissionPrompt = true;
-    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
-    changed = true;
-  }
-
-  return changed;
-}
-
-/**
- * Guide user through first-time Claude bypass permissions acceptance.
- */
-async function guideBypassAcceptance() {
-  // This function is Claude-specific: the bypass-permissions prompt only exists in Claude Code.
-  // Hardcoded 'claude-main' is intentional — this always creates a Claude session for acceptance.
-  const CLAUDE_SESSION = 'claude-main';
-
-  console.log(`\n${heading('Setting up Claude Code...')}`);
-
-  // Stop activity-monitor to prevent restart loop
-  try { execSync('pm2 stop activity-monitor', { stdio: 'pipe' }); } catch {}
-
-  // Kill existing session if stuck
-  try { execSync(`tmux kill-session -t ${CLAUDE_SESSION} 2>/dev/null`, { stdio: 'pipe' }); } catch {}
-
-  // Create new tmux session with Claude
-  try {
-    const tmuxArgs = ['new-session', '-d', '-s', CLAUDE_SESSION];
-    if (process.env.IS_SANDBOX) tmuxArgs.push('-e', 'IS_SANDBOX=1');
-
-    // Write API key to temp file to avoid exposing it in process command line
-    let shellCmd;
-    let tmpEnv = null;
-    if (process.env.ANTHROPIC_API_KEY) {
-      tmpEnv = path.join(os.tmpdir(), `.zylos-env-${process.pid}-${Date.now()}`);
-      fs.writeFileSync(tmpEnv, `ANTHROPIC_API_KEY='${process.env.ANTHROPIC_API_KEY}'\n`, { mode: 0o600 });
-      shellCmd = `set -a; . "${tmpEnv}"; set +a; rm -f "${tmpEnv}"; cd "${ZYLOS_DIR}" && claude --dangerously-skip-permissions`;
-    } else {
-      shellCmd = `cd "${ZYLOS_DIR}" && claude --dangerously-skip-permissions`;
-    }
-    tmuxArgs.push('--', shellCmd);
-    try {
-      execFileSync('tmux', tmuxArgs, { stdio: 'pipe' });
-    } catch (e) {
-      if (tmpEnv) try { fs.unlinkSync(tmpEnv); } catch {}
-      throw e;
-    }
-    // Configure status bar with detach hint
-    try {
-      execSync(`tmux set-option -t ${CLAUDE_SESSION} status-right " Ctrl+B d = detach " 2>/dev/null`, { stdio: 'pipe' });
-      execSync(`tmux set-option -t ${CLAUDE_SESSION} status-right-style "fg=black,bg=yellow" 2>/dev/null`, { stdio: 'pipe' });
-    } catch {}
-  } catch (err) {
-    console.log(`  ${warn(`Failed to create tmux session: ${err.message}`)}`);
-    try { execSync('pm2 start activity-monitor', { stdio: 'pipe' }); } catch {}
-    return;
-  }
-
-  console.log('  Claude Code requires a one-time confirmation for autonomous mode.');
-  console.log('  Please run the following command in another terminal:\n');
-  console.log(`    ${bold('zylos attach')}\n`);
-  console.log('  Then select "Yes, I accept" and press Ctrl+B d to detach.\n');
-
-  await promptYesNo('Press Enter after you have accepted the prompt: ', true);
-
-  // Restart activity-monitor
-  try { execSync('pm2 start activity-monitor', { stdio: 'pipe' }); } catch {}
-  console.log(`  ${success('Claude Code configured')}`);
-}
-
 // ── Installation state detection ────────────────────────────────
 
 /**
@@ -664,6 +534,11 @@ function detectInstallState() {
   if (existing.length === 0) return 'fresh';
   if (existing.length === markers.length) return 'complete';
   return 'incomplete';
+}
+
+export function freshInstallStartFenceProof({ installationRootAbsentAtStart, installState }) {
+  if (installationRootAbsentAtStart !== true || installState !== 'fresh') return null;
+  return Object.freeze({ kind: 'fresh_clean', installation_root_absent: true });
 }
 
 // ── State reset ─────────────────────────────────────────────────
@@ -861,6 +736,7 @@ function syncCoreSkills() {
     }
   }
 
+
   return { installed, updated };
 }
 
@@ -1043,79 +919,46 @@ function printWebConsoleInfo() {
   console.log(line);
 }
 
-// ── Database initialization ─────────────────────────────────────
-
-/**
- * Initialize databases for skills that require them.
- */
-function initializeDatabases() {
-  const dbInitScript = path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-db.js');
-  const dbInitSql = path.join(SKILLS_DIR, 'comm-bridge', 'init-db.sql');
-  if (!fs.existsSync(dbInitSql) || !fs.existsSync(dbInitScript)) return;
-
-  try {
-    execSync(`node "${dbInitScript}" init`, {
-      cwd: path.join(SKILLS_DIR, 'comm-bridge'),
-      stdio: 'pipe',
-      timeout: 10000,
-    });
-    console.log(`  ${success('Database initialized')}`);
-  } catch (err) {
-    const msg = err.stderr?.toString().trim() || err.stdout?.toString().trim() || err.message;
-    console.log(`  ${warn(`Database init failed: ${msg}`)}`);
-  }
-}
-
 // ── Service startup ─────────────────────────────────────────────
+
+export function requireHealthyExecutorStart(result) {
+  if (result?.ok !== true) {
+    throw new Error(`Executor service did not become healthy: ${result?.error ?? 'unknown_error'}`);
+  }
+  if (typeof result.serviceInstanceId !== 'string' || result.serviceInstanceId.length === 0) {
+    throw new Error('Executor service health omitted its authoritative identity.');
+  }
+  return result;
+}
 
 /**
  * Prepare and start core services via PM2 ecosystem config.
  * @returns {number} Number of services successfully started
  */
-function startCoreServices(webPassword = null) {
+async function startCoreServices({ freshInstallProof = null } = {}) {
   installSkillDependencies();
-  ensureWebConsolePassword(webPassword);
-  initializeDatabases();
 
   const ecosystemPath = path.join(ZYLOS_DIR, 'pm2', 'ecosystem.config.cjs');
   if (!fs.existsSync(ecosystemPath)) {
-    console.log(`  ${warn('ecosystem.config.cjs not found')}`);
-    return 0;
+    throw new Error(`Executor service configuration is missing: ${ecosystemPath}`);
   }
 
-  try {
-    // Delete existing core services first so PM2 fully re-evaluates ecosystem config
-    // (--update-env does NOT re-execute the JS, so env changes like SYSTEM_PATH won't apply)
-    const serviceNames = getCoreServiceNames();
-    for (const name of serviceNames) {
-      try { execSync(`pm2 delete "${name}"`, { stdio: 'pipe' }); } catch {}
-    }
-    execSync(`pm2 start "${ecosystemPath}"`, { stdio: 'pipe', timeout: 30000 });
-    execSync('pm2 save', { stdio: 'pipe' });
-  } catch (err) {
-    console.log(`  ${warn(`Failed to start services: ${err.message}`)}`);
-    return 0;
+  if (freshInstallProof !== null) {
+    issueExecutorStartFence({ zylosDir: ZYLOS_DIR, proof: freshInstallProof });
   }
 
-  // Report status of core services only
-  try {
-    const serviceNames = getCoreServiceNames();
-    const list = execSync('pm2 jlist', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
-    const procs = JSON.parse(list);
-    let started = 0;
-    for (const proc of procs) {
-      if (!serviceNames.includes(proc.name)) continue;
-      if (proc.pm2_env?.status === 'online') {
-        console.log(`  ${success(bold(proc.name))}`);
-        started++;
-      } else {
-        console.log(`  ${error(`${bold(proc.name)}: ${proc.pm2_env?.status || 'unknown'}`)}`);
-      }
-    }
-    return started;
-  } catch {
-    return 0;
-  }
+  const result = requireHealthyExecutorStart(
+    await reconcileExecutorService({
+      zylosDir: ZYLOS_DIR,
+      expectedProvider: getZylosConfig().runtime === 'codex' ? 'codex' : 'claude',
+    }),
+  );
+  console.log(`  ${success(`${bold('zylos-executor')} (${result.serviceInstanceId})`)}`);
+  return 1;
+}
+
+function serviceStartSuppressed() {
+  return process.env.ZYLOS_INIT_SKIP_SERVICE_START === '1';
 }
 
 // ── PM2 boot auto-start ──────────────────────────────────────────
@@ -1839,6 +1682,9 @@ Note: --setup-token and --api-key values are visible in process listings.
 
 export async function initCommand(args) {
   const opts = parseInitFlags(args);
+  // This is captured before init can create managed state. A pre-existing or
+  // incomplete installation is never allowed to mint a fresh-start fence.
+  const installationRootAbsentAtStart = !fs.existsSync(ZYLOS_DIR);
 
   // --help: print usage and exit
   if (opts.help) {
@@ -1866,12 +1712,6 @@ export async function initCommand(args) {
   // Track exit code: 0 = success, 1 = fatal, 2 = partial success
   let exitCode = 0;
 
-  // Root sandbox — Claude Code refuses --dangerously-skip-permissions as root
-  // unless IS_SANDBOX=1 is set. Auto-set it so root users (e.g. Docker) just work.
-  if (process.getuid?.() === 0 && !process.env.IS_SANDBOX) {
-    process.env.IS_SANDBOX = '1';
-  }
-
   if (!quiet) {
     console.log(`\n${heading('Welcome to Zylos!')} Let's set up your AI assistant.\n`);
   }
@@ -1884,13 +1724,13 @@ export async function initCommand(args) {
       console.log(dim('  ┌────────────────────────────────────────────────────────┐'));
       console.log(dim('  │                                                        │'));
       console.log(`  ${dim('│')}  ${dim('Zylos currently assumes a trusted environment.')}     ${dim('│')}`);
-      console.log(`  ${dim('│')}  ${dim('It runs with full system access as the current')}     ${dim('│')}`);
-      console.log(`  ${dim('│')}  ${dim('user — it can execute commands, read/write')}          ${dim('│')}`);
-      console.log(`  ${dim('│')}  ${dim('files, and access the network on your behalf.')}      ${dim('│')}`);
+      console.log(`  ${dim('│')}  ${dim('The executor uses provider permission prompts and')}   ${dim('│')}`);
+      console.log(`  ${dim('│')}  ${dim('workspace-write isolation, but approved actions can')}   ${dim('│')}`);
+      console.log(`  ${dim('│')}  ${dim('still modify files and access the network.')}            ${dim('│')}`);
       console.log(dim('  │                                                        │'));
       console.log(`  ${dim('│')}  ${yellow('⚠ Dangerous: If untrusted people can reach')}         ${dim('│')}`);
       console.log(`  ${dim('│')}  ${yellow('this machine or talk to the bot, they can')}          ${dim('│')}`);
-      console.log(`  ${dim('│')}  ${yellow('execute anything as your user.')}                     ${dim('│')}`);
+      console.log(`  ${dim('│')}  ${yellow('request privileged or destructive actions.')}          ${dim('│')}`);
       console.log(dim('  │                                                        │'));
       console.log(dim('  └────────────────────────────────────────────────────────┘'));
       console.log('');
@@ -1917,22 +1757,7 @@ export async function initCommand(args) {
   }
   if (!quiet) console.log(`  ${success(`Node.js ${nodeCheck.version}`)}`);
 
-  // Step 2: Check/install tmux
-  if (commandExists('tmux')) {
-    if (!quiet) console.log(`  ${success('tmux installed')}`);
-  } else {
-    if (!quiet) console.log(`  ${error('tmux not found')}`);
-    if (!quiet) console.log(`    ${cyan('Installing tmux...')}`);
-    if (installSystemPackage('tmux')) {
-      if (!quiet) console.log(`  ${success('tmux installed')}`);
-    } else {
-      console.error(`  ${error('Failed to install tmux')}`);
-      console.error(`    ${dim('Install manually: brew install tmux (macOS) / apt install tmux (Linux)')}`);
-      process.exit(1);
-    }
-  }
-
-  // Step 3: Check/install git
+  // Step 2: Check/install git
   if (commandExists('git')) {
     if (!quiet) console.log(`  ${success('git installed')}`);
   } else {
@@ -2277,14 +2102,6 @@ export async function initCommand(args) {
     } // end if (commandExists('claude')) — Step 6
   } // end else (Claude runtime branch)
 
-  // Pre-accept Claude Code terms (skips manual prompts on first launch).
-  // Called regardless of auth state — user may configure credentials after init.
-  if (selectedRuntime === 'claude') {
-    if (preAcceptClaudeTerms()) {
-      if (!quiet) console.log(`  ${success('Claude Code terms pre-accepted')}`);
-    }
-  }
-
   if (!quiet) console.log('');
 
   // Re-init: skip directory creation, just sync + deploy + start
@@ -2324,9 +2141,6 @@ export async function initCommand(args) {
     if (!quiet) console.log(heading('Deploying templates...'));
     deployTemplates();
 
-    // Migrate WEB_CONSOLE_PASSWORD → ZYLOS_WEB_PASSWORD
-    migrateWebConsolePassword();
-
     // Write auth credentials to .env if entered during this run
     if (pendingApiKey) {
       saveApiKeyToEnv(pendingApiKey);
@@ -2349,34 +2163,13 @@ export async function initCommand(args) {
     if (!quiet) console.log(heading('Checking timezone...'));
     await configureTimezone(skipConfirm, true, opts.timezone, quiet);
 
-    // Caddy setup (idempotent — skips if already configured)
-    if (!quiet) console.log(heading('Checking Caddy...'));
-    const caddyOk = await setupCaddy(skipConfirm, opts);
-    if (!caddyOk && opts.caddy !== false && opts.domain) {
-      exitCode = exitCode || 2; // optional step failed — don't downgrade a fatal (1)
-    }
-
-    // On runtime switch: clear stale health state before restart.
-    // NOTE: do NOT kill the old session here — init.js may itself be running
-    // inside that session (as a subprocess of the current runtime), so
-    // tmux kill-session would silently fail or kill the parent process mid-run.
-    // The new activity-monitor kills the stale session on startup instead.
-    if (existingRuntime && existingRuntime !== selectedRuntime) {
-      try { fs.unlinkSync(path.join(ZYLOS_DIR, 'activity-monitor', 'agent-status.json')); } catch {}
-      try { fs.unlinkSync(path.join(ZYLOS_DIR, 'activity-monitor', 'heartbeat-pending.json')); } catch {}
-      try { fs.unlinkSync(path.join(ZYLOS_DIR, 'activity-monitor', 'codex-heartbeat-pending.json')); } catch {}
-    }
     if (!quiet) console.log(heading('Starting services...'));
-    const servicesStarted = startCoreServices(opts.webPassword);
+    const servicesStarted = serviceStartSuppressed() ? 0 : await startCoreServices();
     if (servicesStarted > 0) {
       setupPm2Startup();
       if (!quiet) console.log(`\n${green(`${servicesStarted} service(s) started.`)} ${dim('Run "zylos status" to check.')}`);
     } else {
       if (!quiet) console.log(`\n${dim('No services to start.')}`);
-    }
-
-    if (selectedRuntime === 'claude' && claudeAuthenticated && !skipConfirm && needsBypassAcceptance()) {
-      await guideBypassAcceptance();
     }
 
     if (selectedRuntime === 'codex' ? !codexAuthenticated : !claudeAuthenticated) {
@@ -2386,7 +2179,6 @@ export async function initCommand(args) {
         console.log(`  ${dim('Run "zylos init" again to authenticate.')}`);
       }
     }
-    printWebConsoleInfo();
     if (!quiet) console.log(`\n${dim('Use "zylos add <component>" to add components.')}`);
     if (exitCode) process.exit(exitCode);
     return;
@@ -2433,9 +2225,6 @@ export async function initCommand(args) {
   deployTemplates({ freshInstall: true });
   if (!quiet) console.log(`  ${success('Templates deployed')}`);
 
-  // Migrate WEB_CONSOLE_PASSWORD → ZYLOS_WEB_PASSWORD
-  migrateWebConsolePassword();
-
   // Write auth credentials to .env now that templates have been deployed
   if (pendingApiKey) {
     saveApiKeyToEnv(pendingApiKey);
@@ -2471,34 +2260,16 @@ export async function initCommand(args) {
     }
   }
 
-  // Step 10: Caddy web server setup
-  if (!quiet) console.log(`\n${heading('HTTPS setup...')}`);
-  const caddyOk = await setupCaddy(skipConfirm, opts);
-  if (!caddyOk && opts.caddy !== false && opts.domain) {
-    exitCode = exitCode || 2; // optional step failed — don't downgrade a fatal (1)
-  }
-
-  // On runtime switch: clear stale health state before restart.
-  // NOTE: do NOT kill the old session here — init.js may run from inside the
-  // old session, and killing it would terminate this process before services start.
-  // The activity-monitor kills the stale session on startup instead.
-  if (existingRuntime && existingRuntime !== selectedRuntime) {
-    try { fs.unlinkSync(path.join(ZYLOS_DIR, 'activity-monitor', 'agent-status.json')); } catch {}
-    try { fs.unlinkSync(path.join(ZYLOS_DIR, 'activity-monitor', 'heartbeat-pending.json')); } catch {}
-    try { fs.unlinkSync(path.join(ZYLOS_DIR, 'activity-monitor', 'codex-heartbeat-pending.json')); } catch {}
-  }
-
-  // Step 11: Start services
+  // Step 10: Start the executor service
   if (!quiet) console.log(`\n${heading('Starting services...')}`);
-  const servicesStarted = startCoreServices(opts.webPassword);
+  const servicesStarted = serviceStartSuppressed() ? 0 : await startCoreServices({
+    freshInstallProof: freshInstallStartFenceProof({
+      installationRootAbsentAtStart, installState,
+    }),
+  });
 
   if (servicesStarted > 0) {
     setupPm2Startup();
-  }
-
-  // First-time Claude bypass acceptance (only if Claude runtime and authenticated)
-  if (selectedRuntime === 'claude' && claudeAuthenticated && !skipConfirm && needsBypassAcceptance()) {
-    await guideBypassAcceptance();
   }
 
   // Done
@@ -2509,8 +2280,6 @@ export async function initCommand(args) {
   if (servicesStarted > 0 && !quiet) {
     console.log(`${green(`${servicesStarted} service(s) started.`)} ${dim('Run "zylos status" to check.')}\n`);
   }
-
-  printWebConsoleInfo();
 
   if (claudeJustInstalled) {
     // Auto-add ~/.local/bin to shell profile so future shell sessions find claude

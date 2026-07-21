@@ -4,10 +4,7 @@
 # Build:  docker build -t zylos .
 # Run:    docker compose up -d   (see docker-compose.yml)
 #
-# This image installs Zylos and its dependencies, then starts all PM2-managed
-# services (scheduler, web-console, c4-dispatcher, activity-monitor, channels).
-# The AI loop (Claude Code) runs inside a persistent tmux session so it can
-# receive heartbeat / message commands through the c4-dispatcher bridge.
+# This image installs Zylos and starts the PM2-supervised Core executor service.
 # ────────────────────────────────────────────────────────────────────────────
 
 FROM node:22-slim
@@ -19,7 +16,6 @@ LABEL org.opencontainers.image.description="Zylos — autonomous AI agent infras
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git \
       curl \
-      tmux \
       bash \
       ca-certificates \
       # Needed by some Claude Code operations
@@ -62,12 +58,6 @@ COPY --chown=zylos:zylos templates/pm2/ecosystem.config.cjs /home/zylos/zylos/pm
 # ── Copy entrypoint ───────────────────────────────────────────────────────────
 COPY --chown=zylos:zylos docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
-
-# ── Ports ─────────────────────────────────────────────────────────────────────
-# Web console (web-console service, default 3456)
-EXPOSE 3456
-# Caddy / reverse proxy (optional, enabled via .env)
-EXPOSE 8080
 
 # Healthcheck is defined in docker-compose.yml (start_period=600s for slow init).
 # No HEALTHCHECK here to avoid a conflicting override.

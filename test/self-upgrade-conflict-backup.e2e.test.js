@@ -61,67 +61,28 @@ afterEach(() => {
 });
 
 describe('self-upgrade durable conflict backups (#717)', () => {
-  test('old launcher prints every nested conflict path and success cleanup preserves durable backups', () => {
-    prepareThreeWayConflictFixture();
+  test.each(['success', 'json', 'later-failure', 'no-conflict'])(
+    'legacy launcher scenario %s fails closed without install, stop, or backup mutation',
+    (scenario) => {
+      if (scenario !== 'no-conflict') prepareThreeWayConflictFixture();
+      else writeFile(packageDir, 'skills/new-skill/SKILL.md', '# New\n');
 
-    const { result, launcherOutput, npmCommands, stoppedServices, transactionBackupDir } = runScenario('success');
+      const { result, launcherOutput, npmCommands, stoppedServices, transactionBackupDir }
+        = runScenario(scenario);
 
-    expect(result.success).toBe(true);
-    expect(result.mergeConflicts).toHaveLength(2);
-    expect(stoppedServices).toEqual(['fixture-service']);
-    expect(npmCommands).toHaveLength(2);
-    expect(npmCommands[0]).toMatch(/^npm pack/);
-    expect(npmCommands[1]).toMatch(/^npm install -g/);
-    expect(fs.existsSync(transactionBackupDir)).toBe(false);
-
-    for (const conflict of result.mergeConflicts) {
-      expect(conflict.backupPath.startsWith(path.join(zylosDir, '.backup') + path.sep)).toBe(true);
-      expect(fs.existsSync(conflict.backupPath)).toBe(true);
-      expect(launcherOutput.join('\n')).toContain(`${conflict.skill}/${conflict.file}`);
-      expect(launcherOutput.join('\n')).toContain(conflict.backupPath);
-    }
-    expect(result.mergeConflicts.some(({ file }) => file === 'nested/settings.txt')).toBe(true);
-    expect(readFile(result.mergeConflicts.find(({ file }) => file === 'SKILL.md').backupPath)).toContain('value=local');
-  });
-
-  test('JSON result exposes durable backup paths without running success cleanup', () => {
-    prepareThreeWayConflictFixture();
-
-    const { result, launcherOutput, transactionBackupDir } = runScenario('json');
-
-    expect(result.success).toBe(true);
-    expect(launcherOutput).toEqual([]);
-    expect(fs.existsSync(transactionBackupDir)).toBe(true);
-    expect(result.mergeConflicts).toHaveLength(2);
-    for (const conflict of result.mergeConflicts) {
-      expect(fs.existsSync(conflict.backupPath)).toBe(true);
-    }
-  });
-
-  test('later finalizer failure performs no rollback and retains both backup lifecycles', () => {
-    prepareThreeWayConflictFixture();
-
-    const { result, transactionBackupDir } = runScenario('later-failure');
-
-    expect(result.success).toBe(false);
-    expect(result.failedStep).toBe(6);
-    expect(result.rollback).toEqual({ performed: false, steps: [] });
-    expect(fs.existsSync(transactionBackupDir)).toBe(true);
-
-    const durableRoot = path.join(zylosDir, '.backup');
-    const durableFiles = fs.readdirSync(durableRoot, { recursive: true })
-      .filter((entry) => !fs.statSync(path.join(durableRoot, entry)).isDirectory());
-    expect(durableFiles).toHaveLength(2);
-    expect(readFile(path.join(durableRoot, durableFiles.find((entry) => entry.endsWith('SKILL.md'))))).toContain('value=local');
-  });
-
-  test('no conflict does not create an empty durable backup directory', () => {
-    writeFile(packageDir, 'skills/new-skill/SKILL.md', '# New\n');
-
-    const { result } = runScenario('no-conflict');
-
-    expect(result.success).toBe(true);
-    expect(result.mergeConflicts).toBeNull();
-    expect(fs.existsSync(path.join(zylosDir, '.backup'))).toBe(false);
-  });
+      expect(result).toMatchObject({
+        success: false,
+        failedStep: 0,
+        durableRuntimeOwner: true,
+        error: 'Legacy self-upgrade is disabled because the durable runtime owns upgrades.',
+        steps: [],
+        rollback: { performed: false, steps: [] },
+      });
+      expect(launcherOutput).toEqual([]);
+      expect(npmCommands).toEqual([]);
+      expect(stoppedServices).toEqual([]);
+      expect(fs.existsSync(transactionBackupDir)).toBe(false);
+      expect(fs.existsSync(path.join(zylosDir, '.backup'))).toBe(false);
+    },
+  );
 });

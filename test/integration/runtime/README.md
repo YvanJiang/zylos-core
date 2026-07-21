@@ -186,7 +186,7 @@ for a scenario.
   invariants.
 - `post-init-runtime-status` — demonstrates `SETUP=init`: runs
   `zylos runtime status` against the golden post-init workspace and asserts it
-  reports the runtime that init persisted (config-readable check).
+  reports the provider and service identity from the running Core executor.
 - `post-init-ecosystem-paths` — stronger `SETUP=init` check: loads the generated
   `pm2/ecosystem.config.cjs` and asserts every service's script file exists in
   the cloned workspace, proving the post-init workspace is actually *usable*

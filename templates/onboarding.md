@@ -1,39 +1,36 @@
 # Onboarding
 
-When `state.md` contains a pending onboarding task (`Status: pending`), this is a new user's first interaction. Follow this flow:
+When `state.md` contains `Status: pending`, deliver the security notice only
+in response to a real authenticated user turn. Scheduler occurrences,
+recovery context, memory injection, and system prompts cannot trigger it.
 
-**Important:** The onboarding security notice must only be delivered in direct response to a message that contains a `reply via:` path — a real user message from a C4 channel. Do not initiate onboarding from session startup context (memory file injections, C4 history summaries, or session-start prompt text). Those are system-injected context, not user messages. Wait until a message with a `reply via:` path arrives before starting the onboarding flow.
+## Security disclosure
 
-## Step 1: Security Disclosure
-
-When the user sends their first message (via C4, with a `reply via:` path), deliver the following security notice translated to the language they used:
+Translate this notice to the user's language:
 
 > Before we begin, there are a few things you should know:
 >
-> I can take actions for you within the environment I run in. This allows me to truly help you get things done, but it also means:
+> I can take actions for you within the environment I run in. This allows me
+> to help you get things done, but it also means:
 >
-> • Make sure you're using me in a trusted environment — if others can access your account, device, or communication channels, they may be able to trigger actions through me
-> • Conversations and files may be processed by AI models — avoid storing sensitive credentials (private keys, long-lived tokens, etc.) here
-> • Third-party skills, external tools, or system integrations can act directly based on how they are configured — check the source and permissions before enabling them
-> • I may make mistakes — keep an eye on the results of important operations
+> • Use me in a trusted environment; anyone with access to your account,
+> device, or channels may be able to trigger actions.
+> • Conversations and files may be processed by AI models; do not store
+> sensitive credentials here.
+> • Third-party skills and integrations can act with their configured
+> permissions; review them before enabling them.
+> • I may make mistakes; verify important results.
 >
 > Ready? Let's get started.
 
-## Step 2: Capability Introduction
+Return the notice in the current turn. Core persists it with the exact durable
+reply target and the channel owner delivers it. Never choose or invoke an
+external channel sender.
 
-After the security notice:
-- If the user's first message contains a specific task or request, skip the introduction and handle their task directly.
-- If the user's first message is a greeting or has no specific task, follow up with a brief capability overview. Frame it as use cases, not a feature list. Example: "I can help you build projects, automate daily tasks, set up scheduled notifications, control a browser to scrape data — basically anything you can think of, give it a try."
+Afterward, handle a specific request directly. For a greeting, offer a brief
+use-case-oriented capability introduction and guide the user toward a first
+project from `reference/projects.md`.
 
-## Step 3: First Project
-
-Guide the user to complete their first end-to-end project. Read `reference/projects.md` for suggested task types and difficulty ratings. Recommend ★★ difficulty tasks for beginners. The agent does the building; the user provides direction.
-
-## Completion
-
-Once the security notice has been **successfully sent via C4** (c4-send.js ran without error):
-1. Update `state.md`: change `- Status: pending` to `- Status: completed`
-2. Do not show the security notice again in future sessions
-3. If the user completed a first project, update `reference/projects.md` accordingly
-
-**Never update state.md before sending** — the update must happen after the c4-send.js call succeeds, not before or as part of planning.
+Do not mark onboarding complete merely because the model produced text. Update
+`state.md` only when the current turn contains durable delivery confirmation;
+otherwise leave it pending for a later confirmed turn.

@@ -1,11 +1,13 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 import { afterEach, describe, expect, test } from '@jest/globals';
 import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/index.js';
 
 import { createIdempotencyKey } from '../contracts/public/index.js';
+import { createChannelNeutralTextRenderer } from '../runtime/compatibility/c4-channel-fallback.js';
 import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { createExecutorStore } from '../runtime/persistence/executor-store.js';
 import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
@@ -15,6 +17,10 @@ import { deliveredResult } from './helpers/delivered-result.js';
 
 const inboundFixture = JSON.parse(fs.readFileSync(
   new URL('../contracts/public/fixtures/inbound-envelope-v1.json', import.meta.url),
+  'utf8',
+));
+const deliveryMappingFixture = JSON.parse(fs.readFileSync(
+  new URL('../contracts/public/fixtures/delivery-mapping-v1.json', import.meta.url),
   'utf8',
 ));
 
@@ -51,6 +57,74 @@ function normalEnvelope(suffix) {
     inbound_event_id: envelope.inbound_event_id,
   });
   return envelope;
+}
+
+function createExactBaseDeliveringOutbox(database) {
+  const command = structuredClone(deliveryMappingFixture.command_vectors.find(
+    ({ name }) => name === 'send_text_bound',
+  ).document);
+  database.exec(`
+    CREATE TABLE runtime_turns (turn_id TEXT PRIMARY KEY);
+    CREATE TABLE runtime_outbox (
+      outbox_id TEXT PRIMARY KEY,
+      delivery_id TEXT NOT NULL UNIQUE,
+      aggregate_type TEXT NOT NULL,
+      aggregate_id TEXT NOT NULL,
+      turn_id TEXT REFERENCES runtime_turns(turn_id),
+      control_id TEXT,
+      lane_key TEXT,
+      predecessor_delivery_id TEXT,
+      aggregate_version INTEGER NOT NULL CHECK (aggregate_version > 0),
+      status TEXT NOT NULL,
+      command_json TEXT NOT NULL,
+      priority INTEGER NOT NULL DEFAULT 0,
+      supersedable INTEGER NOT NULL DEFAULT 0 CHECK (supersedable IN (0, 1)),
+      terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1)),
+      attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+      delivery_attempt_id TEXT,
+      delivery_attempt_no INTEGER CHECK (
+        delivery_attempt_no IS NULL OR delivery_attempt_no > 0
+      ),
+      outbox_lease_epoch INTEGER NOT NULL DEFAULT 0 CHECK (outbox_lease_epoch >= 0),
+      lease_owner TEXT,
+      lease_expires_at TEXT,
+      last_attempt_at TEXT,
+      next_attempt_at TEXT,
+      last_error_json TEXT,
+      result_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT
+    );
+  `);
+  database.prepare(`
+    INSERT INTO runtime_outbox (
+      outbox_id, delivery_id, aggregate_type, aggregate_id, turn_id, control_id,
+      lane_key, predecessor_delivery_id, aggregate_version, status, command_json,
+      priority, supersedable, terminal, attempt_count, delivery_attempt_id,
+      delivery_attempt_no, outbox_lease_epoch, lease_owner, lease_expires_at,
+      last_attempt_at, next_attempt_at, last_error_json, result_json, created_at,
+      updated_at
+    ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, 'delivering', ?, ?, 0, 0,
+      1, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
+  `).run(
+    command.outbox_id,
+    command.delivery_id,
+    command.aggregate_type,
+    command.aggregate_id,
+    command.aggregate_version,
+    JSON.stringify(command),
+    command.priority,
+    command.delivery_attempt_id,
+    command.delivery_attempt_no,
+    command.outbox_lease_epoch,
+    'exact-base-delivery-owner',
+    '2026-07-19T04:00:10Z',
+    '2026-07-19T04:00:00Z',
+    command.created_at,
+    '2026-07-19T04:00:00Z',
+  );
+  database.exec('DROP TABLE runtime_turns;');
+  return command;
 }
 
 function retryableFailure(command, resultAt) {
@@ -139,6 +213,292 @@ afterEach(() => {
 });
 
 describe('durable outbox service', () => {
+  test('quarantines an expired exact-base delivering claim without replay or new authority', async () => {
+    const database = openTestDatabase();
+    const databasePath = database.name;
+    const legacyCommand = createExactBaseDeliveringOutbox(database);
+    database.close();
+
+    const reopened = new Database(databasePath);
+    let sideEffects = 0;
+    const outbox = createOutboxService({
+      database: reopened,
+      renderer: {
+        async deliver(command) {
+          sideEffects += 1;
+          return retryableFailure(command, '2026-07-19T04:00:12Z');
+        },
+      },
+      serviceInstanceId: 'upgraded-delivery-owner',
+      now: () => '2026-07-19T04:00:12Z',
+      generateId: deterministicIds('upgraded-delivery-owner'),
+    });
+
+    await expect(outbox.dispatchNext()).resolves.toEqual({ status: 'idle' });
+    expect(sideEffects).toBe(0);
+    expect(reopened.prepare(`
+      SELECT status, attempt_count, delivery_attempt_id, delivery_attempt_no,
+        outbox_lease_epoch, lease_owner, result_json
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(legacyCommand.outbox_id)).toEqual({
+      status: 'delivery_unknown',
+      attempt_count: 1,
+      delivery_attempt_id: legacyCommand.delivery_attempt_id,
+      delivery_attempt_no: legacyCommand.delivery_attempt_no,
+      outbox_lease_epoch: legacyCommand.outbox_lease_epoch,
+      lease_owner: 'exact-base-delivery-owner',
+      result_json: null,
+    });
+    expect(reopened.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_outbox_claim_snapshots
+      WHERE outbox_id = ?
+    `).get(legacyCommand.outbox_id).count).toBe(0);
+    reopened.close();
+  });
+
+  test('quarantines a jointly altered expired claim instead of blessing a replay snapshot', async () => {
+    const database = openTestDatabase();
+    const databasePath = database.name;
+    acceptNormalInbound(database, normalEnvelope('altered-expired-reclaim'), {
+      now: () => '2026-07-19T09:20:00Z',
+      generateId: deterministicIds('altered-expired-reclaim'),
+    });
+    const firstOwner = createOutboxService({
+      database,
+      serviceInstanceId: 'altered-expired-first-owner',
+      now: () => '2026-07-19T09:20:01Z',
+      generateId: deterministicIds('altered-expired-first-owner'),
+      leaseDurationMs: 10_000,
+    });
+    const originalCommand = firstOwner.claimNext();
+    database.close();
+
+    const reopened = new Database(databasePath);
+    let sideEffects = 0;
+    const contender = createOutboxService({
+      database: reopened,
+      renderer: {
+        async deliver(command) {
+          sideEffects += 1;
+          return retryableFailure(command, '2026-07-19T09:20:12Z');
+        },
+      },
+      serviceInstanceId: 'altered-expired-contender',
+      now: () => '2026-07-19T09:20:12Z',
+      generateId: deterministicIds('altered-expired-contender'),
+      leaseDurationMs: 10_000,
+    });
+    const changedCommand = structuredClone(originalCommand);
+    changedCommand.render_model.text = 'jointly altered before expired reclaim';
+    changedCommand.render_model.terminal = true;
+    changedCommand.priority = 999;
+    const changedJson = JSON.stringify(changedCommand);
+    reopened.prepare(`
+      UPDATE runtime_outbox
+      SET command_json = ?, claimed_command_hash = ?
+      WHERE outbox_id = ?
+    `).run(
+      changedJson,
+      crypto.createHash('sha256').update(changedJson).digest('hex'),
+      originalCommand.outbox_id,
+    );
+
+    await expect(contender.dispatchNext()).resolves.toEqual({ status: 'idle' });
+    expect(sideEffects).toBe(0);
+    expect(reopened.prepare(`
+      SELECT status, attempt_count, delivery_attempt_id, delivery_attempt_no,
+        outbox_lease_epoch, lease_owner, result_json
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(originalCommand.outbox_id)).toEqual({
+      status: 'delivery_unknown',
+      attempt_count: 1,
+      delivery_attempt_id: originalCommand.delivery_attempt_id,
+      delivery_attempt_no: originalCommand.delivery_attempt_no,
+      outbox_lease_epoch: originalCommand.outbox_lease_epoch,
+      lease_owner: 'altered-expired-first-owner',
+      result_json: null,
+    });
+    expect(reopened.prepare(`
+      SELECT delivery_attempt_id, delivery_attempt_no, outbox_lease_epoch,
+        lease_owner, command_json
+      FROM runtime_outbox_claim_snapshots WHERE outbox_id = ?
+    `).all(originalCommand.outbox_id)).toEqual([{
+      delivery_attempt_id: originalCommand.delivery_attempt_id,
+      delivery_attempt_no: originalCommand.delivery_attempt_no,
+      outbox_lease_epoch: originalCommand.outbox_lease_epoch,
+      lease_owner: 'altered-expired-first-owner',
+      command_json: JSON.stringify(originalCommand),
+    }]);
+    reopened.close();
+  });
+
+  test('quarantines a jointly altered retry_wait claim across restart', async () => {
+    const database = openTestDatabase();
+    const databasePath = database.name;
+    acceptNormalInbound(database, normalEnvelope('altered-retry-restart'), {
+      now: () => '2026-07-19T09:30:00Z',
+      generateId: deterministicIds('altered-retry-restart'),
+    });
+    let ownerTime = '2026-07-19T09:30:01Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'altered-retry-restart-owner',
+      now: () => ownerTime,
+      generateId: deterministicIds('altered-retry-restart-owner'),
+    });
+    const originalCommand = owner.claimNext();
+    ownerTime = '2026-07-19T09:30:02Z';
+    expect(owner.recordResult(retryableFailure(originalCommand, ownerTime))).toEqual({
+      status: 'applied', outbox_status: 'retry_wait',
+    });
+    const changedCommand = structuredClone(originalCommand);
+    changedCommand.render_model.text = 'altered retry after authoritative result';
+    const changedJson = JSON.stringify(changedCommand);
+    database.prepare(`
+      UPDATE runtime_outbox SET command_json = ?, claimed_command_hash = ?
+      WHERE outbox_id = ?
+    `).run(
+      changedJson,
+      crypto.createHash('sha256').update(changedJson).digest('hex'),
+      originalCommand.outbox_id,
+    );
+    database.close();
+
+    const reopened = new Database(databasePath);
+    let sideEffects = 0;
+    const contender = createOutboxService({
+      database: reopened,
+      renderer: {
+        async deliver(command) {
+          sideEffects += 1;
+          return retryableFailure(command, '2026-07-19T09:30:05Z');
+        },
+      },
+      serviceInstanceId: 'altered-retry-restart-contender',
+      now: () => '2026-07-19T09:30:05Z',
+      generateId: deterministicIds('altered-retry-restart-contender'),
+    });
+
+    await expect(contender.dispatchNext()).resolves.toEqual({ status: 'idle' });
+    await expect(contender.dispatchNext()).resolves.toEqual({ status: 'idle' });
+    expect(sideEffects).toBe(0);
+    expect(reopened.prepare(`
+      SELECT status, attempt_count, delivery_attempt_id, outbox_lease_epoch,
+        lease_owner, result_json
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(originalCommand.outbox_id)).toEqual({
+      status: 'delivery_unknown',
+      attempt_count: 1,
+      delivery_attempt_id: originalCommand.delivery_attempt_id,
+      outbox_lease_epoch: originalCommand.outbox_lease_epoch,
+      lease_owner: null,
+      result_json: JSON.stringify(retryableFailure(originalCommand, ownerTime)),
+    });
+    expect(reopened.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_outbox_claim_snapshots
+      WHERE outbox_id = ?
+    `).get(originalCommand.outbox_id).count).toBe(1);
+    reopened.close();
+  });
+
+  test('quarantines retry_wait tampering that occurs after service initialization', async () => {
+    const database = openTestDatabase();
+    const databasePath = database.name;
+    acceptNormalInbound(database, normalEnvelope('altered-retry-after-init'), {
+      now: () => '2026-07-19T09:35:00Z',
+      generateId: deterministicIds('altered-retry-after-init'),
+    });
+    let ownerTime = '2026-07-19T09:35:01Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'altered-retry-after-init-owner',
+      now: () => ownerTime,
+      generateId: deterministicIds('altered-retry-after-init-owner'),
+    });
+    const originalCommand = owner.claimNext();
+    ownerTime = '2026-07-19T09:35:02Z';
+    owner.recordResult(retryableFailure(originalCommand, ownerTime));
+    database.close();
+
+    const reopened = new Database(databasePath);
+    let sideEffects = 0;
+    const contender = createOutboxService({
+      database: reopened,
+      renderer: {
+        async deliver(command) {
+          sideEffects += 1;
+          return retryableFailure(command, '2026-07-19T09:35:05Z');
+        },
+      },
+      serviceInstanceId: 'altered-retry-after-init-contender',
+      now: () => '2026-07-19T09:35:05Z',
+      generateId: deterministicIds('altered-retry-after-init-contender'),
+    });
+    const changedCommand = structuredClone(originalCommand);
+    changedCommand.priority = 999;
+    const changedJson = JSON.stringify(changedCommand);
+    reopened.prepare(`
+      UPDATE runtime_outbox SET command_json = ?, claimed_command_hash = ?
+      WHERE outbox_id = ?
+    `).run(
+      changedJson,
+      crypto.createHash('sha256').update(changedJson).digest('hex'),
+      originalCommand.outbox_id,
+    );
+
+    await expect(contender.dispatchNext()).resolves.toEqual({ status: 'idle' });
+    await expect(contender.dispatchNext()).resolves.toEqual({ status: 'idle' });
+    expect(sideEffects).toBe(0);
+    expect(reopened.prepare(`
+      SELECT status, attempt_count FROM runtime_outbox WHERE outbox_id = ?
+    `).get(originalCommand.outbox_id)).toEqual({
+      status: 'delivery_unknown', attempt_count: 1,
+    });
+    expect(reopened.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_outbox_claim_snapshots
+      WHERE outbox_id = ?
+    `).get(originalCommand.outbox_id).count).toBe(1);
+    reopened.close();
+  });
+
+  test('keeps later lane projections staged behind a delivery_unknown barrier', () => {
+    const database = openTestDatabase();
+    const accepted = acceptNormalInbound(database, normalEnvelope('unknown-lane-barrier'), {
+      now: () => '2026-07-19T09:25:00Z',
+      generateId: deterministicIds('unknown-lane-barrier'),
+    });
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'unknown-lane-barrier-owner',
+      now: () => '2026-07-19T09:25:01Z',
+      generateId: deterministicIds('unknown-lane-barrier-owner'),
+    });
+    const command = owner.claimNext();
+    database.prepare(`
+      UPDATE runtime_outbox SET status = 'delivery_unknown' WHERE outbox_id = ?
+    `).run(command.outbox_id);
+
+    stageMainProjection(database, { turn_id: accepted.turn_id }, projectionEvent(accepted, {
+      version: 3,
+      kind: 'text_snapshot',
+      phase: 'running',
+      payload: { text: 'must remain staged', end_offset: 18 },
+      persistedAt: '2026-07-19T09:25:02Z',
+    }), { generateId: deterministicIds('unknown-lane-barrier-projection') });
+
+    expect(database.prepare(`
+      SELECT aggregate_version, status FROM runtime_outbox
+      WHERE turn_id = ? ORDER BY aggregate_version
+    `).all(accepted.turn_id)).toEqual([
+      { aggregate_version: 1, status: 'delivery_unknown' },
+    ]);
+    expect(database.prepare(`
+      SELECT aggregate_version, status FROM runtime_projection_snapshots
+      WHERE turn_id = ? AND aggregate_version = 3
+    `).get(accepted.turn_id)).toEqual({ aggregate_version: 3, status: 'staged' });
+    database.close();
+  });
+
   test('migrates the issue 07 outbox without losing rows or blocking fallback versions', () => {
     const database = openTestDatabase();
     database.exec(`
@@ -152,15 +512,17 @@ describe('durable outbox service', () => {
         aggregate_version INTEGER NOT NULL CHECK (aggregate_version > 0),
         status TEXT NOT NULL,
         command_json TEXT NOT NULL,
+        lease_expires_at TEXT,
         created_at TEXT NOT NULL,
         UNIQUE (aggregate_type, aggregate_id, aggregate_version)
       );
       INSERT INTO runtime_outbox (
         outbox_id, delivery_id, aggregate_type, aggregate_id,
-        aggregate_version, status, command_json, created_at
+        aggregate_version, status, command_json, lease_expires_at, created_at
       ) VALUES (
         'outbox-legacy', 'delivery-legacy', 'turn_main', 'turn-legacy',
-        7, 'dead_letter', '{}', '2026-07-19T07:00:00Z'
+        7, 'dead_letter', '{}', '2026-07-19T15:00:10+08:00',
+        '2026-07-19T07:00:00Z'
       );
     `);
 
@@ -168,7 +530,7 @@ describe('durable outbox service', () => {
 
     expect(database.prepare(`
       SELECT outbox_id, delivery_id, aggregate_version, status, attempt_count,
-        outbox_lease_epoch, supersedable, terminal
+        outbox_lease_epoch, lease_expires_epoch_ms, supersedable, terminal
       FROM runtime_outbox
       WHERE outbox_id = 'outbox-legacy'
     `).get()).toEqual({
@@ -178,6 +540,7 @@ describe('durable outbox service', () => {
       status: 'dead_letter',
       attempt_count: 0,
       outbox_lease_epoch: 0,
+      lease_expires_epoch_ms: Date.parse('2026-07-19T07:00:10Z'),
       supersedable: 0,
       terminal: 0,
     });
@@ -316,6 +679,545 @@ describe('durable outbox service', () => {
     });
     expect(readDeliveryAuthority(database, currentClaim.outbox_id)).toEqual(applied);
 
+    const alteredCommand = {
+      ...currentClaim,
+      priority: currentClaim.priority + 1,
+      render_model: { ...currentClaim.render_model, text: 'altered after result' },
+    };
+    const alteredCommandJson = JSON.stringify(alteredCommand);
+    database.prepare(`
+      UPDATE runtime_outbox SET command_json = ?, claimed_command_hash = ?
+      WHERE outbox_id = ?
+    `).run(
+      alteredCommandJson,
+      crypto.createHash('sha256').update(alteredCommandJson).digest('hex'),
+      currentClaim.outbox_id,
+    );
+    expect(secondService.recordResult(currentResult)).toEqual({ status: 'stale' });
+
+    database.close();
+  });
+
+  test('does not reclaim a live lease when the contender clock uses a positive offset', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('positive-offset-live-lease'), {
+      now: () => '2026-07-19T08:10:00Z',
+      generateId: deterministicIds('positive-offset-live-lease'),
+    });
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-positive-offset-owner',
+      now: () => '2026-07-19T08:10:01Z',
+      generateId: deterministicIds('delivery-positive-offset-owner'),
+      leaseDurationMs: 10_000,
+    });
+    const command = owner.claimNext();
+    const contender = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-positive-offset-contender',
+      now: () => '2026-07-19T16:10:06+08:00',
+      generateId: deterministicIds('delivery-positive-offset-contender'),
+      leaseDurationMs: 10_000,
+    });
+
+    expect(contender.claimNext()).toBeNull();
+    expect(database.prepare(`
+      SELECT attempt_count, outbox_lease_epoch, lease_owner
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(command.outbox_id)).toEqual({
+      attempt_count: 1,
+      outbox_lease_epoch: 1,
+      lease_owner: 'delivery-positive-offset-owner',
+    });
+    database.close();
+  });
+
+  test('does not claim a not-yet-due delivery when the owner clock uses a positive offset', () => {
+    const database = openTestDatabase();
+    const accepted = acceptNormalInbound(database, normalEnvelope('positive-offset-not-before'), {
+      now: () => '2026-07-19T08:15:00Z',
+      generateId: deterministicIds('positive-offset-not-before'),
+    });
+    database.prepare(`
+      UPDATE runtime_outbox SET next_attempt_at = ? WHERE turn_id = ?
+    `).run('2026-07-19T08:15:10Z', accepted.turn_id);
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-positive-offset-not-before',
+      now: () => '2026-07-19T16:15:05+08:00',
+      generateId: deterministicIds('delivery-positive-offset-not-before'),
+    });
+
+    expect(owner.claimNext()).toBeNull();
+    database.close();
+  });
+
+  test('reclaims an expired lease when the contender clock uses a negative offset', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('negative-offset-expired-lease'), {
+      now: () => '2026-07-19T08:20:00Z',
+      generateId: deterministicIds('negative-offset-expired-lease'),
+    });
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-negative-offset-owner',
+      now: () => '2026-07-19T08:20:01Z',
+      generateId: deterministicIds('delivery-negative-offset-owner'),
+      leaseDurationMs: 10_000,
+    });
+    const staleCommand = owner.claimNext();
+    const contender = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-negative-offset-contender',
+      now: () => '2026-07-19T03:20:12-05:00',
+      generateId: deterministicIds('delivery-negative-offset-contender'),
+      leaseDurationMs: 10_000,
+    });
+
+    expect(contender.claimNext()).toMatchObject({
+      outbox_id: staleCommand.outbox_id,
+      delivery_attempt_no: 2,
+      outbox_lease_epoch: 2,
+    });
+    database.close();
+  });
+
+  test('renews a live pre-action lease when the owner clock uses a positive offset', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('positive-offset-pre-action'), {
+      now: () => '2026-07-19T08:30:00Z',
+      generateId: deterministicIds('positive-offset-pre-action'),
+    });
+    let ownerTime = '2026-07-19T08:30:01Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-positive-offset-pre-action',
+      now: () => ownerTime,
+      generateId: deterministicIds('delivery-positive-offset-pre-action'),
+      leaseDurationMs: 10_000,
+    });
+    const command = owner.claimNext();
+    ownerTime = '2026-07-19T16:30:05+08:00';
+
+    expect(() => owner.assertCurrentClaim(command)).not.toThrow();
+    expect(database.prepare(`
+      SELECT lease_expires_at, lease_expires_epoch_ms, pre_action_fenced_at
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(command.outbox_id)).toEqual({
+      lease_expires_at: '2026-07-19T08:30:15.000Z',
+      lease_expires_epoch_ms: Date.parse('2026-07-19T08:30:15Z'),
+      pre_action_fenced_at: '2026-07-19T16:30:05+08:00',
+    });
+    database.close();
+  });
+
+  test('rejects an expired pre-action lease when the owner clock uses a negative offset', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('negative-offset-pre-action'), {
+      now: () => '2026-07-19T08:35:00Z',
+      generateId: deterministicIds('negative-offset-pre-action'),
+    });
+    let ownerTime = '2026-07-19T08:35:01Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-negative-offset-pre-action',
+      now: () => ownerTime,
+      generateId: deterministicIds('delivery-negative-offset-pre-action'),
+      leaseDurationMs: 10_000,
+    });
+    const command = owner.claimNext();
+    ownerTime = '2026-07-19T03:35:12-05:00';
+
+    expect(() => owner.assertCurrentClaim(command)).toThrow('delivery claim is stale');
+    database.close();
+  });
+
+  test('applies a live delivery result when the owner clock uses a positive offset', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('positive-offset-result'), {
+      now: () => '2026-07-19T08:40:00Z',
+      generateId: deterministicIds('positive-offset-result'),
+    });
+    let ownerTime = '2026-07-19T08:40:01Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-positive-offset-result',
+      now: () => ownerTime,
+      generateId: deterministicIds('delivery-positive-offset-result'),
+      leaseDurationMs: 10_000,
+    });
+    const command = owner.claimNext();
+    ownerTime = '2026-07-19T08:40:02Z';
+    owner.assertCurrentClaim(command);
+    ownerTime = '2026-07-19T16:40:05+08:00';
+
+    expect(owner.recordResult(deliveredResult(command, ownerTime))).toEqual({
+      status: 'applied', outbox_status: 'delivered',
+    });
+    database.close();
+  });
+
+  test('rejects an expired delivery result when the owner clock uses a negative offset', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('negative-offset-result'), {
+      now: () => '2026-07-19T08:45:00Z',
+      generateId: deterministicIds('negative-offset-result'),
+    });
+    let ownerTime = '2026-07-19T08:45:01Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-negative-offset-result',
+      now: () => ownerTime,
+      generateId: deterministicIds('delivery-negative-offset-result'),
+      leaseDurationMs: 10_000,
+    });
+    const command = owner.claimNext();
+    ownerTime = '2026-07-19T08:45:02Z';
+    owner.assertCurrentClaim(command);
+    ownerTime = '2026-07-19T03:45:13-05:00';
+
+    expect(owner.recordResult(deliveredResult(command, ownerTime))).toEqual({ status: 'stale' });
+    expect(database.prepare(`
+      SELECT status, result_json, pre_action_fenced_at
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(command.outbox_id)).toEqual({
+      status: 'delivering',
+      result_json: null,
+      pre_action_fenced_at: '2026-07-19T08:45:02Z',
+    });
+    database.close();
+  });
+
+  test('keeps a claimed delivery unconfirmed when its full command snapshot changes', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('command-snapshot-fencing'), {
+      now: () => '2026-07-19T08:30:00Z',
+      generateId: deterministicIds('command-snapshot-fencing'),
+    });
+    const outbox = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-command-snapshot-fencing',
+      now: () => '2026-07-19T08:30:01Z',
+      generateId: deterministicIds('delivery-command-snapshot-fencing'),
+    });
+    const command = outbox.claimNext();
+    const persisted = database.prepare(`
+      SELECT command_json FROM runtime_outbox WHERE outbox_id = ?
+    `).get(command.outbox_id);
+    const changedCommand = JSON.parse(persisted.command_json);
+    changedCommand.render_model.text = 'changed after claim';
+    database.prepare(`
+      UPDATE runtime_outbox SET command_json = ? WHERE outbox_id = ?
+    `).run(JSON.stringify(changedCommand), command.outbox_id);
+
+    expect(outbox.recordResult(deliveredResult(command, '2026-07-19T08:30:02Z')))
+      .toEqual({ status: 'stale' });
+    expect(readDeliveryAuthority(database, command.outbox_id)).toEqual({
+      outbox: {
+        status: 'delivering',
+        attempt_count: 1,
+        delivery_attempt_id: command.delivery_attempt_id,
+        delivery_attempt_no: 1,
+        outbox_lease_epoch: 1,
+        lease_owner: 'delivery-command-snapshot-fencing',
+        result_json: null,
+      },
+      mappings: [],
+    });
+    database.close();
+  });
+
+  test('rejects a jointly replaced command and hash after the side-effect fence across restart', () => {
+    const database = openTestDatabase();
+    const databasePath = database.name;
+    acceptNormalInbound(database, normalEnvelope('immutable-claim-snapshot'), {
+      now: () => '2026-07-19T09:00:00Z',
+      generateId: deterministicIds('immutable-claim-snapshot'),
+    });
+    let ownerTime = '2026-07-19T09:00:01Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-immutable-claim-snapshot',
+      now: () => ownerTime,
+      generateId: deterministicIds('delivery-immutable-claim-snapshot'),
+      leaseDurationMs: 10_000,
+    });
+    const command = owner.claimNext();
+    ownerTime = '2026-07-19T09:00:02Z';
+    owner.assertCurrentClaim(command);
+    const result = deliveredResult(command, '2026-07-19T09:00:03Z');
+    database.close();
+
+    const restartedDatabase = new Database(databasePath);
+    const persisted = restartedDatabase.prepare(`
+      SELECT command_json FROM runtime_outbox WHERE outbox_id = ?
+    `).get(command.outbox_id);
+    const changedCommand = JSON.parse(persisted.command_json);
+    changedCommand.render_model.text = 'jointly replaced after the external effect';
+    changedCommand.render_model.terminal = true;
+    changedCommand.priority = 999;
+    const changedJson = JSON.stringify(changedCommand);
+    const changedHash = crypto.createHash('sha256').update(changedJson).digest('hex');
+    restartedDatabase.prepare(`
+      UPDATE runtime_outbox
+      SET command_json = ?, claimed_command_hash = ?
+      WHERE outbox_id = ?
+    `).run(changedJson, changedHash, command.outbox_id);
+    const restartedOwner = createOutboxService({
+      database: restartedDatabase,
+      serviceInstanceId: 'delivery-immutable-claim-snapshot',
+      now: () => '2026-07-19T09:00:04Z',
+      generateId: deterministicIds('delivery-immutable-claim-snapshot-restart'),
+      leaseDurationMs: 10_000,
+    });
+
+    expect(restartedOwner.recordResult(result)).toEqual({ status: 'stale' });
+    expect(restartedDatabase.prepare(`
+      SELECT status, result_json, pre_action_fenced_at
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(command.outbox_id)).toEqual({
+      status: 'delivery_unknown',
+      result_json: null,
+      pre_action_fenced_at: '2026-07-19T09:00:02Z',
+    });
+    const contender = createOutboxService({
+      database: restartedDatabase,
+      serviceInstanceId: 'delivery-immutable-claim-contender',
+      now: () => '2026-07-19T09:00:13Z',
+      generateId: deterministicIds('delivery-immutable-claim-contender'),
+      leaseDurationMs: 10_000,
+    });
+    expect(contender.claimNext()).toBeNull();
+    restartedDatabase.close();
+  });
+
+  test('keeps the original per-attempt claim snapshot append-only while its outbox exists', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('append-only-claim-snapshot'), {
+      now: () => '2026-07-19T09:05:00Z',
+      generateId: deterministicIds('append-only-claim-snapshot'),
+    });
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-append-only-claim-snapshot',
+      now: () => '2026-07-19T09:05:01Z',
+      generateId: deterministicIds('delivery-append-only-claim-snapshot'),
+    });
+    const command = owner.claimNext();
+
+    expect(() => database.prepare(`
+      INSERT OR REPLACE INTO runtime_outbox_claim_snapshots (
+        outbox_id, delivery_attempt_id, delivery_attempt_no, outbox_lease_epoch,
+        lease_owner, command_json, command_hash, claimed_at
+      )
+      SELECT outbox_id, delivery_attempt_id, delivery_attempt_no, outbox_lease_epoch,
+        lease_owner, '{}', 'replacement', claimed_at
+      FROM runtime_outbox_claim_snapshots
+      WHERE outbox_id = ? AND outbox_lease_epoch = ?
+    `).run(command.outbox_id, command.outbox_lease_epoch)).toThrow(
+      'outbox claim snapshot is immutable',
+    );
+    expect(() => database.prepare(`
+      UPDATE runtime_outbox_claim_snapshots
+      SET command_json = '{}', command_hash = 'replacement'
+      WHERE outbox_id = ? AND outbox_lease_epoch = ?
+    `).run(command.outbox_id, command.outbox_lease_epoch)).toThrow(
+      'outbox claim snapshot is immutable',
+    );
+    expect(() => database.prepare(`
+      DELETE FROM runtime_outbox_claim_snapshots
+      WHERE outbox_id = ? AND outbox_lease_epoch = ?
+    `).run(command.outbox_id, command.outbox_lease_epoch)).toThrow(
+      'active outbox claim snapshot cannot be deleted',
+    );
+    expect(database.prepare(`
+      SELECT command_json, command_hash
+      FROM runtime_outbox_claim_snapshots
+      WHERE outbox_id = ? AND outbox_lease_epoch = ?
+    `).get(command.outbox_id, command.outbox_lease_epoch)).toEqual({
+      command_json: JSON.stringify(command),
+      command_hash: crypto.createHash('sha256').update(JSON.stringify(command)).digest('hex'),
+    });
+    database.prepare('DELETE FROM runtime_outbox WHERE outbox_id = ?').run(command.outbox_id);
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_outbox_claim_snapshots WHERE outbox_id = ?
+    `).get(command.outbox_id).count).toBe(0);
+    database.close();
+  });
+
+  test('refuses an expired claim before the renderer can create a side effect', async () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('expired-pre-action'), {
+      now: () => '2026-07-19T08:40:00Z',
+      generateId: deterministicIds('expired-pre-action'),
+    });
+    const times = ['2026-07-19T08:40:01Z', '2026-07-19T08:40:12Z'];
+    let sideEffects = 0;
+    const outbox = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-expired-pre-action',
+      now: () => times.shift() ?? '2026-07-19T08:40:12Z',
+      generateId: deterministicIds('delivery-expired-pre-action'),
+      leaseDurationMs: 10_000,
+      renderer: {
+        async deliver(command) {
+          sideEffects += 1;
+          return deliveredResult(command, '2026-07-19T08:40:12Z');
+        },
+      },
+    });
+
+    await expect(outbox.dispatchNext()).rejects.toThrow('delivery claim is stale');
+    expect(sideEffects).toBe(0);
+    expect(database.prepare(`
+      SELECT status, result_json, lease_owner, lease_expires_at
+      FROM runtime_outbox
+    `).get()).toEqual({
+      status: 'delivering',
+      result_json: null,
+      lease_owner: 'delivery-expired-pre-action',
+      lease_expires_at: '2026-07-19T08:40:11.000Z',
+    });
+    database.close();
+  });
+
+  test('does not reclaim an expired claim after its pre-action fence starts', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('pre-action-reclaim-barrier'), {
+      now: () => '2026-07-19T08:50:00Z',
+      generateId: deterministicIds('pre-action-reclaim-barrier'),
+    });
+    let ownerTime = '2026-07-19T08:50:01Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-pre-action-owner',
+      now: () => ownerTime,
+      generateId: deterministicIds('delivery-pre-action-owner'),
+      leaseDurationMs: 10_000,
+    });
+    const command = owner.claimNext();
+    ownerTime = '2026-07-19T08:50:05Z';
+    owner.assertCurrentClaim(command);
+
+    const contender = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-pre-action-contender',
+      now: () => '2026-07-19T08:50:16Z',
+      generateId: deterministicIds('delivery-pre-action-contender'),
+      leaseDurationMs: 10_000,
+    });
+    expect(contender.claimNext()).toBeNull();
+    expect(database.prepare(`
+      SELECT status, attempt_count, outbox_lease_epoch, lease_owner,
+        lease_expires_at, pre_action_fenced_at
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(command.outbox_id)).toEqual({
+      status: 'delivering',
+      attempt_count: 1,
+      outbox_lease_epoch: 1,
+      lease_owner: 'delivery-pre-action-owner',
+      lease_expires_at: '2026-07-19T08:50:15.000Z',
+      pre_action_fenced_at: '2026-07-19T08:50:05Z',
+    });
+    database.close();
+  });
+
+  test('keeps an expired post-action result unconfirmed and blocks automatic replay', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('expired-result-unknown'), {
+      now: () => '2026-07-19T09:00:00Z',
+      generateId: deterministicIds('expired-result-unknown'),
+    });
+    let ownerTime = '2026-07-19T09:00:01Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-expired-result-owner',
+      now: () => ownerTime,
+      generateId: deterministicIds('delivery-expired-result-owner'),
+      leaseDurationMs: 10_000,
+    });
+    const command = owner.claimNext();
+    ownerTime = '2026-07-19T09:00:05Z';
+    owner.assertCurrentClaim(command);
+    ownerTime = '2026-07-19T09:00:16Z';
+
+    expect(owner.recordResult(deliveredResult(command, '2026-07-19T09:00:14Z')))
+      .toEqual({ status: 'stale' });
+    const contender = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-expired-result-contender',
+      now: () => '2026-07-19T09:00:17Z',
+      generateId: deterministicIds('delivery-expired-result-contender'),
+    });
+    expect(contender.claimNext()).toBeNull();
+    expect(database.prepare(`
+      SELECT status, result_json, attempt_count, outbox_lease_epoch, lease_owner,
+        lease_expires_at, pre_action_fenced_at
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(command.outbox_id)).toEqual({
+      status: 'delivering',
+      result_json: null,
+      attempt_count: 1,
+      outbox_lease_epoch: 1,
+      lease_owner: 'delivery-expired-result-owner',
+      lease_expires_at: '2026-07-19T09:00:15.000Z',
+      pre_action_fenced_at: '2026-07-19T09:00:05Z',
+    });
+    database.close();
+  });
+
+  test('a competing reclaim prevents a stale shell-style side effect and delivers once', async () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('competing-pre-action-reclaim'), {
+      now: () => '2026-07-19T09:10:00Z',
+      generateId: deterministicIds('competing-pre-action-reclaim'),
+    });
+    const firstOwner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-competing-first',
+      now: () => '2026-07-19T09:10:01Z',
+      generateId: deterministicIds('delivery-competing-first'),
+      leaseDurationMs: 10_000,
+    });
+    const staleCommand = firstOwner.claimNext();
+    const currentOwner = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-competing-current',
+      now: () => '2026-07-19T09:10:12Z',
+      generateId: deterministicIds('delivery-competing-current'),
+      leaseDurationMs: 10_000,
+    });
+    const currentCommand = currentOwner.claimNext();
+    const sideEffects = [];
+    const firstRenderer = createChannelNeutralTextRenderer({
+      beforeSend(command) {
+        firstOwner.assertCurrentClaim(command);
+      },
+      async sendText(delivery) {
+        sideEffects.push(delivery.delivery_id);
+        return { platform_message_id: `shell:${delivery.delivery_id}` };
+      },
+      now: () => '2026-07-19T09:10:13Z',
+    });
+    await expect(firstRenderer.deliver(staleCommand)).rejects
+      .toThrow('delivery claim is stale');
+    expect(sideEffects).toEqual([]);
+
+    const currentRenderer = createChannelNeutralTextRenderer({
+      beforeSend(command) {
+        currentOwner.assertCurrentClaim(command);
+      },
+      async sendText(delivery) {
+        sideEffects.push(delivery.delivery_id);
+        return { platform_message_id: `shell:${delivery.delivery_id}` };
+      },
+      now: () => '2026-07-19T09:10:13Z',
+    });
+    const currentResult = await currentRenderer.deliver(currentCommand);
+    expect(currentOwner.recordResult(currentResult)).toEqual({
+      status: 'applied', outbox_status: 'delivered',
+    });
+    expect(sideEffects).toEqual([currentCommand.delivery_id]);
     database.close();
   });
 

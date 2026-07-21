@@ -11,6 +11,7 @@ import {
   validateObservabilitySnapshot,
 } from '../contracts/public/index.js';
 import { createExecutorService } from '../runtime/executor/service.js';
+import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { createRuntimeSnapshotPublisher } from '../runtime/observability/snapshot-publisher.js';
 import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
 import { acceptScheduledOccurrence } from '../runtime/scheduler/scheduler-queue.js';
@@ -501,6 +502,67 @@ describe('Core runtime observability snapshot publisher', () => {
       await running;
     }
     await service.close();
+    database.close();
+  });
+
+  test('degrades health for an expired outbox claim fenced by an unknown side effect', () => {
+    const { database } = openDatabase();
+    acceptNormalInbound(database, normalEnvelope('outbox-side-effect-unknown'), {
+      now: () => '2026-07-20T07:59:50Z',
+      generateId: deterministicIds('outbox-side-effect-unknown'),
+    });
+    let ownerTime = '2026-07-20T07:59:55Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'outbox-side-effect-owner',
+      now: () => ownerTime,
+      generateId: deterministicIds('outbox-side-effect-owner'),
+      leaseDurationMs: 10_000,
+    });
+    const command = owner.claimNext();
+    ownerTime = '2026-07-20T07:59:56Z';
+    owner.assertCurrentClaim(command);
+
+    const snapshot = createPublisher(database, {
+      now: () => '2026-07-20T03:00:07-05:00',
+    }).publish();
+    expect(snapshot.service.health).toBe('degraded');
+    expect(snapshot.outbox.items).toContainEqual({
+      channel: command.target.channel,
+      status: 'delivery_unknown',
+      count: 1,
+      oldest_age_seconds: 17,
+    });
+    database.close();
+  });
+
+  test('publishes a durably quarantined outbox claim as delivery_unknown', () => {
+    const { database } = openDatabase();
+    acceptNormalInbound(database, normalEnvelope('durable-outbox-delivery-unknown'), {
+      now: () => '2026-07-20T07:59:50Z',
+      generateId: deterministicIds('durable-outbox-delivery-unknown'),
+    });
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'durable-outbox-delivery-unknown-owner',
+      now: () => '2026-07-20T07:59:55Z',
+      generateId: deterministicIds('durable-outbox-delivery-unknown-owner'),
+    });
+    const command = owner.claimNext();
+    database.prepare(`
+      UPDATE runtime_outbox SET status = 'delivery_unknown' WHERE outbox_id = ?
+    `).run(command.outbox_id);
+
+    const snapshot = createPublisher(database, {
+      now: () => '2026-07-20T08:00:07Z',
+    }).publish();
+    expect(snapshot.service.health).toBe('degraded');
+    expect(snapshot.outbox.items).toContainEqual({
+      channel: command.target.channel,
+      status: 'delivery_unknown',
+      count: 1,
+      oldest_age_seconds: 17,
+    });
     database.close();
   });
 

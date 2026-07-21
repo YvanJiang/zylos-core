@@ -100,6 +100,14 @@ afterEach(() => {
 });
 
 describe('C4 channel-neutral fallback', () => {
+  test('requires an explicit current-claim fence before any text side effect', () => {
+    expect(() => createChannelNeutralTextRenderer({
+      async sendText() {
+        return { platform_message_id: 'must-not-run' };
+      },
+    })).toThrow('beforeSend must be a function');
+  });
+
   test('turns a compatibility message into the canonical durable inbound flow', () => {
     const database = openTestDatabase();
     const originalMessage = compatibilityMessage();
@@ -210,6 +218,7 @@ describe('C4 channel-neutral fallback', () => {
     });
     const sent = [];
     const renderer = createChannelNeutralTextRenderer({
+      beforeSend() {},
       async sendText(delivery) {
         sent.push(delivery);
         return { platform_message_id: `telegram-out-${sent.length}` };
@@ -278,6 +287,7 @@ describe('C4 channel-neutral fallback', () => {
 
     const sent = [];
     const renderer = createChannelNeutralTextRenderer({
+      beforeSend() {},
       async sendText(delivery) {
         sent.push(delivery);
         return { platform_message_id: `telegram-round-trip-${sent.length}` };
@@ -343,6 +353,7 @@ describe('C4 channel-neutral fallback', () => {
       generateId: deterministicIds('restart-inbound'),
     });
     const unavailableRenderer = createChannelNeutralTextRenderer({
+      beforeSend() {},
       async sendText() {
         throw new Error('channel process stopped during delivery');
       },
@@ -395,6 +406,7 @@ describe('C4 channel-neutral fallback', () => {
     const restartedChannel = createOutboxService({
       database,
       renderer: createChannelNeutralTextRenderer({
+        beforeSend() {},
         async sendText(delivery) {
           recoveredDeliveries.push(delivery);
           return {
@@ -480,6 +492,7 @@ describe('C4 channel-neutral fallback', () => {
     const outbox = createOutboxService({
       database,
       renderer: createChannelNeutralTextRenderer({
+        beforeSend() {},
         async sendText(delivery) {
           sent.push(delivery);
           return { platform_message_id: `telegram-interaction-${sent.length}` };

@@ -91,6 +91,8 @@ function renderText(command) {
 
 export function createChannelNeutralTextRenderer({
   sendText,
+  beforeSend,
+  supportsPlatformIdempotency = false,
   now = () => new Date().toISOString(),
 }) {
   if (typeof sendText !== 'function') {
@@ -99,12 +101,19 @@ export function createChannelNeutralTextRenderer({
   if (typeof now !== 'function') {
     throw new TypeError('now must be a function');
   }
+  if (typeof beforeSend !== 'function') {
+    throw new TypeError('beforeSend must be a function');
+  }
+  if (typeof supportsPlatformIdempotency !== 'boolean') {
+    throw new TypeError('supportsPlatformIdempotency must be a boolean');
+  }
 
   async function deliver(command) {
     const validated = validateDeliveryCommand(command).forwarded;
     if (validated.operation === 'update_main') {
       throw new TypeError('A channel-neutral text renderer cannot update a platform message');
     }
+    beforeSend(validated);
     const sent = await sendText(Object.freeze({
       target: structuredClone(validated.target),
       text: renderText(validated),
@@ -141,7 +150,7 @@ export function createChannelNeutralTextRenderer({
       renderer_capabilities: {
         supports_update: false,
         supports_actions: false,
-        supports_platform_idempotency: false,
+        supports_platform_idempotency: supportsPlatformIdempotency,
         supports_platform_version: false,
       },
       result_at: deliveredAt,

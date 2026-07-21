@@ -7,6 +7,10 @@ export const UPLOAD_TTL_MS = 30 * 60 * 1000;
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
 const MEDIA_RE = /^\[MEDIA:(image|file)\]([^\r\n]+)$/;
 const ATTACHMENT_RE = /^\[attachment:(image|file) (.+) name="([^"]*)" ([^\]]+)\]$/;
+const CORE_CONTENT_REF_PREFIX = 'web-console-upload:';
+const STORED_FILE_RE = /^wc-[A-Za-z0-9._-]+-[0-9a-f]{8}(?:\.[a-z0-9_-]{1,15})?$/;
+const SAFE_MEDIA_TYPE_RE = /^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes < 0) return '?B';
@@ -52,6 +56,87 @@ export function buildAnnotatedContent(message, attachments = []) {
   if (annotations.length === 0) return text;
   if (!text) return annotations.join('\n');
   return `${text}\n${annotations.join('\n')}`;
+}
+
+function validatedUpload(entry, mediaDir, maxBytes, { requireConsumed = false } = {}) {
+  if (!entry || !UUID_RE.test(entry.id) || (requireConsumed && entry.consumed !== true)) {
+    throw new TypeError('attachment is not a registered Web Console upload');
+  }
+  const allowedPath = resolveAllowedPathSync(entry.path, [mediaDir]);
+  if (!allowedPath) throw new TypeError('attachment is outside the Web Console media directory');
+  const filename = path.basename(allowedPath);
+  if (!STORED_FILE_RE.test(filename)) throw new TypeError('attachment storage name is invalid');
+  const stat = fs.statSync(allowedPath);
+  if (!stat.isFile() || !Number.isSafeInteger(entry.size) || entry.size !== stat.size
+    || entry.size < 0 || entry.size > maxBytes) {
+    throw new TypeError('attachment size does not match the registered upload');
+  }
+  if (sanitizeDisplayName(entry.name) !== entry.name
+    || typeof entry.mime !== 'string' || entry.mime.length > 127
+    || !SAFE_MEDIA_TYPE_RE.test(entry.mime)) {
+    throw new TypeError('attachment display metadata is invalid');
+  }
+  return { ...entry, path: allowedPath, annotationPath: entry.path, filename };
+}
+
+export function createCoreWebConsoleAttachment(entry, { mediaDir, maxBytes }) {
+  const upload = validatedUpload(entry, mediaDir, maxBytes);
+  return {
+    attachment_id: upload.id,
+    media_type: upload.mime,
+    name: upload.name,
+    content_ref: `${CORE_CONTENT_REF_PREFIX}${upload.filename}`,
+    size_bytes: upload.size,
+  };
+}
+
+export function projectCoreWebConsoleContent(content, {
+  lookupUpload, mediaDir, maxBytes,
+}) {
+  if (!content || typeof content !== 'object' || !Array.isArray(content.attachments)) {
+    throw new TypeError('Core content attachments are invalid');
+  }
+  const expectedLines = new Set();
+  const allowedFields = new Set([
+    'attachment_id', 'media_type', 'name', 'content_ref', 'size_bytes',
+  ]);
+  const attachments = content.attachments.map((attachment) => {
+    const fields = Object.keys(attachment || {});
+    if (fields.some((field) => !allowedFields.has(field))
+      || [...allowedFields].some((field) => !Object.hasOwn(attachment, field))) {
+      throw new TypeError('Core attachment has unsupported fields');
+    }
+    const upload = validatedUpload(
+      lookupUpload(attachment.attachment_id), mediaDir, maxBytes, { requireConsumed: true },
+    );
+    if (attachment.content_ref !== `${CORE_CONTENT_REF_PREFIX}${upload.filename}`
+      || attachment.media_type !== upload.mime || attachment.name !== upload.name
+      || attachment.size_bytes !== upload.size) {
+      throw new TypeError('Core attachment does not match the registered upload');
+    }
+    const annotation = buildAttachmentAnnotation({ ...upload, path: upload.annotationPath });
+    if (expectedLines.has(annotation)) throw new TypeError('duplicate Core attachment annotation');
+    expectedLines.add(annotation);
+    return {
+      attachment_id: upload.id,
+      kind: upload.kind === 'image' ? 'image' : 'file',
+      name: upload.name,
+      media_type: upload.mime,
+      size_bytes: upload.size,
+      size_label: formatBytes(upload.size),
+      href: `/api/inbound-media/${upload.filename}`,
+    };
+  });
+  const bodyLines = [];
+  for (const line of String(content.text ?? '').split('\n')) {
+    if (expectedLines.delete(line)) continue;
+    if (line.startsWith('[attachment:')) {
+      throw new TypeError('unbound attachment annotation is not displayable');
+    }
+    bodyLines.push(line);
+  }
+  if (expectedLines.size !== 0) throw new TypeError('Core attachment annotation is missing');
+  return { content: bodyLines.join('\n').trim(), attachments };
 }
 
 export function parseAttachmentAnnotation(line) {

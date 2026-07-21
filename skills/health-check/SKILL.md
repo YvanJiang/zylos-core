@@ -1,72 +1,49 @@
 ---
 name: health-check
 description: |
-  System health check dispatched by the activity monitor via Control queue.
-  Checks PM2 services, disk space, and memory usage.
-  Use when receiving a control message containing "health-check".
+  Report Core service, executor, turn, queue, delivery, disk, and memory health.
+  Runtime facts come only from the provider-neutral Core observability contract.
 user-invocable: false
-allowed-tools: Bash, Read, Grep
+allowed-tools: Bash, Read
 ---
 
 # System Health Check
 
-Periodic system health check delivered via the C4 Control queue.
+## Runtime health
 
-## When to Use
-
-- Receiving a control message with "health-check" in the content
-- The activity monitor enqueues this automatically at regular intervals
-
-## Steps
-
-### 1. Check PM2 Services
+Run the read-only Core diagnostic:
 
 ```bash
-pm2 jlist
+zylos doctor --check --json
 ```
 
-Parse the JSON output. Every service should have `status: "online"`.
-Record which services are stopped or errored.
+Use its observability snapshot facts for service health, maintenance/draining,
+executor queues and wait reasons, turn states, workspace leases, and outbox
+retry/dead-letter counts. An unavailable or degraded snapshot is itself the
+health result; do not infer missing facts from a process or user interface.
 
-### 2. Check Disk Space
+## Host capacity
+
+Disk usage is read-only:
 
 ```bash
-df -h / /home 2>/dev/null || df -h /
+df -h /
 ```
 
-Thresholds:
-- OK: < 80% used
-- Warning: 80-90% used
-- Critical: > 90% used
-
-### 3. Check Memory
+For memory, select the host-native read-only diagnostics:
 
 ```bash
-free -m
+case "$(uname -s)" in
+  Darwin) vm_stat; vm.swapusage; memory_pressure ;;
+  Linux)  sed -n '1,30p' /proc/meminfo ;;
+esac
 ```
 
-Thresholds:
-- OK: < 80% used
-- Warning: 80-90% used
-- Critical: > 90% used (or swap > 50% used)
+Report warnings at 80% usage and critical capacity at 90% usage. Do not restart
+or mutate a service as part of a health check.
 
-### 4. Report Results
+## Result delivery
 
-If all checks pass, log to `~/zylos/logs/health.log`:
-
-```
-[YYYY-MM-DD HH:MM:SS] Health Check: PM2 X/X online, Disk XX%, Memory XX% - ALL OK
-```
-
-If any issues found, notify whoever is most likely to help:
-1. Check your memory files for a designated owner or ops person
-2. If none designated, notify the person you normally work with most
-3. Use `c4-send.js` with the appropriate channel and endpoint to send the alert
-
-## Issue Resolution
-
-| Issue | Action |
-|-------|--------|
-| PM2 service stopped | `pm2 restart <service>` and report |
-| High disk usage | Check logs directories, report findings |
-| High memory / swap | Report findings, check for runaway processes |
+Return the structured findings in the current turn. Core owns the durable
+outbox and the channel delivery owner renders and delivers that result. Never
+select a channel target or call a channel sender from this skill.

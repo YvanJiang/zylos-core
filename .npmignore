@@ -11,3 +11,9 @@
 
 # Environment
 .env
+
+# Repository-only tests and destructive fixtures are never product payloads.
+test/
+**/__tests__/
+scripts/e2e/
+**/node_modules/

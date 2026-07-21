@@ -25,24 +25,13 @@ services:
 
       # ── Core config ───────────────────────────────────────────────────────
       TZ: ${TZ:-UTC}
-      CLAUDE_BYPASS_PERMISSIONS: ${CLAUDE_BYPASS_PERMISSIONS:-true}
-
-      # ── Web console ─────────────────────────────────────────────────────────
-      # Bind to 0.0.0.0 inside container so ports are accessible from host
-      WEB_CONSOLE_BIND: "0.0.0.0"
-      ZYLOS_WEB_PASSWORD: ${ZYLOS_WEB_PASSWORD:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      CODEX_API_KEY: ${CODEX_API_KEY:-}
 
       # ── Channel tokens (optional) ─────────────────────────────────────────
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       LARK_APP_ID: ${LARK_APP_ID:-}
       LARK_APP_SECRET: ${LARK_APP_SECRET:-}
-
-    # ── Ports ────────────────────────────────────────────────────────────────
-    ports:
-      # Web console (default: 3456)
-      - "${WEB_CONSOLE_PORT:-3456}:3456"
-      # Caddy / reverse proxy (optional, set CADDY_ENABLED=true in .env)
-      - "${HTTP_PORT:-8080}:8080"
 
     # ── Volumes ───────────────────────────────────────────────────────────────
     volumes:
@@ -57,7 +46,7 @@ services:
 
     # ── Health ────────────────────────────────────────────────────────────────
     healthcheck:
-      test: ["CMD", "pm2", "list"]
+      test: ["CMD", "zylos", "status"]
       interval: 30s
       timeout: 10s
       retries: 3

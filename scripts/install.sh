@@ -9,10 +9,10 @@
 #   curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/install.sh | bash -s -- --branch <branch-name>
 #
 # Full non-interactive deployment:
-#   curl -fsSL .../install.sh | bash -s -- -y --setup-token sk-ant-oat01-xxx --domain example.com --https
+#   curl -fsSL .../install.sh | bash -s -- -y --setup-token sk-ant-oat01-xxx
 #
 # Install with Codex runtime:
-#   curl -fsSL .../install.sh | bash -s -- -y --runtime codex --domain example.com --https
+#   curl -fsSL .../install.sh | bash -s -- -y --runtime codex
 #
 # Install with custom API base URLs:
 #   curl -fsSL .../install.sh | bash -s -- -y --base-url https://claude-proxy.example.com
@@ -49,7 +49,7 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     # Flags that take a value — forward both flag and value to zylos init
-    --timezone|--setup-token|--api-key|--codex-api-key|--base-url|--codex-base-url|--domain|--web-password|--runtime)
+    --timezone|--setup-token|--api-key|--codex-api-key|--base-url|--codex-base-url|--runtime)
       if [ -z "${2:-}" ]; then
         echo "[zylos] Error: $1 requires a value" >&2
         exit 1
@@ -58,7 +58,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     # Boolean flags — forward as-is to zylos init
-    -y|--yes|-q|--quiet|--https|--no-https|--caddy|--no-caddy|-h|--help)
+    -y|--yes|-q|--quiet|-h|--help)
       INIT_ARGS+=("$1")
       shift
       ;;
@@ -187,16 +187,6 @@ ensure_git() {
   ok "git: installed"
 }
 
-# ── Prerequisite: tmux ────────────────────────────────────────
-ensure_tmux() {
-  if command -v tmux &>/dev/null; then
-    ok "tmux: $(tmux -V)"
-    return
-  fi
-  install_system_package tmux
-  ok "tmux: installed"
-}
-
 # ── Prerequisite: Node.js (via nvm) ──────────────────────────
 ensure_node() {
   # Check if Node.js + npm exist and meet minimum version
@@ -270,7 +260,7 @@ FISH_EOF
       printf '\n# Added by zylos installer\n%s\n' "$local_bin_export" >> "$shell_rc"
     fi
 
-    # 2. ~/zylos/bin — component CLIs (caddy, etc.)
+    # 2. ~/zylos/bin — installed component CLIs
     #    Idempotency: grep for "zylos-managed: bin PATH" marker (matches init.js pattern)
     local zylos_marker='# zylos-managed: bin PATH'
     local zylos_bin_export="export PATH=\"\$HOME/zylos/bin:\$PATH\""
@@ -295,27 +285,109 @@ FISH_EOF
 
 # ── Install Zylos ─────────────────────────────────────────────
 install_zylos() {
+  local bootstrap_backup=""
+  local use_sudo=false
+  local zylos_dir="${ZYLOS_DIR:-$HOME/zylos}"
+  local bootstrap_manifest="$zylos_dir/runtime/base-executor-bootstrap.json"
+  local channel_authority_manifest="$zylos_dir/runtime/channel-authority.json"
+  local installed_bin=""
+  local installed_root=""
   if command -v zylos &>/dev/null; then
     local current_version
     current_version="$(zylos --version 2>/dev/null || echo 'unknown')"
     warn "zylos is already installed (${current_version}). Upgrading..."
+    installed_bin="$(command -v zylos)"
+    installed_root="$(node -e 'const fs=require("fs"),path=require("path");process.stdout.write(path.dirname(path.dirname(fs.realpathSync(process.argv[1]))))' "$installed_bin")"
+    if [ -f "$bootstrap_manifest" ]; then
+      local bootstrap_state resume_entry resume_status cleanup_entry
+      bootstrap_state="$(node -e 'const fs=require("fs");const m=JSON.parse(fs.readFileSync(process.argv[1]));process.stdout.write(String(m.state||""))' "$bootstrap_manifest")"
+      if [ "$bootstrap_state" != "supervisor_started" ] && [ "$bootstrap_state" != "base_restored" ]; then
+        resume_entry="$(node -e 'const fs=require("fs"),path=require("path");const m=JSON.parse(fs.readFileSync(process.argv[1]));process.stdout.write(path.join(m.target_release_path,"scripts","bootstrap-executor-lifecycle.js"))' "$bootstrap_manifest")"
+        warn "Resuming the durable exact-base executor migration (${bootstrap_state})."
+        resume_status=0
+        node "$resume_entry" --resume --zylos-dir "$zylos_dir" || resume_status=$?
+        if [ "$resume_status" -eq 0 ]; then
+          cleanup_entry="$(dirname "$resume_entry")/cleanup-bootstrap-staging.js"
+          node "$cleanup_entry" --zylos-dir "$zylos_dir" || return $?
+        fi
+        return "$resume_status"
+      fi
+    fi
+    local bootstrap_root inventory_root inventory_json inventory_state inventory_reasons
+    bootstrap_root="$zylos_dir/runtime"
+    mkdir -p "$bootstrap_root"
+    inventory_root="$(mktemp -d "$bootstrap_root/install-inventory.XXXXXX")"
+    mkdir -p "$inventory_root/target-source"
+    git clone --depth 1 --branch "$BRANCH" "$ZYLOS_REPO" "$inventory_root/target-source"
+    inventory_json="$(node "$inventory_root/target-source/scripts/installed-runtime-inventory.js" \
+      --zylos-dir "$zylos_dir" --installed-root "$installed_root")"
+    inventory_state="$(node -e 'const v=JSON.parse(process.argv[1]);process.stdout.write(v.state)' "$inventory_json")"
+    inventory_reasons="$(node -e 'const v=JSON.parse(process.argv[1]);process.stdout.write((v.reasons||[]).join(", "))' "$inventory_json")"
+    if [ "$inventory_state" = "executor" ]; then
+      find "$inventory_root" -depth -delete
+      info "Existing executor installation detected; delegating upgrade to authoritative Core control."
+      zylos upgrade --self --yes --branch "$BRANCH"
+      return $?
+    fi
+    if [ "$inventory_state" = "ambiguous" ]; then
+      find "$inventory_root" -depth -delete
+      warn "Existing runtime identity is ambiguous; refusing global package replacement (${inventory_reasons:-unknown evidence})."
+      return 1
+    fi
+    if [ "$inventory_state" = "legacy" ]; then
+      local base_name target_name
+      bootstrap_backup="$inventory_root"
+      mkdir -p "$bootstrap_backup/base-release" "$bootstrap_backup/target-release"
+      cp -R "$installed_root/." "$bootstrap_backup/base-release/"
+      base_name="$(cd "$bootstrap_backup/base-release" && npm pack --ignore-scripts --pack-destination "$bootstrap_backup" --silent)"
+      mv "$bootstrap_backup/$base_name" "$bootstrap_backup/exact-base-package.tgz"
+      target_name="$(cd "$bootstrap_backup/target-source" && npm pack --ignore-scripts --pack-destination "$bootstrap_backup" --silent)"
+      mv "$bootstrap_backup/$target_name" "$bootstrap_backup/executor-package.tgz"
+      tar -xzf "$bootstrap_backup/executor-package.tgz" -C "$bootstrap_backup/target-release" --strip-components=1
+    else
+      find "$inventory_root" -depth -delete
+    fi
   fi
 
-  local install_url="${ZYLOS_REPO}#${BRANCH}"
-  info "Installing zylos from GitHub (${BRANCH})..."
-
-  # If npm global prefix is not user-writable (system-installed node),
-  # use sudo for npm install -g
   local npm_prefix
   npm_prefix="$(npm config get prefix 2>/dev/null || echo "")"
-  if [ -n "$npm_prefix" ] && [ -w "$npm_prefix" ]; then
-    npm install -g --install-links "$install_url"
-  else
+  if ! { [ -n "$npm_prefix" ] && [ -w "$npm_prefix" ]; }; then
     warn "npm global directory (${npm_prefix:-unknown}) requires elevated permissions, using sudo..."
-    if [ "$(id -u)" -eq 0 ]; then
-      npm install -g --install-links "$install_url"
+    if [ "$(id -u)" -ne 0 ]; then use_sudo=true; fi
+  fi
+
+  if [ -n "$bootstrap_backup" ]; then
+    local bootstrap_status install_mode
+    install_mode="direct"
+    if [ "$use_sudo" = true ]; then install_mode="sudo"; fi
+    bootstrap_status=0
+    node "$bootstrap_backup/target-release/scripts/bootstrap-executor-lifecycle.js" \
+      --zylos-dir "$zylos_dir" \
+      --from-release "$bootstrap_backup/base-release" \
+      --target-release "$bootstrap_backup/target-release" \
+      --from-package "$bootstrap_backup/exact-base-package.tgz" \
+      --target-package "$bootstrap_backup/executor-package.tgz" \
+      --channel-authority-manifest "$channel_authority_manifest" \
+      --install-mode "$install_mode" || bootstrap_status=$?
+    if [ "$bootstrap_status" -ne 0 ]; then
+      if [ "$bootstrap_status" -eq 2 ]; then
+        warn "Executor migration committed, but completion is pending; rerun this installer to resume it."
+      elif [ "$bootstrap_status" -eq 3 ]; then
+        warn "Executor migration rollback is pending; Core kept the source batch fenced and no executor was started. Restore the channel delivery owner, then rerun this installer."
+      else
+        warn "Executor migration did not commit; the exact-base package and runtime were restored."
+      fi
+      return "$bootstrap_status"
+    fi
+    node "$bootstrap_backup/target-release/scripts/cleanup-bootstrap-staging.js" \
+      --zylos-dir "$zylos_dir" || return $?
+  else
+    local install_url="${ZYLOS_REPO}#${BRANCH}"
+    info "Installing zylos from GitHub (${BRANCH})..."
+    if [ "$use_sudo" = true ]; then
+      sudo env ZYLOS_PACKAGE_PREPARE=1 npm install -g --install-links "$install_url"
     else
-      sudo npm install -g --install-links "$install_url"
+      ZYLOS_PACKAGE_PREPARE=1 npm install -g --install-links "$install_url"
     fi
   fi
 
@@ -371,15 +443,15 @@ if ! _has_yes_flag && [ -t 0 -o -e /dev/tty ]; then
   echo "  │                                                        │"
   printf '%b' "${NC}"
   printf "  ${DIM}│${NC}  ${DIM}Zylos currently assumes a trusted environment.${NC}     ${DIM}│${NC}\n"
-  printf "  ${DIM}│${NC}  ${DIM}It runs with full system access as the current${NC}     ${DIM}│${NC}\n"
-  printf "  ${DIM}│${NC}  ${DIM}user — it can execute commands, read/write${NC}          ${DIM}│${NC}\n"
-  printf "  ${DIM}│${NC}  ${DIM}files, and access the network on your behalf.${NC}      ${DIM}│${NC}\n"
+  printf "  ${DIM}│${NC}  ${DIM}The executor uses provider permission prompts and${NC}   ${DIM}│${NC}\n"
+  printf "  ${DIM}│${NC}  ${DIM}workspace-write isolation, but approved actions can${NC}   ${DIM}│${NC}\n"
+  printf "  ${DIM}│${NC}  ${DIM}still modify files and access the network.${NC}            ${DIM}│${NC}\n"
   printf '%b' "${DIM}"
   echo "  │                                                        │"
   printf '%b' "${NC}"
   printf "  ${DIM}│${NC}  ${YELLOW}⚠ Dangerous: If untrusted people can reach${NC}         ${DIM}│${NC}\n"
   printf "  ${DIM}│${NC}  ${YELLOW}this machine or talk to the bot, they can${NC}          ${DIM}│${NC}\n"
-  printf "  ${DIM}│${NC}  ${YELLOW}execute anything as your user.${NC}                     ${DIM}│${NC}\n"
+  printf "  ${DIM}│${NC}  ${YELLOW}request privileged or destructive actions.${NC}          ${DIM}│${NC}\n"
   printf '%b' "${DIM}"
   echo "  │                                                        │"
   echo "  └────────────────────────────────────────────────────────┘"
@@ -416,7 +488,6 @@ echo ""
 
 ensure_curl
 ensure_git
-ensure_tmux
 ensure_node
 
 echo ""
@@ -498,6 +569,7 @@ else
     _show_source_hint
   else
     echo ""
+    return "$init_exit"
   fi
 fi
 

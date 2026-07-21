@@ -1260,6 +1260,8 @@ export function createClaudeConversationAdapter({
   }
 
   return Object.freeze({
+    provider: 'claude',
+    provider_transport: 'claude_agent_sdk',
     abort,
     cancel,
     close,

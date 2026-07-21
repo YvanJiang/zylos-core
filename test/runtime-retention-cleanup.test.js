@@ -743,6 +743,15 @@ describe('runtime retention cleanup', () => {
       '2026-01-01T00:00:00.000Z',
       { deliverOutbox: false },
     );
+    const unknownOutbox = createTerminalTurn(
+      database,
+      'protected-unknown-outbox',
+      '2026-01-01T00:00:00.000Z',
+      { deliverOutbox: false },
+    );
+    database.prepare(`
+      UPDATE runtime_outbox SET status = 'delivery_unknown' WHERE turn_id = ?
+    `).run(unknownOutbox.accepted.turn_id);
     database.prepare(`
       UPDATE runtime_provider_attempts SET side_effect_status = 'unknown'
       WHERE turn_id = ?
@@ -816,6 +825,7 @@ describe('runtime retention cleanup', () => {
     const protectedTurnIds = [
       blocking.accepted.turn_id,
       pendingOutbox.accepted.turn_id,
+      unknownOutbox.accepted.turn_id,
       unknown.accepted.turn_id,
       background.accepted.turn_id,
       unfinished.accepted.turn_id,

@@ -6,6 +6,7 @@ import {
 } from '../../contracts/public/index.js';
 import { createOperationsControlService } from '../control/operations-control-service.js';
 import { createRuntimeSnapshotPublisher } from '../observability/snapshot-publisher.js';
+import { findAnyBlockingRuntimeUpgrade } from '../migration/upgrade-state.js';
 import { createPermissionService } from '../permissions/permission-service.js';
 import { createExecutorStore } from '../persistence/executor-store.js';
 import { resolveProviderWorkspaceAccess } from '../workspace/lease-coordinator.js';
@@ -119,6 +120,8 @@ export function createExecutorService({
   serviceInstanceId,
   hostId = serviceInstanceId,
   serviceStartedAt = null,
+  releaseRef = null,
+  upgradeId = null,
   now = () => new Date().toISOString(),
   generateId = defaultGenerateId,
   leaseDurationMs = 30_000,
@@ -169,6 +172,15 @@ export function createExecutorService({
   }
   if (typeof generateId !== 'function') {
     throw new TypeError('generateId must be a function');
+  }
+  if ((releaseRef === null) !== (upgradeId === null)) {
+    throw new TypeError('releaseRef and upgradeId must be provided together');
+  }
+  if (releaseRef !== null && (typeof releaseRef !== 'string' || releaseRef.length === 0)) {
+    throw new TypeError('releaseRef must be a non-empty string');
+  }
+  if (upgradeId !== null && (typeof upgradeId !== 'string' || upgradeId.length === 0)) {
+    throw new TypeError('upgradeId must be a non-empty string');
   }
   if (permissionHandler !== null && typeof permissionHandler !== 'function') {
     throw new TypeError('permissionHandler must be a function or null');
@@ -286,6 +298,48 @@ export function createExecutorService({
     workspaceLeaseDurationMs,
     interactionTimeoutMs,
   });
+  const startedAt = serviceStartedAt ?? now();
+  const adapterProvider = adapter.provider ?? provider;
+  if (adapterProvider !== provider) {
+    throw new TypeError('adapter provider identity does not match executor provider');
+  }
+  const providerTransport = adapter.provider_transport ?? 'injected_test_seam';
+  if (releaseRef !== null) {
+    const targetRun = database.prepare(`
+      SELECT to_release, state FROM runtime_upgrade_runs WHERE upgrade_id = ?
+    `).get(upgradeId);
+    const activeCommittedFence = targetRun?.state === 'committed'
+      && database.prepare(`
+        SELECT 1 FROM runtime_active_release_fences
+        WHERE upgrade_id = ? AND release_ref = ?
+      `).get(upgradeId, releaseRef) !== undefined;
+    if (!targetRun || targetRun.to_release !== releaseRef
+      || (targetRun.state !== 'health_check' && !activeCommittedFence)) {
+      throw new Error(
+        'Executor release registration must match the health-check or active committed target.',
+      );
+    }
+  }
+  database.prepare(`
+    INSERT OR IGNORE INTO runtime_executor_service_instances (
+      service_instance_id, provider, provider_transport, release_ref,
+      upgrade_id, started_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    serviceInstanceId, provider, providerTransport, releaseRef, upgradeId, startedAt, startedAt,
+  );
+  const registeredService = database.prepare(`
+    SELECT provider, provider_transport, release_ref, upgrade_id, started_at, revoked_at
+    FROM runtime_executor_service_instances WHERE service_instance_id = ?
+  `).get(serviceInstanceId);
+  if (registeredService.provider !== provider
+    || registeredService.provider_transport !== providerTransport
+    || registeredService.release_ref !== releaseRef
+    || registeredService.upgrade_id !== upgradeId
+    || registeredService.started_at !== startedAt
+    || registeredService.revoked_at !== null) {
+    throw new Error('Executor service instance identity conflicts with its durable registration.');
+  }
   const permissionPolicy = createPermissionService({ database, now, generateId });
   let executors = [];
   let started = false;
@@ -319,19 +373,22 @@ export function createExecutorService({
     database,
     serviceInstanceId,
     hostId,
-    startedAt: serviceStartedAt ?? now(),
+    startedAt,
     now,
     generateId,
-    getServiceState: () => ({
-      degraded: residentHeartbeatFailure !== null
+    getServiceState: () => {
+      const blockingUpgrade = findAnyBlockingRuntimeUpgrade(database);
+      return {
+        degraded: residentHeartbeatFailure !== null
         || workspaceHeartbeatFailure !== null
         || workspaceRecoveryFlight !== null
         || lifecycle === 'close_failed',
-      offline: !started || lifecycle === 'closed',
-      maintenance: false,
-      draining: lifecycle === 'closing',
-      reconciling: workspaceRecoveryFlight !== null,
-    }),
+        offline: !started || lifecycle === 'closed',
+        maintenance: blockingUpgrade !== null,
+        draining: lifecycle === 'closing' || blockingUpgrade?.state === 'maintenance',
+        reconciling: workspaceRecoveryFlight !== null,
+      };
+    },
   });
   const operationsControl = operationsPolicy === null ? null : createOperationsControlService({
     database,

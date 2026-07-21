@@ -1,15 +1,8 @@
 /**
  * Shared formatter for session-start context injection.
  *
- * Both memory injection (zylos-memory/session-start-inject.js) and C4 session
- * init (comm-bridge/c4-session-init.js) emit labeled blocks into the same
- * stdout stream consumed at session start. Historically each script had its
- * own ad-hoc style (`=== LABEL ===` header-only vs `[Bracket Label]`), so the
- * combined injection read inconsistently. This module is the single source of
- * truth for that framing so every section looks the same.
- *
- * The orchestrator (activity-monitor/session-start-orchestrator.js) also uses
- * it to render visible failure notices when a context step fails.
+ * Historical record and memory utilities use this stable framing. It contains
+ * no runtime routing, lifecycle, or health authority.
  */
 
 /**

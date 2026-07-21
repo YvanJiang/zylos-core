@@ -1,0 +1,477 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+
+import { describe, expect, test } from '@jest/globals';
+
+const normalRuntimeFiles = [
+  'skills/comm-bridge/scripts/c4-receive.js',
+  'skills/scheduler/scripts/runtime.js',
+  'skills/scheduler/scripts/daemon.js',
+  'skills/scheduler/scripts/daemon-tasks.js',
+  'skills/web-console/scripts/server.js',
+  'skills/web-console/scripts/core-outbox-owner.js',
+  'skills/web-console/scripts/db.js',
+  'skills/web-console/scripts/send.js',
+  'skills/web-console/public/message-reconciliation.js',
+  'skills/web-console/public/mailbox-cursor.js',
+  'skills/web-console/public/app.js',
+  'skills/shell/SKILL.md',
+  'skills/shell/scripts/send.js',
+  'skills/health-check/SKILL.md',
+  'skills/check-context/SKILL.md',
+  'skills/restart-claude/SKILL.md',
+  'skills/zylos-memory/SKILL.md',
+  'cli/commands/init.js',
+  'cli/commands/add.js',
+  'cli/commands/shell.js',
+  'cli/lib/components.js',
+  'runtime/observability/executor-snapshot-client.js',
+  'runtime/observability/health-projection.js',
+  'runtime/executor/daemon.js',
+  'runtime/executor/prerequisite-owner.js',
+  'runtime/scheduler/scheduler-observability.js',
+  'templates/claude-system.md',
+  'templates/codex-system.md',
+  'templates/onboarding.md',
+  'docs/hook-activity-tracking.md',
+  'README.md',
+  'README.zh-CN.md',
+];
+
+const retiredRuntimeIdentifier = new RegExp([
+  'tmux',
+  'capture-pane',
+  'send-keys',
+  'paste-buffer',
+  'agent-status\\.json',
+  'global[ _-]session',
+  'terminal injection',
+  'input health',
+  'window health',
+  'old provider remains quiesced',
+  'captured runtime pane text',
+  'activity[ _-]monitor',
+  'c4[ _-](?:dispatcher|control|session[ _-]init)',
+].join('|'), 'i');
+
+const retiredDocumentationAuthority = new RegExp([
+  'input[ _-](?:box|state)',
+  'cursor_[xy]',
+  'prompt_y',
+  'status[ _-]line layout',
+  'attach[^\\n]*overlay',
+  'unaccepted prompt',
+  'block[ _-]queue[ _-]until[ _-]idle',
+  'require[ _-]idle',
+  'idle_seconds',
+  'sustained idle',
+  'control queue',
+  'periodic task dispatch',
+  'monitor/dispatcher',
+].join('|'), 'i');
+
+function containsRetiredAuthority(file) {
+  const source = fs.readFileSync(path.resolve(file), 'utf8');
+  return retiredRuntimeIdentifier.test(source)
+    || (file.endsWith('.md') && retiredDocumentationAuthority.test(source));
+}
+
+let cachedPackedFiles = null;
+function packedFiles() {
+  if (cachedPackedFiles === null) {
+    const packed = JSON.parse(execFileSync('npm', [
+      'pack', '--dry-run', '--json', '--ignore-scripts',
+    ], { cwd: path.resolve('.'), encoding: 'utf8', timeout: 30_000 }));
+    cachedPackedFiles = packed[0].files.map(({ path: file }) => file);
+  }
+  return cachedPackedFiles;
+}
+
+function repositoryFiles() {
+  return execFileSync('git', ['ls-files', '-z'], {
+    cwd: path.resolve('.'), encoding: 'utf8',
+  }).split('\0').filter(Boolean).filter((file) => fs.existsSync(path.resolve(file)));
+}
+
+function isScannableText(file) {
+  return /\.(?:js|cjs|mjs|md|html|json|ya?ml|sh|env|sql)$/.test(file)
+    || ['Dockerfile', '.npmignore'].includes(path.basename(file))
+    || file.startsWith('test/integration/runtime/bin/');
+}
+
+const migrationOnlyRepositoryFiles = new Set([
+  // Executable negative/migration proofs. These files are tests only; the
+  // repository scan still covers every other tracked product, source, doc,
+  // fixture, package, and test file.
+  'cli/lib/__tests__/codex-hooks.test.js',
+  'cli/lib/__tests__/self-upgrade.test.js',
+  'cli/lib/__tests__/sync-settings-hooks.test.js',
+  'scripts/bootstrap-executor-lifecycle.js',
+  'scripts/installed-runtime-inventory.js',
+  'test/base-to-executor-bootstrap.test.js',
+  'test/exact-base-legacy-source.test.js',
+  'test/executor-service-lifecycle.test.js',
+  'test/installed-executor-upgrade.test.js',
+  'test/installer-init-executor-lifecycle.test.js',
+  'test/runtime-atomic-upgrade.test.js',
+  'test/runtime-c4-normal-callers.test.js',
+  'test/runtime-c4-source-boundary.test.js',
+  'test/runtime-normal-path-static.test.js',
+  'test/runtime-provider-neutral-health.test.js',
+  'test/runtime-upgrade-coordinator.test.js',
+  'runtime/migration/installed-executor-upgrade.js',
+  'runtime/migration/legacy-lifecycle-artifacts.js',
+]);
+
+// This is not a legacy execution route: fresh init reads PM2 once to refuse
+// executor startup when a selected-installation retired registration exists.
+// Keep its narrow exception paired with a mutation/import ban below.
+const readOnlyFreshFenceGuardFiles = new Set([
+  'runtime/executor/start-fence.js',
+  'runtime/retired-pm2-identities.js',
+  'test/executor-start-fence.test.js',
+  'test/retired-pm2-identities.test.js',
+]);
+
+describe('normal product paths have no retired runtime authority', () => {
+  test('the tracked repository contains retired identifiers only in isolated migration code or proofs', () => {
+    const violations = repositoryFiles()
+      .filter(isScannableText)
+      .filter((file) => !migrationOnlyRepositoryFiles.has(file))
+      .filter((file) => !readOnlyFreshFenceGuardFiles.has(file))
+      .filter(containsRetiredAuthority);
+    expect(violations).toEqual([]);
+  });
+
+  test('normal callers contain no terminal or host-file execution authority', () => {
+    for (const file of normalRuntimeFiles) {
+      const source = fs.readFileSync(path.resolve(file), 'utf8');
+      expect(source).not.toMatch(
+        /tmux|capture-pane|send-keys|paste-buffer|agent-status\.json|global session|runtime is alive/i,
+      );
+    }
+  });
+
+  test('the fresh fence PM2 overlap guard is read-only and cannot dispatch migration cleanup', () => {
+    const source = fs.readFileSync(path.resolve('runtime/executor/start-fence.js'), 'utf8');
+    expect(source).toContain("execFileSyncFn('pm2', ['jlist']");
+    expect(source).not.toMatch(/\['(?:stop|delete|save|start|restart)'/);
+    expect(source).not.toMatch(/runtime\/migration|reconcileLegacyServicesForExecutorStart/);
+  });
+
+  test('fresh fencing, migration, and installer inventory share one read-only PM2 identity owner', () => {
+    const identitySource = fs.readFileSync(path.resolve('runtime/retired-pm2-identities.js'), 'utf8');
+    expect(identitySource).toMatch(/RETIRED_PM2_SERVICE_NAMES/);
+    expect(identitySource).toMatch(/retiredPm2ServicePaths/);
+    expect(identitySource).not.toMatch(/node:fs|node:child_process|runtime\/migration|execFileSync|spawn/);
+    for (const file of [
+      'runtime/executor/start-fence.js',
+      'runtime/migration/installed-executor-upgrade.js',
+      'scripts/installed-runtime-inventory.js',
+    ]) {
+      const source = fs.readFileSync(path.resolve(file), 'utf8');
+      expect(source).toMatch(/retired-pm2-identities\.js/);
+      expect(source).toMatch(/RETIRED_PM2_SERVICE_NAMES/);
+      expect(source).toMatch(/retiredPm2ServicePaths/);
+    }
+  });
+
+  test('system instructions never ask a model to select or execute a delivery route', () => {
+    for (const file of [
+      'templates/claude-system.md', 'templates/codex-system.md', 'templates/onboarding.md',
+    ]) {
+      const source = fs.readFileSync(path.resolve(file), 'utf8');
+      expect(source).not.toMatch(/reply via|c4-send\.js|latest message|parent chat fallback/i);
+      expect(source).toMatch(/durable (outbox|delivery)/i);
+    }
+  });
+
+  test('shipped multilingual docs do not describe global sessions or idle-gated scheduling', () => {
+    for (const file of ['README.md', 'README.zh-CN.md']) {
+      const source = fs.readFileSync(path.resolve(file), 'utf8');
+      expect(source).not.toMatch(
+        /unified (?:gateway|conversation|session)|one conversation(?:,|\s+[—-])|idle gating|统一网关|统一会话|一个对话、一份|空闲门控/i,
+      );
+    }
+  });
+
+  test('component installation has no terminal-observation or ownerless C4 fallback', () => {
+    const source = fs.readFileSync(path.resolve('cli/lib/components.js'), 'utf8');
+    expect(source).not.toMatch(/outputTask|ZYLOS_TASK|COMPONENT_TASK|zylos-cli|reply_channel|Claude session|c4-receive/i);
+    expect(source).toMatch(/operator setup/i);
+  });
+
+  test('Web Console routes consume only the monotonic channel mailbox projection', () => {
+    const source = fs.readFileSync(path.resolve('skills/web-console/scripts/server.js'), 'utf8');
+    const ownerSource = fs.readFileSync(
+      path.resolve('skills/web-console/scripts/core-outbox-owner.js'), 'utf8',
+    );
+    const outboxSource = fs.readFileSync(
+      path.resolve('runtime/delivery/outbox-service.js'), 'utf8',
+    );
+    const schemaSource = fs.readFileSync(
+      path.resolve('runtime/persistence/schema.js'), 'utf8',
+    );
+    const shellSource = fs.readFileSync(path.resolve('cli/commands/shell.js'), 'utf8');
+    const snapshotSource = fs.readFileSync(
+      path.resolve('runtime/observability/snapshot-publisher.js'), 'utf8',
+    );
+    const mailboxSource = fs.readFileSync(
+      path.resolve('skills/web-console/scripts/db.js'), 'utf8',
+    );
+    const appSource = fs.readFileSync(path.resolve('skills/web-console/public/app.js'), 'utf8');
+    const reconciliationSource = fs.readFileSync(
+      path.resolve('skills/web-console/public/message-reconciliation.js'), 'utf8',
+    );
+    const cursorSource = fs.readFileSync(
+      path.resolve('skills/web-console/public/mailbox-cursor.js'), 'utf8',
+    );
+    const indexSource = fs.readFileSync(
+      path.resolve('skills/web-console/public/index.html'), 'utf8',
+    );
+    expect(source).toMatch(/DeliveryMailbox|deliveryMailbox\.list|syncCoreInbound/);
+    expect(source).toMatch(/validateInboundEnvelope|projectCoreWebConsoleContent/);
+    expect(source).toMatch(/projectInbound\([^)]*\)[\s\S]*projectInboundForDelivery/);
+    expect(source).toMatch(/source\.turn_id === null/);
+    expect(source).toMatch(/deliveryMailbox\.hasInboundEvent/);
+    expect(ownerSource).toMatch(
+      /await projectInbound\(command\)[\s\S]*return textRenderer\.deliver\(command\)/,
+    );
+    expect(ownerSource).toMatch(/beforeSend\(command\)[\s\S]*assertCurrentClaim\(command\)/);
+    expect(outboxSource).toMatch(/claimed_command_hash[\s\S]*assertCurrentClaim/);
+    expect(outboxSource).toMatch(
+      /julianday\(candidate\.next_attempt_at\) <= julianday\(\?\)/,
+    );
+    expect(outboxSource).toMatch(
+      /pre_action_fenced_at = CASE WHEN \? = 1[\s\S]*COALESCE\(pre_action_fenced_at,[\s\S]*lease_expires_epoch_ms IS NOT NULL AND lease_expires_epoch_ms > \?/,
+    );
+    expect(outboxSource).toMatch(/candidate\.pre_action_fenced_at IS NULL/);
+    expect(outboxSource).toMatch(/expiredClaimRecovery = 'fenced'/);
+    expect(ownerSource).toMatch(/expiredClaimRecovery: 'same_delivery_id'/);
+    expect(ownerSource).toMatch(/supportsPlatformIdempotency: true/);
+    expect(mailboxSource).toMatch(/delivery_id TEXT UNIQUE/);
+    expect(mailboxSource).toMatch(/row\.delivery_id !== scopedDeliveryId/);
+    expect(shellSource).not.toMatch(/same_delivery_id|supportsPlatformIdempotency:\s*true/);
+    expect(snapshotSource).toMatch(
+      /pre_action_fenced_at !== null[\s\S]*\? 'delivery_unknown'/,
+    );
+    expect(snapshotSource).toMatch(
+      /row\.lease_expires_epoch_ms <= Date\.parse\(generatedAt\)/,
+    );
+    expect(snapshotSource).toMatch(
+      /status === 'delivery_unknown'[\s\S]*return 'degraded'/,
+    );
+    expect(outboxSource).toMatch(
+      /row\.lease_expires_epoch_ms === null[\s\S]*row\.lease_expires_epoch_ms <= appliedAtEpochMs/,
+    );
+    expect(outboxSource).toMatch(/INSERT INTO runtime_outbox_claim_snapshots/);
+    expect(outboxSource).toMatch(
+      /sourceCommandJson = row\.status === 'pending'[\s\S]*row\.snapshot_command_json/,
+    );
+    expect(outboxSource).toMatch(
+      /quarantineUnverifiableOutboxClaims\(database\)[\s\S]*const claimedAt = now\(\)/,
+    );
+    expect(schemaSource).toMatch(
+      /WHERE outbox\.status IN \('delivering', 'retry_wait'\)/,
+    );
+    expect(schemaSource).toMatch(
+      /row\.snapshot_command_json === row\.command_json[\s\S]*row\.snapshot_command_hash === row\.claimed_command_hash/,
+    );
+    expect(outboxSource).toMatch(
+      /active\.status = 'delivery_unknown'[\s\S]*active\.status = 'delivering'/,
+    );
+    expect(outboxSource).toMatch(
+      /snapshot\.command_json = \? AND snapshot\.command_hash = \?/,
+    );
+    expect(schemaSource).toMatch(
+      /quarantineUnverifiableOutboxClaims[\s\S]*status = 'delivery_unknown'/,
+    );
+    expect(snapshotSource).toMatch(
+      /'dead_letter', 'delivery_unknown'/,
+    );
+    expect(schemaSource).toMatch(/runtime_outbox_claim_snapshot_update_immutable/);
+    expect(schemaSource).toMatch(/runtime_outbox_claim_snapshot_insert_once/);
+    expect(schemaSource).toMatch(/runtime_outbox_claim_snapshot_delete_immutable/);
+    expect(source).toMatch(/source\.command_json !== JSON\.stringify\(command\)/);
+    expect(source).toMatch(/command_outbox_id[\s\S]*command_turn_id/);
+    expect(source).toMatch(/source\.turn_id !== command\.mapping\.turn_id/);
+    expect(source).toMatch(/command_aggregate_version !== command\.aggregate_version/);
+    expect(source).toMatch(/CORE_REGION|CORE_TENANT_ID|CORE_BOT_ID/);
+    expect(ownerSource).toMatch(/targetRegion|targetTenantId|targetBotId/);
+    expect(mailboxSource).toMatch(/region = \? AND tenant_id = \? AND bot_id = \?/);
+    expect(mailboxSource).toMatch(/delivery_mailbox_scope_cursor/);
+    expect(mailboxSource).toMatch(/mailbox_cursor_scope_required/);
+    expect(mailboxSource).toMatch(/scoped_uploads_scope_capability/);
+    expect(mailboxSource).toMatch(/uploads_rollback_compatible/);
+    expect(mailboxSource).toMatch(/region = \? AND tenant_id = \? AND bot_id = \?/);
+    expect(source).toMatch(/X-Zylos-Mailbox-Cursor-Scope/);
+    expect(source).toMatch(/cursor_reset/);
+    expect(source).toMatch(/type: 'messages', cursor_scope/);
+    expect(source).toMatch(/requestUpdate/);
+    expect(source).toMatch(/requireMailboxMutationScope/);
+    expect(source).toMatch(/getForMediaPath/);
+    expect(source).toMatch(/upload\?\.consumed/);
+    expect(source).toMatch(/deliveryMailbox\.hasInboundAttachment/);
+    expect(source).toMatch(/requestedFilename !== filename/);
+    expect(mailboxSource).toMatch(/hasInboundAttachment/);
+    expect(source).toMatch(/new PersistentUploadRegistry[\s\S]*CORE_REGION[\s\S]*CORE_TENANT_ID/);
+    expect(source).not.toMatch(/getCoreMessages|event\.rowid|outbox_rowid|broadcast\('messages'/);
+    expect(source).not.toMatch(/latest message|parent chat|c4-send/i);
+    expect(appSource).toMatch(/mailboxPollUrl/);
+    expect(appSource).toMatch(/cursor_scope/);
+    expect(appSource).toMatch(/scopeGeneration/);
+    expect(appSource).toMatch(/connectionGeneration/);
+    expect(appSource).toMatch(/pollInFlight/);
+    expect(appSource).toMatch(/X-Zylos-Mailbox-Cursor-Scope/);
+    expect(appSource).toMatch(/setRequestHeader\('X-Zylos-Mailbox-Cursor-Scope'/);
+    expect(appSource).toMatch(/applyMutationScopeResponse/);
+    expect(appSource).toMatch(
+      /pendingMessages\.set\(tempId,\s*\{[\s\S]*scopeGeneration:\s*sendGeneration/,
+    );
+    expect(appSource).not.toMatch(/msg\.status,\s*msg,\s*this\.scopeGeneration/);
+    expect(appSource).not.toMatch(/conversations\/recent\?limit=100/);
+    expect(cursorSource).toMatch(/web-console-mailbox-v1/);
+    expect(cursorSource).toMatch(/lastMessageId: reset \? 0/);
+    expect(cursorSource).toMatch(/acceptScopedResponse/);
+    expect(cursorSource).toMatch(/acceptMutationResponse/);
+    expect(cursorSource).toMatch(/isCurrentGeneration/);
+    expect(cursorSource).toMatch(/pendingAttachments/);
+    expect(cursorSource).toMatch(/pendingUploads/);
+    expect(indexSource.indexOf('mailbox-cursor.js')).toBeLessThan(indexSource.indexOf('app.js'));
+    expect(reconciliationSource).toMatch(/safeAttachmentHref|attachmentKey/);
+    expect(reconciliationSource).not.toMatch(/javascript:|https?:\/\/|latest|parent/i);
+  });
+
+  test('compatibility ingress accepts option-like text values without model or terminal routing', () => {
+    const source = fs.readFileSync(
+      path.resolve('skills/comm-bridge/scripts/c4-receive.js'), 'utf8',
+    );
+    expect(source).toMatch(/field !== 'content' && value\.startsWith\('--'\)/);
+    expect(source).toMatch(/value === undefined/);
+  });
+
+  test('the exact Node suite cannot execute retired provider-interface tests', () => {
+    const runner = fs.readFileSync(path.resolve('scripts/run-node-tests.js'), 'utf8');
+    expect(runner).toContain("'skills', 'scheduler', 'scripts', '__tests__'");
+    expect(runner).not.toMatch(/activity-monitor|cli', 'lib', 'runtime', '__tests__/);
+  });
+
+  test('every local import selected by the exact Node suite resolves to a tracked source', () => {
+    const roots = [
+      'cli/lib/__tests__',
+      'skills/scheduler/scripts/__tests__',
+    ];
+    const tracked = new Set(repositoryFiles());
+    const missing = [];
+    const testFiles = [];
+    for (const root of roots) {
+      const pending = [root];
+      while (pending.length > 0) {
+        const directory = pending.pop();
+        for (const entry of fs.readdirSync(path.resolve(directory), { withFileTypes: true })) {
+          const file = path.join(directory, entry.name);
+          if (entry.isDirectory()) pending.push(file);
+          else if (entry.isFile() && entry.name.endsWith('.test.js')) testFiles.push(file);
+        }
+      }
+    }
+    for (const file of testFiles) {
+      const source = fs.readFileSync(path.resolve(file), 'utf8');
+      const imports = source.matchAll(/(?:from\s+|import\s*\()(['"])(\.{1,2}\/[^'"]+)\1/g);
+      for (const [, , specifier] of imports) {
+        const resolved = path.resolve(path.dirname(file), specifier);
+        const relative = path.relative(path.resolve('.'), resolved).split(path.sep).join('/');
+        if (!fs.existsSync(resolved) || !tracked.has(relative)) {
+          missing.push(`${file} -> ${specifier}`);
+        }
+      }
+    }
+    expect(missing).toEqual([]);
+  });
+
+  test('retired executable implementations are absent from both repository and package payload', () => {
+    const tracked = new Set(repositoryFiles());
+    const files = packedFiles();
+    for (const retired of [
+      'skills/activity-monitor/',
+      'skills/comm-bridge/scripts/c4-dispatcher.js',
+      'skills/comm-bridge/scripts/c4-control.js',
+      'skills/comm-bridge/scripts/c4-session-init.js',
+      'skills/comm-bridge/scripts/c4-db.js',
+      'skills/comm-bridge/scripts/c4-fetch.js',
+      'skills/comm-bridge/scripts/c4-checkpoint.js',
+      'skills/comm-bridge/scripts/tmux-input-state.js',
+      'cli/lib/runtime/claude.js',
+      'cli/lib/runtime/codex.js',
+      'cli/lib/runtime/tmux-helpers.js',
+      'cli/lib/__tests__/claude-auth.test.js',
+      'cli/lib/__tests__/codex.test.js',
+      'runtime/migration/legacy-c4-runtime-config.js',
+      'runtime/migration/legacy-c4-diagnostic.js',
+      'runtime/migration/legacy-provider-quiescence.js',
+    ]) {
+      expect([...tracked].some((file) => file === retired || file.startsWith(retired))).toBe(false);
+      expect(files.some((file) => file === retired || file.startsWith(retired))).toBe(false);
+    }
+  });
+
+  test('every packaged product and ordinary document is free of retired runtime authority', () => {
+    const migrationOnly = new Set([
+      'scripts/bootstrap-executor-lifecycle.js',
+      'scripts/installed-runtime-inventory.js',
+      'runtime/migration/installed-executor-upgrade.js',
+      'runtime/migration/legacy-lifecycle-artifacts.js',
+      'runtime/retired-pm2-identities.js',
+    ]);
+    const files = packedFiles();
+    expect(files).toContain('CHANGELOG.md');
+    const violations = files
+      .filter(isScannableText)
+      .filter((file) => !migrationOnly.has(file))
+      .filter((file) => file !== 'runtime/executor/start-fence.js')
+      .filter(containsRetiredAuthority);
+    expect(violations).toEqual([]);
+  });
+
+  test('one-time migration has no executable tmux or provider-session authority', () => {
+    const bootstrap = fs.readFileSync(
+      path.resolve('scripts/bootstrap-executor-lifecycle.js'), 'utf8',
+    );
+    const upgrade = fs.readFileSync(
+      path.resolve('runtime/migration/installed-executor-upgrade.js'), 'utf8',
+    );
+    expect(bootstrap).not.toMatch(/tmux|providerquiescence|provider[_ -]?(?:session|suspend|resume)/i);
+    expect(upgrade).not.toMatch(/tmux|providerquiescence|provider[_ -]?(?:session|suspend|resume)/i);
+    expect(upgrade).not.toMatch(/execFileSyncFn\('pm2', \['start'/);
+  });
+
+  test('rollback reconciliation proves source restoration without reviving a legacy runtime', () => {
+    const coordinator = fs.readFileSync(
+      path.resolve('runtime/migration/runtime-upgrade-coordinator.js'), 'utf8',
+    );
+    const service = fs.readFileSync(
+      path.resolve('runtime/migration/runtime-upgrade-service.js'), 'utf8',
+    );
+    expect(coordinator).toMatch(/legacy-source-reconciliation/);
+    expect(coordinator).toMatch(/legacy_runtime_remained_inactive: true/);
+    expect(coordinator).not.toMatch(/legacy-dispatcher-restart|restartLegacyDispatcher|legacy_dispatcher_restarted/);
+    expect(service).toMatch(/legacy-source-reconciliation/);
+    expect(service).toMatch(/legacy_runtime_remained_inactive !== true/);
+    expect(service).not.toMatch(/legacy-dispatcher-restart|legacy_dispatcher_restarted/);
+  });
+
+  test('normal runtime entrypoints do not import migration code', () => {
+    for (const file of normalRuntimeFiles) {
+      const source = fs.readFileSync(path.resolve(file), 'utf8');
+      expect(source).not.toMatch(/(?:from|import)\s+['"][^'"]*runtime\/migration\//);
+    }
+  });
+
+  test('executor loads one-time migration code only for an upgrade or durable recovery', () => {
+    const daemon = fs.readFileSync(path.resolve('runtime/executor/daemon.js'), 'utf8');
+    expect(daemon).not.toMatch(/import\s+[^'";]+['"][^'"]*runtime\/migration\//);
+    expect(daemon).toMatch(/async function onUpgrade\(request\)[\s\S]*await getUpgradeHandler\(\)/);
+    expect(daemon).toMatch(/if \(hasResumableUpgrade\(\{ database, zylosDir \}\)\)[\s\S]*await getUpgradeHandler\(\)/);
+  });
+});

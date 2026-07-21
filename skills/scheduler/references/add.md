@@ -25,10 +25,8 @@ Creates a new scheduled task. Exactly one timing option is required.
 |--------|-------------|---------|
 | `--priority <1-3>` | 1=urgent, 2=high, 3=normal | 3 |
 | `--name "<name>"` | Task display name | Truncated prompt |
-| `--block-queue-until-idle` | Wait for sustained idle, then block later dispatch until execution settles | off |
 | `--miss-threshold <seconds>` | Skip if overdue by more than this | 300 |
-| `--reply-channel "<source>"` | Reply channel (e.g., "telegram", "lark") | none |
-| `--reply-endpoint "<endpoint>"` | Reply endpoint (e.g., user ID) | none |
+| `--bound-conversation-json "<json>"` | Complete durable Core conversation identity | synthetic schedule conversation |
 
 ## Examples
 
@@ -46,12 +44,9 @@ cli.js add "Health check" --cron "0 9 * * *"
 cli.js add "Check updates" --every "2 hours"
 cli.js add "Check updates" --every "90 minutes"
 
-# Maintenance (wait for idle)
-cli.js add "Compact session" --cron "0 2 * * *" --block-queue-until-idle
-
-# With reply
-cli.js add "Daily report" --at "9am" --reply-channel "telegram" --reply-endpoint "8101553026"
-cli.js add "Weekly report" --cron "0 9 * * 1" --reply-channel "lark" --reply-endpoint "chat_id topic_id"
+# Bound to an existing native thread with durable root and reply target
+cli.js add "Weekly report" --cron "0 9 * * 1" \
+  --bound-conversation-json '{"channel":"lark","chat_type":"thread","chat_id":"chat_xxx","native_thread_or_topic_id":"thread_yyy","message_id":"message_reply_target","root_message_id":"message_thread_root"}'
 
 # Long miss threshold (backup: must execute even if delayed)
 cli.js add "Backup data" --cron "0 2 * * *" --miss-threshold 86400
@@ -59,25 +54,23 @@ cli.js add "Backup data" --cron "0 2 * * *" --miss-threshold 86400
 
 ## Best Practices
 
-### --block-queue-until-idle
-
-Use for: session compaction, data cleanup, health checks needing full attention.
-Don't use for: user notifications, time-sensitive tasks, high-priority alerts.
-
 ### --miss-threshold
 
 - **Default 300s**: health checks, heartbeats, real-time notifications
 - **Long (explicit)**: backups (`86400`), reports (`14400`), batch processing
 - Default (5 min) is suitable for most tasks.
 
-### Reply Configuration
+### Bound Conversation
 
-`--reply-channel` and `--reply-endpoint` specify where results are sent.
+The JSON value is validated before the task is persisted. It must carry
+`channel`, `chat_type`, `chat_id`, `native_thread_or_topic_id`, `message_id`,
+and `root_message_id`. A thread requires three distinct durable anchors: its
+native conversation ID, immutable root message, and exact reply-target message.
+Outside a thread, both the native thread ID and root message are `null`.
 
 ```bash
---reply-channel "telegram" --reply-endpoint "8101553026"     # Telegram user
---reply-channel "lark" --reply-endpoint "chat_xxx topic_yyy" # Lark topic
---reply-channel "telegram"                                    # Broadcast
+--bound-conversation-json '{"channel":"telegram","chat_type":"dm","chat_id":"user_123","native_thread_or_topic_id":null,"message_id":"message_456","root_message_id":null}'
 ```
 
-Endpoint structure depends on channel implementation. Can contain multiple space-separated values.
+Primitive channel/endpoint pairs and local idle gates are retired and rejected.
+Core queue and maintenance state are the only execution authority.
