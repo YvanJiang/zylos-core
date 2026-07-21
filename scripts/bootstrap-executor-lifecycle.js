@@ -10,7 +10,6 @@ import { pathToFileURL } from 'node:url';
 
 import { startExecutorService } from '../cli/lib/executor-service-lifecycle.js';
 import { createInstalledExecutorUpgradeHandler } from '../runtime/migration/installed-executor-upgrade.js';
-import { createLegacyProviderQuiescence } from '../runtime/migration/legacy-provider-quiescence.js';
 import {
   readChannelAuthorityManifest,
   readDurableBootstrapAuthority,
@@ -256,10 +255,6 @@ export async function runBaseToExecutorBootstrap({
       provider: configuredProvider(installationRoot),
       allowLegacyFromRelease: true,
       legacyChannelAuthority: authority,
-      legacyProviderQuiescence: createLegacyProviderQuiescence({
-        provider: configuredProvider(installationRoot), execFileSyncFn,
-        tmuxArgsPrefix: handlerOverrides.legacyTmuxArgsPrefix ?? [],
-      }),
       packageLifecycle,
       execFileSyncFn,
       ...handlerOverrides,

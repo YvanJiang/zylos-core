@@ -5,14 +5,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-
-const LEGACY_SERVICE_PATHS = Object.freeze(new Map([
-  ['activity-monitor', ['.claude', 'skills', 'activity-monitor', 'scripts', 'activity-monitor.js']],
-  ['c4-dispatcher', ['.claude', 'skills', 'comm-bridge', 'scripts', 'c4-dispatcher.js']],
-  ['scheduler', ['.claude', 'skills', 'scheduler', 'scripts', 'daemon.js']],
-  ['web-console', ['.claude', 'skills', 'web-console', 'scripts', 'server.js']],
-  ['caddy', ['bin', 'caddy']],
-]));
+import {
+  RETIRED_PM2_SERVICE_NAMES,
+  retiredPm2ServicePaths,
+} from '../runtime/retired-pm2-identities.js';
 
 function requireDirectory(name, value) {
   if (typeof value !== 'string' || !path.isAbsolute(value) || path.parse(value).root === value
@@ -45,7 +41,7 @@ export function inspectInstalledRuntime({
   const ecosystem = ecosystemExists ? fs.readFileSync(ecosystemFile, 'utf8') : '';
   const executorPackage = fs.existsSync(path.join(packageRoot, 'runtime', 'executor', 'launcher.js'));
   const executorConfig = ecosystemExists && /\bzylos-executor\b/.test(ecosystem);
-  const legacyConfig = ecosystemExists && [...LEGACY_SERVICE_PATHS.keys()]
+  const legacyConfig = ecosystemExists && RETIRED_PM2_SERVICE_NAMES
     .some((name) => new RegExp(`['\"]${name}['\"]`).test(ecosystem));
   const legacyDatabase = fs.existsSync(path.join(root, 'comm-bridge', 'c4.db'));
   const pm2 = readPm2(execFileSyncFn);
@@ -53,10 +49,10 @@ export function inspectInstalledRuntime({
   if (pm2 === null) reasons.push('pm2_inventory_unavailable');
   const legacyPm2 = [];
   const collisions = [];
+  const expectedLegacyPaths = retiredPm2ServicePaths(root);
   for (const processInfo of pm2 ?? []) {
-    const relative = LEGACY_SERVICE_PATHS.get(processInfo?.name);
-    if (!relative) continue;
-    const expected = path.resolve(root, ...relative);
+    const expected = expectedLegacyPaths.get(processInfo?.name);
+    if (!expected) continue;
     const actual = processInfo.pm2_env?.pm_exec_path ?? processInfo.pm_exec_path;
     if (typeof actual !== 'string' || path.resolve(actual) !== expected) {
       collisions.push(processInfo.name);

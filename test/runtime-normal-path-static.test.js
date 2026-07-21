@@ -28,6 +28,8 @@ const normalRuntimeFiles = [
   'cli/lib/components.js',
   'runtime/observability/executor-snapshot-client.js',
   'runtime/observability/health-projection.js',
+  'runtime/executor/daemon.js',
+  'runtime/executor/prerequisite-owner.js',
   'runtime/scheduler/scheduler-observability.js',
   'templates/claude-system.md',
   'templates/codex-system.md',
@@ -47,6 +49,8 @@ const retiredRuntimeIdentifier = new RegExp([
   'terminal injection',
   'input health',
   'window health',
+  'old provider remains quiesced',
+  'captured runtime pane text',
   'activity[ _-]monitor',
   'c4[ _-](?:dispatcher|control|session[ _-]init)',
 ].join('|'), 'i');
@@ -118,7 +122,16 @@ const migrationOnlyRepositoryFiles = new Set([
   'test/runtime-upgrade-coordinator.test.js',
   'runtime/migration/installed-executor-upgrade.js',
   'runtime/migration/legacy-lifecycle-artifacts.js',
-  'runtime/migration/legacy-provider-quiescence.js',
+]);
+
+// This is not a legacy execution route: fresh init reads PM2 once to refuse
+// executor startup when a selected-installation retired registration exists.
+// Keep its narrow exception paired with a mutation/import ban below.
+const readOnlyFreshFenceGuardFiles = new Set([
+  'runtime/executor/start-fence.js',
+  'runtime/retired-pm2-identities.js',
+  'test/executor-start-fence.test.js',
+  'test/retired-pm2-identities.test.js',
 ]);
 
 describe('normal product paths have no retired runtime authority', () => {
@@ -126,6 +139,7 @@ describe('normal product paths have no retired runtime authority', () => {
     const violations = repositoryFiles()
       .filter(isScannableText)
       .filter((file) => !migrationOnlyRepositoryFiles.has(file))
+      .filter((file) => !readOnlyFreshFenceGuardFiles.has(file))
       .filter(containsRetiredAuthority);
     expect(violations).toEqual([]);
   });
@@ -136,6 +150,30 @@ describe('normal product paths have no retired runtime authority', () => {
       expect(source).not.toMatch(
         /tmux|capture-pane|send-keys|paste-buffer|agent-status\.json|global session|runtime is alive/i,
       );
+    }
+  });
+
+  test('the fresh fence PM2 overlap guard is read-only and cannot dispatch migration cleanup', () => {
+    const source = fs.readFileSync(path.resolve('runtime/executor/start-fence.js'), 'utf8');
+    expect(source).toContain("execFileSyncFn('pm2', ['jlist']");
+    expect(source).not.toMatch(/\['(?:stop|delete|save|start|restart)'/);
+    expect(source).not.toMatch(/runtime\/migration|reconcileLegacyServicesForExecutorStart/);
+  });
+
+  test('fresh fencing, migration, and installer inventory share one read-only PM2 identity owner', () => {
+    const identitySource = fs.readFileSync(path.resolve('runtime/retired-pm2-identities.js'), 'utf8');
+    expect(identitySource).toMatch(/RETIRED_PM2_SERVICE_NAMES/);
+    expect(identitySource).toMatch(/retiredPm2ServicePaths/);
+    expect(identitySource).not.toMatch(/node:fs|node:child_process|runtime\/migration|execFileSync|spawn/);
+    for (const file of [
+      'runtime/executor/start-fence.js',
+      'runtime/migration/installed-executor-upgrade.js',
+      'scripts/installed-runtime-inventory.js',
+    ]) {
+      const source = fs.readFileSync(path.resolve(file), 'utf8');
+      expect(source).toMatch(/retired-pm2-identities\.js/);
+      expect(source).toMatch(/RETIRED_PM2_SERVICE_NAMES/);
+      expect(source).toMatch(/retiredPm2ServicePaths/);
     }
   });
 
@@ -371,6 +409,7 @@ describe('normal product paths have no retired runtime authority', () => {
       'cli/lib/__tests__/codex.test.js',
       'runtime/migration/legacy-c4-runtime-config.js',
       'runtime/migration/legacy-c4-diagnostic.js',
+      'runtime/migration/legacy-provider-quiescence.js',
     ]) {
       expect([...tracked].some((file) => file === retired || file.startsWith(retired))).toBe(false);
       expect(files.some((file) => file === retired || file.startsWith(retired))).toBe(false);
@@ -383,14 +422,56 @@ describe('normal product paths have no retired runtime authority', () => {
       'scripts/installed-runtime-inventory.js',
       'runtime/migration/installed-executor-upgrade.js',
       'runtime/migration/legacy-lifecycle-artifacts.js',
-      'runtime/migration/legacy-provider-quiescence.js',
+      'runtime/retired-pm2-identities.js',
     ]);
     const files = packedFiles();
     expect(files).toContain('CHANGELOG.md');
     const violations = files
       .filter(isScannableText)
       .filter((file) => !migrationOnly.has(file))
+      .filter((file) => file !== 'runtime/executor/start-fence.js')
       .filter(containsRetiredAuthority);
     expect(violations).toEqual([]);
+  });
+
+  test('one-time migration has no executable tmux or provider-session authority', () => {
+    const bootstrap = fs.readFileSync(
+      path.resolve('scripts/bootstrap-executor-lifecycle.js'), 'utf8',
+    );
+    const upgrade = fs.readFileSync(
+      path.resolve('runtime/migration/installed-executor-upgrade.js'), 'utf8',
+    );
+    expect(bootstrap).not.toMatch(/tmux|providerquiescence|provider[_ -]?(?:session|suspend|resume)/i);
+    expect(upgrade).not.toMatch(/tmux|providerquiescence|provider[_ -]?(?:session|suspend|resume)/i);
+    expect(upgrade).not.toMatch(/execFileSyncFn\('pm2', \['start'/);
+  });
+
+  test('rollback reconciliation proves source restoration without reviving a legacy runtime', () => {
+    const coordinator = fs.readFileSync(
+      path.resolve('runtime/migration/runtime-upgrade-coordinator.js'), 'utf8',
+    );
+    const service = fs.readFileSync(
+      path.resolve('runtime/migration/runtime-upgrade-service.js'), 'utf8',
+    );
+    expect(coordinator).toMatch(/legacy-source-reconciliation/);
+    expect(coordinator).toMatch(/legacy_runtime_remained_inactive: true/);
+    expect(coordinator).not.toMatch(/legacy-dispatcher-restart|restartLegacyDispatcher|legacy_dispatcher_restarted/);
+    expect(service).toMatch(/legacy-source-reconciliation/);
+    expect(service).toMatch(/legacy_runtime_remained_inactive !== true/);
+    expect(service).not.toMatch(/legacy-dispatcher-restart|legacy_dispatcher_restarted/);
+  });
+
+  test('normal runtime entrypoints do not import migration code', () => {
+    for (const file of normalRuntimeFiles) {
+      const source = fs.readFileSync(path.resolve(file), 'utf8');
+      expect(source).not.toMatch(/(?:from|import)\s+['"][^'"]*runtime\/migration\//);
+    }
+  });
+
+  test('executor loads one-time migration code only for an upgrade or durable recovery', () => {
+    const daemon = fs.readFileSync(path.resolve('runtime/executor/daemon.js'), 'utf8');
+    expect(daemon).not.toMatch(/import\s+[^'";]+['"][^'"]*runtime\/migration\//);
+    expect(daemon).toMatch(/async function onUpgrade\(request\)[\s\S]*await getUpgradeHandler\(\)/);
+    expect(daemon).toMatch(/if \(hasResumableUpgrade\(\{ database, zylosDir \}\)\)[\s\S]*await getUpgradeHandler\(\)/);
   });
 });

@@ -373,7 +373,7 @@ install_zylos() {
       if [ "$bootstrap_status" -eq 2 ]; then
         warn "Executor migration committed, but completion is pending; rerun this installer to resume it."
       elif [ "$bootstrap_status" -eq 3 ]; then
-        warn "Executor migration rollback is pending; the old provider remains quiesced and no executor was started. Restore the channel delivery owner, then rerun this installer."
+        warn "Executor migration rollback is pending; Core kept the source batch fenced and no executor was started. Restore the channel delivery owner, then rerun this installer."
       else
         warn "Executor migration did not commit; the exact-base package and runtime were restored."
       fi

@@ -461,7 +461,7 @@ describe('self-upgrade hook migration hints', () => {
     return { tmpDir, templatesDir, zylosDir };
   }
 
-  it('generates removed_hook for retired core SessionStart hooks absent from the template', () => {
+  it('does not dispatch retired SessionStart cleanup through normal self-upgrade hints', () => {
     const { tmpDir, templatesDir, zylosDir } = writeSettingsPair({
       templateSettings: {
         hooks: {
@@ -491,10 +491,9 @@ describe('self-upgrade hook migration hints', () => {
 
     const hints = generateMigrationHints(templatesDir, { zylosDir });
 
-    assert.ok(hints.some(hint =>
-      hint.type === 'removed_hook' &&
-      hint.command.includes('session-start-inject.js')
-    ));
+    assert.equal(hints.some(hint =>
+      hint.type === 'removed_hook' && hint.command.includes('session-start-inject.js')
+    ), false);
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 

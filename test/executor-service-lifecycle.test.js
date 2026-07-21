@@ -19,6 +19,7 @@ import { createExecutorPrerequisiteOwner } from '../runtime/executor/prerequisit
 import {
   cleanupObsoleteLifecycleArtifacts,
   legacyLifecycleArtifactPaths,
+  obsoleteHookBaseKeys,
 } from '../runtime/migration/legacy-lifecycle-artifacts.js';
 
 const directories = [];
@@ -47,6 +48,17 @@ function fixture() {
   const tempRoot = fs.existsSync('/tmp') ? fs.realpathSync('/tmp') : os.tmpdir();
   const directory = fs.mkdtempSync(path.join(tempRoot, 'zylos-executor-host-'));
   directories.push(directory);
+  fs.mkdirSync(path.join(directory, 'runtime'), { recursive: true });
+  fs.writeFileSync(path.join(directory, 'runtime', 'executor-start-fence.json'), JSON.stringify({
+    contract: 'zylos.executor-start-fence@1',
+    runtime_generation: 'executor_only',
+    reconciled_at: '2026-07-21T00:00:00.000Z',
+    issuance_kind: 'committed_reconciliation',
+    upgrade_id: 'upgrade-executor-fixture',
+    legacy_services_quiesced: true,
+    legacy_registrations_absent: true,
+    legacy_artifacts_reconciled: true,
+  }));
   return {
     directory,
     database: new Database(path.join(directory, 'c4.db')),
@@ -471,6 +483,7 @@ describe('executor daemon resource ownership', () => {
       Database: function DatabaseFixture() { return database; },
       createAdapter: () => { throw new Error('stale target adapter must not be created'); },
       createUpgradeHandler: () => upgradeHandler,
+      hasResumableUpgrade: () => true,
       createHost: () => { throw new Error('stale target host must not be created'); },
     });
 
@@ -492,11 +505,110 @@ describe('executor daemon resource ownership', () => {
       Database: function DatabaseFixture() { return database; },
       createAdapter: () => { throw new Error('old adapter must not be created'); },
       createUpgradeHandler: () => upgradeHandler,
+      hasResumableUpgrade: () => true,
       createHost: () => { throw new Error('old host must not be created'); },
     });
 
     expect(daemon.restartRequired).toBe(true);
     expect(events).toEqual(['upgrade-resume', 'database-close']);
+  });
+
+  test('resumes an orphaned durable upgrade plan before starting normal runtime work', async () => {
+    const state = fixture();
+    fs.mkdirSync(path.join(state.directory, 'runtime', 'upgrade-plans'), { recursive: true });
+    fs.writeFileSync(path.join(state.directory, 'runtime', 'upgrade-plans', 'orphan.json'), '{}\n');
+    const events = [];
+    const database = { close: () => events.push('database-close') };
+    const upgradeHandler = async () => ({ state: 'committed' });
+    upgradeHandler.resumeBlocking = async () => {
+      events.push('upgrade-resume');
+      return { state: 'rolled_back' };
+    };
+    const daemon = await runExecutorDaemon({
+      zylosDir: state.directory,
+      Database: function DatabaseFixture() { return database; },
+      createAdapter: () => { throw new Error('normal adapter must not be created'); },
+      createUpgradeHandler: () => upgradeHandler,
+      createHost: () => { throw new Error('normal host must not be created'); },
+    });
+
+    expect(daemon.restartRequired).toBe(true);
+    expect(events).toEqual(['upgrade-resume', 'database-close']);
+  });
+
+  test('fails closed when durable-upgrade probing fails', async () => {
+    const state = fixture();
+    const events = [];
+    const database = { close: () => events.push('database-close') };
+    await expect(runExecutorDaemon({
+      zylosDir: state.directory,
+      Database: function DatabaseFixture() { return database; },
+      hasResumableUpgrade: () => { throw new Error('upgrade probe unavailable'); },
+      createAdapter: () => { throw new Error('normal adapter must not be created'); },
+      createPrerequisiteOwner: () => { throw new Error('prerequisites must not start'); },
+      createHost: () => { throw new Error('normal host must not be created'); },
+    })).rejects.toThrow('upgrade probe unavailable');
+    expect(events).toEqual(['database-close']);
+  });
+
+  test('does not start executor prerequisites without the one-time reconciliation fence', async () => {
+    const state = fixture();
+    fs.rmSync(path.join(state.directory, 'runtime', 'executor-start-fence.json'));
+    const events = [];
+    const database = { close: () => events.push('database-close') };
+    await expect(runExecutorDaemon({
+      zylosDir: state.directory,
+      Database: function DatabaseFixture() { return database; },
+      createAdapter: () => { throw new Error('normal adapter must not be created'); },
+      createPrerequisiteOwner: () => { throw new Error('prerequisites must not start'); },
+      createHost: () => { throw new Error('normal host must not be created'); },
+    })).rejects.toThrow('one-time runtime reconciliation');
+    expect(events).toEqual(['database-close']);
+  });
+
+  test('recovers a committed upgrade until postcommit cleanup is durable', async () => {
+    const state = fixture();
+    const events = [];
+    state.database.exec(`
+      CREATE TABLE runtime_upgrade_runs (upgrade_id TEXT, scope_kind TEXT, bot_id TEXT, state TEXT, state_version INTEGER, created_at TEXT);
+      CREATE TABLE runtime_upgrade_events (upgrade_id TEXT, step_key TEXT);
+      INSERT INTO runtime_upgrade_runs VALUES ('upgrade-pending', 'installation', NULL, 'committed', 1, '2026-07-21T00:00:00.000Z');
+    `);
+    const database = state.database;
+    const close = database.close.bind(database);
+    database.close = () => { events.push('database-close'); close(); };
+    const handler = async () => ({ state: 'committed' });
+    handler.resumeBlocking = async () => { events.push('upgrade-resume'); return { state: 'committed' }; };
+    const daemon = await runExecutorDaemon({
+      zylosDir: state.directory, Database: function DatabaseFixture() { return database; },
+      createUpgradeHandler: () => handler,
+      createHost: () => { throw new Error('host must not start'); },
+    });
+    expect(daemon.restartRequired).toBe(true);
+    expect(events).toEqual(['upgrade-resume', 'database-close']);
+  });
+
+  test('ignores a stale terminal upgrade plan after durable cleanup', async () => {
+    const state = fixture();
+    fs.mkdirSync(path.join(state.directory, 'runtime', 'upgrade-plans'), { recursive: true });
+    fs.writeFileSync(path.join(state.directory, 'runtime', 'upgrade-plans', 'finished.json'), '{}\n');
+    const events = [];
+    state.database.exec(`
+      CREATE TABLE runtime_upgrade_runs (upgrade_id TEXT, scope_kind TEXT, bot_id TEXT, state TEXT, state_version INTEGER, created_at TEXT);
+      CREATE TABLE runtime_upgrade_events (upgrade_id TEXT, step_key TEXT);
+      INSERT INTO runtime_upgrade_runs VALUES ('finished', 'installation', NULL, 'committed', 1, '2026-07-21T00:00:00.000Z');
+      INSERT INTO runtime_upgrade_events VALUES ('finished', 'postcommit-cleanup');
+    `);
+    const database = state.database;
+    const host = { closed: Promise.resolve(), async start() { events.push('host-start'); }, async close() {} };
+    const daemon = await runExecutorDaemon({
+      zylosDir: state.directory, Database: function DatabaseFixture() { return database; },
+      createAdapter: () => inertAdapter(),
+      createPrerequisiteOwner: () => ({ async start() {}, health() { return { ok: true }; }, async close() {} }),
+      createHost: () => host,
+    });
+    expect(events).toEqual(['host-start']);
+    await daemon.close();
   });
 
   test('gives the service host sole ownership of closing the Core database', async () => {
@@ -537,21 +649,6 @@ describe('executor daemon resource ownership', () => {
 });
 
 describe('executor prerequisite ownership', () => {
-  test.each([
-    [{ name: 'c4-dispatcher', was_running: true }, 'Active legacy runtime services'],
-    [{ name: 'scheduler', was_running: false }, 'Stopped legacy runtime registrations'],
-  ])('fails closed before spawning when legacy registration remains: %j', async (registration, message) => {
-    const state = fixture();
-    const spawned = [];
-    const owner = createExecutorPrerequisiteOwner({
-      zylosDir: state.directory,
-      inspectLegacy: () => [registration],
-      spawnFn: (...args) => { spawned.push(args); throw new Error('must not spawn'); },
-    });
-    await expect(owner.start()).rejects.toThrow(message);
-    expect(spawned).toEqual([]);
-  });
-
   test('owns scheduler and web-console children without starting retired runtime daemons', async () => {
     const state = fixture();
     const scheduler = path.join(state.directory, '.claude', 'skills', 'scheduler', 'scripts', 'daemon.js');
@@ -573,7 +670,6 @@ describe('executor prerequisite ownership', () => {
     }
     const owner = createExecutorPrerequisiteOwner({
       zylosDir: state.directory,
-      inspectLegacy: () => [],
       spawnFn: (command, args, options) => {
         spawned.push({ command, args, options });
         const child = new ChildFixture();
@@ -606,6 +702,30 @@ describe('one-time lifecycle cleanup', () => {
         fs.writeFileSync(artifact, 'legacy');
       }
     }
+    const codexHooks = path.join(state.directory, '.codex', 'hooks.json');
+    fs.mkdirSync(path.dirname(codexHooks), { recursive: true });
+    fs.writeFileSync(codexHooks, JSON.stringify({
+      hooks: {
+        SessionStart: [{ hooks: [
+          {
+            type: 'command',
+            command: `node ${path.join(state.directory, '.codex', 'skills', 'comm-bridge', 'scripts', 'c4-session-init.js')}`,
+          },
+          { type: 'command', command: 'node retained-hook.js' },
+        ] }],
+      },
+    }));
+    const claudeSettings = path.join(state.directory, '.claude', 'settings.json');
+    fs.writeFileSync(claudeSettings, JSON.stringify({
+      hooks: {
+        SessionStart: [{ hooks: [
+          ...[...obsoleteHookBaseKeys()].map((key) => ({
+            type: 'command', command: `node ${path.join(state.directory, '.claude', key)}`,
+          })),
+          { type: 'command', command: 'node retained-claude-hook.js' },
+        ] }],
+      },
+    }));
 
     expect(() => cleanupObsoleteLifecycleArtifacts({
       zylosDir: state.directory,
@@ -616,7 +736,113 @@ describe('one-time lifecycle cleanup', () => {
     expect(cleanupObsoleteLifecycleArtifacts({
       zylosDir: state.directory,
       upgradeState: 'committed',
-    })).toEqual({ removed: artifacts });
+    })).toEqual({ removed: [codexHooks, claudeSettings, ...artifacts] });
     expect(artifacts.every((artifact) => !fs.existsSync(artifact))).toBe(true);
+    expect(JSON.parse(fs.readFileSync(codexHooks, 'utf8'))).toEqual({
+      hooks: {
+        SessionStart: [{ hooks: [{ type: 'command', command: 'node retained-hook.js' }] }],
+      },
+    });
+    expect(JSON.parse(fs.readFileSync(claudeSettings, 'utf8'))).toEqual({
+      hooks: {
+        SessionStart: [{ hooks: [{ type: 'command', command: 'node retained-claude-hook.js' }] }],
+      },
+    });
+  });
+
+  test('removes exact owned home-relative hooks from the supported flat Codex config', () => {
+    const state = fixture();
+    const homeDir = path.dirname(state.directory);
+    const relativeRoot = path.basename(state.directory);
+    const codexHooks = path.join(state.directory, '.codex', 'hooks.json');
+    fs.mkdirSync(path.dirname(codexHooks), { recursive: true });
+    fs.writeFileSync(codexHooks, JSON.stringify([
+        {
+          event: 'SessionStart',
+          command: `node ~/${relativeRoot}/.codex/skills/activity-monitor/scripts/session-start-orchestrator.js`,
+        },
+        {
+          event: 'PreToolUse',
+          command: `node $HOME/${relativeRoot}/.claude/skills/activity-monitor/scripts/hook-activity.js`,
+        },
+        {
+          event: 'PostToolUse',
+          command: `node \${HOME}/${relativeRoot}/.claude/skills/zylos-memory/scripts/session-start-inject.js`,
+        },
+        {
+          event: 'SessionStart',
+          command: `node ~/${relativeRoot}/.codex/skills/activity-monitor/scripts/session-start-orchestrator.js.bak`,
+        },
+        { event: 'SessionStart', command: 'node retained-flat-hook.js' },
+    ]));
+
+    expect(cleanupObsoleteLifecycleArtifacts({
+      zylosDir: state.directory,
+      upgradeState: 'committed',
+      homeDir,
+    })).toEqual({ removed: [codexHooks] });
+    expect(JSON.parse(fs.readFileSync(codexHooks, 'utf8'))).toEqual([
+      {
+        event: 'SessionStart',
+        command: `node ~/${relativeRoot}/.codex/skills/activity-monitor/scripts/session-start-orchestrator.js.bak`,
+      },
+      { event: 'SessionStart', command: 'node retained-flat-hook.js' },
+    ]);
+  });
+
+  test('fails closed rather than following a symlinked hook configuration', () => {
+    const state = fixture();
+    const externalDirectory = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-external-hooks-'));
+    const externalConfig = path.join(externalDirectory, 'hooks.json');
+    fs.writeFileSync(externalConfig, JSON.stringify({
+      hooks: {
+        SessionStart: [{ hooks: [{
+          type: 'command',
+          command: `node ${path.join(state.directory, '.claude', 'skills', 'activity-monitor', 'scripts', 'session-start-orchestrator.js')}`,
+        }] }],
+      },
+    }));
+    const codexHooks = path.join(state.directory, '.codex', 'hooks.json');
+    fs.mkdirSync(path.dirname(codexHooks), { recursive: true });
+    fs.symlinkSync(externalConfig, codexHooks);
+
+    try {
+      expect(() => cleanupObsoleteLifecycleArtifacts({
+        zylosDir: state.directory,
+        upgradeState: 'committed',
+      })).toThrow('symlinked hook configuration');
+      expect(JSON.parse(fs.readFileSync(externalConfig, 'utf8')).hooks.SessionStart[0].hooks)
+        .toHaveLength(1);
+    } finally {
+      fs.rmSync(externalDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test('fails closed rather than rewriting a multiply linked hook configuration', () => {
+    const state = fixture();
+    const externalDirectory = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-external-hooks-'));
+    const externalConfig = path.join(externalDirectory, 'hooks.json');
+    fs.writeFileSync(externalConfig, JSON.stringify({
+      hooks: {
+        SessionStart: [{ hooks: [{
+          type: 'command',
+          command: `node ${path.join(state.directory, '.claude', 'skills', 'activity-monitor', 'scripts', 'session-start-orchestrator.js')}`,
+        }] }],
+      },
+    }));
+    const codexHooks = path.join(state.directory, '.codex', 'hooks.json');
+    fs.mkdirSync(path.dirname(codexHooks), { recursive: true });
+    fs.linkSync(externalConfig, codexHooks);
+
+    try {
+      expect(() => cleanupObsoleteLifecycleArtifacts({
+        zylosDir: state.directory,
+        upgradeState: 'committed',
+      })).toThrow('unexpected hook configuration type');
+      expect(JSON.parse(fs.readFileSync(externalConfig, 'utf8')).hooks.SessionStart[0].hooks)
+        .toHaveLength(1);
+    } finally {
+      fs.rmSync(externalDirectory, { recursive: true, force: true });
+    }
   });
 });

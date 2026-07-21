@@ -18,11 +18,7 @@ import { prompt, promptYesNo, promptChoice, promptSecret } from '../lib/prompts.
 import { bold, dim, green, red, yellow, cyan, bgGreen, success, error, warn, heading } from '../lib/colors.js';
 import { commandExists } from '../lib/shell-utils.js';
 import { reconcileExecutorService } from '../lib/executor-service-lifecycle.js';
-import { reconcileLegacyServicesForExecutorStart } from '../../runtime/migration/installed-executor-upgrade.js';
-import {
-  cleanupRetiredRuntimeSkillArtifacts,
-  isRetiredRuntimeSkill,
-} from '../../runtime/migration/legacy-lifecycle-artifacts.js';
+import { issueExecutorStartFence } from '../../runtime/executor/start-fence.js';
 import {
   activateFreshSplitInstructions,
   refreshSplitInstructions,
@@ -540,6 +536,11 @@ function detectInstallState() {
   return 'incomplete';
 }
 
+export function freshInstallStartFenceProof({ installationRootAbsentAtStart, installState }) {
+  if (installationRootAbsentAtStart !== true || installState !== 'fresh') return null;
+  return Object.freeze({ kind: 'fresh_clean', installation_root_absent: true });
+}
+
 // ── State reset ─────────────────────────────────────────────────
 
 /**
@@ -717,7 +718,6 @@ function syncCoreSkills() {
   const entries = fs.readdirSync(CORE_SKILLS_SRC, { withFileTypes: true });
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
-    if (isRetiredRuntimeSkill(entry.name)) continue;
 
     const srcDir = path.join(CORE_SKILLS_SRC, entry.name);
     const destDir = path.join(SKILLS_DIR, entry.name);
@@ -736,7 +736,6 @@ function syncCoreSkills() {
     }
   }
 
-  cleanupRetiredRuntimeSkillArtifacts({ skillsDir: SKILLS_DIR });
 
   return { installed, updated };
 }
@@ -750,7 +749,6 @@ function installSkillDependencies() {
   const entries = fs.readdirSync(SKILLS_DIR, { withFileTypes: true });
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
-    if (isRetiredRuntimeSkill(entry.name)) continue;
     const skillDir = path.join(SKILLS_DIR, entry.name);
     const pkgPath = path.join(skillDir, 'package.json');
     if (!fs.existsSync(pkgPath)) continue;
@@ -937,7 +935,7 @@ export function requireHealthyExecutorStart(result) {
  * Prepare and start core services via PM2 ecosystem config.
  * @returns {number} Number of services successfully started
  */
-async function startCoreServices() {
+async function startCoreServices({ freshInstallProof = null } = {}) {
   installSkillDependencies();
 
   const ecosystemPath = path.join(ZYLOS_DIR, 'pm2', 'ecosystem.config.cjs');
@@ -945,7 +943,9 @@ async function startCoreServices() {
     throw new Error(`Executor service configuration is missing: ${ecosystemPath}`);
   }
 
-  reconcileLegacyServicesForExecutorStart({ zylosDir: ZYLOS_DIR });
+  if (freshInstallProof !== null) {
+    issueExecutorStartFence({ zylosDir: ZYLOS_DIR, proof: freshInstallProof });
+  }
 
   const result = requireHealthyExecutorStart(
     await reconcileExecutorService({
@@ -1682,6 +1682,9 @@ Note: --setup-token and --api-key values are visible in process listings.
 
 export async function initCommand(args) {
   const opts = parseInitFlags(args);
+  // This is captured before init can create managed state. A pre-existing or
+  // incomplete installation is never allowed to mint a fresh-start fence.
+  const installationRootAbsentAtStart = !fs.existsSync(ZYLOS_DIR);
 
   // --help: print usage and exit
   if (opts.help) {
@@ -2259,7 +2262,11 @@ export async function initCommand(args) {
 
   // Step 10: Start the executor service
   if (!quiet) console.log(`\n${heading('Starting services...')}`);
-  const servicesStarted = serviceStartSuppressed() ? 0 : await startCoreServices();
+  const servicesStarted = serviceStartSuppressed() ? 0 : await startCoreServices({
+    freshInstallProof: freshInstallStartFenceProof({
+      installationRootAbsentAtStart, installState,
+    }),
+  });
 
   if (servicesStarted > 0) {
     setupPm2Startup();

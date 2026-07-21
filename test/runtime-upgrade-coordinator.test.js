@@ -50,11 +50,11 @@ function createFixture() {
     snapshotDirectory: path.join(directory, 'snapshots'),
     legacyQueueFile: path.join(directory, 'legacy-control-queue.json'),
     legacyAuditDirectory: path.join(directory, 'legacy-audit'),
-    legacyDispatcher: { running: true, stop_count: 0, restart_count: 0 },
+    legacyDispatcher: { running: true, stop_count: 0, reconciliation_count: 0 },
   };
 }
 
-function legacySourceAdapter(fixture, { restartLegacyDispatcher } = {}) {
+function legacySourceAdapter(fixture, { verifyLegacySourceRestored } = {}) {
   return createLegacySourceQueueAdapter({
     sourceQueueFile: fixture.legacyQueueFile,
     auditDirectory: fixture.legacyAuditDirectory,
@@ -63,11 +63,14 @@ function legacySourceAdapter(fixture, { restartLegacyDispatcher } = {}) {
       fixture.legacyDispatcher.stop_count += 1;
       return { stopped: true, stopped_at: '2026-07-20T10:00:05.500Z' };
     },
-    restartLegacyDispatcher: restartLegacyDispatcher ?? (async ({ step_id: stepId }) => {
-      fixture.legacyDispatcher.running = true;
-      fixture.legacyDispatcher.restart_count += 1;
+    verifyLegacySourceRestored: verifyLegacySourceRestored ?? (async ({ step_id: stepId }) => {
+      if (fixture.legacyDispatcher.running) throw new Error('legacy runtime must remain inactive');
+      fixture.legacyDispatcher.reconciliation_count += 1;
       return {
-        step_id: stepId, restarted: true, restarted_at: '2026-07-20T10:00:06.750Z',
+        step_id: stepId,
+        source_data_restored: true,
+        legacy_runtime_remained_inactive: true,
+        reconciled_at: '2026-07-20T10:00:06.750Z',
       };
     }),
   });
@@ -491,20 +494,23 @@ describe('runtime upgrade coordinator', () => {
 
     let reopened = new Database(fixture.databasePath);
     const noticeDeliveries = [];
-    const durableRestartProofs = new Map();
-    let crashAfterDispatcherRestart = true;
+    const durableReconciliationProofs = new Map();
+    let crashAfterSourceReconciliation = true;
     const crashSafeLegacyAdapter = legacySourceAdapter(fixture, {
-      async restartLegacyDispatcher({ step_id: stepId }) {
-        if (durableRestartProofs.has(stepId)) return durableRestartProofs.get(stepId);
-        fixture.legacyDispatcher.running = true;
-        fixture.legacyDispatcher.restart_count += 1;
+      async verifyLegacySourceRestored({ step_id: stepId }) {
+        if (durableReconciliationProofs.has(stepId)) return durableReconciliationProofs.get(stepId);
+        if (fixture.legacyDispatcher.running) throw new Error('legacy runtime must remain inactive');
+        fixture.legacyDispatcher.reconciliation_count += 1;
         const proof = {
-          step_id: stepId, restarted: true, restarted_at: '2026-07-20T10:00:06.750Z',
+          step_id: stepId,
+          source_data_restored: true,
+          legacy_runtime_remained_inactive: true,
+          reconciled_at: '2026-07-20T10:00:06.750Z',
         };
-        durableRestartProofs.set(stepId, proof);
-        if (crashAfterDispatcherRestart) {
-          crashAfterDispatcherRestart = false;
-          throw new Error('injected crash after dispatcher restart');
+        durableReconciliationProofs.set(stepId, proof);
+        if (crashAfterSourceReconciliation) {
+          crashAfterSourceReconciliation = false;
+          throw new Error('injected crash after source reconciliation');
         }
         return proof;
       },
@@ -535,19 +541,22 @@ describe('runtime upgrade coordinator', () => {
     expect(await host.advance(preflight.upgrade_id)).toMatchObject({
       state: 'rollback_required', completed_step: 'legacy-source-restore',
     });
-    expect(JSON.parse(fs.readFileSync(fixture.legacyQueueFile, 'utf8')).records).toEqual([
+    const restoredSource = JSON.parse(fs.readFileSync(fixture.legacyQueueFile, 'utf8'));
+    expect(restoredSource.records).toEqual([
       expect.objectContaining({ legacy_record_id: 'safe-pending' }),
       expect.objectContaining({ legacy_record_id: 'recurring-next' }),
     ]);
+    fs.writeFileSync(fixture.legacyQueueFile, `${JSON.stringify({ ...restoredSource, records: [] })}\n`);
     await expect(host.advance(preflight.upgrade_id))
-      .rejects.toThrow('injected crash after dispatcher restart');
+      .rejects.toThrow('Legacy restored source queue changed before reconciliation');
+    fs.writeFileSync(fixture.legacyQueueFile, `${JSON.stringify(restoredSource)}\n`);
+    await expect(host.advance(preflight.upgrade_id))
+      .rejects.toThrow('injected crash after source reconciliation');
     expect(reopened.prepare(`
       SELECT state FROM runtime_upgrade_effects
-      WHERE upgrade_id = ? AND step_key = 'legacy-dispatcher-restart'
+      WHERE upgrade_id = ? AND step_key = 'legacy-source-reconciliation'
     `).get(preflight.upgrade_id)).toEqual({ state: 'claimed' });
-    const consumedAfterRestart = JSON.parse(fs.readFileSync(fixture.legacyQueueFile, 'utf8'));
-    consumedAfterRestart.records = [];
-    fs.writeFileSync(fixture.legacyQueueFile, `${JSON.stringify(consumedAfterRestart)}\n`);
+    fs.writeFileSync(fixture.legacyQueueFile, `${JSON.stringify({ ...restoredSource, records: [] })}\n`);
     reopened.close();
     reopened = new Database(fixture.databasePath);
     host = createInstalledRuntimeUpgradeHost({
@@ -559,15 +568,20 @@ describe('runtime upgrade coordinator', () => {
       releaseAdapter,
       legacySourceAdapter: crashSafeLegacyAdapter,
       noticeAdapter: deliveredNoticeAdapter(reopened, noticeDeliveries),
-      zylosDir: fixture.directory, generateId: ids('host-rollback-restart-reopen'),
+      zylosDir: fixture.directory, generateId: ids('host-rollback-reconciliation-reopen'),
     });
+    await expect(host.advance(preflight.upgrade_id))
+      .rejects.toThrow('Legacy restored source queue changed before reconciliation');
+    fs.writeFileSync(fixture.legacyQueueFile, `${JSON.stringify(restoredSource)}\n`);
     expect(await host.advance(preflight.upgrade_id)).toMatchObject({
-      state: 'rollback_required', completed_step: 'legacy-dispatcher-restart',
+      state: 'rollback_required', completed_step: 'legacy-source-reconciliation',
     });
     expect(await host.advance(preflight.upgrade_id)).toMatchObject({ state: 'rolled_back' });
     expect(activationAttempts).toBe(1);
-    expect(fixture.legacyDispatcher).toMatchObject({ running: true, restart_count: 1 });
-    expect(JSON.parse(fs.readFileSync(fixture.legacyQueueFile, 'utf8')).records).toEqual([]);
+    expect(fixture.legacyDispatcher).toMatchObject({ running: false, reconciliation_count: 1 });
+    expect(JSON.parse(fs.readFileSync(fixture.legacyQueueFile, 'utf8')).records).toEqual(
+      restoredSource.records,
+    );
     expect(noticeDeliveries).toEqual([
       expect.objectContaining({ legacy_record_id: 'unknown-running', status: 'delivered' }),
     ]);
@@ -684,7 +698,7 @@ describe('runtime upgrade coordinator', () => {
     expect((await coordinator.advance('upgrade-partial-invalidation')).completed_step)
       .toBe('legacy-source-restore');
     expect((await coordinator.advance('upgrade-partial-invalidation')).completed_step)
-      .toBe('legacy-dispatcher-restart');
+      .toBe('legacy-source-reconciliation');
     expect(await coordinator.advance('upgrade-partial-invalidation')).toMatchObject({
       state: 'rolled_back',
     });
@@ -981,7 +995,7 @@ describe('runtime upgrade coordinator', () => {
       state: 'rollback_required', completed_step: 'legacy-source-restore',
     });
     expect(await coordinator.advance('upgrade-physical')).toMatchObject({
-      state: 'rollback_required', completed_step: 'legacy-dispatcher-restart',
+      state: 'rollback_required', completed_step: 'legacy-source-reconciliation',
     });
     const rolledBack = await coordinator.advance('upgrade-physical');
     expect(rolledBack).toMatchObject({ state: 'rolled_back' });
@@ -990,7 +1004,7 @@ describe('runtime upgrade coordinator', () => {
       release_ref: 'release-A', release_path: fixture.releaseA,
     });
     expect(fixture.legacyDispatcher).toMatchObject({
-      running: true, stop_count: 1, restart_count: 1,
+      running: false, stop_count: 1, reconciliation_count: 1,
     });
     expect(JSON.parse(fs.readFileSync(fixture.legacyQueueFile, 'utf8'))).toMatchObject({
       batch_id: 'physical-batch', rollback_reconciled: true,
@@ -1047,8 +1061,8 @@ describe('runtime upgrade coordinator', () => {
       WHERE upgrade_id = 'upgrade-physical'
       GROUP BY step_key ORDER BY step_key
     `).all()).toEqual([
-      { step_key: 'legacy-dispatcher-restart', count: 1 },
       { step_key: 'legacy-source-invalidate', count: 1 },
+      { step_key: 'legacy-source-reconciliation', count: 1 },
       { step_key: 'legacy-source-restore', count: 1 },
       { step_key: 'legacy-source-seal', count: 1 },
       { step_key: 'release-activate', count: 1 },

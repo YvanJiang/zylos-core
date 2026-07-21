@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 
 import { requestExecutorService } from '../../runtime/executor/service-host.js';
+import { assertExecutorStartFence } from '../../runtime/executor/start-fence.js';
 
 export const EXECUTOR_SERVICE_NAME = 'zylos-executor';
 
@@ -141,8 +142,10 @@ export async function startExecutorService({
   execFileSyncFn = execFileSync,
   requestFn = requestExecutorService,
   retryDelaysMs = [0, 100, 250, 500, 1_000, 2_000],
+  assertStartFence = assertExecutorStartFence,
 } = {}) {
   try {
+    assertStartFence({ zylosDir });
     inspectExecutorRegistration({ zylosDir, execFileSyncFn, required: false });
     runPm2(execFileSyncFn, [
       'start', ecosystemPath(zylosDir), '--only', EXECUTOR_SERVICE_NAME,

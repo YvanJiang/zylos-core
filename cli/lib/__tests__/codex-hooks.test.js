@@ -62,7 +62,7 @@ function writeTrustedState({ homeDir, zylosDir, hash = 'sha256:core' }) {
 }
 
 describe('Codex core hook installer', () => {
-  it('removes retired core SessionStart hooks and preserves other groups', () => {
+  it('does not dispatch retired hook cleanup through normal Codex configuration', () => {
     const { zylosDir } = makeEnv();
     const hooksPath = codexHooksPath(zylosDir);
     fs.mkdirSync(path.dirname(hooksPath), { recursive: true });
@@ -78,18 +78,18 @@ describe('Codex core hook installer', () => {
     const first = installCoreCodexHook({ zylosDir });
     const second = installCoreCodexHook({ zylosDir });
 
-    assert.equal(first.changed, true);
+    assert.equal(first.changed, false);
     assert.equal(second.changed, false);
 
     const config = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
-    assert.equal(config.hooks.SessionStart.length, 1);
-    assert.equal(JSON.stringify(config).includes('session-start-orchestrator.js'), false);
+    assert.equal(config.hooks.SessionStart.length, 2);
+    assert.equal(JSON.stringify(config).includes('session-start-orchestrator.js'), true);
     assert.ok(config.hooks.SessionStart.some(group =>
       group.hooks?.some(h => h.command.includes('dashboard/hook-ingest.cjs'))
     ));
   });
 
-  it('migrates old flat-array hooks.json and uninstall removes only core hook', () => {
+  it('leaves old flat-array hooks for the isolated migration cleanup path', () => {
     const { zylosDir } = makeEnv();
     const hooksPath = codexHooksPath(zylosDir);
     fs.mkdirSync(path.dirname(hooksPath), { recursive: true });
@@ -99,21 +99,19 @@ describe('Codex core hook installer', () => {
     ], null, 2) + '\n');
 
     const installed = installCoreCodexHook({ zylosDir });
-    // Install removes the retired hook without creating a replacement path.
+    // Normal configuration must not dispatch legacy cleanup.
     assert.equal(installed.commands.length, 0);
     const migrated = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
-    const migratedCommands = migrated.hooks.SessionStart.flatMap(group => group.hooks.map(h => h.command));
-    assert.equal(migratedCommands.filter(c => c.includes('session-start-orchestrator.js')).length, 0);
+    assert.equal(Array.isArray(migrated), true);
 
     const removed = uninstallCoreCodexHook({ zylosDir });
 
     assert.equal(removed.removed, 0);
     const config = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
-    assert.equal(config.hooks.SessionStart.length, 1);
-    assert.equal(config.hooks.SessionStart[0].hooks[0].command, 'node /tmp/other.js');
+    assert.equal(Array.isArray(config), true);
   });
 
-  it('uninstall removes only the core hook from a mixed hook group', () => {
+  it('uninstall leaves migration-owned hook cleanup untouched', () => {
     const { zylosDir } = makeEnv();
     const hooksPath = codexHooksPath(zylosDir);
     const coreCommand = `node ${path.join(zylosDir, '.claude', 'skills', 'activity-monitor', 'scripts', 'session-start-orchestrator.js')}`;
@@ -132,13 +130,11 @@ describe('Codex core hook installer', () => {
 
     const removed = uninstallCoreCodexHook({ zylosDir });
 
-    assert.equal(removed.removed, 1);
+    assert.equal(removed.removed, 0);
     const config = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
     assert.equal(config.hooks.SessionStart.length, 1);
     assert.equal(config.hooks.SessionStart[0].matcher, '*');
-    assert.deepEqual(config.hooks.SessionStart[0].hooks, [
-      { type: 'command', command: 'node /tmp/other.js', timeout: 5 },
-    ]);
+    assert.equal(config.hooks.SessionStart[0].hooks.length, 2);
   });
 
   it('sets [features] hooks=true without dropping existing values', () => {

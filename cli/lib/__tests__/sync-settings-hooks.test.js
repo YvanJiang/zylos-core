@@ -629,12 +629,12 @@ function makeAssemblerTemplate() {
 }
 
 function assertSessionStartUsesAssembler(settings) {
-  assert.equal(settings.hooks.SessionStart.length, 3);
-  for (const group of settings.hooks.SessionStart) {
+  for (const matcher of ['startup', 'clear', 'compact']) {
+    const group = settings.hooks.SessionStart.find((entry) => entry.matcher === matcher);
+    assert.ok(group, `missing ${matcher} assembler group`);
     const assemblerHooks = group.hooks.filter(h => h.command?.includes('assembler.mjs'));
     assert.equal(assemblerHooks.length, 1);
     assert.equal(assemblerHooks[0].timeout, 20000);
-    assert.equal(group.hooks.some(h => /activity-monitor|session-start-orchestrator/.test(h.command ?? '')), false);
   }
 }
 
@@ -714,7 +714,7 @@ describe('hookScriptKey', () => {
       );
       assert.equal(
         isCoreManaged({ type: 'command', command: `node ${absoluteCoreHook}` }),
-        true
+        false
       );
     } finally {
       if (previousZylosDir === undefined) {
@@ -772,7 +772,7 @@ describe('syncHooks SessionStart assembler convergence', () => {
     assert.equal(Object.hasOwn(installed.hooks, 'PostToolUseFailure'), false);
   });
 
-  it('converges standard old SessionStart groups through generic sync', () => {
+  it('adds assembler hooks while preserving legacy groups for committed migration cleanup', () => {
     const installed = {
       hooks: {
         SessionStart: ['startup', 'clear', 'compact'].map(makeStandardOldSessionStartGroup),
@@ -784,7 +784,7 @@ describe('syncHooks SessionStart assembler convergence', () => {
       desiredHooks: desiredClaudeHooks({ existsSync: () => true }),
     });
 
-    assert.deepEqual(result, { added: 3, updated: 0, removed: 12 });
+    assert.deepEqual(result, { added: 3, updated: 0, removed: 0 });
     assertSessionStartUsesAssembler(installed);
   });
 
@@ -829,7 +829,7 @@ describe('syncHooks SessionStart assembler convergence', () => {
     assertSessionStartUsesAssembler(installed);
   });
 
-  it('converges old catch-all SessionStart group to specific orchestrator matchers', () => {
+  it('adds specific assembler matchers without dispatching catch-all legacy cleanup', () => {
     const installed = {
       hooks: {
         SessionStart: [
@@ -847,10 +847,10 @@ describe('syncHooks SessionStart assembler convergence', () => {
     });
 
     assertSessionStartUsesAssembler(installed);
-    assert.equal(installed.hooks.SessionStart.some(group => group.matcher === ''), false);
+    assert.equal(installed.hooks.SessionStart.some(group => group.matcher === ''), true);
   });
 
-  it('preserves user command hooks and non-command hooks while removing retired core hooks', () => {
+  it('preserves user, non-command, and retired hooks until committed migration cleanup', () => {
     const installed = {
       hooks: {
         SessionStart: [
@@ -875,7 +875,7 @@ describe('syncHooks SessionStart assembler convergence', () => {
     assert.ok(startup.hooks.some(h => h.command?.includes('assembler.mjs')));
     assert.ok(startup.hooks.some(h => h.command?.includes('/custom/my-session-start.js')));
     assert.ok(startup.hooks.some(h => h.type === 'prompt'));
-    assert.equal(startup.hooks.some(h => h.command?.includes('session-start-inject.js')), false);
+    assert.equal(startup.hooks.some(h => h.command?.includes('session-start-inject.js')), true);
   });
 
   it('does not claim user hooks outside the zylos .claude root whose suffix collides with current or retired registry keys', () => {
@@ -1235,11 +1235,12 @@ describe('syncHooks forward pass', () => {
 
     syncHooks(installed, template, { log: noopLog, desiredHooks: template.hooks });
 
-    assert.equal(installed.hooks.SessionStart.length, 3);
+    assert.equal(installed.hooks.SessionStart.length, 4);
     const matchers = installed.hooks.SessionStart.map(g => g.matcher).sort();
-    assert.deepEqual(matchers, ['clear', 'compact', 'startup']);
-    for (const group of installed.hooks.SessionStart) {
-      assert.equal(group.hooks.length, 3);
+    assert.deepEqual(matchers, ['', 'clear', 'compact', 'startup']);
+    assert.equal(installed.hooks.SessionStart.find((group) => group.matcher === '').hooks.length, 3);
+    for (const matcher of ['startup', 'clear', 'compact']) {
+      assert.equal(installed.hooks.SessionStart.find((group) => group.matcher === matcher).hooks.length, 3);
     }
   });
 
@@ -1293,7 +1294,7 @@ describe('syncHooks forward pass', () => {
     assert.ok(startupGroup.hooks.some(h => h.command.includes('/skills/a/scripts/a.js')));
   });
 
-  it('reverse pass removes core hook from one matcher when template removes it (matcher-aware)', () => {
+  it('reverse pass leaves retired hooks for committed migration cleanup', () => {
     // Hook exists in both startup and clear in installed config
     // Template keeps it in startup but removes it from clear
     const installed = {
@@ -1319,12 +1320,12 @@ describe('syncHooks forward pass', () => {
 
     const result = syncHooks(installed, template, { log: noopLog, desiredHooks: template.hooks });
 
-    assert.equal(result.removed, 1);
+    assert.equal(result.removed, 0);
     // startup should still have the hook
     const startupGroup = installed.hooks.SessionStart.find(g => g.matcher === 'startup');
     assert.equal(startupGroup.hooks.length, 1);
-    // clear group should be cleaned up (empty after removal)
+    // The retired hook remains until the isolated committed cleanup runs.
     const clearGroup = installed.hooks.SessionStart.find(g => g.matcher === 'clear');
-    assert.equal(clearGroup, undefined); // empty group gets removed
+    assert.equal(clearGroup.hooks.length, 1);
   });
 });
