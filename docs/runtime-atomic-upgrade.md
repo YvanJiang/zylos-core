@@ -60,9 +60,9 @@ routed pending C4 and safe next occurrences of one-time, recurring, or interval 
 it. A rollback after an activation or migration failure first reads the hash-bound full audit into
 immutable Core migration records, compact facts, 30-day detail, and 180-day runtime-control audit;
 unknown-side-effect notices must have durable delivery proof before release recovery can begin. The
-temporary mixed audit is then sealed. Queue restoration and dispatcher restart are separate durable
-effects: the former finishes while the dispatcher is stopped, and the latter requires a
-dispatcher-owned `step_id` proof that is replayable even if the restored queue has already progressed.
+temporary mixed audit is then sealed. Queue restoration and inert source reconciliation are separate
+durable effects: the latter requires a `step_id` proof that the restored source is correct while the
+legacy runtime remains inactive, even if the restored queue has already progressed.
 Runtime control, ambiguous/running work, history, and unknown side effects can never re-enter the
 executable source. Commit deletes the unused rollback queue.
 
@@ -72,7 +72,7 @@ the attemptless turns outside active states. A later upgrade may
 adopt the exact payload and turn after proving the prior run rolled back and no provider attempt exists.
 It does not replace the live SQLite database, so ingress accepted during maintenance remains durable.
 The service transaction refuses to terminalize `rolled_back` when a completed source invalidation
-lacks audit sealing, queue restoration, dispatcher restart, or delivered notice evidence. A claimed
+lacks audit sealing, queue restoration, inert source reconciliation, or delivered notice evidence. A claimed
 invalidation that crashed after stopping or renaming the source is resumed from its durable input
 before any rollback code consumes its result.
 

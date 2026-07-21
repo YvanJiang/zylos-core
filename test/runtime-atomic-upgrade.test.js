@@ -176,7 +176,7 @@ function recordVerifiedRestoreEffect(database, upgradeId, snapshot) {
   if (sourceInvalidation !== undefined) {
     const sourceProof = JSON.parse(sourceInvalidation.result_json);
     for (const stepKey of [
-      'legacy-source-seal', 'legacy-source-restore', 'legacy-dispatcher-restart',
+      'legacy-source-seal', 'legacy-source-restore', 'legacy-source-reconciliation',
     ]) {
       const result = stepKey === 'legacy-source-seal'
         ? {
@@ -192,8 +192,9 @@ function recordVerifiedRestoreEffect(database, upgradeId, snapshot) {
               }
             : {
                 source_queue_ref: sourceProof.source_queue_ref,
-                legacy_dispatcher_restarted: true,
-                dispatcher_restart_idempotency_key: `${upgradeId}:${stepKey}`,
+                source_data_restored: true,
+                legacy_runtime_remained_inactive: true,
+                source_reconciliation_idempotency_key: `${upgradeId}:${stepKey}`,
               });
       database.prepare(`
         INSERT OR REPLACE INTO runtime_upgrade_effects (
@@ -829,22 +830,23 @@ describe('atomic runtime upgrade state machine', () => {
     recordVerifiedRestoreEffect(database, 'upgrade-data-rollback', dataRollbackSnapshot);
     database.prepare(`
       DELETE FROM runtime_upgrade_effects
-      WHERE upgrade_id = 'upgrade-data-rollback' AND step_key = 'legacy-dispatcher-restart'
+      WHERE upgrade_id = 'upgrade-data-rollback' AND step_key = 'legacy-source-reconciliation'
     `).run();
     expect(() => upgrade.completeRollback('upgrade-data-rollback'))
-      .toThrow('completed legacy-dispatcher-restart effect');
+      .toThrow('completed legacy-source-reconciliation effect');
     database.prepare(`
       INSERT INTO runtime_upgrade_effects (
         upgrade_id, step_key, step_id, input_hash, state, claim_owner,
         claim_attempt, claim_expires_at, result_json, committed_at, updated_at
-      ) VALUES ('upgrade-data-rollback', 'legacy-dispatcher-restart',
-        'upgrade-data-rollback:legacy-dispatcher-restart', 'fixture-input-hash',
+      ) VALUES ('upgrade-data-rollback', 'legacy-source-reconciliation',
+        'upgrade-data-rollback:legacy-source-reconciliation', 'fixture-input-hash',
         'completed', 'fixture', 1, NULL, ?,
         '2026-07-20T10:00:02.000Z', '2026-07-20T10:00:02.000Z')
     `).run(JSON.stringify({
       source_queue_ref: '/disposable/legacy-control-queue.json',
-      legacy_dispatcher_restarted: true,
-      dispatcher_restart_idempotency_key: 'upgrade-data-rollback:legacy-dispatcher-restart',
+      source_data_restored: true,
+      legacy_runtime_remained_inactive: true,
+      source_reconciliation_idempotency_key: 'upgrade-data-rollback:legacy-source-reconciliation',
     }));
     upgrade.completeRollback('upgrade-data-rollback');
     expect(database.prepare(`

@@ -415,7 +415,7 @@ describe('installed executor production upgrade owner', () => {
     database.close();
   });
 
-  test('stops owned legacy registrations before activation and restores their exact state on rollback', async () => {
+  test('removes inactive legacy registrations before activation and keeps them removed on rollback', async () => {
     const directory = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-legacy-rollback-'));
     directories.push(directory);
     const currentRelease = path.join(directory, 'release-A');
@@ -448,7 +448,7 @@ describe('installed executor production upgrade owner', () => {
       ['c4-dispatcher', path.join(zylosDir, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-dispatcher.js')],
     ]);
     const processes = new Map([
-      ['activity-monitor', 'online'],
+      ['activity-monitor', 'stopped'],
       ['c4-dispatcher', 'stopped'],
     ]);
     const commands = [];
@@ -488,16 +488,13 @@ describe('installed executor production upgrade owner', () => {
       action: 'upgrade',
       target: { release: 'release-B', downloaded_source: downloadedSource },
     })).resolves.toMatchObject({ success: false, state: 'rolled_back' });
-    expect(processes).toEqual(new Map([
-      ['activity-monitor', 'online'],
-      ['c4-dispatcher', 'stopped'],
-    ]));
+    expect(processes).toEqual(new Map());
     expect(commands).toContainEqual(['pm2', ['delete', 'activity-monitor']]);
     expect(commands).toContainEqual(['pm2', ['delete', 'c4-dispatcher']]);
-    expect(commands).toContainEqual([
+    expect(commands).not.toContainEqual([
       'pm2', ['start', path.join(zylosDir, 'pm2', 'ecosystem.config.cjs'), '--only', 'activity-monitor'],
     ]);
-    expect(commands).toContainEqual(['pm2', ['stop', 'c4-dispatcher']]);
+    expect(commands).not.toContainEqual(['pm2', ['stop', 'c4-dispatcher']]);
     expect(JSON.parse(fs.readFileSync(
       path.join(zylosDir, 'runtime', 'active-release.json'), 'utf8',
     ))).toMatchObject({ release_ref: 'release-A', upgrade_id: null });

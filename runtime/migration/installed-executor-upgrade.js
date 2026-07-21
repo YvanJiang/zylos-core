@@ -672,7 +672,12 @@ export function createInstalledExecutorUpgradeHandler({
     if (registered.length > 0) {
       throw new Error('Legacy runtime registrations must remain removed after rollback.');
     }
-    return Object.freeze({ step_id: stepId, source_data_restored: true, restarted: true, restarted_at: now() });
+    return Object.freeze({
+      step_id: stepId,
+      source_data_restored: true,
+      legacy_runtime_remained_inactive: true,
+      reconciled_at: now(),
+    });
   }
 
   async function executePlan(plan) {
@@ -720,7 +725,7 @@ export function createInstalledExecutorUpgradeHandler({
         upgradeId: plan.upgrade_id,
         stepId,
       }),
-      restartLegacyDispatcher: async ({ step_id: stepId }) => restoreLegacySourceData({
+      verifyLegacySourceRestored: async ({ step_id: stepId }) => restoreLegacySourceData({
         upgradeId: plan.upgrade_id,
         stepId,
       }),
@@ -825,7 +830,7 @@ export function createInstalledExecutorUpgradeHandler({
     }
     const rollbackReconciliationStarted = database.prepare(`
       SELECT 1 FROM runtime_upgrade_effects
-      WHERE upgrade_id = ? AND step_key = 'legacy-dispatcher-restart'
+      WHERE upgrade_id = ? AND step_key = 'legacy-source-reconciliation'
       LIMIT 1
     `).get(upgradeId) !== undefined;
     if (plan.from_release_kind === 'legacy_base' && !rollbackReconciliationStarted) {

@@ -166,7 +166,7 @@ export function createLegacySourceQueueAdapter({
   sourceQueueFile,
   auditDirectory,
   stopLegacyDispatcher,
-  restartLegacyDispatcher,
+  verifyLegacySourceRestored,
 }) {
   for (const [name, value] of Object.entries({ sourceQueueFile, auditDirectory })) {
     if (typeof value !== 'string' || !path.isAbsolute(value)
@@ -177,7 +177,7 @@ export function createLegacySourceQueueAdapter({
   const sourcePath = path.resolve(sourceQueueFile);
   const auditRoot = path.resolve(auditDirectory);
   requireFunction('stopLegacyDispatcher', stopLegacyDispatcher);
-  requireFunction('restartLegacyDispatcher', restartLegacyDispatcher);
+  requireFunction('verifyLegacySourceRestored', verifyLegacySourceRestored);
 
   async function materializeReadOnly(file, document) {
     try {
@@ -336,24 +336,27 @@ export function createLegacySourceQueueAdapter({
         source_queue_restored: true,
       });
     },
-    async restart({ step_id: stepId, source_queue_ref: restoredSourceRef }) {
+    async reconcile({ step_id: stepId, source_queue_ref: restoredSourceRef }) {
       if (path.resolve(restoredSourceRef) !== sourcePath) {
-        throw new Error('Legacy dispatcher restart requires the exact restored source queue.');
+        throw new Error('Legacy source reconciliation requires the exact restored source queue.');
       }
-      const restartProof = await restartLegacyDispatcher(Object.freeze({
+      const reconciliationProof = await verifyLegacySourceRestored(Object.freeze({
         step_id: stepId,
         source_queue_ref: sourcePath,
       }));
-      if (restartProof?.restarted !== true || typeof restartProof.restarted_at !== 'string'
-        || restartProof.step_id !== stepId) {
-        throw new Error('Legacy rollback requires dispatcher-owned idempotent restart proof.');
+      if (reconciliationProof?.source_data_restored !== true
+        || reconciliationProof?.legacy_runtime_remained_inactive !== true
+        || typeof reconciliationProof.reconciled_at !== 'string'
+        || reconciliationProof.step_id !== stepId) {
+        throw new Error('Legacy rollback requires idempotent inert source-reconciliation proof.');
       }
       return Object.freeze({
         step_id: stepId,
         source_queue_ref: sourcePath,
-        legacy_dispatcher_restarted: true,
-        legacy_dispatcher_restarted_at: restartProof.restarted_at,
-        dispatcher_restart_idempotency_key: stepId,
+        source_data_restored: true,
+        legacy_runtime_remained_inactive: true,
+        legacy_source_reconciled_at: reconciliationProof.reconciled_at,
+        source_reconciliation_idempotency_key: stepId,
       });
     },
     async commit({ rollback_queue_ref: rollbackQueueRef, rollback_queue_sha256: rollbackQueueSha256 }) {
@@ -397,10 +400,10 @@ export function createRuntimeUpgradeCoordinator({
       || typeof legacySourceAdapter.readAudit !== 'function'
       || typeof legacySourceAdapter.seal !== 'function'
       || typeof legacySourceAdapter.restore !== 'function'
-      || typeof legacySourceAdapter.restart !== 'function'
+      || typeof legacySourceAdapter.reconcile !== 'function'
       || typeof legacySourceAdapter.commit !== 'function')) {
     throw new TypeError(
-      'legacySourceAdapter must expose invalidate, readAudit, seal, restore, restart, and commit',
+      'legacySourceAdapter must expose invalidate, readAudit, seal, restore, reconcile, and commit',
     );
   }
   requireFunction('snapshotAdapter.capture', snapshotAdapter.capture);
@@ -813,18 +816,18 @@ export function createRuntimeUpgradeCoordinator({
         return Object.freeze({ ...run, completed_step: 'legacy-source-restore' });
       }
       if (sourceInvalidation !== null
-        && loadEffect(upgradeId, 'legacy-dispatcher-restart')?.state !== 'completed') {
+        && loadEffect(upgradeId, 'legacy-source-reconciliation')?.state !== 'completed') {
         const sourceRestore = loadEffect(upgradeId, 'legacy-source-restore');
         await performEffect(
           upgradeId,
-          'legacy-dispatcher-restart',
+          'legacy-source-reconciliation',
           {
             upgrade_id: upgradeId,
             source_queue_ref: sourceRestore.result.source_queue_ref,
           },
-          (request) => legacySourceAdapter.restart(request),
+          (request) => legacySourceAdapter.reconcile(request),
         );
-        return Object.freeze({ ...run, completed_step: 'legacy-dispatcher-restart' });
+        return Object.freeze({ ...run, completed_step: 'legacy-source-reconciliation' });
       }
       return upgradeService.completeRollback(upgradeId);
     }

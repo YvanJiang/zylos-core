@@ -459,11 +459,11 @@ export function createRuntimeUpgradeService({
         const completedEffects = new Map(database.prepare(`
           SELECT step_key, step_id, result_json FROM runtime_upgrade_effects
           WHERE upgrade_id = ? AND step_key IN (
-            'legacy-source-seal', 'legacy-source-restore', 'legacy-dispatcher-restart'
+            'legacy-source-seal', 'legacy-source-restore', 'legacy-source-reconciliation'
           ) AND state = 'completed'
         `).all(upgradeId).map((effect) => [effect.step_key, effect]));
         for (const stepKey of [
-          'legacy-source-seal', 'legacy-source-restore', 'legacy-dispatcher-restart',
+          'legacy-source-seal', 'legacy-source-restore', 'legacy-source-reconciliation',
         ]) {
           if (!completedEffects.has(stepKey)) {
             throw new Error(`Rollback requires completed ${stepKey} effect.`);
@@ -471,8 +471,8 @@ export function createRuntimeUpgradeService({
         }
         const seal = JSON.parse(completedEffects.get('legacy-source-seal').result_json);
         const sourceRestore = JSON.parse(completedEffects.get('legacy-source-restore').result_json);
-        const dispatcherRestart = JSON.parse(
-          completedEffects.get('legacy-dispatcher-restart').result_json,
+        const sourceReconciliation = JSON.parse(
+          completedEffects.get('legacy-source-reconciliation').result_json,
         );
         if (seal.audit_queue_ref !== sourceProof.audit_queue_ref
           || seal.audit_sha256 !== sourceProof.audit_sha256
@@ -480,10 +480,11 @@ export function createRuntimeUpgradeService({
           || sourceRestore.source_queue_ref !== sourceProof.source_queue_ref
           || sourceRestore.rollback_queue_sha256 !== sourceProof.rollback_queue_sha256
           || sourceRestore.source_queue_restored !== true
-          || dispatcherRestart.source_queue_ref !== sourceProof.source_queue_ref
-          || dispatcherRestart.legacy_dispatcher_restarted !== true
-          || dispatcherRestart.dispatcher_restart_idempotency_key
-            !== completedEffects.get('legacy-dispatcher-restart').step_id) {
+          || sourceReconciliation.source_queue_ref !== sourceProof.source_queue_ref
+          || sourceReconciliation.source_data_restored !== true
+          || sourceReconciliation.legacy_runtime_remained_inactive !== true
+          || sourceReconciliation.source_reconciliation_idempotency_key
+            !== completedEffects.get('legacy-source-reconciliation').step_id) {
           throw new Error('Rollback legacy source effects do not match invalidation proof.');
         }
         const pendingNotices = database.prepare(`

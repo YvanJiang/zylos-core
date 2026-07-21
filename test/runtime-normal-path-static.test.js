@@ -405,6 +405,21 @@ describe('normal product paths have no retired runtime authority', () => {
     expect(upgrade).not.toMatch(/execFileSyncFn\('pm2', \['start'/);
   });
 
+  test('rollback reconciliation proves source restoration without reviving a legacy runtime', () => {
+    const coordinator = fs.readFileSync(
+      path.resolve('runtime/migration/runtime-upgrade-coordinator.js'), 'utf8',
+    );
+    const service = fs.readFileSync(
+      path.resolve('runtime/migration/runtime-upgrade-service.js'), 'utf8',
+    );
+    expect(coordinator).toMatch(/legacy-source-reconciliation/);
+    expect(coordinator).toMatch(/legacy_runtime_remained_inactive: true/);
+    expect(coordinator).not.toMatch(/legacy-dispatcher-restart|restartLegacyDispatcher|legacy_dispatcher_restarted/);
+    expect(service).toMatch(/legacy-source-reconciliation/);
+    expect(service).toMatch(/legacy_runtime_remained_inactive !== true/);
+    expect(service).not.toMatch(/legacy-dispatcher-restart|legacy_dispatcher_restarted/);
+  });
+
   test('normal runtime entrypoints do not import migration code', () => {
     for (const file of normalRuntimeFiles.filter((file) => !file.startsWith('cli/'))) {
       const source = fs.readFileSync(path.resolve(file), 'utf8');
