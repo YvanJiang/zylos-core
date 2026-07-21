@@ -1,8 +1,58 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 const START_FENCE_CONTRACT = 'zylos.executor-start-fence@1';
+const RETIRED_PM2_SERVICE_NAMES = Object.freeze([
+  'activity-monitor', 'c4-dispatcher', 'scheduler', 'web-console', 'caddy',
+]);
+
+function expectedRetiredPm2Paths(zylosDir) {
+  const resolved = path.resolve(zylosDir);
+  if (!path.isAbsolute(zylosDir) || path.parse(resolved).root === resolved) {
+    throw new TypeError('zylosDir must be an explicit absolute non-root path');
+  }
+  const skills = path.join(resolved, '.claude', 'skills');
+  return new Map([
+    ['activity-monitor', path.join(skills, 'activity-monitor', 'scripts', 'activity-monitor.js')],
+    ['c4-dispatcher', path.join(skills, 'comm-bridge', 'scripts', 'c4-dispatcher.js')],
+    ['scheduler', path.join(skills, 'scheduler', 'scripts', 'daemon.js')],
+    ['web-console', path.join(skills, 'web-console', 'scripts', 'server.js')],
+    ['caddy', path.join(resolved, 'bin', 'caddy')],
+  ]);
+}
+
+function requireFreshPm2Absence({ zylosDir, execFileSyncFn }) {
+  let inventory;
+  try {
+    inventory = JSON.parse(execFileSyncFn('pm2', ['jlist'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000,
+    }));
+  } catch {
+    throw new Error('Fresh executor start requires an authoritative PM2 inventory.');
+  }
+  if (!Array.isArray(inventory)) {
+    throw new Error('Fresh executor start requires an authoritative PM2 inventory.');
+  }
+  const expected = expectedRetiredPm2Paths(zylosDir);
+  for (const registration of inventory) {
+    if (!registration || typeof registration !== 'object' || Array.isArray(registration)
+      || typeof registration.name !== 'string' || registration.name.length === 0
+      || !registration.pm2_env || typeof registration.pm2_env !== 'object'
+      || Array.isArray(registration.pm2_env)) {
+      throw new Error('Fresh executor start requires an authoritative PM2 inventory.');
+    }
+    if (!RETIRED_PM2_SERVICE_NAMES.includes(registration.name)) continue;
+    const actualPath = registration.pm2_env.pm_exec_path ?? registration.pm_exec_path;
+    const expectedPath = expected.get(registration.name);
+    if (typeof actualPath !== 'string' || path.resolve(actualPath) !== path.resolve(expectedPath)) {
+      throw new Error(`Fresh executor start PM2 registration is ambiguous: ${registration.name}.`);
+    }
+    throw new Error(`Fresh executor start PM2 registration remains: ${registration.name}.`);
+  }
+  return Object.freeze({ legacy_pm2_registrations_absent: true });
+}
 
 export function executorStartFencePath(zylosDir) {
   if (typeof zylosDir !== 'string' || !path.isAbsolute(zylosDir)
@@ -17,12 +67,14 @@ function requireIssuanceProof(proof) {
     throw new TypeError('Executor start fence requires an explicit issuance proof.');
   }
   if (proof.kind === 'fresh_clean') {
-    if (proof.installation_root_absent !== true) {
+    if (proof.installation_root_absent !== true
+      || proof.legacy_pm2_registrations_absent !== true) {
       throw new Error('Executor start fence fresh-clean proof is not authoritative.');
     }
     return Object.freeze({
       issuance_kind: 'fresh_clean',
       installation_root_absent: true,
+      legacy_pm2_registrations_absent: true,
     });
   }
   if (proof.kind === 'committed_reconciliation') {
@@ -66,8 +118,17 @@ export function issueExecutorStartFence({
   zylosDir,
   proof,
   now = () => new Date().toISOString(),
+  execFileSyncFn = execFileSync,
 } = {}) {
-  const issuance = requireIssuanceProof(proof);
+  if (proof?.kind === 'fresh_clean' && proof.installation_root_absent !== true) {
+    throw new Error('Executor start fence fresh-clean proof is not authoritative.');
+  }
+  const freshAbsence = proof?.kind === 'fresh_clean'
+    ? requireFreshPm2Absence({ zylosDir, execFileSyncFn })
+    : null;
+  const issuance = requireIssuanceProof(freshAbsence === null
+    ? proof
+    : { ...proof, ...freshAbsence });
   const reconciledAt = now();
   if (typeof reconciledAt !== 'string' || reconciledAt.length === 0) {
     throw new TypeError('Executor start fence reconciliation time is required.');
@@ -97,7 +158,11 @@ export function assertExecutorStartFence({ zylosDir, readFileSync = fs.readFileS
     throw new Error('Executor startup reconciliation fence is invalid.');
   }
   requireIssuanceProof(fence.issuance_kind === 'fresh_clean'
-    ? { kind: 'fresh_clean', installation_root_absent: fence.installation_root_absent }
+    ? {
+      kind: 'fresh_clean',
+      installation_root_absent: fence.installation_root_absent,
+      legacy_pm2_registrations_absent: fence.legacy_pm2_registrations_absent,
+    }
     : {
       kind: 'committed_reconciliation',
       upgrade_id: fence.upgrade_id,

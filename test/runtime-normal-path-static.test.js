@@ -124,11 +124,20 @@ const migrationOnlyRepositoryFiles = new Set([
   'runtime/migration/legacy-lifecycle-artifacts.js',
 ]);
 
+// This is not a legacy execution route: fresh init reads PM2 once to refuse
+// executor startup when a selected-installation retired registration exists.
+// Keep its narrow exception paired with a mutation/import ban below.
+const readOnlyFreshFenceGuardFiles = new Set([
+  'runtime/executor/start-fence.js',
+  'test/executor-start-fence.test.js',
+]);
+
 describe('normal product paths have no retired runtime authority', () => {
   test('the tracked repository contains retired identifiers only in isolated migration code or proofs', () => {
     const violations = repositoryFiles()
       .filter(isScannableText)
       .filter((file) => !migrationOnlyRepositoryFiles.has(file))
+      .filter((file) => !readOnlyFreshFenceGuardFiles.has(file))
       .filter(containsRetiredAuthority);
     expect(violations).toEqual([]);
   });
@@ -140,6 +149,13 @@ describe('normal product paths have no retired runtime authority', () => {
         /tmux|capture-pane|send-keys|paste-buffer|agent-status\.json|global session|runtime is alive/i,
       );
     }
+  });
+
+  test('the fresh fence PM2 overlap guard is read-only and cannot dispatch migration cleanup', () => {
+    const source = fs.readFileSync(path.resolve('runtime/executor/start-fence.js'), 'utf8');
+    expect(source).toContain("execFileSyncFn('pm2', ['jlist']");
+    expect(source).not.toMatch(/\['(?:stop|delete|save|start|restart)'/);
+    expect(source).not.toMatch(/runtime\/migration|reconcileLegacyServicesForExecutorStart/);
   });
 
   test('system instructions never ask a model to select or execute a delivery route', () => {
@@ -393,6 +409,7 @@ describe('normal product paths have no retired runtime authority', () => {
     const violations = files
       .filter(isScannableText)
       .filter((file) => !migrationOnly.has(file))
+      .filter((file) => file !== 'runtime/executor/start-fence.js')
       .filter(containsRetiredAuthority);
     expect(violations).toEqual([]);
   });
