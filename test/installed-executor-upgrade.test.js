@@ -9,7 +9,6 @@ import { driveInstalledRuntimeUpgrade } from '../runtime/migration/executor-upgr
 import {
   createInstalledExecutorUpgradeHandler,
   reconcileLegacyServicesForExecutorStart,
-  removeLegacyServiceRegistrations,
   retireOwnedLegacyServices,
 } from '../runtime/migration/installed-executor-upgrade.js';
 import { legacyLifecycleArtifactPaths } from '../runtime/migration/legacy-lifecycle-artifacts.js';
@@ -331,59 +330,7 @@ describe('installed executor production upgrade owner', () => {
     expect(deleteAttempts).toBe(1);
   });
 
-  test('postcommit cleanup removes only obsolete supervisor registrations', () => {
-    const zylosDir = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-pm2-owner-'));
-    directories.push(zylosDir);
-    const commands = [];
-    const result = removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn: (file, args) => {
-      commands.push([file, args]);
-      if (args[0] === 'jlist') {
-        return JSON.stringify([
-          { name: 'c4-dispatcher', pm2_env: {
-            status: 'stopped',
-            pm_exec_path: path.join(zylosDir, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-dispatcher.js'),
-          } },
-          { name: 'activity-monitor', pm2_env: {
-            status: 'errored',
-            pm_exec_path: path.join(zylosDir, '.claude', 'skills', 'activity-monitor', 'scripts', 'activity-monitor.js'),
-          } },
-          { name: 'zylos-executor', pm2_env: { status: 'online' } },
-        ]);
-      }
-      return '';
-    } });
-
-    expect(result).toEqual({ removed_services: ['c4-dispatcher', 'activity-monitor'] });
-    expect(commands).toEqual([
-      ['pm2', ['jlist']],
-      ['pm2', ['delete', 'c4-dispatcher']],
-      ['pm2', ['delete', 'activity-monitor']],
-      ['pm2', ['save']],
-    ]);
-  });
-
-  test('fails closed on generic PM2 name collisions without deleting user services', () => {
-    const zylosDir = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-pm2-collision-'));
-    directories.push(zylosDir);
-    const commands = [];
-
-    expect(() => removeLegacyServiceRegistrations({
-      zylosDir,
-      execFileSyncFn: (file, args) => {
-        commands.push([file, args]);
-        if (args[0] === 'jlist') {
-          return JSON.stringify([{
-            name: 'scheduler',
-            pm2_env: { status: 'online', pm_exec_path: '/opt/user/scheduler.js' },
-          }]);
-        }
-        return '';
-      },
-    })).toThrow('ambiguous PM2 service name collisions: scheduler');
-    expect(commands).toEqual([['pm2', ['jlist']]]);
-  });
-
-  test('init removes exact stopped legacy registrations but never takes over active ones', () => {
+  test('postcommit reconciliation refuses reappeared registrations instead of deleting them', () => {
     const zylosDir = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-init-legacy-'));
     directories.push(zylosDir);
     const scriptPath = path.join(
@@ -391,31 +338,21 @@ describe('installed executor production upgrade owner', () => {
     );
     for (const status of ['stopped', 'online']) {
       const commands = [];
-      let registered = true;
       const execFileSyncFn = (file, args) => {
         commands.push([file, args]);
         if (args[0] === 'jlist') {
-          return JSON.stringify(registered ? [{
+          return JSON.stringify([{
             name: 'c4-dispatcher', pm2_env: { status, pm_exec_path: scriptPath },
-          }] : []);
+          }]);
         }
-        if (args[0] === 'delete') registered = false;
         return '';
       };
       if (status === 'stopped') {
-        expect(reconcileLegacyServicesForExecutorStart({
+        expect(() => reconcileLegacyServicesForExecutorStart({
           zylosDir, upgradeId: 'upgrade-fence-fixture', execFileSyncFn,
-        }))
-          .toMatchObject({
-            removed_services: ['c4-dispatcher'],
-            executor_start_fence_path: path.join(zylosDir, 'runtime', 'executor-start-fence.json'),
-          });
-        expect(JSON.parse(fs.readFileSync(
-          path.join(zylosDir, 'runtime', 'executor-start-fence.json'), 'utf8',
-        ))).toMatchObject({
-          contract: 'zylos.executor-start-fence@1', runtime_generation: 'executor_only',
-        });
-        expect(commands).toContainEqual(['pm2', ['delete', 'c4-dispatcher']]);
+        })).toThrow('registrations reappeared after verified retirement');
+        expect(fs.existsSync(path.join(zylosDir, 'runtime', 'executor-start-fence.json'))).toBe(false);
+        expect(commands).toEqual([['pm2', ['jlist']], ['pm2', ['jlist']]]);
       } else {
         expect(() => reconcileLegacyServicesForExecutorStart({
           zylosDir, upgradeId: 'upgrade-fence-fixture', execFileSyncFn,

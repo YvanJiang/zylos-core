@@ -480,9 +480,12 @@ export function reconcileLegacyServicesForExecutorStart({
     throw new TypeError('Committed executor reconciliation requires an upgrade id.');
   }
   assertLegacyServicesInactive({ zylosDir, execFileSyncFn });
-  const result = removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn });
+  // All destructive retirement belongs to the earlier, durable
+  // legacy-source-invalidate effect. A registration here is either a race,
+  // tamper, or an unproven prior action; never delete it from postcommit
+  // cleanup because that would turn a timeout/crash into an unsafe replay.
   if (inspectLegacyServiceRegistrations({ zylosDir, execFileSyncFn }).length > 0) {
-    throw new Error('Obsolete runtime registrations remained after reconciliation.');
+    throw new Error('Obsolete runtime registrations reappeared after verified retirement.');
   }
   const residual = legacyLifecycleArtifactPaths(zylosDir).filter((artifact) => fs.existsSync(artifact));
   if (residual.length > 0) {
@@ -498,23 +501,10 @@ export function reconcileLegacyServicesForExecutorStart({
       legacy_artifacts_reconciled: true,
     },
   });
-  return Object.freeze({ ...result, executor_start_fence_path: issued.path });
-}
-
-export function removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn = execFileSync }) {
-  const registrations = inspectLegacyServiceRegistrations({ zylosDir, execFileSyncFn });
-  const active = registrations.filter(({ was_running: wasRunning }) => wasRunning);
-  if (active.length > 0) {
-    throw new Error(`Obsolete runtime services are still active: ${active.map(({ name }) => name).join(', ')}`);
-  }
-  const registered = registrations.map(({ name }) => name);
-  for (const serviceName of registered) {
-    execFileSyncFn('pm2', ['delete', serviceName], { stdio: 'pipe', timeout: 30_000 });
-  }
-  if (registered.length > 0) {
-    execFileSyncFn('pm2', ['save'], { stdio: 'pipe', timeout: 30_000 });
-  }
-  return Object.freeze({ removed_services: Object.freeze(registered) });
+  return Object.freeze({
+    removed_services: Object.freeze([]),
+    executor_start_fence_path: issued.path,
+  });
 }
 
 function installReleaseDependencies({ releasePath, execFileSyncFn, prepareOnly, installRoot = true }) {
