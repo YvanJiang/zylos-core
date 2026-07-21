@@ -523,9 +523,9 @@ describe('web-console attachment routes', () => {
   test('an outbox row cannot borrow another turn identity to authorize its reply', async () => {
     ctx = await startServer({ actualC4Receive: true });
     const coreDb = new Database(ctx.dbPath);
-    const acceptText = (suffix, text) => acceptCompatibilityInbound(coreDb, {
+    const acceptText = (suffix, text, timestamp) => acceptCompatibilityInbound(coreDb, {
       inbound_event_id: `identity-${suffix}-inbound`, trace_id: `identity-${suffix}-trace`,
-      occurred_at: '2026-07-21T00:00:00.000Z', received_at: '2026-07-21T00:00:00.000Z',
+      occurred_at: timestamp, received_at: timestamp,
       region: 'global', tenant_id: 'default', channel: 'web-console',
       bot_id: 'zylos', chat_type: 'dm', chat_id: 'console',
       native_thread_or_topic_id: null, message_id: `identity-${suffix}-message`,
@@ -533,9 +533,17 @@ describe('web-console attachment routes', () => {
       content: { kind: 'text', text, attachments: [] },
       reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
       source_ref: `identity-${suffix}-source`,
-    }, { now: () => '2026-07-21T00:00:00.000Z' });
-    const first = acceptText('first', 'canonical first inbound');
-    const second = acceptText('second', 'safe second inbound');
+    }, { now: () => timestamp });
+    const first = acceptText(
+      'first', 'canonical first inbound', '2026-07-21T00:00:00.000Z',
+    );
+    const second = acceptText(
+      'second', 'safe second inbound', '2026-07-21T00:00:01.000Z',
+    );
+    const firstDeliveryId = coreDb.prepare(`
+      SELECT delivery_id FROM runtime_outbox
+      WHERE json_extract(command_json, '$.mapping.turn_id') = ?
+    `).get(first.turn_id).delivery_id;
     coreDb.prepare('UPDATE runtime_outbox SET turn_id = ? WHERE turn_id = ?')
       .run(second.turn_id, first.turn_id);
     coreDb.close();
@@ -552,6 +560,8 @@ describe('web-console attachment routes', () => {
     const response = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
     expect(response.status).toBe(200);
     const messages = await response.json();
+    expect(messages.filter(({ delivery_id: deliveryId }) => deliveryId === firstDeliveryId))
+      .toEqual([]);
     expect(messages.filter(({ direction }) => direction === 'out')).toEqual([]);
     expect(messages.filter(({ direction }) => direction === 'in').map(({ content }) => content))
       .toEqual(['stale first projection', 'safe second inbound']);
