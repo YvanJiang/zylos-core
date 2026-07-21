@@ -203,7 +203,9 @@ describe('exact-base durable source fencing', () => {
     const server = `zylos-issue27-${process.pid}-${Date.now()}`;
     execFileSync('tmux', [
       '-L', server, '-f', '/dev/null', 'new-session', '-d', '-s', 'claude-main',
-      'while :; do sleep 1; done',
+      // Preserve the child identity across suspend/resume assertions under
+      // parallel test load; ESRCH and PID-reuse paths are injected below.
+      'while :; do sleep 30; done',
     ]);
     tmuxServers.set(server, Number(execFileSync(
       'tmux', ['-L', server, 'display-message', '-p', '#{pid}'], { encoding: 'utf8' },

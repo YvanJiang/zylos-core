@@ -414,11 +414,11 @@ export function reconcileRunningTasks(db, snapshot, {
 /**
  * Update next_run_at for recurring/interval tasks after completion
  */
-export function updateNextRunTime(db, task) {
+export function updateNextRunTime(db, task, { fromDate = new Date() } = {}) {
   let nextRun;
 
   if (task.type === 'recurring' && task.cron_expression) {
-    nextRun = getNextRun(task.cron_expression, task.timezone);
+    nextRun = getNextRun(task.cron_expression, task.timezone, fromDate);
   } else if (task.type === 'interval' && task.interval_seconds) {
     nextRun = now() + task.interval_seconds;
   } else {

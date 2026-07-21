@@ -110,28 +110,34 @@ describe('updateNextRunTime', () => {
     });
   });
 
-  it('uses task timezone for cron calculation', async () => {
-    const originalTz = process.env.TZ;
-    try {
-      process.env.TZ = 'UTC';
+  for (const scenario of [
+    {
+      label: 'before Shanghai and UTC 09:00',
+      reference: '2026-07-21T00:30:00.000Z',
+      expected: { shanghai: 1784595600, utc: 1784624400 },
+    },
+    {
+      label: 'after Shanghai but before UTC 09:00',
+      reference: '2026-07-21T02:00:00.000Z',
+      expected: { shanghai: 1784682000, utc: 1784624400 },
+    },
+  ]) {
+    it(`uses task timezone for cron calculation ${scenario.label}`, async () => {
       await withDb((db) => {
         const task1 = insertTask(db, { id: 'task-utc', type: 'recurring', cron_expression: '0 9 * * *', timezone: 'UTC', status: 'completed' });
         const task2 = insertTask(db, { id: 'task-sh', type: 'recurring', cron_expression: '0 9 * * *', timezone: 'Asia/Shanghai', status: 'completed' });
+        const fromDate = new Date(scenario.reference);
 
-        updateNextRunTime(db, task1);
-        updateNextRunTime(db, task2);
+        updateNextRunTime(db, task1, { fromDate });
+        updateNextRunTime(db, task2, { fromDate });
 
         const utcRow = db.prepare('SELECT next_run_at FROM tasks WHERE id = ?').get('task-utc');
         const shRow = db.prepare('SELECT next_run_at FROM tasks WHERE id = ?').get('task-sh');
 
-        // Shanghai 9am is 8 hours earlier in UTC than UTC 9am
-        assert.ok(shRow.next_run_at < utcRow.next_run_at,
-          `Shanghai 9am (${shRow.next_run_at}) should be before UTC 9am (${utcRow.next_run_at})`);
+        assert.deepEqual({ shanghai: shRow.next_run_at, utc: utcRow.next_run_at }, scenario.expected);
       });
-    } finally {
-      if (originalTz === undefined) { delete process.env.TZ; } else { process.env.TZ = originalTz; }
-    }
-  });
+    });
+  }
 });
 
 // ---- processCompletedTasks ----
