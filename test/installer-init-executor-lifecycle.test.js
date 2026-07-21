@@ -5,7 +5,10 @@ import { execFileSync } from 'node:child_process';
 
 import { describe, expect, test } from '@jest/globals';
 
-import { requireHealthyExecutorStart } from '../cli/commands/init.js';
+import {
+  freshInstallStartFenceProof,
+  requireHealthyExecutorStart,
+} from '../cli/commands/init.js';
 import { desiredClaudeHooks } from '../cli/lib/sync-settings-hooks.js';
 import { cleanupRetiredRuntimeSkillArtifacts } from '../runtime/migration/legacy-lifecycle-artifacts.js';
 import { inspectInstalledRuntime } from '../scripts/installed-runtime-inventory.js';
@@ -22,6 +25,20 @@ describe('installer and init executor lifecycle', () => {
     })).toThrow('executor_offline');
     expect(() => requireHealthyExecutorStart({ ok: true }))
       .toThrow('authoritative identity');
+  });
+
+  test('fresh init issues start authority only from an absent-root first-install state', () => {
+    expect(freshInstallStartFenceProof({
+      installationRootAbsentAtStart: true, installState: 'fresh',
+    })).toEqual({ kind: 'fresh_clean', installation_root_absent: true });
+    for (const installState of ['fresh', 'incomplete', 'complete']) {
+      expect(freshInstallStartFenceProof({
+        installationRootAbsentAtStart: false, installState,
+      })).toBeNull();
+    }
+    expect(freshInstallStartFenceProof({
+      installationRootAbsentAtStart: true, installState: 'incomplete',
+    })).toBeNull();
   });
 
   test('installer propagates init failure and has no tmux prerequisite', () => {
@@ -137,5 +154,7 @@ describe('installer and init executor lifecycle', () => {
   test('init never imports or dispatches migration cleanup in the normal path', () => {
     const initSource = fs.readFileSync(new URL('../cli/commands/init.js', import.meta.url), 'utf8');
     expect(initSource).not.toMatch(/runtime\/migration|reconcileLegacyServicesForExecutorStart/);
-    expect(initSource).toContain('startCoreServices({ freshInstallation: true })');
+    expect(initSource).toContain('installationRootAbsentAtStart');
+    expect(initSource).toContain("kind: 'fresh_clean'");
+    expect(initSource).toContain('issueExecutorStartFence');
   });

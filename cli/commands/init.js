@@ -18,6 +18,7 @@ import { prompt, promptYesNo, promptChoice, promptSecret } from '../lib/prompts.
 import { bold, dim, green, red, yellow, cyan, bgGreen, success, error, warn, heading } from '../lib/colors.js';
 import { commandExists } from '../lib/shell-utils.js';
 import { reconcileExecutorService } from '../lib/executor-service-lifecycle.js';
+import { issueExecutorStartFence } from '../../runtime/executor/start-fence.js';
 import {
   activateFreshSplitInstructions,
   refreshSplitInstructions,
@@ -535,6 +536,11 @@ function detectInstallState() {
   return 'incomplete';
 }
 
+export function freshInstallStartFenceProof({ installationRootAbsentAtStart, installState }) {
+  if (installationRootAbsentAtStart !== true || installState !== 'fresh') return null;
+  return Object.freeze({ kind: 'fresh_clean', installation_root_absent: true });
+}
+
 // ── State reset ─────────────────────────────────────────────────
 
 /**
@@ -929,17 +935,7 @@ export function requireHealthyExecutorStart(result) {
  * Prepare and start core services via PM2 ecosystem config.
  * @returns {number} Number of services successfully started
  */
-function writeFreshExecutorStartFence() {
-  const fencePath = path.join(ZYLOS_DIR, 'runtime', 'executor-start-fence.json');
-  fs.mkdirSync(path.dirname(fencePath), { recursive: true });
-  fs.writeFileSync(fencePath, `${JSON.stringify({
-    contract: 'zylos.executor-start-fence@1',
-    runtime_generation: 'executor_only',
-    reconciled_at: new Date().toISOString(),
-  })}\n`, { mode: 0o600 });
-}
-
-async function startCoreServices({ freshInstallation = false } = {}) {
+async function startCoreServices({ freshInstallProof = null } = {}) {
   installSkillDependencies();
 
   const ecosystemPath = path.join(ZYLOS_DIR, 'pm2', 'ecosystem.config.cjs');
@@ -947,7 +943,9 @@ async function startCoreServices({ freshInstallation = false } = {}) {
     throw new Error(`Executor service configuration is missing: ${ecosystemPath}`);
   }
 
-  if (freshInstallation) writeFreshExecutorStartFence();
+  if (freshInstallProof !== null) {
+    issueExecutorStartFence({ zylosDir: ZYLOS_DIR, proof: freshInstallProof });
+  }
 
   const result = requireHealthyExecutorStart(
     await reconcileExecutorService({
@@ -1684,6 +1682,9 @@ Note: --setup-token and --api-key values are visible in process listings.
 
 export async function initCommand(args) {
   const opts = parseInitFlags(args);
+  // This is captured before init can create managed state. A pre-existing or
+  // incomplete installation is never allowed to mint a fresh-start fence.
+  const installationRootAbsentAtStart = !fs.existsSync(ZYLOS_DIR);
 
   // --help: print usage and exit
   if (opts.help) {
@@ -2261,7 +2262,11 @@ export async function initCommand(args) {
 
   // Step 10: Start the executor service
   if (!quiet) console.log(`\n${heading('Starting services...')}`);
-  const servicesStarted = serviceStartSuppressed() ? 0 : await startCoreServices({ freshInstallation: true });
+  const servicesStarted = serviceStartSuppressed() ? 0 : await startCoreServices({
+    freshInstallProof: freshInstallStartFenceProof({
+      installationRootAbsentAtStart, installState,
+    }),
+  });
 
   if (servicesStarted > 0) {
     setupPm2Startup();

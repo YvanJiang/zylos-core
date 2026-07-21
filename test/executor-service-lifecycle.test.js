@@ -53,6 +53,11 @@ function fixture() {
     contract: 'zylos.executor-start-fence@1',
     runtime_generation: 'executor_only',
     reconciled_at: '2026-07-21T00:00:00.000Z',
+    issuance_kind: 'committed_reconciliation',
+    upgrade_id: 'upgrade-executor-fixture',
+    legacy_services_quiesced: true,
+    legacy_registrations_absent: true,
+    legacy_artifacts_reconciled: true,
   }));
   return {
     directory,

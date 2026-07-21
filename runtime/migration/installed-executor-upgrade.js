@@ -26,6 +26,7 @@ import {
   validateChannelAuthorityManifest,
 } from './channel-authority-manifest.js';
 import { findResumableRuntimeUpgrade } from './upgrade-state.js';
+import { issueExecutorStartFence } from '../executor/start-fence.js';
 
 const LEGACY_SERVICE_NAMES = Object.freeze([
   'activity-monitor', 'c4-dispatcher', 'scheduler', 'web-console', 'caddy',
@@ -240,20 +241,32 @@ export function assertLegacyServicesInactive({ zylosDir, execFileSyncFn = execFi
 
 export function reconcileLegacyServicesForExecutorStart({
   zylosDir,
+  upgradeId,
   execFileSyncFn = execFileSync,
 }) {
+  if (typeof upgradeId !== 'string' || upgradeId.length === 0) {
+    throw new TypeError('Committed executor reconciliation requires an upgrade id.');
+  }
   assertLegacyServicesInactive({ zylosDir, execFileSyncFn });
   const result = removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn });
   if (inspectLegacyServiceRegistrations({ zylosDir, execFileSyncFn }).length > 0) {
     throw new Error('Obsolete runtime registrations remained after reconciliation.');
   }
-  const fencePath = path.join(zylosDir, 'runtime', 'executor-start-fence.json');
-  atomicJson(fencePath, {
-    contract: 'zylos.executor-start-fence@1',
-    runtime_generation: 'executor_only',
-    reconciled_at: new Date().toISOString(),
+  const residual = legacyLifecycleArtifactPaths(zylosDir).filter((artifact) => fs.existsSync(artifact));
+  if (residual.length > 0) {
+    throw new Error(`Obsolete lifecycle artifacts remained after reconciliation: ${residual.join(', ')}`);
+  }
+  const issued = issueExecutorStartFence({
+    zylosDir,
+    proof: {
+      kind: 'committed_reconciliation',
+      upgrade_id: upgradeId,
+      legacy_services_quiesced: true,
+      legacy_registrations_absent: true,
+      legacy_artifacts_reconciled: true,
+    },
   });
-  return Object.freeze({ ...result, executor_start_fence_path: fencePath });
+  return Object.freeze({ ...result, executor_start_fence_path: issued.path });
 }
 
 export function removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn = execFileSync }) {
@@ -388,6 +401,7 @@ function decorateReleaseAdapter(adapter, activeReleaseFile, execFileSyncFn, {
       return { ...result, upgrade_id: null, package_restoration: packageResult };
     },
     async cleanup(request) {
+      assertLegacyServicesInactive({ zylosDir, execFileSyncFn });
       const deployedConfig = deployManagedFile(ecosystemSource, ecosystemDestination);
       execFileSyncFn(process.execPath, [path.join(targetReleasePath, 'scripts', 'postinstall.js')], {
         cwd: targetReleasePath,
@@ -413,7 +427,11 @@ function decorateReleaseAdapter(adapter, activeReleaseFile, execFileSyncFn, {
         zylosDir,
         upgradeState: 'committed',
       });
-      const registrations = removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn });
+      const registrations = reconcileLegacyServicesForExecutorStart({
+        zylosDir,
+        upgradeId: request.upgrade_id,
+        execFileSyncFn,
+      });
       return Object.freeze({
         ...result,
         ...registrations,

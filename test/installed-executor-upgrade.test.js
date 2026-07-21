@@ -13,6 +13,7 @@ import {
 } from '../runtime/migration/installed-executor-upgrade.js';
 import { legacyLifecycleArtifactPaths } from '../runtime/migration/legacy-lifecycle-artifacts.js';
 import { createExecutorService } from '../runtime/executor/service.js';
+import { startExecutorService } from '../cli/lib/executor-service-lifecycle.js';
 import { createRuntimeUpgradeService } from '../runtime/migration/runtime-upgrade-service.js';
 import { createSqliteSnapshotAdapter } from '../runtime/migration/runtime-upgrade-coordinator.js';
 
@@ -245,7 +246,9 @@ describe('installed executor production upgrade owner', () => {
         return '';
       };
       if (status === 'stopped') {
-        expect(reconcileLegacyServicesForExecutorStart({ zylosDir, execFileSyncFn }))
+        expect(reconcileLegacyServicesForExecutorStart({
+          zylosDir, upgradeId: 'upgrade-fence-fixture', execFileSyncFn,
+        }))
           .toMatchObject({
             removed_services: ['c4-dispatcher'],
             executor_start_fence_path: path.join(zylosDir, 'runtime', 'executor-start-fence.json'),
@@ -257,7 +260,9 @@ describe('installed executor production upgrade owner', () => {
         });
         expect(commands).toContainEqual(['pm2', ['delete', 'c4-dispatcher']]);
       } else {
-        expect(() => reconcileLegacyServicesForExecutorStart({ zylosDir, execFileSyncFn }))
+        expect(() => reconcileLegacyServicesForExecutorStart({
+          zylosDir, upgradeId: 'upgrade-fence-fixture', execFileSyncFn,
+        }))
           .toThrow('still active');
         expect(commands).toEqual([['pm2', ['jlist']]]);
       }
@@ -405,6 +410,7 @@ describe('installed executor production upgrade owner', () => {
       state: 'committed',
       error: 'strict postinstall fixture failed',
     });
+    expect(fs.existsSync(path.join(zylosDir, 'runtime', 'executor-start-fence.json'))).toBe(false);
     expect(fs.readdirSync(path.join(zylosDir, 'runtime', 'upgrade-plans'))).toHaveLength(1);
 
     const result = await handler.resumeBlocking();
@@ -453,6 +459,31 @@ describe('installed executor production upgrade owner', () => {
     expect(JSON.parse(fs.readFileSync(
       path.join(zylosDir, 'runtime', 'active-release.json'), 'utf8',
     ))).toMatchObject({ release_ref: 'release-B', upgrade_id: expect.stringMatching(/^upgrade-/) });
+    await expect(startExecutorService({
+      zylosDir,
+      execFileSyncFn: (file, args) => (file === 'pm2' && args[0] === 'jlist' ? '[]' : ''),
+      requestFn: async () => ({
+        ok: true,
+        result: {
+          executor: { service_instance_id: 'committed-executor' },
+          snapshot: {
+            contract: 'zylos.observability-snapshot',
+            core_service_instance_id: 'committed-executor',
+            service: { health: 'healthy', service_instance_id: 'committed-executor' },
+          },
+        },
+      }),
+      retryDelaysMs: [0],
+    })).resolves.toMatchObject({ ok: true, serviceInstanceId: 'committed-executor' });
+    expect(JSON.parse(fs.readFileSync(
+      path.join(zylosDir, 'runtime', 'executor-start-fence.json'), 'utf8',
+    ))).toMatchObject({
+      issuance_kind: 'committed_reconciliation',
+      upgrade_id: expect.stringMatching(/^upgrade-/),
+      legacy_services_quiesced: true,
+      legacy_registrations_absent: true,
+      legacy_artifacts_reconciled: true,
+    });
     expect(fs.readFileSync(path.join(zylosDir, 'pm2', 'ecosystem.config.cjs'), 'utf8'))
       .toBe('module.exports = { apps: [{ name: "zylos-executor" }] };\n');
     database.close();
