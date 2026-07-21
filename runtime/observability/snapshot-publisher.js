@@ -482,7 +482,7 @@ function collectOutbox(database, generatedAt) {
     const status = row.status === 'delivering'
       && row.pre_action_fenced_at !== null
       && row.lease_expires_at !== null
-      && row.lease_expires_at <= generatedAt
+      && Date.parse(row.lease_expires_at) <= Date.parse(generatedAt)
       ? 'delivery_unknown'
       : row.status;
     const key = `${channel}\u0000${status}`;

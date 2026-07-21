@@ -524,7 +524,7 @@ describe('Core runtime observability snapshot publisher', () => {
     owner.assertCurrentClaim(command);
 
     const snapshot = createPublisher(database, {
-      now: () => '2026-07-20T08:00:07Z',
+      now: () => '2026-07-20T03:00:07-05:00',
     }).publish();
     expect(snapshot.service.health).toBe('degraded');
     expect(snapshot.outbox.items).toContainEqual({

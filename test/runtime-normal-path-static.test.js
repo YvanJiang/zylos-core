@@ -180,6 +180,9 @@ describe('normal product paths have no retired runtime authority', () => {
       /pre_action_fenced_at !== null[\s\S]*\? 'delivery_unknown'/,
     );
     expect(snapshotSource).toMatch(
+      /Date\.parse\(row\.lease_expires_at\) <= Date\.parse\(generatedAt\)/,
+    );
+    expect(snapshotSource).toMatch(
       /status === 'delivery_unknown'[\s\S]*return 'degraded'/,
     );
     expect(outboxSource).toMatch(
