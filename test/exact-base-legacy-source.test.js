@@ -380,7 +380,9 @@ describe('exact-base durable source fencing', () => {
     const server = `zylos-issue27-commit-${process.pid}-${Date.now()}`;
     execFileSync('tmux', [
       '-L', server, '-f', '/dev/null', 'new-session', '-d', '-s', 'claude-main',
-      'while :; do sleep 1; done',
+      // Keep a real child process without churning its PID between two full
+      // ownership snapshots when the parallel suite delays `ps` observation.
+      'while :; do sleep 30; done',
     ]);
     tmuxServers.set(server, Number(execFileSync(
       'tmux', ['-L', server, 'display-message', '-p', '#{pid}'], { encoding: 'utf8' },
