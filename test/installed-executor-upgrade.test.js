@@ -10,6 +10,7 @@ import {
   createInstalledExecutorUpgradeHandler,
   reconcileLegacyServicesForExecutorStart,
   removeLegacyServiceRegistrations,
+  retireOwnedLegacyServices,
 } from '../runtime/migration/installed-executor-upgrade.js';
 import { legacyLifecycleArtifactPaths } from '../runtime/migration/legacy-lifecycle-artifacts.js';
 import { createExecutorService } from '../runtime/executor/service.js';
@@ -174,6 +175,162 @@ describe('installed executor upgrade driver', () => {
 });
 
 describe('installed executor production upgrade owner', () => {
+  test('durably retires identity-verified running services before executor migration', () => {
+    const zylosDir = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-pm2-running-'));
+    directories.push(zylosDir);
+    const auditFile = path.join(zylosDir, 'runtime', 'legacy-upgrade-audit', 'upgrade-running-services.json');
+    const scripts = new Map([
+      ['activity-monitor', path.join(zylosDir, '.claude', 'skills', 'activity-monitor', 'scripts', 'activity-monitor.js')],
+      ['c4-dispatcher', path.join(zylosDir, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-dispatcher.js')],
+    ]);
+    const processes = new Map([
+      ['activity-monitor', 'online'],
+      ['c4-dispatcher', 'online'],
+    ]);
+    const commands = [];
+    const result = retireOwnedLegacyServices({
+      zylosDir,
+      upgradeId: 'upgrade-running',
+      stepId: 'upgrade-running:legacy-source-invalidate',
+      stateFile: auditFile,
+      now: () => '2026-07-21T00:00:00.000Z',
+      execFileSyncFn: (file, args) => {
+        commands.push([file, args]);
+        if (args[0] === 'jlist') {
+          return JSON.stringify([...processes].map(([name, status]) => ({
+            name, pm2_env: { status, pm_exec_path: scripts.get(name) },
+          })));
+        }
+        if (args[0] === 'stop') {
+          const state = JSON.parse(fs.readFileSync(auditFile, 'utf8'));
+          expect(state).toMatchObject({
+            upgrade_id: 'upgrade-running', step_id: 'upgrade-running:legacy-source-invalidate',
+            phase: 'services_quiescing',
+          });
+          expect(state.services).toEqual(expect.arrayContaining([
+            expect.objectContaining({ name: args[1], observed_stop_command: ['pm2', 'stop', args[1]] }),
+          ]));
+          processes.set(args[1], 'stopped');
+        }
+        if (args[0] === 'delete') processes.delete(args[1]);
+        return '';
+      },
+    });
+
+    expect(result).toMatchObject({ stopped: true, deleted: true, pm2_saved: true });
+    expect(commands).toContainEqual(['pm2', ['stop', 'activity-monitor']]);
+    expect(commands).toContainEqual(['pm2', ['stop', 'c4-dispatcher']]);
+    expect(commands).toContainEqual(['pm2', ['delete', 'activity-monitor']]);
+    expect(commands).toContainEqual(['pm2', ['delete', 'c4-dispatcher']]);
+    expect(commands).toContainEqual(['pm2', ['save']]);
+    expect(processes).toEqual(new Map());
+  });
+
+  test('fails closed on identity drift and treats an unproven stop as a recovery barrier', () => {
+    const zylosDir = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-pm2-unknown-'));
+    directories.push(zylosDir);
+    const auditFile = path.join(zylosDir, 'runtime', 'legacy-upgrade-audit', 'upgrade-unknown-services.json');
+    const expected = path.join(zylosDir, '.claude', 'skills', 'activity-monitor', 'scripts', 'activity-monitor.js');
+    let inspection = 0;
+    const driftCommands = [];
+    expect(() => retireOwnedLegacyServices({
+      zylosDir, upgradeId: 'upgrade-unknown', stepId: 'upgrade-unknown:legacy-source-invalidate',
+      stateFile: auditFile,
+      execFileSyncFn: (file, args) => {
+        driftCommands.push([file, args]);
+        if (args[0] !== 'jlist') return '';
+        inspection += 1;
+        return JSON.stringify([{
+          name: 'activity-monitor',
+          pm2_env: {
+            status: 'online',
+            pm_exec_path: inspection === 1 ? expected : '/opt/user/activity-monitor.js',
+          },
+        }]);
+      },
+    })).toThrow('ambiguous PM2 service name collisions: activity-monitor');
+    expect(driftCommands).toEqual([['pm2', ['jlist']], ['pm2', ['jlist']]]);
+
+    let status = 'online';
+    const unknownCommands = [];
+    const unknownExec = (file, args) => {
+      unknownCommands.push([file, args]);
+      if (args[0] === 'jlist') return JSON.stringify([{
+        name: 'activity-monitor', pm2_env: { status, pm_exec_path: expected },
+      }]);
+      if (args[0] === 'stop') throw new Error('PM2 stop timed out');
+      return '';
+    };
+    expect(() => retireOwnedLegacyServices({
+      zylosDir, upgradeId: 'upgrade-unknown-stop', stepId: 'upgrade-unknown-stop:legacy-source-invalidate',
+      stateFile: path.join(zylosDir, 'runtime', 'legacy-upgrade-audit', 'unknown-stop.json'),
+      execFileSyncFn: unknownExec,
+    })).toThrow('PM2 stop timed out');
+    expect(() => retireOwnedLegacyServices({
+      zylosDir, upgradeId: 'upgrade-unknown-stop', stepId: 'upgrade-unknown-stop:legacy-source-invalidate',
+      stateFile: path.join(zylosDir, 'runtime', 'legacy-upgrade-audit', 'unknown-stop.json'),
+      execFileSyncFn: unknownExec,
+    })).toThrow('Unknown PM2 stop outcome requires authorized disposition');
+    expect(unknownCommands.filter(([, args]) => args[0] === 'stop')).toHaveLength(1);
+  });
+
+  test('does not replay partial stop or delete effects without durable PM2 proof', () => {
+    const zylosDir = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-pm2-partial-'));
+    directories.push(zylosDir);
+    const scripts = new Map([
+      ['activity-monitor', path.join(zylosDir, '.claude', 'skills', 'activity-monitor', 'scripts', 'activity-monitor.js')],
+      ['c4-dispatcher', path.join(zylosDir, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-dispatcher.js')],
+    ]);
+    const processes = new Map([['activity-monitor', 'online'], ['c4-dispatcher', 'online']]);
+    const partialFile = path.join(zylosDir, 'runtime', 'legacy-upgrade-audit', 'partial.json');
+    const stopCommands = [];
+    const partialExec = (file, args) => {
+      if (args[0] === 'jlist') return JSON.stringify([...processes].map(([name, status]) => ({
+        name, pm2_env: { status, pm_exec_path: scripts.get(name) },
+      })));
+      if (args[0] === 'stop') {
+        stopCommands.push(args[1]);
+        if (args[1] === 'activity-monitor') processes.set(args[1], 'stopped');
+        else throw new Error('PM2 stop timeout after partial retirement');
+      }
+      return '';
+    };
+    expect(() => retireOwnedLegacyServices({
+      zylosDir, upgradeId: 'upgrade-partial', stepId: 'upgrade-partial:legacy-source-invalidate',
+      stateFile: partialFile, execFileSyncFn: partialExec,
+    })).toThrow('PM2 stop timeout after partial retirement');
+    expect(() => retireOwnedLegacyServices({
+      zylosDir, upgradeId: 'upgrade-partial', stepId: 'upgrade-partial:legacy-source-invalidate',
+      stateFile: partialFile, execFileSyncFn: partialExec,
+    })).toThrow('Unknown PM2 stop outcome requires authorized disposition: c4-dispatcher');
+    expect(stopCommands).toEqual(['activity-monitor', 'c4-dispatcher']);
+
+    const deleteFile = path.join(zylosDir, 'runtime', 'legacy-upgrade-audit', 'delete-proof.json');
+    processes.clear();
+    processes.set('activity-monitor', 'stopped');
+    let deleteAttempts = 0;
+    const deleteExec = (file, args) => {
+      if (args[0] === 'jlist') return JSON.stringify([...processes].map(([name, status]) => ({
+        name, pm2_env: { status, pm_exec_path: scripts.get(name) },
+      })));
+      if (args[0] === 'delete') {
+        deleteAttempts += 1;
+        processes.delete(args[1]);
+        throw new Error('PM2 delete timed out after registration removal');
+      }
+      return '';
+    };
+    expect(() => retireOwnedLegacyServices({
+      zylosDir, upgradeId: 'upgrade-delete-proof', stepId: 'upgrade-delete-proof:legacy-source-invalidate',
+      stateFile: deleteFile, execFileSyncFn: deleteExec,
+    })).toThrow('PM2 delete timed out after registration removal');
+    expect(retireOwnedLegacyServices({
+      zylosDir, upgradeId: 'upgrade-delete-proof', stepId: 'upgrade-delete-proof:legacy-source-invalidate',
+      stateFile: deleteFile, execFileSyncFn: deleteExec,
+    })).toMatchObject({ stopped: true, deleted: true, pm2_saved: true });
+    expect(deleteAttempts).toBe(1);
+  });
+
   test('postcommit cleanup removes only obsolete supervisor registrations', () => {
     const zylosDir = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-pm2-owner-'));
     directories.push(zylosDir);
@@ -342,6 +499,15 @@ describe('installed executor production upgrade owner', () => {
     const commandStates = [];
     const commandDirectories = [];
     const commandOptions = [];
+    const legacyScripts = new Map([
+      ['activity-monitor', path.join(zylosDir, '.claude', 'skills', 'activity-monitor', 'scripts', 'activity-monitor.js')],
+      ['c4-dispatcher', path.join(zylosDir, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-dispatcher.js')],
+    ]);
+    const legacyProcesses = new Map([
+      ['activity-monitor', 'online'],
+      ['c4-dispatcher', 'online'],
+    ]);
+    let preActionOwnershipRecord = null;
     let failStrictPostinstallOnce = true;
     const handler = createInstalledExecutorUpgradeHandler({
       database,
@@ -363,8 +529,8 @@ describe('installed executor production upgrade owner', () => {
           workspaceRoot: zylosDir,
           releaseRef: request.release_ref,
           upgradeId: request.upgrade_id,
-          serviceStartedAt: '2026-07-20T12:00:30.000Z',
-          now: () => '2026-07-20T12:00:30.000Z',
+          serviceStartedAt: '2026-07-20T12:05:30.000Z',
+          now: () => '2026-07-20T12:05:30.000Z',
         });
         service.start();
         const snapshot = service.publishObservabilitySnapshot();
@@ -391,7 +557,19 @@ describe('installed executor production upgrade owner', () => {
             throw new Error('strict postinstall fixture failed');
           }
         }
-        if (file === 'pm2') return '[]';
+        if (file === 'pm2' && args[0] === 'jlist') {
+          return JSON.stringify([...legacyProcesses].map(([name, status]) => ({
+            name,
+            pm2_env: { status, pm_exec_path: legacyScripts.get(name) },
+          })));
+        }
+        if (file === 'pm2' && args[0] === 'stop') {
+          const auditDirectory = path.join(zylosDir, 'runtime', 'legacy-upgrade-audit');
+          const auditEntry = fs.readdirSync(auditDirectory).find((entry) => entry.endsWith('-services.json'));
+          preActionOwnershipRecord ??= JSON.parse(fs.readFileSync(path.join(auditDirectory, auditEntry), 'utf8'));
+          legacyProcesses.set(args[1], 'stopped');
+        }
+        if (file === 'pm2' && args[0] === 'delete') legacyProcesses.delete(args[1]);
         return '';
       },
       now: (() => {
@@ -416,6 +594,28 @@ describe('installed executor production upgrade owner', () => {
     const result = await handler.resumeBlocking();
 
     expect(result).toMatchObject({ success: true, state: 'committed', to: 'release-B' });
+    expect(preActionOwnershipRecord).toMatchObject({
+      schema_version: 2,
+      phase: 'services_quiescing',
+      services: expect.arrayContaining([
+        expect.objectContaining({
+          name: 'activity-monitor',
+          observed_was_running: true,
+          observed_script_path: legacyScripts.get('activity-monitor'),
+        }),
+        expect.objectContaining({
+          name: 'c4-dispatcher',
+          observed_was_running: true,
+          observed_script_path: legacyScripts.get('c4-dispatcher'),
+        }),
+      ]),
+    });
+    expect(legacyProcesses).toEqual(new Map());
+    expect(commands).toContainEqual(['pm2', ['stop', 'activity-monitor']]);
+    expect(commands).toContainEqual(['pm2', ['stop', 'c4-dispatcher']]);
+    expect(commands).toContainEqual(['pm2', ['delete', 'activity-monitor']]);
+    expect(commands).toContainEqual(['pm2', ['delete', 'c4-dispatcher']]);
+    expect(commands).toContainEqual(['pm2', ['save']]);
     expect(commands.filter(([file, args]) => file === 'npm' && args[0] === 'ci'))
       .toHaveLength(7);
     expect(commands).toContainEqual(['npm', ['ci', '--omit=dev', '--no-audit', '--no-fund']]);
@@ -522,8 +722,8 @@ describe('installed executor production upgrade owner', () => {
       ['c4-dispatcher', path.join(zylosDir, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-dispatcher.js')],
     ]);
     const processes = new Map([
-      ['activity-monitor', 'stopped'],
-      ['c4-dispatcher', 'stopped'],
+      ['activity-monitor', 'online'],
+      ['c4-dispatcher', 'online'],
     ]);
     const commands = [];
     const execFileSyncFn = (file, args) => {
@@ -568,7 +768,8 @@ describe('installed executor production upgrade owner', () => {
     expect(commands).not.toContainEqual([
       'pm2', ['start', path.join(zylosDir, 'pm2', 'ecosystem.config.cjs'), '--only', 'activity-monitor'],
     ]);
-    expect(commands).not.toContainEqual(['pm2', ['stop', 'c4-dispatcher']]);
+    expect(commands).toContainEqual(['pm2', ['stop', 'activity-monitor']]);
+    expect(commands).toContainEqual(['pm2', ['stop', 'c4-dispatcher']]);
     expect(JSON.parse(fs.readFileSync(
       path.join(zylosDir, 'runtime', 'active-release.json'), 'utf8',
     ))).toMatchObject({ release_ref: 'release-A', upgrade_id: null });

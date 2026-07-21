@@ -74,7 +74,239 @@ export function inspectLegacyServiceRegistrations({ zylosDir, execFileSyncFn = e
   if (collisions.length > 0) {
     throw new Error(`Refusing to control ambiguous PM2 service name collisions: ${collisions.map(({ name }) => name).join(', ')}`);
   }
+  const duplicateNames = owned.filter(({ name }, index) => owned.findIndex((entry) => entry.name === name) !== index);
+  if (duplicateNames.length > 0) {
+    throw new Error(`Refusing to control duplicate PM2 service identities: ${duplicateNames.map(({ name }) => name).join(', ')}`);
+  }
   return Object.freeze(owned);
+}
+
+function recordLegacyServiceState({ stateFile, upgradeId, stepId, services, now }) {
+  const state = Object.freeze({
+    schema_version: 2,
+    upgrade_id: upgradeId,
+    step_id: stepId,
+    phase: 'ownership_recorded',
+    recorded_at: now(),
+    services: Object.freeze(services.map((service) => Object.freeze({
+      name: service.name,
+      observed_status: service.status,
+      observed_was_running: service.was_running,
+      observed_script_path: service.script_path,
+      observed_stop_command: Object.freeze(['pm2', 'stop', service.name]),
+      observed_delete_command: Object.freeze(['pm2', 'delete', service.name]),
+      stop_state: service.was_running ? 'pending' : 'verified_inactive',
+      delete_state: 'pending',
+    }))),
+    save_state: services.length === 0 ? 'not_required' : 'pending',
+  });
+  atomicJson(stateFile, state);
+  return state;
+}
+
+function readRecordedLegacyServiceState({ stateFile, upgradeId, stepId }) {
+  const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  if (state?.schema_version !== 2 || state.upgrade_id !== upgradeId || state.step_id !== stepId
+    || !Array.isArray(state.services) || typeof state.phase !== 'string') {
+    throw new Error('Legacy service ownership record conflicts with the upgrade step.');
+  }
+  if (!['pending', 'intent_recorded', 'verified_saved', 'not_required'].includes(state.save_state)) {
+    throw new Error('Legacy service ownership record has an invalid PM2 save state.');
+  }
+  for (const service of state.services) {
+    if (!service || typeof service.name !== 'string' || typeof service.observed_script_path !== 'string'
+      || !['pending', 'intent_recorded', 'verified_inactive'].includes(service.stop_state)
+      || !['pending', 'intent_recorded', 'verified_deleted'].includes(service.delete_state)) {
+      throw new Error('Legacy service ownership record is malformed.');
+    }
+  }
+  return state;
+}
+
+function updateRecordedLegacyServiceState(stateFile, state, patch) {
+  const next = Object.freeze({ ...state, ...patch });
+  atomicJson(stateFile, next);
+  return next;
+}
+
+function verifyRecordedLegacyServices({ zylosDir, execFileSyncFn, state, allowMissing = false }) {
+  const actual = inspectLegacyServiceRegistrations({ zylosDir, execFileSyncFn });
+  const expectedByName = new Map(state.services.map((service) => [service.name, service]));
+  for (const service of actual) {
+    const expected = expectedByName.get(service.name);
+    if (!expected) {
+      throw new Error(`Unexpected legacy PM2 registration appeared after ownership audit: ${service.name}.`);
+    }
+    if (service.script_path !== expected.observed_script_path) {
+      throw new Error(`Legacy PM2 service identity changed after ownership audit: ${service.name}.`);
+    }
+  }
+  if (!allowMissing) {
+    for (const service of state.services) {
+      if (!actual.some(({ name }) => name === service.name)) {
+        throw new Error(`Legacy PM2 service disappeared before verified retirement: ${service.name}.`);
+      }
+    }
+  }
+  return actual;
+}
+
+function stateWithService(state, name, patch) {
+  return Object.freeze({
+    ...state,
+    services: Object.freeze(state.services.map((service) => (
+      service.name === name ? Object.freeze({ ...service, ...patch }) : service
+    ))),
+  });
+}
+
+/**
+ * Retire only services recorded as exact Zylos-owned PM2 identities.  The
+ * audit document is intentionally a per-action recovery ledger: an intent
+ * survives a crash/timeout and may only advance from a fresh PM2 proof, never
+ * by replaying the uncertain destructive command.
+ */
+export function retireOwnedLegacyServices({
+  zylosDir,
+  upgradeId,
+  stepId,
+  stateFile,
+  execFileSyncFn = execFileSync,
+  now = () => new Date().toISOString(),
+}) {
+  if (typeof upgradeId !== 'string' || upgradeId.length === 0
+    || typeof stepId !== 'string' || stepId.length === 0
+    || typeof stateFile !== 'string' || !path.isAbsolute(stateFile)) {
+    throw new TypeError('Legacy service retirement requires durable upgrade, step, and audit identities.');
+  }
+  let state;
+  try {
+    state = readRecordedLegacyServiceState({ stateFile, upgradeId, stepId });
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+    // This inspection is read-only. Persist its exact ownership/path facts
+    // before the first stop/delete/save command is allowed.
+    state = recordLegacyServiceState({
+      stateFile,
+      upgradeId,
+      stepId,
+      services: inspectLegacyServiceRegistrations({ zylosDir, execFileSyncFn }),
+      now,
+    });
+  }
+
+  for (const service of state.services) {
+    // A persisted delete intent is resolved in the delete phase from a fresh
+    // absence proof. Do not mistake that intentionally unknown deletion for a
+    // stop-phase disappearance on resume.
+    if (service.delete_state !== 'pending') continue;
+    let actual = verifyRecordedLegacyServices({ zylosDir, execFileSyncFn, state });
+    const current = actual.find(({ name }) => name === service.name);
+    if (service.stop_state === 'pending') {
+      if (!current.was_running) {
+        state = updateRecordedLegacyServiceState(
+          stateFile, stateWithService(state, service.name, { stop_state: 'verified_inactive' }),
+          { phase: 'services_quiescing', updated_at: now() },
+        );
+        continue;
+      }
+      state = updateRecordedLegacyServiceState(
+        stateFile, stateWithService(state, service.name, {
+          stop_state: 'intent_recorded', stop_intent_at: now(),
+        }),
+        { phase: 'services_quiescing', updated_at: now() },
+      );
+      execFileSyncFn('pm2', ['stop', service.name], { stdio: 'pipe', timeout: 30_000 });
+      actual = verifyRecordedLegacyServices({ zylosDir, execFileSyncFn, state });
+      if (actual.find(({ name }) => name === service.name).was_running) {
+        throw new Error(`PM2 stop outcome is not inactive for ${service.name}.`);
+      }
+      state = updateRecordedLegacyServiceState(
+        stateFile, stateWithService(state, service.name, { stop_state: 'verified_inactive' }),
+        { phase: 'services_quiescing', updated_at: now() },
+      );
+      continue;
+    }
+    if (service.stop_state === 'intent_recorded') {
+      if (current.was_running) {
+        throw new Error(`Unknown PM2 stop outcome requires authorized disposition: ${service.name}.`);
+      }
+      state = updateRecordedLegacyServiceState(
+        stateFile, stateWithService(state, service.name, { stop_state: 'verified_inactive' }),
+        { phase: 'services_quiescing', updated_at: now() },
+      );
+      continue;
+    }
+    if (current.was_running) {
+      throw new Error(`Legacy PM2 service became active after verified stop: ${service.name}.`);
+    }
+  }
+
+  for (const service of state.services) {
+    const actual = verifyRecordedLegacyServices({
+      zylosDir,
+      execFileSyncFn,
+      state,
+      allowMissing: state.services.some(({ delete_state: deleteState }) => deleteState !== 'pending'),
+    });
+    const current = actual.find(({ name }) => name === service.name);
+    if (service.delete_state === 'pending') {
+      if (!current || current.was_running) {
+        throw new Error(`Legacy PM2 service is not safely inactive before delete: ${service.name}.`);
+      }
+      state = updateRecordedLegacyServiceState(
+        stateFile, stateWithService(state, service.name, {
+          delete_state: 'intent_recorded', delete_intent_at: now(),
+        }),
+        { phase: 'registrations_removing', updated_at: now() },
+      );
+      execFileSyncFn('pm2', ['delete', service.name], { stdio: 'pipe', timeout: 30_000 });
+      const afterDelete = verifyRecordedLegacyServices({
+        zylosDir, execFileSyncFn, state, allowMissing: true,
+      });
+      if (afterDelete.some(({ name }) => name === service.name)) {
+        throw new Error(`PM2 delete outcome is not absent for ${service.name}.`);
+      }
+      state = updateRecordedLegacyServiceState(
+        stateFile, stateWithService(state, service.name, { delete_state: 'verified_deleted' }),
+        { phase: 'registrations_removing', updated_at: now() },
+      );
+      continue;
+    }
+    if (service.delete_state === 'intent_recorded') {
+      if (current) {
+        throw new Error(`Unknown PM2 delete outcome requires authorized disposition: ${service.name}.`);
+      }
+      state = updateRecordedLegacyServiceState(
+        stateFile, stateWithService(state, service.name, { delete_state: 'verified_deleted' }),
+        { phase: 'registrations_removing', updated_at: now() },
+      );
+    }
+  }
+  if (verifyRecordedLegacyServices({ zylosDir, execFileSyncFn, state, allowMissing: true }).length > 0) {
+    throw new Error('Obsolete runtime registrations remained after verified retirement.');
+  }
+  if (state.save_state === 'pending') {
+    state = updateRecordedLegacyServiceState(
+      stateFile, state, { phase: 'saving_pm2_state', save_state: 'intent_recorded', updated_at: now() },
+    );
+    execFileSyncFn('pm2', ['save'], { stdio: 'pipe', timeout: 30_000 });
+    state = updateRecordedLegacyServiceState(
+      stateFile, state, { phase: 'retired', save_state: 'verified_saved', updated_at: now() },
+    );
+  } else if (state.save_state === 'intent_recorded') {
+    throw new Error('Unknown PM2 save outcome requires authorized disposition.');
+  }
+  return Object.freeze({
+    step_id: stepId,
+    stopped: true,
+    deleted: true,
+    pm2_saved: state.save_state === 'verified_saved' || state.save_state === 'not_required',
+    stopped_at: now(),
+    services_were_running: Object.freeze(
+      state.services.filter(({ observed_was_running: wasRunning }) => wasRunning).map(({ name }) => name),
+    ),
+  });
 }
 
 function requireDirectory(name, value) {
@@ -270,8 +502,12 @@ export function reconcileLegacyServicesForExecutorStart({
 }
 
 export function removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn = execFileSync }) {
-  const registered = inspectLegacyServiceRegistrations({ zylosDir, execFileSyncFn })
-    .map(({ name }) => name);
+  const registrations = inspectLegacyServiceRegistrations({ zylosDir, execFileSyncFn });
+  const active = registrations.filter(({ was_running: wasRunning }) => wasRunning);
+  if (active.length > 0) {
+    throw new Error(`Obsolete runtime services are still active: ${active.map(({ name }) => name).join(', ')}`);
+  }
+  const registered = registrations.map(({ name }) => name);
   for (const serviceName of registered) {
     execFileSyncFn('pm2', ['delete', serviceName], { stdio: 'pipe', timeout: 30_000 });
   }
@@ -631,69 +867,14 @@ export function createInstalledExecutorUpgradeHandler({
     return path.join(installationRoot, 'runtime', 'legacy-upgrade-audit', `${upgradeId}-services.json`);
   }
 
-  function readLegacyServiceState(upgradeId) {
-    return JSON.parse(fs.readFileSync(legacyServiceStateFile(upgradeId), 'utf8'));
-  }
-
   function stopOwnedLegacyServices({ upgradeId, stepId }) {
-    const stateFile = legacyServiceStateFile(upgradeId);
-    let state;
-    try {
-      state = readLegacyServiceState(upgradeId);
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error;
-      state = {
-        schema_version: 1,
-        upgrade_id: upgradeId,
-        services: inspectLegacyServiceRegistrations({
-          zylosDir: installationRoot,
-          execFileSyncFn,
-        }),
-        recorded_at: now(),
-      };
-      atomicJson(stateFile, state);
-    }
-    if (state.upgrade_id !== upgradeId || !Array.isArray(state.services)) {
-      throw new Error('Legacy service ownership record conflicts with the upgrade.');
-    }
-    let currentlyOwned = inspectLegacyServiceRegistrations({
+    return retireOwnedLegacyServices({
       zylosDir: installationRoot,
+      upgradeId,
+      stepId,
+      stateFile: legacyServiceStateFile(upgradeId),
       execFileSyncFn,
-    });
-    const active = currentlyOwned.filter(({ was_running: wasRunning }) => wasRunning);
-    if (active.length > 0) {
-      throw new Error(
-        `Legacy runtime must be stopped before migration: ${active.map(({ name }) => name).join(', ')}.`,
-      );
-    }
-    if (state.services.some(({ was_running: wasRunning }) => wasRunning)) {
-      state = { ...state, services: currentlyOwned, recorded_at: now() };
-      atomicJson(stateFile, state);
-    }
-    // Re-inspect before any destructive command so generic-name collisions
-    // always fail closed and remain untouched.
-    currentlyOwned = inspectLegacyServiceRegistrations({
-      zylosDir: installationRoot,
-      execFileSyncFn,
-    });
-    for (const { name } of currentlyOwned) {
-      execFileSyncFn('pm2', ['delete', name], { stdio: 'pipe', timeout: 30_000 });
-    }
-    if (currentlyOwned.length > 0) {
-      execFileSyncFn('pm2', ['save'], { stdio: 'pipe', timeout: 30_000 });
-    }
-    const remaining = inspectLegacyServiceRegistrations({
-      zylosDir: installationRoot,
-      execFileSyncFn,
-    });
-    if (remaining.length > 0) throw new Error('Obsolete runtime services remained registered after isolation.');
-    return Object.freeze({
-      step_id: stepId,
-      stopped: true,
-      stopped_at: now(),
-      services_were_running: Object.freeze(
-        state.services.filter(({ was_running: wasRunning }) => wasRunning).map(({ name }) => name),
-      ),
+      now,
     });
   }
 
