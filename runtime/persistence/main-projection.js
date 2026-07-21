@@ -242,7 +242,8 @@ export function materializeNextStagedMainProjection(
   const active = database.prepare(`
     SELECT outbox_id
     FROM runtime_outbox
-    WHERE lane_key = ? AND status IN ('pending', 'delivering', 'retry_wait')
+    WHERE lane_key = ?
+      AND status IN ('pending', 'delivering', 'retry_wait', 'delivery_unknown')
     LIMIT 1
   `).get(laneKey);
   if (active) return null;

@@ -1,3 +1,5 @@
+import crypto from 'node:crypto';
+
 import {
   createDeliveryLaneKey,
   createDeliveryLaneKeyFromIdentity,
@@ -1507,6 +1509,67 @@ function backfillOutboxLeaseEpochs(database) {
   }
 }
 
+function quarantineUnverifiableOutboxClaims(database) {
+  const quarantine = database.transaction(() => {
+    const rows = database.prepare(`
+      SELECT outbox.outbox_id, outbox.delivery_attempt_id,
+        outbox.delivery_attempt_no, outbox.outbox_lease_epoch,
+        outbox.lease_owner, outbox.command_json, outbox.claimed_command_hash,
+        outbox.last_attempt_at, outbox.created_at,
+        snapshot.command_json AS snapshot_command_json,
+        snapshot.command_hash AS snapshot_command_hash,
+        snapshot.lease_owner AS snapshot_lease_owner
+      FROM runtime_outbox AS outbox
+      LEFT JOIN runtime_outbox_claim_snapshots AS snapshot
+        ON snapshot.outbox_id = outbox.outbox_id
+        AND snapshot.delivery_attempt_id = outbox.delivery_attempt_id
+        AND snapshot.delivery_attempt_no = outbox.delivery_attempt_no
+        AND snapshot.outbox_lease_epoch = outbox.outbox_lease_epoch
+      WHERE outbox.status = 'delivering'
+    `).all();
+    const update = database.prepare(`
+      UPDATE runtime_outbox
+      SET status = 'delivery_unknown', next_attempt_at = NULL,
+        last_error_json = COALESCE(last_error_json, ?),
+        updated_at = COALESCE(updated_at, last_attempt_at, created_at)
+      WHERE outbox_id = ? AND status = 'delivering'
+        AND delivery_attempt_id IS ? AND delivery_attempt_no IS ?
+        AND outbox_lease_epoch = ? AND lease_owner IS ?
+        AND command_json = ? AND claimed_command_hash IS ?
+    `);
+    for (const row of rows) {
+      const snapshotHash = row.snapshot_command_json === null
+        ? null
+        : crypto.createHash('sha256').update(row.snapshot_command_json).digest('hex');
+      const verified = row.snapshot_command_json !== null
+        && row.snapshot_lease_owner === row.lease_owner
+        && row.snapshot_command_json === row.command_json
+        && row.snapshot_command_hash === row.claimed_command_hash
+        && snapshotHash === row.snapshot_command_hash;
+      if (verified) continue;
+      const occurredAt = row.last_attempt_at ?? row.created_at;
+      update.run(
+        JSON.stringify({
+          code: 'delivery_claim_authority_unverifiable',
+          category: 'internal',
+          retryable: false,
+          side_effect_status: 'unknown',
+          user_message: 'Delivery acknowledgement is unknown and requires reconciliation.',
+          occurred_at: occurredAt,
+        }),
+        row.outbox_id,
+        row.delivery_attempt_id,
+        row.delivery_attempt_no,
+        row.outbox_lease_epoch,
+        row.lease_owner,
+        row.command_json,
+        row.claimed_command_hash,
+      );
+    }
+  });
+  quarantine.immediate();
+}
+
 function backfillDeliveryLanes(database) {
   const rows = database.prepare(`
     SELECT outbox_id, delivery_id, aggregate_version, status, command_json,
@@ -2460,6 +2523,7 @@ export function initializeRuntimePersistence(database) {
     'terminal',
     'INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1))',
   );
+  quarantineUnverifiableOutboxClaims(database);
   migrateLegacyOutboxConstraint(database);
   backfillDeliveryLanes(database);
   migrateDeliveryLaneIdentity(database);

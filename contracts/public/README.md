@@ -167,6 +167,11 @@ An expired non-idempotent pre-send claim remains fenced from automatic replay an
 provider-neutral outbox `delivery_unknown`, which degrades Core health pending reconciliation.
 Only an owner whose durable sink proves exact same-`delivery_id` idempotency may reclaim that
 expired claim; replay must return the original effect or fail on conflicting content.
+When opening an older database, Core quarantines every in-flight delivery that lacks an immutable
+snapshot matching its exact attempt, owner, full command, and hash. The upgrade never creates a
+replacement snapshot from that mutable legacy row and never automatically replays its possible
+external effect. A current expired claim is reclaimable only from its verified original snapshot;
+the next attempt is derived from that snapshot rather than from the mutable outbox projection.
 
 - `create_main` and `send_text` have no platform target or predecessor;
 - `update_main` names both the exact platform message and predecessor delivery;

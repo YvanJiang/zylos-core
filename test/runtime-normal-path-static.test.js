@@ -229,7 +229,19 @@ describe('normal product paths have no retired runtime authority', () => {
     );
     expect(outboxSource).toMatch(/INSERT INTO runtime_outbox_claim_snapshots/);
     expect(outboxSource).toMatch(
+      /sourceCommandJson = row\.status === 'pending'[\s\S]*row\.snapshot_command_json/,
+    );
+    expect(outboxSource).toMatch(
+      /snapshot\.command_json = candidate\.command_json[\s\S]*snapshot\.command_hash = candidate\.claimed_command_hash/,
+    );
+    expect(outboxSource).toMatch(
       /snapshot\.command_json = \? AND snapshot\.command_hash = \?/,
+    );
+    expect(schemaSource).toMatch(
+      /quarantineUnverifiableOutboxClaims[\s\S]*status = 'delivery_unknown'/,
+    );
+    expect(snapshotSource).toMatch(
+      /'dead_letter', 'delivery_unknown'/,
     );
     expect(schemaSource).toMatch(/runtime_outbox_claim_snapshot_update_immutable/);
     expect(schemaSource).toMatch(/runtime_outbox_claim_snapshot_insert_once/);

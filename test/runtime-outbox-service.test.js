@@ -19,6 +19,10 @@ const inboundFixture = JSON.parse(fs.readFileSync(
   new URL('../contracts/public/fixtures/inbound-envelope-v1.json', import.meta.url),
   'utf8',
 ));
+const deliveryMappingFixture = JSON.parse(fs.readFileSync(
+  new URL('../contracts/public/fixtures/delivery-mapping-v1.json', import.meta.url),
+  'utf8',
+));
 
 const temporaryDirectories = [];
 
@@ -53,6 +57,74 @@ function normalEnvelope(suffix) {
     inbound_event_id: envelope.inbound_event_id,
   });
   return envelope;
+}
+
+function createExactBaseDeliveringOutbox(database) {
+  const command = structuredClone(deliveryMappingFixture.command_vectors.find(
+    ({ name }) => name === 'send_text_bound',
+  ).document);
+  database.exec(`
+    CREATE TABLE runtime_turns (turn_id TEXT PRIMARY KEY);
+    CREATE TABLE runtime_outbox (
+      outbox_id TEXT PRIMARY KEY,
+      delivery_id TEXT NOT NULL UNIQUE,
+      aggregate_type TEXT NOT NULL,
+      aggregate_id TEXT NOT NULL,
+      turn_id TEXT REFERENCES runtime_turns(turn_id),
+      control_id TEXT,
+      lane_key TEXT,
+      predecessor_delivery_id TEXT,
+      aggregate_version INTEGER NOT NULL CHECK (aggregate_version > 0),
+      status TEXT NOT NULL,
+      command_json TEXT NOT NULL,
+      priority INTEGER NOT NULL DEFAULT 0,
+      supersedable INTEGER NOT NULL DEFAULT 0 CHECK (supersedable IN (0, 1)),
+      terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1)),
+      attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+      delivery_attempt_id TEXT,
+      delivery_attempt_no INTEGER CHECK (
+        delivery_attempt_no IS NULL OR delivery_attempt_no > 0
+      ),
+      outbox_lease_epoch INTEGER NOT NULL DEFAULT 0 CHECK (outbox_lease_epoch >= 0),
+      lease_owner TEXT,
+      lease_expires_at TEXT,
+      last_attempt_at TEXT,
+      next_attempt_at TEXT,
+      last_error_json TEXT,
+      result_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT
+    );
+  `);
+  database.prepare(`
+    INSERT INTO runtime_outbox (
+      outbox_id, delivery_id, aggregate_type, aggregate_id, turn_id, control_id,
+      lane_key, predecessor_delivery_id, aggregate_version, status, command_json,
+      priority, supersedable, terminal, attempt_count, delivery_attempt_id,
+      delivery_attempt_no, outbox_lease_epoch, lease_owner, lease_expires_at,
+      last_attempt_at, next_attempt_at, last_error_json, result_json, created_at,
+      updated_at
+    ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, 'delivering', ?, ?, 0, 0,
+      1, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
+  `).run(
+    command.outbox_id,
+    command.delivery_id,
+    command.aggregate_type,
+    command.aggregate_id,
+    command.aggregate_version,
+    JSON.stringify(command),
+    command.priority,
+    command.delivery_attempt_id,
+    command.delivery_attempt_no,
+    command.outbox_lease_epoch,
+    'exact-base-delivery-owner',
+    '2026-07-19T04:00:10Z',
+    '2026-07-19T04:00:00Z',
+    command.created_at,
+    '2026-07-19T04:00:00Z',
+  );
+  database.exec('DROP TABLE runtime_turns;');
+  return command;
 }
 
 function retryableFailure(command, resultAt) {
@@ -141,6 +213,163 @@ afterEach(() => {
 });
 
 describe('durable outbox service', () => {
+  test('quarantines an expired exact-base delivering claim without replay or new authority', async () => {
+    const database = openTestDatabase();
+    const databasePath = database.name;
+    const legacyCommand = createExactBaseDeliveringOutbox(database);
+    database.close();
+
+    const reopened = new Database(databasePath);
+    let sideEffects = 0;
+    const outbox = createOutboxService({
+      database: reopened,
+      renderer: {
+        async deliver(command) {
+          sideEffects += 1;
+          return retryableFailure(command, '2026-07-19T04:00:12Z');
+        },
+      },
+      serviceInstanceId: 'upgraded-delivery-owner',
+      now: () => '2026-07-19T04:00:12Z',
+      generateId: deterministicIds('upgraded-delivery-owner'),
+    });
+
+    await expect(outbox.dispatchNext()).resolves.toEqual({ status: 'idle' });
+    expect(sideEffects).toBe(0);
+    expect(reopened.prepare(`
+      SELECT status, attempt_count, delivery_attempt_id, delivery_attempt_no,
+        outbox_lease_epoch, lease_owner, result_json
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(legacyCommand.outbox_id)).toEqual({
+      status: 'delivery_unknown',
+      attempt_count: 1,
+      delivery_attempt_id: legacyCommand.delivery_attempt_id,
+      delivery_attempt_no: legacyCommand.delivery_attempt_no,
+      outbox_lease_epoch: legacyCommand.outbox_lease_epoch,
+      lease_owner: 'exact-base-delivery-owner',
+      result_json: null,
+    });
+    expect(reopened.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_outbox_claim_snapshots
+      WHERE outbox_id = ?
+    `).get(legacyCommand.outbox_id).count).toBe(0);
+    reopened.close();
+  });
+
+  test('quarantines a jointly altered expired claim instead of blessing a replay snapshot', async () => {
+    const database = openTestDatabase();
+    const databasePath = database.name;
+    acceptNormalInbound(database, normalEnvelope('altered-expired-reclaim'), {
+      now: () => '2026-07-19T09:20:00Z',
+      generateId: deterministicIds('altered-expired-reclaim'),
+    });
+    const firstOwner = createOutboxService({
+      database,
+      serviceInstanceId: 'altered-expired-first-owner',
+      now: () => '2026-07-19T09:20:01Z',
+      generateId: deterministicIds('altered-expired-first-owner'),
+      leaseDurationMs: 10_000,
+    });
+    const originalCommand = firstOwner.claimNext();
+    database.close();
+
+    const reopened = new Database(databasePath);
+    let sideEffects = 0;
+    const contender = createOutboxService({
+      database: reopened,
+      renderer: {
+        async deliver(command) {
+          sideEffects += 1;
+          return retryableFailure(command, '2026-07-19T09:20:12Z');
+        },
+      },
+      serviceInstanceId: 'altered-expired-contender',
+      now: () => '2026-07-19T09:20:12Z',
+      generateId: deterministicIds('altered-expired-contender'),
+      leaseDurationMs: 10_000,
+    });
+    const changedCommand = structuredClone(originalCommand);
+    changedCommand.render_model.text = 'jointly altered before expired reclaim';
+    changedCommand.render_model.terminal = true;
+    changedCommand.priority = 999;
+    const changedJson = JSON.stringify(changedCommand);
+    reopened.prepare(`
+      UPDATE runtime_outbox
+      SET command_json = ?, claimed_command_hash = ?
+      WHERE outbox_id = ?
+    `).run(
+      changedJson,
+      crypto.createHash('sha256').update(changedJson).digest('hex'),
+      originalCommand.outbox_id,
+    );
+
+    await expect(contender.dispatchNext()).resolves.toEqual({ status: 'idle' });
+    expect(sideEffects).toBe(0);
+    expect(reopened.prepare(`
+      SELECT status, attempt_count, delivery_attempt_id, delivery_attempt_no,
+        outbox_lease_epoch, lease_owner, result_json
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(originalCommand.outbox_id)).toEqual({
+      status: 'delivery_unknown',
+      attempt_count: 1,
+      delivery_attempt_id: originalCommand.delivery_attempt_id,
+      delivery_attempt_no: originalCommand.delivery_attempt_no,
+      outbox_lease_epoch: originalCommand.outbox_lease_epoch,
+      lease_owner: 'altered-expired-first-owner',
+      result_json: null,
+    });
+    expect(reopened.prepare(`
+      SELECT delivery_attempt_id, delivery_attempt_no, outbox_lease_epoch,
+        lease_owner, command_json
+      FROM runtime_outbox_claim_snapshots WHERE outbox_id = ?
+    `).all(originalCommand.outbox_id)).toEqual([{
+      delivery_attempt_id: originalCommand.delivery_attempt_id,
+      delivery_attempt_no: originalCommand.delivery_attempt_no,
+      outbox_lease_epoch: originalCommand.outbox_lease_epoch,
+      lease_owner: 'altered-expired-first-owner',
+      command_json: JSON.stringify(originalCommand),
+    }]);
+    reopened.close();
+  });
+
+  test('keeps later lane projections staged behind a delivery_unknown barrier', () => {
+    const database = openTestDatabase();
+    const accepted = acceptNormalInbound(database, normalEnvelope('unknown-lane-barrier'), {
+      now: () => '2026-07-19T09:25:00Z',
+      generateId: deterministicIds('unknown-lane-barrier'),
+    });
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'unknown-lane-barrier-owner',
+      now: () => '2026-07-19T09:25:01Z',
+      generateId: deterministicIds('unknown-lane-barrier-owner'),
+    });
+    const command = owner.claimNext();
+    database.prepare(`
+      UPDATE runtime_outbox SET status = 'delivery_unknown' WHERE outbox_id = ?
+    `).run(command.outbox_id);
+
+    stageMainProjection(database, { turn_id: accepted.turn_id }, projectionEvent(accepted, {
+      version: 3,
+      kind: 'text_snapshot',
+      phase: 'running',
+      payload: { text: 'must remain staged', end_offset: 18 },
+      persistedAt: '2026-07-19T09:25:02Z',
+    }), { generateId: deterministicIds('unknown-lane-barrier-projection') });
+
+    expect(database.prepare(`
+      SELECT aggregate_version, status FROM runtime_outbox
+      WHERE turn_id = ? ORDER BY aggregate_version
+    `).all(accepted.turn_id)).toEqual([
+      { aggregate_version: 1, status: 'delivery_unknown' },
+    ]);
+    expect(database.prepare(`
+      SELECT aggregate_version, status FROM runtime_projection_snapshots
+      WHERE turn_id = ? AND aggregate_version = 3
+    `).get(accepted.turn_id)).toEqual({ aggregate_version: 3, status: 'staged' });
+    database.close();
+  });
+
   test('migrates the issue 07 outbox without losing rows or blocking fallback versions', () => {
     const database = openTestDatabase();
     database.exec(`
@@ -618,7 +847,7 @@ describe('durable outbox service', () => {
       SELECT status, result_json, pre_action_fenced_at
       FROM runtime_outbox WHERE outbox_id = ?
     `).get(command.outbox_id)).toEqual({
-      status: 'delivering',
+      status: 'delivery_unknown',
       result_json: null,
       pre_action_fenced_at: '2026-07-19T09:00:02Z',
     });

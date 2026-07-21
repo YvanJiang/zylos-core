@@ -536,6 +536,36 @@ describe('Core runtime observability snapshot publisher', () => {
     database.close();
   });
 
+  test('publishes a durably quarantined outbox claim as delivery_unknown', () => {
+    const { database } = openDatabase();
+    acceptNormalInbound(database, normalEnvelope('durable-outbox-delivery-unknown'), {
+      now: () => '2026-07-20T07:59:50Z',
+      generateId: deterministicIds('durable-outbox-delivery-unknown'),
+    });
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'durable-outbox-delivery-unknown-owner',
+      now: () => '2026-07-20T07:59:55Z',
+      generateId: deterministicIds('durable-outbox-delivery-unknown-owner'),
+    });
+    const command = owner.claimNext();
+    database.prepare(`
+      UPDATE runtime_outbox SET status = 'delivery_unknown' WHERE outbox_id = ?
+    `).run(command.outbox_id);
+
+    const snapshot = createPublisher(database, {
+      now: () => '2026-07-20T08:00:07Z',
+    }).publish();
+    expect(snapshot.service.health).toBe('degraded');
+    expect(snapshot.outbox.items).toContainEqual({
+      channel: command.target.channel,
+      status: 'delivery_unknown',
+      count: 1,
+      oldest_age_seconds: 17,
+    });
+    database.close();
+  });
+
   test('publishes complete full replacements with durable monotonic versions across reopen', () => {
     const { database, databasePath } = openDatabase();
     const firstPublisher = createPublisher(database);

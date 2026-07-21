@@ -472,7 +472,9 @@ function collectOutbox(database, generatedAt) {
     SELECT status, command_json, created_at, lease_expires_at,
       lease_expires_epoch_ms, pre_action_fenced_at
     FROM runtime_outbox
-    WHERE status IN ('pending', 'delivering', 'retry_wait', 'dead_letter')
+    WHERE status IN (
+      'pending', 'delivering', 'retry_wait', 'dead_letter', 'delivery_unknown'
+    )
     ORDER BY created_at, outbox_id
   `).all();
   const grouped = new Map();
