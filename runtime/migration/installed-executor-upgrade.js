@@ -661,10 +661,14 @@ export function createInstalledExecutorUpgradeHandler({
     });
   }
 
-  function restoreLegacySourceData({ upgradeId, stepId }) {
-    const sourceQueue = JSON.parse(fs.readFileSync(
-      path.join(installationRoot, 'runtime', 'upgrade-input', `${upgradeId}.json`), 'utf8',
-    ));
+  function restoreLegacySourceData({ upgradeId, stepId, rollbackQueueSha256 }) {
+    const sourceQueueFile = path.join(installationRoot, 'runtime', 'upgrade-input', `${upgradeId}.json`);
+    const sourceQueuePayload = fs.readFileSync(sourceQueueFile);
+    if (typeof rollbackQueueSha256 !== 'string'
+      || crypto.createHash('sha256').update(sourceQueuePayload).digest('hex') !== rollbackQueueSha256) {
+      throw new Error('Legacy restored source queue changed before reconciliation.');
+    }
+    const sourceQueue = JSON.parse(sourceQueuePayload.toString('utf8'));
     if (allowLegacyFromRelease) {
       reconcileLegacyBaseRollback({ database, rollbackBatch: sourceQueue });
     }
@@ -725,9 +729,13 @@ export function createInstalledExecutorUpgradeHandler({
         upgradeId: plan.upgrade_id,
         stepId,
       }),
-      verifyLegacySourceRestored: async ({ step_id: stepId }) => restoreLegacySourceData({
+      verifyLegacySourceRestored: async ({
+        step_id: stepId,
+        rollback_queue_sha256: rollbackQueueSha256,
+      }) => restoreLegacySourceData({
         upgradeId: plan.upgrade_id,
         stepId,
+        rollbackQueueSha256,
       }),
     });
     let targetHealth = null;

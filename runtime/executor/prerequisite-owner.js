@@ -2,8 +2,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
-import { inspectLegacyServiceRegistrations } from '../migration/installed-executor-upgrade.js';
-
 function closeChild(child, graceMs) {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
   return new Promise((resolve) => {
@@ -28,7 +26,6 @@ export function createExecutorPrerequisiteOwner({
   zylosDir,
   spawnFn = spawn,
   existsSync = fs.existsSync,
-  inspectLegacy = inspectLegacyServiceRegistrations,
   closeGraceMs = 5_000,
 } = {}) {
   if (typeof zylosDir !== 'string' || !path.isAbsolute(zylosDir)
@@ -72,14 +69,6 @@ export function createExecutorPrerequisiteOwner({
 
   async function start() {
     if (started) return health();
-    const legacy = inspectLegacy({ zylosDir });
-    if (legacy.length > 0) {
-      const active = legacy.filter(({ was_running: wasRunning }) => wasRunning);
-      const names = (active.length > 0 ? active : legacy).map(({ name }) => name).join(', ');
-      throw new Error(active.length > 0
-        ? `Active legacy runtime services block executor startup: ${names}`
-        : `Stopped legacy runtime registrations require one-time reconciliation: ${names}`);
-    }
     for (const descriptor of descriptors()) {
       const child = spawnFn(descriptor.command, descriptor.args, {
         cwd: descriptor.cwd,

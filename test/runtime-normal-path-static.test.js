@@ -28,6 +28,8 @@ const normalRuntimeFiles = [
   'cli/lib/components.js',
   'runtime/observability/executor-snapshot-client.js',
   'runtime/observability/health-projection.js',
+  'runtime/executor/daemon.js',
+  'runtime/executor/prerequisite-owner.js',
   'runtime/scheduler/scheduler-observability.js',
   'templates/claude-system.md',
   'templates/codex-system.md',
@@ -47,6 +49,8 @@ const retiredRuntimeIdentifier = new RegExp([
   'terminal injection',
   'input health',
   'window health',
+  'old provider remains quiesced',
+  'captured runtime pane text',
   'activity[ _-]monitor',
   'c4[ _-](?:dispatcher|control|session[ _-]init)',
 ].join('|'), 'i');
@@ -425,5 +429,12 @@ describe('normal product paths have no retired runtime authority', () => {
       const source = fs.readFileSync(path.resolve(file), 'utf8');
       expect(source).not.toMatch(/(?:from|import)\s+['"][^'"]*runtime\/migration\//);
     }
+  });
+
+  test('executor loads one-time migration code only for an upgrade or durable recovery', () => {
+    const daemon = fs.readFileSync(path.resolve('runtime/executor/daemon.js'), 'utf8');
+    expect(daemon).not.toMatch(/import\s+[^'";]+['"][^'"]*runtime\/migration\//);
+    expect(daemon).toMatch(/async function onUpgrade\(request\)[\s\S]*await getUpgradeHandler\(\)/);
+    expect(daemon).toMatch(/if \(hasResumableUpgrade\(database\)\)[\s\S]*await getUpgradeHandler\(\)/);
   });
 });

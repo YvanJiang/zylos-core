@@ -471,6 +471,7 @@ describe('executor daemon resource ownership', () => {
       Database: function DatabaseFixture() { return database; },
       createAdapter: () => { throw new Error('stale target adapter must not be created'); },
       createUpgradeHandler: () => upgradeHandler,
+      hasResumableUpgrade: () => true,
       createHost: () => { throw new Error('stale target host must not be created'); },
     });
 
@@ -492,6 +493,7 @@ describe('executor daemon resource ownership', () => {
       Database: function DatabaseFixture() { return database; },
       createAdapter: () => { throw new Error('old adapter must not be created'); },
       createUpgradeHandler: () => upgradeHandler,
+      hasResumableUpgrade: () => true,
       createHost: () => { throw new Error('old host must not be created'); },
     });
 
@@ -537,21 +539,6 @@ describe('executor daemon resource ownership', () => {
 });
 
 describe('executor prerequisite ownership', () => {
-  test.each([
-    [{ name: 'c4-dispatcher', was_running: true }, 'Active legacy runtime services'],
-    [{ name: 'scheduler', was_running: false }, 'Stopped legacy runtime registrations'],
-  ])('fails closed before spawning when legacy registration remains: %j', async (registration, message) => {
-    const state = fixture();
-    const spawned = [];
-    const owner = createExecutorPrerequisiteOwner({
-      zylosDir: state.directory,
-      inspectLegacy: () => [registration],
-      spawnFn: (...args) => { spawned.push(args); throw new Error('must not spawn'); },
-    });
-    await expect(owner.start()).rejects.toThrow(message);
-    expect(spawned).toEqual([]);
-  });
-
   test('owns scheduler and web-console children without starting retired runtime daemons', async () => {
     const state = fixture();
     const scheduler = path.join(state.directory, '.claude', 'skills', 'scheduler', 'scripts', 'daemon.js');
@@ -573,7 +560,6 @@ describe('executor prerequisite ownership', () => {
     }
     const owner = createExecutorPrerequisiteOwner({
       zylosDir: state.directory,
-      inspectLegacy: () => [],
       spawnFn: (command, args, options) => {
         spawned.push({ command, args, options });
         const child = new ChildFixture();

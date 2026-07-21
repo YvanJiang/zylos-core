@@ -336,13 +336,21 @@ export function createLegacySourceQueueAdapter({
         source_queue_restored: true,
       });
     },
-    async reconcile({ step_id: stepId, source_queue_ref: restoredSourceRef }) {
+    async reconcile({
+      step_id: stepId,
+      source_queue_ref: restoredSourceRef,
+      rollback_queue_sha256: rollbackQueueSha256,
+    }) {
       if (path.resolve(restoredSourceRef) !== sourcePath) {
         throw new Error('Legacy source reconciliation requires the exact restored source queue.');
+      }
+      if (typeof rollbackQueueSha256 !== 'string' || await sha256File(sourcePath) !== rollbackQueueSha256) {
+        throw new Error('Legacy restored source queue changed before reconciliation.');
       }
       const reconciliationProof = await verifyLegacySourceRestored(Object.freeze({
         step_id: stepId,
         source_queue_ref: sourcePath,
+        rollback_queue_sha256: rollbackQueueSha256,
       }));
       if (reconciliationProof?.source_data_restored !== true
         || reconciliationProof?.legacy_runtime_remained_inactive !== true
@@ -824,6 +832,7 @@ export function createRuntimeUpgradeCoordinator({
           {
             upgrade_id: upgradeId,
             source_queue_ref: sourceRestore.result.source_queue_ref,
+            rollback_queue_sha256: sourceRestore.result.rollback_queue_sha256,
           },
           (request) => legacySourceAdapter.reconcile(request),
         );

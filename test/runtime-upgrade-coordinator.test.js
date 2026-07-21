@@ -541,19 +541,22 @@ describe('runtime upgrade coordinator', () => {
     expect(await host.advance(preflight.upgrade_id)).toMatchObject({
       state: 'rollback_required', completed_step: 'legacy-source-restore',
     });
-    expect(JSON.parse(fs.readFileSync(fixture.legacyQueueFile, 'utf8')).records).toEqual([
+    const restoredSource = JSON.parse(fs.readFileSync(fixture.legacyQueueFile, 'utf8'));
+    expect(restoredSource.records).toEqual([
       expect.objectContaining({ legacy_record_id: 'safe-pending' }),
       expect.objectContaining({ legacy_record_id: 'recurring-next' }),
     ]);
+    fs.writeFileSync(fixture.legacyQueueFile, `${JSON.stringify({ ...restoredSource, records: [] })}\n`);
+    await expect(host.advance(preflight.upgrade_id))
+      .rejects.toThrow('Legacy restored source queue changed before reconciliation');
+    fs.writeFileSync(fixture.legacyQueueFile, `${JSON.stringify(restoredSource)}\n`);
     await expect(host.advance(preflight.upgrade_id))
       .rejects.toThrow('injected crash after source reconciliation');
     expect(reopened.prepare(`
       SELECT state FROM runtime_upgrade_effects
       WHERE upgrade_id = ? AND step_key = 'legacy-source-reconciliation'
     `).get(preflight.upgrade_id)).toEqual({ state: 'claimed' });
-    const consumedAfterReconciliation = JSON.parse(fs.readFileSync(fixture.legacyQueueFile, 'utf8'));
-    consumedAfterReconciliation.records = [];
-    fs.writeFileSync(fixture.legacyQueueFile, `${JSON.stringify(consumedAfterReconciliation)}\n`);
+    fs.writeFileSync(fixture.legacyQueueFile, `${JSON.stringify({ ...restoredSource, records: [] })}\n`);
     reopened.close();
     reopened = new Database(fixture.databasePath);
     host = createInstalledRuntimeUpgradeHost({
@@ -567,13 +570,18 @@ describe('runtime upgrade coordinator', () => {
       noticeAdapter: deliveredNoticeAdapter(reopened, noticeDeliveries),
       zylosDir: fixture.directory, generateId: ids('host-rollback-reconciliation-reopen'),
     });
+    await expect(host.advance(preflight.upgrade_id))
+      .rejects.toThrow('Legacy restored source queue changed before reconciliation');
+    fs.writeFileSync(fixture.legacyQueueFile, `${JSON.stringify(restoredSource)}\n`);
     expect(await host.advance(preflight.upgrade_id)).toMatchObject({
       state: 'rollback_required', completed_step: 'legacy-source-reconciliation',
     });
     expect(await host.advance(preflight.upgrade_id)).toMatchObject({ state: 'rolled_back' });
     expect(activationAttempts).toBe(1);
     expect(fixture.legacyDispatcher).toMatchObject({ running: false, reconciliation_count: 1 });
-    expect(JSON.parse(fs.readFileSync(fixture.legacyQueueFile, 'utf8')).records).toEqual([]);
+    expect(JSON.parse(fs.readFileSync(fixture.legacyQueueFile, 'utf8')).records).toEqual(
+      restoredSource.records,
+    );
     expect(noticeDeliveries).toEqual([
       expect.objectContaining({ legacy_record_id: 'unknown-running', status: 'delivered' }),
     ]);

@@ -11,7 +11,6 @@ import dotenv from 'dotenv';
 
 import { createClaudeConversationAdapter } from '../providers/claude/conversation-adapter.js';
 import { createCodexAppServerAdapter } from '../providers/codex-app-server-adapter.js';
-import { createInstalledExecutorUpgradeHandler } from '../migration/installed-executor-upgrade.js';
 import { createExecutorServiceHost } from './service-host.js';
 import { createExecutorPrerequisiteOwner } from './prerequisite-owner.js';
 
@@ -45,6 +44,28 @@ export function createConfiguredProviderAdapter({ provider, zylosDir, environmen
   throw new Error(`Unsupported executor provider: ${provider}`);
 }
 
+function hasResumableRuntimeUpgrade(database) {
+  if (typeof database?.prepare !== 'function') return false;
+  try {
+    const table = database.prepare(`
+      SELECT 1 FROM sqlite_master
+      WHERE type = 'table' AND name = 'runtime_upgrade_runs'
+    `).get();
+    if (table === undefined) return false;
+    return database.prepare(`
+      SELECT 1 FROM runtime_upgrade_runs
+      WHERE state NOT IN ('committed', 'rolled_back') LIMIT 1
+    `).get() !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+async function loadInstalledExecutorUpgradeHandler() {
+  const module = await import('../migration/installed-executor-upgrade.js');
+  return module.createInstalledExecutorUpgradeHandler;
+}
+
 export async function runExecutorDaemon({
   zylosDir = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos'),
   serviceInstanceId = `executor-${crypto.randomUUID()}`,
@@ -52,7 +73,8 @@ export async function runExecutorDaemon({
   Database = require('better-sqlite3'),
   createAdapter = createConfiguredProviderAdapter,
   createHost = createExecutorServiceHost,
-  createUpgradeHandler = createInstalledExecutorUpgradeHandler,
+  createUpgradeHandler = null,
+  hasResumableUpgrade = hasResumableRuntimeUpgrade,
   createPrerequisiteOwner = createExecutorPrerequisiteOwner,
 } = {}) {
   if (!path.isAbsolute(zylosDir) || path.parse(zylosDir).root === zylosDir) {
@@ -74,18 +96,41 @@ export async function runExecutorDaemon({
     databaseClosed = true;
     database.close();
   };
-  const onUpgrade = createUpgradeHandler({
+  if (createUpgradeHandler !== null && typeof createUpgradeHandler !== 'function') {
+    closeDatabase();
+    throw new TypeError('createUpgradeHandler must be a function or null');
+  }
+  if (typeof hasResumableUpgrade !== 'function') {
+    closeDatabase();
+    throw new TypeError('hasResumableUpgrade must be a function');
+  }
+  const upgradeHandlerOptions = {
     database,
     Database,
     zylosDir,
     currentReleasePath,
     currentReleaseRef: currentPackage.version,
     provider,
-  });
+  };
+  let upgradeHandler = null;
+  async function getUpgradeHandler() {
+    if (upgradeHandler !== null) return upgradeHandler;
+    const factory = createUpgradeHandler ?? await loadInstalledExecutorUpgradeHandler();
+    upgradeHandler = factory(upgradeHandlerOptions);
+    return upgradeHandler;
+  }
+  async function onUpgrade(request) {
+    const handler = await getUpgradeHandler();
+    return handler(request);
+  }
   let resumed = null;
   try {
-    if (typeof onUpgrade.resumeBlocking === 'function') {
-      resumed = await onUpgrade.resumeBlocking();
+    if (hasResumableUpgrade(database)) {
+      const handler = await getUpgradeHandler();
+      if (typeof handler.resumeBlocking !== 'function') {
+        throw new Error('Runtime upgrade recovery handler is unavailable.');
+      }
+      resumed = await handler.resumeBlocking();
       if (resumed !== null && !['committed', 'rolled_back'].includes(resumed?.state)) {
         throw new Error(
           `Runtime upgrade ${resumed?.state ?? 'unknown'} did not reach a safe terminal state.`,
