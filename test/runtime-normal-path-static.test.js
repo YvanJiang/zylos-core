@@ -135,6 +135,9 @@ describe('normal product paths have no retired runtime authority', () => {
     const ownerSource = fs.readFileSync(
       path.resolve('skills/web-console/scripts/core-outbox-owner.js'), 'utf8',
     );
+    const outboxSource = fs.readFileSync(
+      path.resolve('runtime/delivery/outbox-service.js'), 'utf8',
+    );
     const mailboxSource = fs.readFileSync(
       path.resolve('skills/web-console/scripts/db.js'), 'utf8',
     );
@@ -156,6 +159,9 @@ describe('normal product paths have no retired runtime authority', () => {
     expect(ownerSource).toMatch(
       /await projectInbound\(command\)[\s\S]*return textRenderer\.deliver\(command\)/,
     );
+    expect(ownerSource).toMatch(/beforeSend\(command\)[\s\S]*assertCurrentClaim\(command\)/);
+    expect(outboxSource).toMatch(/claimed_command_hash[\s\S]*assertCurrentClaim/);
+    expect(source).toMatch(/source\.command_json !== JSON\.stringify\(command\)/);
     expect(source).toMatch(/command_outbox_id[\s\S]*command_turn_id/);
     expect(source).toMatch(/source\.turn_id !== command\.mapping\.turn_id/);
     expect(source).toMatch(/command_aggregate_version !== command\.aggregate_version/);

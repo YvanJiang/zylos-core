@@ -348,6 +348,53 @@ describe('normal C4 callers use durable Core contracts', () => {
     database.close();
   });
 
+  test('the Web Console owner stops before mailbox delivery when a command changes', async () => {
+    const { zylosDir, env } = fixture();
+    const acceptedProcess = run(receiveCli, [
+      '--channel', 'web-console', '--endpoint', 'console',
+      '--message-id', 'web-owner-command-change', '--actor-id', 'fixture-user',
+      '--occurred-at', '2026-07-21T00:21:00.000Z', '--content', 'command change', '--json',
+    ], env);
+    assert.equal(acceptedProcess.status, 0, acceptedProcess.stderr);
+    const accepted = JSON.parse(acceptedProcess.stdout.trim());
+    const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
+    const claimTime = claimTimeFor(database, 'web-console', 'console');
+    let mailboxDeliveries = 0;
+    const owner = createWebConsoleOutboxOwner({
+      database,
+      region: 'global',
+      tenantId: 'tenant-c4',
+      botId: 'bot-c4',
+      serviceInstanceId: 'web-console-owner-command-change',
+      now: () => claimTime,
+      projectInbound(command) {
+        const persisted = database.prepare(`
+          SELECT command_json FROM runtime_outbox WHERE outbox_id = ?
+        `).get(command.outbox_id);
+        const changedCommand = JSON.parse(persisted.command_json);
+        changedCommand.render_model.text = 'changed after projection';
+        database.prepare(`
+          UPDATE runtime_outbox SET command_json = ? WHERE outbox_id = ?
+        `).run(JSON.stringify(changedCommand), command.outbox_id);
+      },
+      deliverMessage() {
+        mailboxDeliveries += 1;
+        return { platform_message_id: 'must-not-be-written' };
+      },
+    });
+
+    await assert.rejects(owner.drain(), /delivery claim is stale/i);
+    assert.equal(mailboxDeliveries, 0);
+    assert.deepEqual({ ...database.prepare(`
+      SELECT status, result_json, lease_owner FROM runtime_outbox WHERE turn_id = ?
+    `).get(accepted.turn_id) }, {
+      status: 'delivering',
+      result_json: null,
+      lease_owner: 'web-console-owner-command-change',
+    });
+    database.close();
+  });
+
   test('shell and web-console describe Core outbox owners, not direct model sends', () => {
     const shellSkill = fs.readFileSync(path.resolve('skills/shell/SKILL.md'), 'utf8');
     const shellCli = fs.readFileSync(path.resolve('cli/commands/shell.js'), 'utf8');

@@ -91,6 +91,7 @@ function renderText(command) {
 
 export function createChannelNeutralTextRenderer({
   sendText,
+  beforeSend = () => {},
   now = () => new Date().toISOString(),
 }) {
   if (typeof sendText !== 'function') {
@@ -99,12 +100,16 @@ export function createChannelNeutralTextRenderer({
   if (typeof now !== 'function') {
     throw new TypeError('now must be a function');
   }
+  if (typeof beforeSend !== 'function') {
+    throw new TypeError('beforeSend must be a function');
+  }
 
   async function deliver(command) {
     const validated = validateDeliveryCommand(command).forwarded;
     if (validated.operation === 'update_main') {
       throw new TypeError('A channel-neutral text renderer cannot update a platform message');
     }
+    beforeSend(validated);
     const sent = await sendText(Object.freeze({
       target: structuredClone(validated.target),
       text: renderText(validated),

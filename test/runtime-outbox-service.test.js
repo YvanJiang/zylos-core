@@ -319,6 +319,45 @@ describe('durable outbox service', () => {
     database.close();
   });
 
+  test('keeps a claimed delivery unconfirmed when its full command snapshot changes', () => {
+    const database = openTestDatabase();
+    acceptNormalInbound(database, normalEnvelope('command-snapshot-fencing'), {
+      now: () => '2026-07-19T08:30:00Z',
+      generateId: deterministicIds('command-snapshot-fencing'),
+    });
+    const outbox = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-command-snapshot-fencing',
+      now: () => '2026-07-19T08:30:01Z',
+      generateId: deterministicIds('delivery-command-snapshot-fencing'),
+    });
+    const command = outbox.claimNext();
+    const persisted = database.prepare(`
+      SELECT command_json FROM runtime_outbox WHERE outbox_id = ?
+    `).get(command.outbox_id);
+    const changedCommand = JSON.parse(persisted.command_json);
+    changedCommand.render_model.text = 'changed after claim';
+    database.prepare(`
+      UPDATE runtime_outbox SET command_json = ? WHERE outbox_id = ?
+    `).run(JSON.stringify(changedCommand), command.outbox_id);
+
+    expect(outbox.recordResult(deliveredResult(command, '2026-07-19T08:30:02Z')))
+      .toEqual({ status: 'stale' });
+    expect(readDeliveryAuthority(database, command.outbox_id)).toEqual({
+      outbox: {
+        status: 'delivering',
+        attempt_count: 1,
+        delivery_attempt_id: command.delivery_attempt_id,
+        delivery_attempt_no: 1,
+        outbox_lease_epoch: 1,
+        lease_owner: 'delivery-command-snapshot-fencing',
+        result_json: null,
+      },
+      mappings: [],
+    });
+    database.close();
+  });
+
   test('orders create before update, throttles ordinary progress, and never loses terminal state', () => {
     const database = openTestDatabase();
     const accepted = acceptNormalInbound(database, normalEnvelope('ordered'), {

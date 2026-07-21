@@ -25,6 +25,10 @@ function addMilliseconds(timestamp, milliseconds) {
   return new Date(Date.parse(timestamp) + milliseconds).toISOString();
 }
 
+function createCommandSnapshotHash(commandJson) {
+  return crypto.createHash('sha256').update(commandJson).digest('hex');
+}
+
 function isCurrentFence(row, result) {
   return row.delivery_attempt_id === result.delivery_attempt_id
     && row.delivery_attempt_no === result.delivery_attempt_no
@@ -370,6 +374,8 @@ export function createOutboxService({
         });
       }
       validateDeliveryCommand(command, { occurredAt: claimedAt });
+      const commandJson = JSON.stringify(command);
+      const claimedCommandHash = createCommandSnapshotHash(commandJson);
       const leaseExpiresAt = new Date(
         Date.parse(claimedAt) + leaseDurationMs,
       ).toISOString();
@@ -378,7 +384,7 @@ export function createOutboxService({
         SET status = 'delivering', attempt_count = ?, delivery_attempt_id = ?,
           delivery_attempt_no = ?, outbox_lease_epoch = ?, lease_owner = ?,
           lease_expires_at = ?, last_attempt_at = ?, next_attempt_at = NULL,
-          command_json = ?, updated_at = ?
+          command_json = ?, claimed_command_hash = ?, updated_at = ?
         WHERE outbox_id = ? AND status = ? AND attempt_count = ?
           AND outbox_lease_epoch = ?
       `).run(
@@ -389,7 +395,8 @@ export function createOutboxService({
         serviceInstanceId,
         leaseExpiresAt,
         claimedAt,
-        JSON.stringify(command),
+        commandJson,
+        claimedCommandHash,
         claimedAt,
         row.outbox_id,
         row.status,
@@ -402,11 +409,42 @@ export function createOutboxService({
     return claim.immediate();
   }
 
+  function assertCurrentClaim(command) {
+    const commandJson = JSON.stringify(command);
+    const claimedCommandHash = createCommandSnapshotHash(commandJson);
+    const row = database.prepare(`
+      SELECT status, delivery_id, aggregate_type, aggregate_id, turn_id, aggregate_version,
+        delivery_attempt_id, delivery_attempt_no, outbox_lease_epoch, lease_owner,
+        command_json, claimed_command_hash
+      FROM runtime_outbox
+      WHERE outbox_id = ?
+    `).get(command.outbox_id);
+    if (!row
+      || row.status !== 'delivering'
+      || row.delivery_id !== command.delivery_id
+      || row.aggregate_type !== command.aggregate_type
+      || row.aggregate_id !== command.aggregate_id
+      || row.turn_id !== command.mapping.turn_id
+      || row.aggregate_version !== command.aggregate_version
+      || row.delivery_attempt_id !== command.delivery_attempt_id
+      || row.delivery_attempt_no !== command.delivery_attempt_no
+      || row.outbox_lease_epoch !== command.outbox_lease_epoch
+      || row.lease_owner !== serviceInstanceId
+      || row.claimed_command_hash !== claimedCommandHash
+      || createCommandSnapshotHash(row.command_json) !== claimedCommandHash) {
+      const error = new Error('The durable delivery claim is stale.');
+      error.code = 'stale_delivery_claim';
+      throw error;
+    }
+    return command;
+  }
+
   function recordResult(result) {
     const apply = database.transaction(() => {
       const row = database.prepare(`
         SELECT status, delivery_attempt_id, delivery_attempt_no, outbox_lease_epoch,
-          command_json, result_json, lane.target_json AS lane_target_json
+          command_json, claimed_command_hash, result_json,
+          lane.target_json AS lane_target_json
           , lane.lane_key AS durable_lane_key, lane.turn_id AS lane_turn_id
           , lane.aggregate_type AS lane_aggregate_type
         FROM runtime_outbox AS outbox
@@ -414,7 +452,19 @@ export function createOutboxService({
         WHERE outbox.outbox_id = ?
       `).get(result.outbox_id);
       if (!row) return { status: 'stale' };
-      const command = JSON.parse(row.command_json);
+      if (row.result_json === JSON.stringify(result)) {
+        return { status: 'duplicate', outbox_status: row.status };
+      }
+      if (row.claimed_command_hash === null
+        || createCommandSnapshotHash(row.command_json) !== row.claimed_command_hash) {
+        return { status: 'stale' };
+      }
+      let command;
+      try {
+        command = JSON.parse(row.command_json);
+      } catch {
+        return { status: 'stale' };
+      }
       if (row.lane_target_json !== null) {
         assertDurableDeliveryTarget({
           lane: {
@@ -426,9 +476,6 @@ export function createOutboxService({
           candidateTarget: command.target,
           occurredAt: result.result_at,
         });
-      }
-      if (row.result_json === JSON.stringify(result)) {
-        return { status: 'duplicate', outbox_status: row.status };
       }
       if (
         row.status !== 'delivering'
@@ -547,9 +594,10 @@ export function createOutboxService({
     if (!renderer) throw new Error('dispatchNext requires a renderer');
     const command = claimNext();
     if (!command) return { status: 'idle' };
+    assertCurrentClaim(command);
     const result = await renderer.deliver(command);
     return recordResult(result);
   }
 
-  return Object.freeze({ claimNext, dispatchNext, recordResult });
+  return Object.freeze({ claimNext, assertCurrentClaim, dispatchNext, recordResult });
 }

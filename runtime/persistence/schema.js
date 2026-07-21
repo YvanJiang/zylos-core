@@ -15,6 +15,7 @@ const OUTBOX_TABLE_SCHEMA = `(
     aggregate_version INTEGER NOT NULL CHECK (aggregate_version > 0),
     status TEXT NOT NULL,
     command_json TEXT NOT NULL,
+    claimed_command_hash TEXT,
     priority INTEGER NOT NULL DEFAULT 0,
     supersedable INTEGER NOT NULL DEFAULT 0 CHECK (supersedable IN (0, 1)),
     terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1)),
@@ -1133,6 +1134,7 @@ const OUTBOX_COLUMNS = Object.freeze([
   'aggregate_version',
   'status',
   'command_json',
+  'claimed_command_hash',
   'priority',
   'supersedable',
   'terminal',
@@ -2400,6 +2402,7 @@ export function initializeRuntimePersistence(database) {
   addColumnIfMissing(database, 'runtime_outbox', 'next_attempt_at', 'TEXT');
   addColumnIfMissing(database, 'runtime_outbox', 'last_error_json', 'TEXT');
   addColumnIfMissing(database, 'runtime_outbox', 'result_json', 'TEXT');
+  addColumnIfMissing(database, 'runtime_outbox', 'claimed_command_hash', 'TEXT');
   addColumnIfMissing(database, 'runtime_outbox', 'updated_at', 'TEXT');
   addColumnIfMissing(
     database,

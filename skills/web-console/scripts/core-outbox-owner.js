@@ -23,8 +23,12 @@ export function createWebConsoleOutboxOwner({
     }
   }
 
+  let owner;
   const textRenderer = createChannelNeutralTextRenderer({
     now,
+    beforeSend(command) {
+      owner.assertCurrentClaim(command);
+    },
     async sendText(delivery) {
       const message = Object.freeze({
         delivery_id: delivery.delivery_id,
@@ -42,7 +46,7 @@ export function createWebConsoleOutboxOwner({
       return { platform_message_id: effect.platform_message_id };
     },
   });
-  const owner = createOutboxService({
+  owner = createOutboxService({
     database,
     channel: 'web-console',
     targetChatId: 'console',
@@ -53,7 +57,9 @@ export function createWebConsoleOutboxOwner({
     now,
     renderer: {
       async deliver(command) {
+        owner.assertCurrentClaim(command);
         await projectInbound(command);
+        owner.assertCurrentClaim(command);
         return textRenderer.deliver(command);
       },
     },

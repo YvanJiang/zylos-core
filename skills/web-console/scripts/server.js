@@ -301,7 +301,7 @@ function requireMailboxMutationScope(cursorScope) {
 
 function projectInboundForDelivery(command) {
   const source = db.prepare(`
-    SELECT outbox.turn_id, turn.inbound_event_id,
+    SELECT outbox.turn_id, turn.inbound_event_id, outbox.command_json,
       outbox.aggregate_type, outbox.aggregate_id, outbox.aggregate_version,
       json_extract(outbox.command_json, '$.outbox_id') AS command_outbox_id,
       json_extract(outbox.command_json, '$.delivery_id') AS command_delivery_id,
@@ -314,7 +314,8 @@ function projectInboundForDelivery(command) {
     WHERE outbox.outbox_id = ? AND outbox.delivery_id = ?
   `).get(command.outbox_id, command.delivery_id);
   if (!source) throw new Error('The Core outbox delivery source is missing.');
-  if (source.command_outbox_id !== command.outbox_id
+  if (source.command_json !== JSON.stringify(command)
+    || source.command_outbox_id !== command.outbox_id
     || source.command_delivery_id !== command.delivery_id
     || source.turn_id !== command.mapping.turn_id
     || source.command_turn_id !== command.mapping.turn_id
