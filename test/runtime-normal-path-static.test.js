@@ -134,6 +134,9 @@ describe('normal product paths have no retired runtime authority', () => {
     const ownerSource = fs.readFileSync(
       path.resolve('skills/web-console/scripts/core-outbox-owner.js'), 'utf8',
     );
+    const mailboxSource = fs.readFileSync(
+      path.resolve('skills/web-console/scripts/db.js'), 'utf8',
+    );
     const appSource = fs.readFileSync(path.resolve('skills/web-console/public/app.js'), 'utf8');
     const reconciliationSource = fs.readFileSync(
       path.resolve('skills/web-console/public/message-reconciliation.js'), 'utf8',
@@ -142,6 +145,8 @@ describe('normal product paths have no retired runtime authority', () => {
     expect(source).toMatch(/validateInboundEnvelope|projectCoreWebConsoleContent/);
     expect(source).toMatch(/CORE_REGION|CORE_TENANT_ID|CORE_BOT_ID/);
     expect(ownerSource).toMatch(/targetRegion|targetTenantId|targetBotId/);
+    expect(mailboxSource).toMatch(/region = \? AND tenant_id = \? AND bot_id = \?/);
+    expect(mailboxSource).toMatch(/delivery_mailbox_scope_cursor/);
     expect(source).not.toMatch(/getCoreMessages|event\.rowid|outbox_rowid|broadcast\('messages'/);
     expect(source).not.toMatch(/latest message|parent chat|c4-send/i);
     expect(appSource).toMatch(/api\/poll\?since_id=/);

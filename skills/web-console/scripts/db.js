@@ -40,6 +40,9 @@ function openDb(dbPath = DB_PATH) {
       direction TEXT NOT NULL CHECK(direction IN ('in', 'out')),
       channel TEXT NOT NULL,
       endpoint_id TEXT NOT NULL,
+      region TEXT NOT NULL,
+      tenant_id TEXT NOT NULL,
+      bot_id TEXT NOT NULL,
       content TEXT NOT NULL,
       attachments_json TEXT NOT NULL DEFAULT '[]',
       timestamp TEXT NOT NULL
@@ -51,6 +54,15 @@ function openDb(dbPath = DB_PATH) {
   if (!mailboxColumns.has('attachments_json')) {
     db.exec("ALTER TABLE delivery_mailbox ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'");
   }
+  for (const column of ['region', 'tenant_id', 'bot_id']) {
+    if (!mailboxColumns.has(column)) {
+      db.exec(`ALTER TABLE delivery_mailbox ADD COLUMN ${column} TEXT`);
+    }
+  }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS delivery_mailbox_scope_cursor
+    ON delivery_mailbox (region, tenant_id, bot_id, channel, endpoint_id, id)
+  `);
   return db;
 }
 
@@ -81,14 +93,34 @@ function serializeMailboxAttachments(attachments) {
 }
 
 export class DeliveryMailbox {
-  constructor(db) {
+  constructor(db, { region, tenantId, botId }) {
+    for (const [fieldName, value] of [
+      ['region', region], ['tenantId', tenantId], ['botId', botId],
+    ]) {
+      if (typeof value !== 'string' || value.length === 0) {
+        throw new TypeError(`${fieldName} must be a non-empty string`);
+      }
+    }
     this.db = db;
+    this.region = region;
+    this.tenantId = tenantId;
+    this.botId = botId;
+    this.channel = 'web-console';
+    this.endpointId = 'console';
+    this.scopeKey = crypto.createHash('sha256').update(JSON.stringify([
+      region, tenantId, botId, this.channel, this.endpointId,
+    ])).digest('hex');
     this._insert = db.prepare(`
       INSERT OR IGNORE INTO delivery_mailbox (
-        source_key, delivery_id, direction, channel, endpoint_id, content, attachments_json, timestamp
-      ) VALUES (?, ?, ?, 'web-console', ?, ?, ?, ?)
+        source_key, delivery_id, direction, channel, endpoint_id,
+        region, tenant_id, bot_id, content, attachments_json, timestamp
+      ) VALUES (?, ?, ?, 'web-console', 'console', ?, ?, ?, ?, ?, ?)
     `);
-    this._bySource = db.prepare('SELECT * FROM delivery_mailbox WHERE source_key = ?');
+    this._bySource = db.prepare(`
+      SELECT * FROM delivery_mailbox
+      WHERE source_key = ? AND channel = 'web-console' AND endpoint_id = 'console'
+        AND region = ? AND tenant_id = ? AND bot_id = ?
+    `);
   }
 
   _store({
@@ -101,16 +133,25 @@ export class DeliveryMailbox {
     if (typeof endpointId !== 'string' || endpointId.length === 0) {
       throw new TypeError('endpointId must be a non-empty string');
     }
+    if (endpointId !== this.endpointId) {
+      throw new TypeError('endpointId does not match this Web Console mailbox owner');
+    }
     if (typeof content !== 'string') throw new TypeError('content must be a string');
     if (typeof timestamp !== 'string' || Number.isNaN(Date.parse(timestamp))) {
       throw new TypeError('timestamp must be an ISO timestamp');
     }
     const attachmentsJson = serializeMailboxAttachments(attachments);
+    const scopedSourceKey = `scope:${this.scopeKey}:${sourceKey}`;
+    const scopedDeliveryId = deliveryId === null
+      ? null : `scope:${this.scopeKey}:${deliveryId}`;
     this._insert.run(
-      sourceKey, deliveryId, direction, endpointId, content, attachmentsJson, timestamp,
+      scopedSourceKey, scopedDeliveryId, direction,
+      this.region, this.tenantId, this.botId, content, attachmentsJson, timestamp,
     );
-    const row = this._bySource.get(sourceKey);
-    if (!row || row.delivery_id !== deliveryId || row.direction !== direction
+    const row = this._bySource.get(
+      scopedSourceKey, this.region, this.tenantId, this.botId,
+    );
+    if (!row || row.delivery_id !== scopedDeliveryId || row.direction !== direction
       || row.endpoint_id !== endpointId || row.content !== content
       || row.attachments_json !== attachmentsJson) {
       throw new Error('A Web Console mailbox source conflicts with its durable projection.');
@@ -154,10 +195,11 @@ export class DeliveryMailbox {
     const rows = this.db.prepare(`
       SELECT id, direction, channel, endpoint_id, content, attachments_json, timestamp
       FROM delivery_mailbox
-      WHERE id > ?
+      WHERE id > ? AND channel = 'web-console' AND endpoint_id = 'console'
+        AND region = ? AND tenant_id = ? AND bot_id = ?
       ORDER BY id ${latest ? 'DESC' : 'ASC'}
       LIMIT ?
-    `).all(sinceId, limit);
+    `).all(sinceId, this.region, this.tenantId, this.botId, limit);
     const projected = rows.map(({ attachments_json: attachmentsJson, ...row }) => ({
       ...row,
       attachments: JSON.parse(attachmentsJson),

@@ -100,7 +100,11 @@ const AUTH_ENABLED = AUTH_PASSWORD.length > 0;
 const wcDb = openDb();
 const sessionStore = new SessionStore(wcDb);
 const uploadRegistry = new PersistentUploadRegistry(wcDb);
-const deliveryMailbox = new DeliveryMailbox(wcDb);
+const deliveryMailbox = new DeliveryMailbox(wcDb, {
+  region: CORE_REGION,
+  tenantId: CORE_TENANT_ID,
+  botId: CORE_BOT_ID,
+});
 
 fs.mkdirSync(MEDIA_DIR, { recursive: true });
 

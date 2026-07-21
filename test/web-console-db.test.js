@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, test } from '@jest/globals';
+import Database from '../skills/web-console/node_modules/better-sqlite3/lib/index.js';
 import {
   DeliveryMailbox,
   openDb,
@@ -12,6 +13,9 @@ import { createDrainBarrier } from '../skills/web-console/scripts/core-outbox-ow
 
 let tempDir;
 let db;
+const TEST_MAILBOX_SCOPE = Object.freeze({
+  region: 'global', tenantId: 'test-tenant', botId: 'test-bot',
+});
 
 beforeEach(() => {
   tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wc-db-test-'));
@@ -134,9 +138,80 @@ describe('PersistentUploadRegistry', () => {
 });
 
 describe('DeliveryMailbox', () => {
+  test('migrates legacy unscoped rows as hidden records and admits a scoped reprojection', () => {
+    const legacyPath = path.join(tempDir, 'legacy-mailbox.db');
+    const legacyDb = new Database(legacyPath);
+    legacyDb.exec(`
+      CREATE TABLE delivery_mailbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_key TEXT NOT NULL UNIQUE,
+        delivery_id TEXT UNIQUE,
+        direction TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        endpoint_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        timestamp TEXT NOT NULL
+      );
+      INSERT INTO delivery_mailbox (
+        source_key, delivery_id, direction, channel, endpoint_id, content, timestamp
+      ) VALUES (
+        'inbound:legacy-unscoped', NULL, 'in', 'web-console', 'console',
+        'legacy scope unknown', '2026-07-21T00:00:00.000Z'
+      );
+    `);
+    legacyDb.close();
+
+    const migrated = openDb(legacyPath);
+    const mailbox = new DeliveryMailbox(migrated, TEST_MAILBOX_SCOPE);
+    expect(mailbox.list()).toEqual([]);
+    mailbox.projectInbound({
+      inboundEventId: 'legacy-unscoped', endpointId: 'console', content: 'scoped reprojection',
+      timestamp: '2026-07-21T00:00:01.000Z',
+    });
+    expect(mailbox.list().map(({ content }) => content)).toEqual(['scoped reprojection']);
+    expect(migrated.prepare(`
+      SELECT region, tenant_id, bot_id FROM delivery_mailbox WHERE content = ?
+    `).get('legacy scope unknown')).toEqual({ region: null, tenant_id: null, bot_id: null });
+    migrated.close();
+  });
+
+  test('isolates inbound and outbound rows across scope reconfiguration and reopen', () => {
+    const dbPath = path.join(tempDir, 'test.db');
+    const scopeA = { region: 'global', tenantId: 'tenant-a', botId: 'bot-a' };
+    const scopeB = { region: 'global', tenantId: 'tenant-b', botId: 'bot-b' };
+    const first = new DeliveryMailbox(db, scopeA);
+    first.projectInbound({
+      inboundEventId: 'shared-inbound-id', endpointId: 'console', content: 'tenant A inbound',
+      timestamp: '2026-07-21T00:00:00.000Z',
+    });
+    first.deliver({
+      deliveryId: 'shared-delivery-id', endpointId: 'console', content: 'tenant A outbound',
+      timestamp: '2026-07-21T00:00:01.000Z',
+    });
+    db.close();
+    db = openDb(dbPath);
+
+    const second = new DeliveryMailbox(db, scopeB);
+    expect(second.list()).toEqual([]);
+    second.projectInbound({
+      inboundEventId: 'shared-inbound-id', endpointId: 'console', content: 'tenant B inbound',
+      timestamp: '2026-07-21T00:00:02.000Z',
+    });
+    second.deliver({
+      deliveryId: 'shared-delivery-id', endpointId: 'console', content: 'tenant B outbound',
+      timestamp: '2026-07-21T00:00:03.000Z',
+    });
+    expect(second.list().map(({ content }) => content)).toEqual([
+      'tenant B inbound', 'tenant B outbound',
+    ]);
+    expect(new DeliveryMailbox(db, scopeA).list().map(({ content }) => content)).toEqual([
+      'tenant A inbound', 'tenant A outbound',
+    ]);
+  });
+
   test('persists canonical attachment metadata across reopen and fences conflicting replay', () => {
     const dbPath = path.join(tempDir, 'test.db');
-    const mailbox = new DeliveryMailbox(db);
+    const mailbox = new DeliveryMailbox(db, TEST_MAILBOX_SCOPE);
     const attachment = {
       attachment_id: 'upload-attachment-1',
       kind: 'file',
@@ -152,7 +227,7 @@ describe('DeliveryMailbox', () => {
     });
     db.close();
     db = openDb(dbPath);
-    const reopened = new DeliveryMailbox(db);
+    const reopened = new DeliveryMailbox(db, TEST_MAILBOX_SCOPE);
     expect(reopened.list()).toEqual([
       expect.objectContaining({ content: 'report', attachments: [attachment] }),
     ]);
@@ -164,7 +239,7 @@ describe('DeliveryMailbox', () => {
   });
 
   test('assigns durable monotonic visibility cursors in actual mailbox order', () => {
-    const mailbox = new DeliveryMailbox(db);
+    const mailbox = new DeliveryMailbox(db, TEST_MAILBOX_SCOPE);
     const firstInbound = mailbox.projectInbound({
       inboundEventId: 'inbound-1', endpointId: 'console', content: 'first',
       timestamp: '2026-07-21T00:00:00.000Z',
@@ -185,7 +260,7 @@ describe('DeliveryMailbox', () => {
   });
 
   test('makes renderer retries idempotent and rejects conflicting replay content', () => {
-    const mailbox = new DeliveryMailbox(db);
+    const mailbox = new DeliveryMailbox(db, TEST_MAILBOX_SCOPE);
     const delivery = {
       deliveryId: 'delivery-retry', endpointId: 'console', content: 'rendered text',
       timestamp: '2026-07-21T00:00:00.000Z',
@@ -199,7 +274,7 @@ describe('DeliveryMailbox', () => {
   });
 
   test('paginates more than 100 unseen rows without a later reply skipping backlog', () => {
-    const mailbox = new DeliveryMailbox(db);
+    const mailbox = new DeliveryMailbox(db, TEST_MAILBOX_SCOPE);
     for (let index = 1; index <= 150; index += 1) {
       mailbox.projectInbound({
         inboundEventId: `backlog-${index}`, endpointId: 'console', content: `message ${index}`,

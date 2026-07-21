@@ -718,17 +718,21 @@ describe('web-console attachment routes', () => {
   test('HTTP mailbox pagination exposes more than 100 mixed rows without a cursor gap', async () => {
     ctx = await startServer();
     const mailboxDb = new Database(path.join(ctx.root, 'web-console', 'web-console.db'));
+    const scopeKey = crypto.createHash('sha256').update(JSON.stringify([
+      'global', 'default', 'zylos', 'web-console', 'console',
+    ])).digest('hex');
     const insert = mailboxDb.prepare(`
       INSERT INTO delivery_mailbox (
-        source_key, delivery_id, direction, channel, endpoint_id, content, timestamp
-      ) VALUES (?, ?, ?, 'web-console', 'console', ?, ?)
+        source_key, delivery_id, direction, channel, endpoint_id,
+        region, tenant_id, bot_id, content, timestamp
+      ) VALUES (?, ?, ?, 'web-console', 'console', 'global', 'default', 'zylos', ?, ?)
     `);
     mailboxDb.transaction(() => {
       for (let index = 1; index <= 151; index += 1) {
         const outbound = index % 3 === 0;
         insert.run(
-          `route-backlog:${index}`,
-          outbound ? `route-delivery:${index}` : null,
+          `scope:${scopeKey}:route-backlog:${index}`,
+          outbound ? `scope:${scopeKey}:route-delivery:${index}` : null,
           outbound ? 'out' : 'in',
           `route message ${index}`,
           new Date(Date.UTC(2026, 6, 21, 0, 0, index)).toISOString(),
