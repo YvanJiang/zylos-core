@@ -13,7 +13,8 @@
     "test": "npm run test:jest && npm run test:node",
     "test:jest": "node --experimental-vm-modules node_modules/.bin/jest",
     "test:node": "node scripts/run-node-tests.js",
-    "test:contracts:five-repo": "node scripts/verify-five-repo-contracts.js"
+    "test:contracts:five-repo": "node scripts/verify-five-repo-contracts.js",
+    "test:release:retired-runtime": "node --experimental-vm-modules node_modules/.bin/jest --runInBand test/five-repo-retired-runtime-gate.test.js test/runtime-normal-path-static.test.js && node scripts/verify-five-repo-retired-runtime.js"
   },
   "repository": {
     "type": "git",

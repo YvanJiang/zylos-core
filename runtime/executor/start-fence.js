@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import {
   RETIRED_PM2_SERVICE_NAMES,
   retiredPm2ServicePaths,
-} from '../retired-pm2-identities.js';
+} from '../migration/retired-pm2-identities.js';
 
 const START_FENCE_CONTRACT = 'zylos.executor-start-fence@1';
 

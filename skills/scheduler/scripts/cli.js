@@ -60,10 +60,17 @@ Examples:
   ~/zylos/.claude/skills/scheduler/scripts/cli.js update task-abc --priority 1
 `;
 
-const RETIRED_OPTIONS = new Set([
-  'block-queue-until-idle', 'no-block-queue-until-idle',
-  'require-idle', 'no-require-idle',
-  'reply-channel', 'reply-endpoint', 'clear-reply',
+const BOOLEAN_OPTIONS = new Set(['use-synthetic-conversation']);
+const VALUE_OPTIONS = new Set([
+  'at',
+  'bound-conversation-json',
+  'cron',
+  'every',
+  'in',
+  'miss-threshold',
+  'name',
+  'priority',
+  'prompt',
 ]);
 
 function parseArgs(args) {
@@ -75,16 +82,6 @@ function parseArgs(args) {
 
   result.command = args[0];
 
-  // Boolean flags (no value required)
-  const booleanFlags = new Set([
-    'block-queue-until-idle',
-    'no-block-queue-until-idle',
-    'require-idle',
-    'no-require-idle',
-    'clear-reply',
-    'use-synthetic-conversation'
-  ]);
-
   let i = 1;
   while (i < args.length) {
     const arg = args[i];
@@ -92,15 +89,20 @@ function parseArgs(args) {
     if (arg.startsWith('--')) {
       const key = arg.slice(2);
 
-      // Check if this is a boolean flag
-      if (booleanFlags.has(key)) {
+      if (BOOLEAN_OPTIONS.has(key)) {
         result.options[key] = true;
         i++;
-      } else {
-        // Regular flag with value
+      } else if (VALUE_OPTIONS.has(key)) {
         const value = args[i + 1];
+        if (value === undefined || value.startsWith('--')) {
+          result.error = `Option --${key} requires a value.`;
+          return result;
+        }
         result.options[key] = value;
         i += 2;
+      } else {
+        result.error = `Unknown option: --${key}`;
+        return result;
       }
     } else {
       result.args.push(arg);
@@ -685,13 +687,9 @@ function main() {
     process.exit(1);
   }
 
-  const { command, args, options } = parseArgs(process.argv.slice(2));
-
-  const retired = Object.keys(options).find((name) => RETIRED_OPTIONS.has(name));
-  if (retired) {
-    console.error(
-      `Error: --${retired} is retired; use --bound-conversation-json with a complete Core identity.`,
-    );
+  const { command, args, options, error } = parseArgs(process.argv.slice(2));
+  if (error) {
+    console.error(`Error: ${error}`);
     process.exitCode = 2;
     return;
   }

@@ -347,6 +347,16 @@ zylos search [keyword]        # 搜索组件注册表
 
 ---
 
+## 五仓退役运行时发布 Gate
+
+发布前，使用明确的 Core、Feishu、Lark、Dashboard 与 Luna candidate 目录运行源码与包内容 gate。消费者目录通过 `ZYLOS_FEISHU_RETIRED_RUNTIME_REPO`、`ZYLOS_LARK_RETIRED_RUNTIME_REPO`、`ZYLOS_DASHBOARD_RETIRED_RUNTIME_REPO` 与 `ZYLOS_LUNA_RETIRED_RUNTIME_REPO` 指定；Core 使用当前 checkout。
+
+```bash
+npm run test:release:retired-runtime
+```
+
+Gate 扫描每个仓库的全部 tracked 文本文件，以及 `npm pack --dry-run` 报告的全部包内容。Allowlist 必须精确到文件和规则、写明用途，并且只能用于隔离的一次性迁移记录或负向证明。
+
 ## 卸载
 
 ```bash

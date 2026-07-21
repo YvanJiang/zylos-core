@@ -8,6 +8,7 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { validateOpaqueId } from '../../../contracts/public/index.js';
+import { retireLegacySchedulerControls } from './migration/retired-controls.js';
 
 // Data goes to ~/zylos/scheduler/, code stays in skills directory
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
@@ -152,31 +153,7 @@ function initSchema() {
   ]) {
     if (!taskColumns.has(name)) db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${definition}`);
   }
-  const legacyControls = ['require_idle', 'reply_channel', 'reply_endpoint']
-    .filter((name) => taskColumns.has(name));
-  if (legacyControls.length > 0) {
-    const predicates = [];
-    if (taskColumns.has('require_idle')) predicates.push('COALESCE(require_idle, 0) != 0');
-    if (taskColumns.has('reply_channel')) predicates.push('reply_channel IS NOT NULL');
-    if (taskColumns.has('reply_endpoint')) predicates.push('reply_endpoint IS NOT NULL');
-    const assignments = [
-      `status = CASE
-        WHEN status = 'running' THEN 'running'
-        WHEN status IN ('pending', 'paused') THEN 'paused'
-        WHEN status = 'completed' AND type IN ('recurring', 'interval') THEN 'paused'
-        ELSE status
-      END`,
-      'requires_reconfiguration = 1',
-      "last_error = 'Paused during migration: retired scheduler controls require explicit canonical reconfiguration.'",
-    ];
-    if (taskColumns.has('require_idle')) assignments.push('require_idle = 0');
-    if (taskColumns.has('reply_channel')) assignments.push('reply_channel = NULL');
-    if (taskColumns.has('reply_endpoint')) assignments.push('reply_endpoint = NULL');
-    db.prepare(`
-      UPDATE tasks SET ${assignments.join(', ')}
-      WHERE (${predicates.join(' OR ')})
-    `).run();
-  }
+  retireLegacySchedulerControls(db, taskColumns);
   const historyColumns = new Set(
     db.prepare('PRAGMA table_info(task_history)').all().map(({ name }) => name),
   );

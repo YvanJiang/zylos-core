@@ -30,7 +30,7 @@ import { issueExecutorStartFence } from '../executor/start-fence.js';
 import {
   RETIRED_PM2_SERVICE_NAMES,
   retiredPm2ServicePaths,
-} from '../retired-pm2-identities.js';
+} from './retired-pm2-identities.js';
 
 function readPm2Processes(execFileSyncFn) {
   const parsed = JSON.parse(execFileSyncFn('pm2', ['jlist'], {

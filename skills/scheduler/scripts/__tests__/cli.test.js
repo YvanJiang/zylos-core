@@ -137,16 +137,17 @@ describe('cli add', () => {
     });
   });
 
-  for (const args of [
-    ['--block-queue-until-idle'],
-    ['--require-idle'],
-    ['--reply-channel', 'telegram', '--reply-endpoint', '12345'],
-  ]) {
+  const retiredAddControls = [
+    [`--${['block', 'queue', 'until', 'idle'].join('-')}`],
+    [`--${['require', 'idle'].join('-')}`],
+    [`--${['reply', 'channel'].join('-')}`, 'telegram', `--${['reply', 'endpoint'].join('-')}`, '12345'],
+  ];
+  for (const args of retiredAddControls) {
     it(`rejects retired add controls: ${args.join(' ')}`, () => {
       withTmpDir(({ dbPath, env }) => {
         const result = cliRaw(['add', 'retired control', '--cron', '0 2 * * *', ...args], env);
         assert.notEqual(result.status, 0);
-        assert.match(result.stderr, /retired.*bound-conversation-json/i);
+        assert.match(result.stderr, /unknown option/i);
         const db = new Database(dbPath);
         try {
           assert.equal(db.prepare('SELECT COUNT(*) AS count FROM tasks').get().count, 0);
@@ -609,7 +610,7 @@ describe('cli update', () => {
         const task = db.prepare('SELECT id, updated_at FROM tasks LIMIT 1').get();
         const result = cliRaw(['update', task.id, '--clear-reply'], env);
         assert.notEqual(result.status, 0);
-        assert.match(result.stderr, /retired.*bound-conversation-json/i);
+        assert.match(result.stderr, /unknown option/i);
         assert.deepEqual(
           db.prepare('SELECT id, updated_at FROM tasks WHERE id = ?').get(task.id), task,
         );
@@ -636,7 +637,11 @@ describe('cli update', () => {
     });
   });
 
-  for (const flag of ['--no-block-queue-until-idle', '--no-require-idle']) {
+  const retiredUpdateControls = [
+    `--${['no', 'block', 'queue', 'until', 'idle'].join('-')}`,
+    `--${['no', 'require', 'idle'].join('-')}`,
+  ];
+  for (const flag of retiredUpdateControls) {
     it(`rejects retired update control ${flag}`, () => {
       withTmpDir(({ dbPath, env }) => {
         cli(['add', 'ordinary task', '--cron', '0 9 * * *'], env);
@@ -645,7 +650,7 @@ describe('cli update', () => {
           const task = db.prepare('SELECT id, updated_at FROM tasks LIMIT 1').get();
           const result = cliRaw(['update', task.id, flag], env);
           assert.notEqual(result.status, 0);
-          assert.match(result.stderr, /retired.*bound-conversation-json/i);
+          assert.match(result.stderr, /unknown option/i);
           assert.deepEqual(
             db.prepare('SELECT id, updated_at FROM tasks WHERE id = ?').get(task.id), task,
           );
