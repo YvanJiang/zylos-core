@@ -3,25 +3,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
-const START_FENCE_CONTRACT = 'zylos.executor-start-fence@1';
-const RETIRED_PM2_SERVICE_NAMES = Object.freeze([
-  'activity-monitor', 'c4-dispatcher', 'scheduler', 'web-console', 'caddy',
-]);
+import {
+  RETIRED_PM2_SERVICE_NAMES,
+  retiredPm2ServicePaths,
+} from '../retired-pm2-identities.js';
 
-function expectedRetiredPm2Paths(zylosDir) {
-  const resolved = path.resolve(zylosDir);
-  if (!path.isAbsolute(zylosDir) || path.parse(resolved).root === resolved) {
-    throw new TypeError('zylosDir must be an explicit absolute non-root path');
-  }
-  const skills = path.join(resolved, '.claude', 'skills');
-  return new Map([
-    ['activity-monitor', path.join(skills, 'activity-monitor', 'scripts', 'activity-monitor.js')],
-    ['c4-dispatcher', path.join(skills, 'comm-bridge', 'scripts', 'c4-dispatcher.js')],
-    ['scheduler', path.join(skills, 'scheduler', 'scripts', 'daemon.js')],
-    ['web-console', path.join(skills, 'web-console', 'scripts', 'server.js')],
-    ['caddy', path.join(resolved, 'bin', 'caddy')],
-  ]);
-}
+const START_FENCE_CONTRACT = 'zylos.executor-start-fence@1';
 
 function requireFreshPm2Absence({ zylosDir, execFileSyncFn }) {
   let inventory;
@@ -35,7 +22,7 @@ function requireFreshPm2Absence({ zylosDir, execFileSyncFn }) {
   if (!Array.isArray(inventory)) {
     throw new Error('Fresh executor start requires an authoritative PM2 inventory.');
   }
-  const expected = expectedRetiredPm2Paths(zylosDir);
+  const expected = retiredPm2ServicePaths(zylosDir);
   for (const registration of inventory) {
     if (!registration || typeof registration !== 'object' || Array.isArray(registration)
       || typeof registration.name !== 'string' || registration.name.length === 0

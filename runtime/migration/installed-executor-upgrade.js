@@ -27,21 +27,10 @@ import {
 } from './channel-authority-manifest.js';
 import { findResumableRuntimeUpgrade } from './upgrade-state.js';
 import { issueExecutorStartFence } from '../executor/start-fence.js';
-
-const LEGACY_SERVICE_NAMES = Object.freeze([
-  'activity-monitor', 'c4-dispatcher', 'scheduler', 'web-console', 'caddy',
-]);
-
-function expectedLegacyServicePaths(zylosDir) {
-  const skills = path.join(zylosDir, '.claude', 'skills');
-  return new Map([
-    ['activity-monitor', path.join(skills, 'activity-monitor', 'scripts', 'activity-monitor.js')],
-    ['c4-dispatcher', path.join(skills, 'comm-bridge', 'scripts', 'c4-dispatcher.js')],
-    ['scheduler', path.join(skills, 'scheduler', 'scripts', 'daemon.js')],
-    ['web-console', path.join(skills, 'web-console', 'scripts', 'server.js')],
-    ['caddy', path.join(zylosDir, 'bin', 'caddy')],
-  ]);
-}
+import {
+  RETIRED_PM2_SERVICE_NAMES,
+  retiredPm2ServicePaths,
+} from '../retired-pm2-identities.js';
 
 function readPm2Processes(execFileSyncFn) {
   const parsed = JSON.parse(execFileSyncFn('pm2', ['jlist'], {
@@ -52,11 +41,11 @@ function readPm2Processes(execFileSyncFn) {
 }
 
 export function inspectLegacyServiceRegistrations({ zylosDir, execFileSyncFn = execFileSync }) {
-  const expected = expectedLegacyServicePaths(requireDirectory('zylosDir', zylosDir));
+  const expected = retiredPm2ServicePaths(requireDirectory('zylosDir', zylosDir));
   const owned = [];
   const collisions = [];
   for (const processInfo of readPm2Processes(execFileSyncFn)) {
-    if (!LEGACY_SERVICE_NAMES.includes(processInfo.name)) continue;
+    if (!RETIRED_PM2_SERVICE_NAMES.includes(processInfo.name)) continue;
     const actualPath = processInfo.pm2_env?.pm_exec_path ?? processInfo.pm_exec_path;
     const expectedPath = expected.get(processInfo.name);
     if (typeof actualPath !== 'string' || path.resolve(actualPath) !== path.resolve(expectedPath)) {

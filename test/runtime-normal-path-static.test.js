@@ -129,7 +129,9 @@ const migrationOnlyRepositoryFiles = new Set([
 // Keep its narrow exception paired with a mutation/import ban below.
 const readOnlyFreshFenceGuardFiles = new Set([
   'runtime/executor/start-fence.js',
+  'runtime/retired-pm2-identities.js',
   'test/executor-start-fence.test.js',
+  'test/retired-pm2-identities.test.js',
 ]);
 
 describe('normal product paths have no retired runtime authority', () => {
@@ -156,6 +158,23 @@ describe('normal product paths have no retired runtime authority', () => {
     expect(source).toContain("execFileSyncFn('pm2', ['jlist']");
     expect(source).not.toMatch(/\['(?:stop|delete|save|start|restart)'/);
     expect(source).not.toMatch(/runtime\/migration|reconcileLegacyServicesForExecutorStart/);
+  });
+
+  test('fresh fencing, migration, and installer inventory share one read-only PM2 identity owner', () => {
+    const identitySource = fs.readFileSync(path.resolve('runtime/retired-pm2-identities.js'), 'utf8');
+    expect(identitySource).toMatch(/RETIRED_PM2_SERVICE_NAMES/);
+    expect(identitySource).toMatch(/retiredPm2ServicePaths/);
+    expect(identitySource).not.toMatch(/node:fs|node:child_process|runtime\/migration|execFileSync|spawn/);
+    for (const file of [
+      'runtime/executor/start-fence.js',
+      'runtime/migration/installed-executor-upgrade.js',
+      'scripts/installed-runtime-inventory.js',
+    ]) {
+      const source = fs.readFileSync(path.resolve(file), 'utf8');
+      expect(source).toMatch(/retired-pm2-identities\.js/);
+      expect(source).toMatch(/RETIRED_PM2_SERVICE_NAMES/);
+      expect(source).toMatch(/retiredPm2ServicePaths/);
+    }
   });
 
   test('system instructions never ask a model to select or execute a delivery route', () => {
@@ -403,6 +422,7 @@ describe('normal product paths have no retired runtime authority', () => {
       'scripts/installed-runtime-inventory.js',
       'runtime/migration/installed-executor-upgrade.js',
       'runtime/migration/legacy-lifecycle-artifacts.js',
+      'runtime/retired-pm2-identities.js',
     ]);
     const files = packedFiles();
     expect(files).toContain('CHANGELOG.md');
