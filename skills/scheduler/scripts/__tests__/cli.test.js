@@ -359,7 +359,8 @@ describe('cli pause and resume', () => {
         const refused = cliRaw(['resume', task.id], env);
         assert.notEqual(refused.status, 0);
         assert.match(refused.stderr, /advance.*schedule.*replay/i);
-        cli(['update', task.id, '--in', '30 minutes'], env);
+        const advanced = new Date((task.next_run_at + 30 * 60) * 1000).toISOString();
+        cli(['update', task.id, '--at', advanced], env);
         cli(['resume', task.id], env);
         assert.deepEqual(db.prepare(`
           SELECT status, requires_occurrence_advance FROM tasks WHERE id = ?
@@ -369,6 +370,42 @@ describe('cli pause and resume', () => {
       }
     });
   });
+
+  for (const [label, nextRunOffset] of [
+    ['the fenced occurrence time', 0],
+    ['a time before the fenced occurrence', -60],
+  ]) {
+    it(`does not clear a replay barrier when updated to ${label}`, () => {
+      withTmpDir(({ dbPath, env }) => {
+        cli(['add', 'barrier task', '--cron', '0 9 * * *'], env);
+        const db = new Database(dbPath);
+        try {
+          const task = db.prepare('SELECT id, next_run_at FROM tasks LIMIT 1').get();
+          const occurrence = `${task.id}:${task.next_run_at}`;
+          db.prepare(`
+            UPDATE tasks SET status = 'paused', requires_reconfiguration = 0,
+              requires_occurrence_advance = 1, current_occurrence_id = ?,
+              last_error = 'replay barrier' WHERE id = ?
+          `).run(occurrence, task.id);
+          const requested = new Date((task.next_run_at + nextRunOffset) * 1000).toISOString();
+          const result = cliRaw(['update', task.id, '--at', requested], env);
+          assert.notEqual(result.status, 0);
+          assert.match(result.stderr, /strictly after.*fenced occurrence/i);
+          assert.deepEqual(db.prepare(`
+            SELECT status, next_run_at, current_occurrence_id,
+                   requires_occurrence_advance, last_error
+            FROM tasks WHERE id = ?
+          `).get(task.id), {
+            status: 'paused', next_run_at: task.next_run_at,
+            current_occurrence_id: occurrence,
+            requires_occurrence_advance: 1, last_error: 'replay barrier',
+          });
+        } finally {
+          db.close();
+        }
+      });
+    });
+  }
 });
 
 describe('cli remove', () => {

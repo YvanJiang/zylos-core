@@ -626,6 +626,17 @@ function cmdUpdate(taskId, options) {
   }
 
   if (scheduleUpdated) {
+    const nextOccurrenceId = `${task.id}:${updates.next_run_at}`;
+    if (task.requires_occurrence_advance === 1
+      && (!Number.isSafeInteger(updates.next_run_at)
+        || updates.next_run_at <= task.next_run_at
+        || nextOccurrenceId === task.current_occurrence_id)) {
+      console.error(
+        'Error: The new schedule must be strictly after the fenced occurrence.',
+      );
+      process.exitCode = 2;
+      return;
+    }
     updates.timezone = getDefaultTimezone();
     updates.requires_occurrence_advance = 0;
     updatedFields.push('type', 'schedule');
