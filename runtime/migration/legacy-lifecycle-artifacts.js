@@ -76,36 +76,55 @@ export function legacyLifecycleArtifactPaths(zylosDir) {
   ]);
 }
 
+function isObsoleteInstalledHook(command, root) {
+  if (typeof command !== 'string') return false;
+  const normalized = command.replaceAll('\\', '/');
+  return OBSOLETE_HOOK_BASE_KEYS.some((key) => normalized.includes(
+    path.join(root, '.claude', key).replaceAll('\\', '/'),
+  ));
+}
+
+function cleanupObsoleteHooksInFile(file, root, removed) {
+  try {
+    const document = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!document || typeof document !== 'object' || Array.isArray(document)
+      || !document.hooks || typeof document.hooks !== 'object' || Array.isArray(document.hooks)) {
+      return;
+    }
+    let changed = false;
+    for (const [event, groups] of Object.entries(document.hooks)) {
+      if (!Array.isArray(groups)) continue;
+      const retainedGroups = groups.map((group) => {
+        if (!Array.isArray(group?.hooks)) return group;
+        const hooks = group.hooks.filter(
+          (hook) => !isObsoleteInstalledHook(hook?.command, root),
+        );
+        if (hooks.length !== group.hooks.length) changed = true;
+        return { ...group, hooks };
+      }).filter((group) => !Array.isArray(group.hooks) || group.hooks.length > 0);
+      if (retainedGroups.length > 0) document.hooks[event] = retainedGroups;
+      else if (retainedGroups.length !== groups.length) {
+        delete document.hooks[event];
+        changed = true;
+      }
+    }
+    if (changed) {
+      fs.writeFileSync(file, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
+      removed.push(file);
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+}
+
 export function cleanupObsoleteLifecycleArtifacts({ zylosDir, upgradeState }) {
   if (upgradeState !== 'committed') {
     throw new Error('Obsolete lifecycle artifacts may be removed only after the upgrade is durably committed.');
   }
   const root = requireZylosDir(zylosDir);
   const removed = [];
-  const codexHooks = path.join(root, '.codex', 'hooks.json');
-  try {
-    const document = JSON.parse(fs.readFileSync(codexHooks, 'utf8'));
-    if (document && typeof document === 'object' && !Array.isArray(document)) {
-      let changed = false;
-      for (const [event, groups] of Object.entries(document.hooks ?? {})) {
-        if (!Array.isArray(groups)) continue;
-        document.hooks[event] = groups.map((group) => {
-          if (!Array.isArray(group?.hooks)) return group;
-          const hooks = group.hooks.filter(
-            (hook) => !String(hook?.command ?? '').includes('session-start-orchestrator.js'),
-          );
-          if (hooks.length !== group.hooks.length) changed = true;
-          return { ...group, hooks };
-        }).filter((group) => !Array.isArray(group.hooks) || group.hooks.length > 0);
-      }
-      if (changed) {
-        fs.writeFileSync(codexHooks, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
-        removed.push(codexHooks);
-      }
-    }
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
-  }
+  cleanupObsoleteHooksInFile(path.join(root, '.codex', 'hooks.json'), root, removed);
+  cleanupObsoleteHooksInFile(path.join(root, '.claude', 'settings.json'), root, removed);
   for (const artifact of legacyLifecycleArtifactPaths(zylosDir)) {
     let stat;
     try {

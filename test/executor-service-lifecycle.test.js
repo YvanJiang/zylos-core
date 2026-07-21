@@ -19,6 +19,7 @@ import { createExecutorPrerequisiteOwner } from '../runtime/executor/prerequisit
 import {
   cleanupObsoleteLifecycleArtifacts,
   legacyLifecycleArtifactPaths,
+  obsoleteHookBaseKeys,
 } from '../runtime/migration/legacy-lifecycle-artifacts.js';
 
 const directories = [];
@@ -701,8 +702,22 @@ describe('one-time lifecycle cleanup', () => {
     fs.writeFileSync(codexHooks, JSON.stringify({
       hooks: {
         SessionStart: [{ hooks: [
-          { type: 'command', command: 'node session-start-orchestrator.js' },
+          {
+            type: 'command',
+            command: `node ${path.join(state.directory, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-session-init.js')}`,
+          },
           { type: 'command', command: 'node retained-hook.js' },
+        ] }],
+      },
+    }));
+    const claudeSettings = path.join(state.directory, '.claude', 'settings.json');
+    fs.writeFileSync(claudeSettings, JSON.stringify({
+      hooks: {
+        SessionStart: [{ hooks: [
+          ...[...obsoleteHookBaseKeys()].map((key) => ({
+            type: 'command', command: `node ${path.join(state.directory, '.claude', key)}`,
+          })),
+          { type: 'command', command: 'node retained-claude-hook.js' },
         ] }],
       },
     }));
@@ -716,11 +731,16 @@ describe('one-time lifecycle cleanup', () => {
     expect(cleanupObsoleteLifecycleArtifacts({
       zylosDir: state.directory,
       upgradeState: 'committed',
-    })).toEqual({ removed: [codexHooks, ...artifacts] });
+    })).toEqual({ removed: [codexHooks, claudeSettings, ...artifacts] });
     expect(artifacts.every((artifact) => !fs.existsSync(artifact))).toBe(true);
     expect(JSON.parse(fs.readFileSync(codexHooks, 'utf8'))).toEqual({
       hooks: {
         SessionStart: [{ hooks: [{ type: 'command', command: 'node retained-hook.js' }] }],
+      },
+    });
+    expect(JSON.parse(fs.readFileSync(claudeSettings, 'utf8'))).toEqual({
+      hooks: {
+        SessionStart: [{ hooks: [{ type: 'command', command: 'node retained-claude-hook.js' }] }],
       },
     });
   });

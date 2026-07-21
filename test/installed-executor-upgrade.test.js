@@ -313,8 +313,23 @@ describe('installed executor production upgrade owner', () => {
     fs.writeFileSync(codexHooks, JSON.stringify({
       hooks: {
         SessionStart: [{ hooks: [
-          { type: 'command', command: 'node session-start-orchestrator.js' },
+          {
+            type: 'command',
+            command: `node ${path.join(zylosDir, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-session-init.js')}`,
+          },
           { type: 'command', command: 'node retained-hook.js' },
+        ] }],
+      },
+    }));
+    const claudeSettings = path.join(zylosDir, '.claude', 'settings.json');
+    fs.writeFileSync(claudeSettings, JSON.stringify({
+      hooks: {
+        PreToolUse: [{ hooks: [
+          {
+            type: 'command',
+            command: `node ${path.join(zylosDir, '.claude', 'skills', 'activity-monitor', 'scripts', 'hook-activity.js')}`,
+          },
+          { type: 'command', command: 'node retained-claude-hook.js' },
         ] }],
       },
     }));
@@ -428,6 +443,11 @@ describe('installed executor production upgrade owner', () => {
     expect(JSON.parse(fs.readFileSync(codexHooks, 'utf8'))).toEqual({
       hooks: {
         SessionStart: [{ hooks: [{ type: 'command', command: 'node retained-hook.js' }] }],
+      },
+    });
+    expect(JSON.parse(fs.readFileSync(claudeSettings, 'utf8'))).toEqual({
+      hooks: {
+        PreToolUse: [{ hooks: [{ type: 'command', command: 'node retained-claude-hook.js' }] }],
       },
     });
     expect(JSON.parse(fs.readFileSync(
