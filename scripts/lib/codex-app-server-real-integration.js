@@ -59,6 +59,28 @@ function normalEnvelope(suffix, text) {
   return envelope;
 }
 
+function installEarlyBindingWitness(database) {
+  database.exec(`
+    CREATE TEMP TRIGGER global43_require_binding_before_provider_started
+    BEFORE INSERT ON runtime_normalized_events
+    WHEN json_extract(NEW.event_json, '$.kind') = 'turn_state_changed'
+      AND json_extract(NEW.event_json, '$.phase') = 'running'
+      AND json_extract(NEW.event_json, '$.payload.reason_code') = 'provider_started'
+    BEGIN
+      SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM runtime_turns AS turn
+        JOIN runtime_lineages AS lineage ON lineage.lineage_id = turn.lineage_id
+        WHERE turn.turn_id = NEW.turn_id
+          AND lineage.provider = 'codex'
+          AND lineage.provider_native_id IS NOT NULL
+          AND json_extract(NEW.event_json, '$.provider_native_id')
+            = lineage.provider_native_id
+      ) THEN RAISE(ABORT, 'provider_started preceded durable native-thread binding') END;
+    END;
+  `);
+}
+
 function readTurnEvidence(database, accepted) {
   const lineage = database.prepare(`
     SELECT provider_native_id, provider_native_id_bound_at
@@ -105,45 +127,66 @@ async function runLifecycleTurn(database, service, suffix, expectedText) {
   return evidence;
 }
 
-async function runLifecycleProbe({ codexExecutable, workspaceDirectory, databasePath }) {
-  let database = new Database(databasePath);
-  let adapter = createCodexAppServerAdapter({
-    codexExecutable,
-    cwd: workspaceDirectory,
-    sandbox: 'read-only',
-  });
-  let service = createExecutorService({
-    database,
-    adapter,
-    provider: 'codex',
-    serviceInstanceId: 'global43-real-service-before-restart',
-    workspaceRoot: workspaceDirectory,
-  });
-  const first = await runLifecycleTurn(database, service, 'first', 'ZYLOS-GLOBAL43-FIRST-OK');
-  const second = await runLifecycleTurn(database, service, 'second', 'ZYLOS-GLOBAL43-SECOND-OK');
-  await service.close();
-  database.close();
-
-  database = new Database(databasePath);
-  adapter = createCodexAppServerAdapter({
-    codexExecutable,
-    cwd: workspaceDirectory,
-    sandbox: 'read-only',
-  });
-  service = createExecutorService({
-    database,
-    adapter,
-    provider: 'codex',
-    serviceInstanceId: 'global43-real-service-after-restart',
-    workspaceRoot: workspaceDirectory,
-  });
-  let third;
+async function runLifecyclePhase({
+  codexExecutable,
+  databasePath,
+  serviceInstanceId,
+  turns,
+  workspaceDirectory,
+}) {
+  const database = new Database(databasePath);
+  let service = null;
   try {
-    third = await runLifecycleTurn(database, service, 'restart', 'ZYLOS-GLOBAL43-RESTART-OK');
+    const adapter = createCodexAppServerAdapter({
+      codexExecutable,
+      cwd: workspaceDirectory,
+      sandbox: 'read-only',
+    });
+    service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId,
+      workspaceRoot: workspaceDirectory,
+    });
+    installEarlyBindingWitness(database);
+    const evidence = [];
+    for (const [suffix, expectedText] of turns) {
+      evidence.push(await runLifecycleTurn(
+        database,
+        service,
+        suffix,
+        expectedText,
+      ));
+    }
+    return evidence;
   } finally {
-    await service.close();
-    database.close();
+    try {
+      await service?.close();
+    } finally {
+      database.close();
+    }
   }
+}
+
+async function runLifecycleProbe({ codexExecutable, workspaceDirectory, databasePath }) {
+  const [first, second] = await runLifecyclePhase({
+    codexExecutable,
+    databasePath,
+    serviceInstanceId: 'global43-real-service-before-restart',
+    turns: [
+      ['first', 'ZYLOS-GLOBAL43-FIRST-OK'],
+      ['second', 'ZYLOS-GLOBAL43-SECOND-OK'],
+    ],
+    workspaceDirectory,
+  });
+  const [third] = await runLifecyclePhase({
+    codexExecutable,
+    databasePath,
+    serviceInstanceId: 'global43-real-service-after-restart',
+    turns: [['restart', 'ZYLOS-GLOBAL43-RESTART-OK']],
+    workspaceDirectory,
+  });
 
   const turns = [first, second, third];
   const normalizedEventKinds = [...new Set(turns.flatMap(({ event_kinds: kinds }) => kinds))];
@@ -151,13 +194,13 @@ async function runLifecycleProbe({ codexExecutable, workspaceDirectory, database
     typeof turn.thread_id === 'string'
     && typeof turn.thread_bound_at === 'string'
     && typeof turn.provider_started_at === 'string'
-    && Date.parse(turn.thread_bound_at) <= Date.parse(turn.provider_started_at)
   ));
   return {
     initialize_connect: true,
     new_thread: first.thread_id !== null,
     subsequent_turn: second.final_text === 'ZYLOS-GLOBAL43-SECOND-OK',
     early_durable_thread_binding: earlyDurableBinding,
+    early_binding_witness: 'sqlite_before_provider_started_insert_trigger',
     restart_thread_resume: third.final_text === 'ZYLOS-GLOBAL43-RESTART-OK',
     provider_neutral_translation: [
       'text_delta',
@@ -198,53 +241,71 @@ async function collect(iterable) {
   return values;
 }
 
-async function captureAdapterFailure(adapter, context, timeoutMs = 60_000) {
+async function runCoreFailureProbe({
+  adapter,
+  databasePath,
+  providerNativeId = null,
+  suffix,
+  workspaceDirectory,
+}) {
+  const database = new Database(databasePath);
+  let service = null;
   try {
-    await withTimeout(collect(adapter.execute(context)), timeoutMs, context.turn_id);
-    throw new Error(`${context.turn_id} unexpectedly completed.`);
-  } catch (error) {
-    if (typeof error?.code !== 'string') throw error;
-    return error.providerError?.code ?? error.code;
-  } finally {
-    await adapter.close().catch(() => {});
-  }
-}
-
-async function runSideEffectUnknownProbe({ codexExecutable, workspaceDirectory }) {
-  let child;
-  let resolveStarted;
-  const started = new Promise((resolve) => { resolveStarted = resolve; });
-  const adapter = createCodexAppServerAdapter({
-    codexExecutable,
-    cwd: workspaceDirectory,
-    sandbox: 'read-only',
-    spawnProcess(command, args, options) {
-      child = spawn(command, args, options);
-      return child;
-    },
-  });
-  const context = executionContext({ suffix: 'side-effect-unknown', onStarted: resolveStarted });
-  context.input = {
-    kind: 'text',
-    text: 'Think carefully before replying, then reply with exactly GLOBAL43-FAULT-PROBE.',
-    attachments: [],
-  };
-  const execution = collect(adapter.execute(context)).then(
-    () => { throw new Error('Side-effect-unknown fault probe unexpectedly completed.'); },
-    (error) => error,
-  );
-  try {
-    await withTimeout(started, 30_000, 'side-effect-unknown provider start');
-    if (!Number.isSafeInteger(child?.pid) || child.pid <= 0) {
-      throw new Error('Side-effect-unknown fault probe did not capture the app-server PID.');
+    const accepted = acceptNormalInbound(database, normalEnvelope(
+      `failure-${suffix}`,
+      'Reply with exactly GLOBAL43-FAILURE-PROBE and do not use tools.',
+    ), {
+      now: () => new Date().toISOString(),
+      generateId: deterministicIds(`global43-failure-${suffix}`),
+    });
+    if (providerNativeId !== null) {
+      const boundAt = new Date().toISOString();
+      database.prepare(`
+        UPDATE runtime_lineages
+        SET provider = 'codex', provider_native_id = ?,
+          provider_native_id_bound_at = ?, provider_native_state = 'valid'
+        WHERE lineage_id = ?
+      `).run(providerNativeId, boundAt, accepted.lineage_id);
     }
-    if (process.platform === 'win32') child.kill('SIGKILL');
-    else process.kill(-child.pid, 'SIGKILL');
-    const error = await withTimeout(execution, 15_000, 'side-effect-unknown terminal');
-    if (typeof error?.code !== 'string') throw error;
-    return error.providerError?.code ?? error.code;
+    service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: `global43-failure-service-${suffix}`,
+      workspaceRoot: workspaceDirectory,
+      providerRetryJitterRatio: 0,
+    });
+    const result = await withTimeout(service.runNext(), 60_000, `${suffix} Core failure`);
+    const turn = database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id);
+    const attempt = database.prepare(`
+      SELECT state, error_json FROM runtime_provider_attempts
+      WHERE turn_id = ? AND attempt_no = 1
+    `).get(accepted.turn_id);
+    const error = attempt?.error_json === null || attempt?.error_json === undefined
+      ? null
+      : JSON.parse(attempt.error_json);
+    const events = database.prepare(`
+      SELECT event_json FROM runtime_normalized_events
+      WHERE turn_id = ? ORDER BY event_sequence ASC
+    `).all(accepted.turn_id).map(({ event_json: eventJson }) => JSON.parse(eventJson));
+    if (typeof error?.code !== 'string') {
+      throw new Error(`${suffix} did not persist a typed provider error.`);
+    }
+    return Object.freeze({
+      provider_code: error.code,
+      core_status: result.status,
+      turn_state: turn.state,
+      attempt_state: attempt.state,
+      durable_error_event: events.some((event) => event.error?.code === error.code),
+    });
   } finally {
-    await adapter.close().catch(() => {});
+    try {
+      await service?.close();
+    } finally {
+      database.close();
+    }
   }
 }
 
@@ -262,10 +323,13 @@ async function runFailureProbes({ codexExecutable, workspaceDirectory, temporary
       TERM: 'dumb',
     },
   });
-  const context = await captureAdapterFailure(contextAdapter, executionContext({
+  const context = await runCoreFailureProbe({
+    adapter: contextAdapter,
+    databasePath: path.join(temporaryDirectory, 'context.db'),
     providerNativeId: '00000000-0000-0000-0000-000000000000',
     suffix: 'context',
-  }), 15_000);
+    workspaceDirectory,
+  });
 
   const authHome = path.join(temporaryDirectory, 'auth-home');
   fs.mkdirSync(authHome, { recursive: true });
@@ -280,11 +344,12 @@ async function runFailureProbes({ codexExecutable, workspaceDirectory, temporary
       TERM: 'dumb',
     },
   });
-  const auth = await captureAdapterFailure(
-    authAdapter,
-    executionContext({ suffix: 'auth' }),
-    45_000,
-  );
+  const auth = await runCoreFailureProbe({
+    adapter: authAdapter,
+    databasePath: path.join(temporaryDirectory, 'auth.db'),
+    suffix: 'auth',
+    workspaceDirectory,
+  });
 
   const transientHome = path.join(temporaryDirectory, 'transient-home');
   fs.mkdirSync(transientHome, { recursive: true });
@@ -311,15 +376,53 @@ async function runFailureProbes({ codexExecutable, workspaceDirectory, temporary
       TERM: 'dumb',
     },
   });
-  const transient = await captureAdapterFailure(
-    transientAdapter,
-    executionContext({ suffix: 'transient' }),
-    45_000,
-  );
-  const sideEffectUnknown = await runSideEffectUnknownProbe({
-    codexExecutable,
+  const transient = await runCoreFailureProbe({
+    adapter: transientAdapter,
+    databasePath: path.join(temporaryDirectory, 'transient.db'),
+    suffix: 'transient',
     workspaceDirectory,
   });
+
+  let sideEffectChild;
+  let sideEffectBuffer = '';
+  let sideEffectKilled = false;
+  const sideEffectAdapter = createCodexAppServerAdapter({
+    codexExecutable,
+    cwd: workspaceDirectory,
+    sandbox: 'read-only',
+    spawnProcess(command, args, options) {
+      sideEffectChild = spawn(command, args, options);
+      sideEffectChild.stdout.on('data', (chunk) => {
+        sideEffectBuffer += chunk.toString('utf8');
+        while (sideEffectBuffer.includes('\n')) {
+          const newline = sideEffectBuffer.indexOf('\n');
+          const line = sideEffectBuffer.slice(0, newline);
+          sideEffectBuffer = sideEffectBuffer.slice(newline + 1);
+          let message;
+          try {
+            message = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (message.method !== 'turn/started' || sideEffectKilled) continue;
+          sideEffectKilled = true;
+          queueMicrotask(() => {
+            if (!Number.isSafeInteger(sideEffectChild?.pid) || sideEffectChild.pid <= 0) return;
+            if (process.platform === 'win32') sideEffectChild.kill('SIGKILL');
+            else process.kill(-sideEffectChild.pid, 'SIGKILL');
+          });
+        }
+      });
+      return sideEffectChild;
+    },
+  });
+  const sideEffectUnknown = await runCoreFailureProbe({
+    adapter: sideEffectAdapter,
+    databasePath: path.join(temporaryDirectory, 'side-effect-unknown.db'),
+    suffix: 'side-effect-unknown',
+    workspaceDirectory,
+  });
+  if (!sideEffectKilled) throw new Error('Side-effect-unknown fault injection did not run.');
   return {
     auth,
     context,
@@ -342,7 +445,10 @@ async function runInterruptProbe({ codexExecutable, workspaceDirectory, reason }
     cwd: workspaceDirectory,
     sandbox: 'read-only',
   });
-  const execution = collect(adapter.execute(context)).catch((error) => error);
+  const execution = collect(adapter.execute(context)).then(
+    () => ({ status: 'completed' }),
+    (error) => ({ status: 'failed', error }),
+  );
   try {
     await withTimeout(started, 30_000, `${reason} provider start`);
     const result = await withTimeout(adapter.interrupt({
@@ -350,8 +456,19 @@ async function runInterruptProbe({ codexExecutable, workspaceDirectory, reason }
       attempt: context.attempt,
       reason,
     }), 15_000, `${reason} interrupt`);
-    await withTimeout(execution, 15_000, `${reason} terminal`);
-    return result.status;
+    const terminal = await withTimeout(execution, 15_000, `${reason} terminal`);
+    if (
+      terminal.status !== 'failed'
+      || terminal.error?.providerError?.code !== 'side_effect_unknown'
+      || !/status interrupted\b/i.test(terminal.error.message)
+    ) {
+      throw new Error(`${reason} did not end with the matching canonical interrupted terminal.`);
+    }
+    return Object.freeze({
+      request_status: result.status,
+      provider_status: result.provider_status ?? 'interrupted',
+      terminal_status: 'interrupted',
+    });
   } finally {
     await adapter.close().catch(() => {});
   }
@@ -366,6 +483,7 @@ async function initializeProtocolProbe({ codexExecutable, workspaceDirectory }) 
   });
   child.stderr.resume();
   const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  const closed = new Promise((resolve) => child.once('close', resolve));
   const response = new Promise((resolve, reject) => {
     lines.on('line', (line) => {
       try {
@@ -404,7 +522,14 @@ async function initializeProtocolProbe({ codexExecutable, workspaceDirectory }) 
   try {
     return await withTimeout(response, 15_000, 'initialize protocol probe');
   } finally {
-    child.kill('SIGTERM');
+    lines.close();
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+    try {
+      await withTimeout(closed, 5_000, 'initialize process shutdown');
+    } catch {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      await withTimeout(closed, 5_000, 'initialize process forced shutdown');
+    }
   }
 }
 
@@ -457,7 +582,7 @@ export async function runCodexAppServerRealIntegration({
       }),
       prerequisites: Object.freeze({
         codex_executable: codexExecutable,
-        credential_status: credentialStatus,
+        credential_status: 'authenticated',
         network: 'required for authenticated lifecycle and interrupt probes',
         bounded_workspace: true,
       }),

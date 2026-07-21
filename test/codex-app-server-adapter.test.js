@@ -291,6 +291,8 @@ describe('Codex app-server provider adapter', () => {
   });
 
   test('waits through retry progress and classifies the target app-server final 401 as auth', async () => {
+    let completeTurn;
+    let finalErrorSent = false;
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
         send({
@@ -321,6 +323,100 @@ describe('Codex app-server provider adapter', () => {
             turnId,
           },
         });
+        finalErrorSent = true;
+        completeTurn = () => {
+          send({
+            method: 'turn/completed',
+            params: {
+              threadId,
+              turn: {
+                id: turnId,
+                status: 'failed',
+                items: [],
+                error: {
+                  message: 'unexpected status 401 Unauthorized',
+                  codexErrorInfo: 'other',
+                  additionalDetails: null,
+                },
+              },
+            },
+          });
+        };
+      },
+    });
+    const reportProviderFailure = jest.fn();
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const running = collect(executeAdapter(adapter, executionContext({ reportProviderFailure })));
+    running.catch(() => {});
+    let settled = false;
+    running.finally(() => { settled = true; }).catch(() => {});
+    await waitFor(() => finalErrorSent);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(settled).toBe(false);
+    expect(reportProviderFailure).not.toHaveBeenCalled();
+    completeTurn();
+    await expect(running).rejects.toMatchObject({
+        code: 'provider_auth_failed',
+        providerError: {
+          code: 'provider_auth_failed',
+          category: 'authentication',
+          retryable: false,
+          side_effect_status: 'none',
+        },
+      });
+    expect(reportProviderFailure).not.toHaveBeenCalled();
+    expect(server.child.kill).not.toHaveBeenCalled();
+  });
+
+  test('does not treat an error notification without turn/completed as timeout stop proof', async () => {
+    let finalErrorSent = false;
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'error',
+          params: {
+            error: { message: 'service unavailable HTTP status 503' },
+            willRetry: false,
+            threadId,
+            turnId,
+          },
+        });
+        finalErrorSent = true;
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      interruptConfirmationTimeoutMs: 5,
+    });
+    const context = executionContext();
+    const running = collect(executeAdapter(adapter, context));
+    running.catch(() => {});
+    await waitFor(() => finalErrorSent);
+
+    await expect(adapter.interrupt({
+      turn_id: context.turn_id,
+      attempt: context.attempt,
+      reason: 'timeout',
+    })).resolves.toEqual({ status: 'uncertain', reason: 'timeout' });
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+    await expect(running).rejects.toMatchObject({
+      providerError: { code: 'side_effect_unknown' },
+    });
+  });
+
+  test('uses the canonical terminal error after an earlier retry-progress classification', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'error',
+          params: {
+            error: { message: 'provider unavailable with HTTP status 503' },
+            willRetry: true,
+            threadId,
+            turnId,
+          },
+        });
         send({
           method: 'turn/completed',
           params: {
@@ -329,11 +425,7 @@ describe('Codex app-server provider adapter', () => {
               id: turnId,
               status: 'failed',
               items: [],
-              error: {
-                message: 'unexpected status 401 Unauthorized',
-                codexErrorInfo: 'other',
-                additionalDetails: null,
-              },
+              error: { message: 'unexpected status 401 Unauthorized' },
             },
           },
         });
@@ -351,7 +443,41 @@ describe('Codex app-server provider adapter', () => {
           side_effect_status: 'none',
         },
       });
-    expect(server.child.kill).not.toHaveBeenCalled();
+  });
+
+  test('does not treat an error notification without turn/completed as abort proof', async () => {
+    let finalErrorSent = false;
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'error',
+          params: {
+            error: { message: 'service unavailable HTTP status 503' },
+            willRetry: false,
+            threadId,
+            turnId,
+          },
+        });
+        finalErrorSent = true;
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      interruptConfirmationTimeoutMs: 5,
+    });
+    const context = executionContext();
+    const running = collect(executeAdapter(adapter, context));
+    running.catch(() => {});
+    await waitFor(() => finalErrorSent);
+
+    await expect(adapter.abort(context)).resolves.toEqual({
+      status: 'provider_stopped',
+      provider_status: 'process_exited',
+    });
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+    await expect(running).rejects.toMatchObject({
+      providerError: { code: 'side_effect_unknown' },
+    });
   });
 
   test('advertises the workspace access enforced by its configured sandbox', () => {
@@ -2671,12 +2797,18 @@ describe('Codex app-server provider adapter', () => {
   });
 
   test.each([
-    ['error', {
+    ['error followed by failed terminal', {
       method: 'error',
       params: {
         threadId: 'codex-thread-1',
         turnId: 'codex-turn-1',
         error: { message: 'private provider error' },
+      },
+    }, {
+      method: 'turn/completed',
+      params: {
+        threadId: 'codex-thread-1',
+        turn: { id: 'codex-turn-1', status: 'failed', items: [] },
       },
     }],
     ['failed terminal', {
@@ -2700,7 +2832,8 @@ describe('Codex app-server provider adapter', () => {
         turn: { id: 'codex-turn-1', status: 'completed', items: [] },
       },
     }],
-  ])('reports a fenced provider failure for a waiting interaction on %s', async (_label, terminal) => {
+  ])('reports a fenced provider failure for a waiting interaction on %s', async (...testCase) => {
+    const [, terminal, followupTerminal = null] = testCase;
     const reportProviderFailure = jest.fn();
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
@@ -2720,6 +2853,11 @@ describe('Codex app-server provider adapter', () => {
     });
 
     server.send(terminal);
+    if (followupTerminal) {
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(reportProviderFailure).not.toHaveBeenCalled();
+      server.send(followupTerminal);
+    }
     await waitFor(() => reportProviderFailure.mock.calls.length === 1);
     expect(reportProviderFailure).toHaveBeenCalledWith(expect.objectContaining({
       providerError: expect.objectContaining({

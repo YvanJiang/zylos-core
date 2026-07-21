@@ -28,11 +28,13 @@ Run the opt-in acceptance with:
 npm run test:integration:codex-app-server:real
 ```
 
-The Jest test invokes [`scripts/lib/codex-app-server-real-integration.js`](../scripts/lib/codex-app-server-real-integration.js)
-and emits one machine-readable line prefixed with
-`ZYLOS_CODEX_APP_SERVER_REAL_EVIDENCE=`. The standalone
-[`scripts/e2e/codex-app-server-real-integration.js`](../scripts/e2e/codex-app-server-real-integration.js)
-emits the same schema.
+The named command first installs the existing `comm-bridge` native dependency and then invokes
+[`scripts/e2e/codex-app-server-real-integration.js`](../scripts/e2e/codex-app-server-real-integration.js).
+That packaged runner and the opt-in repository Jest test both call
+[`scripts/lib/codex-app-server-real-integration.js`](../scripts/lib/codex-app-server-real-integration.js)
+and emit one machine-readable line prefixed with
+`ZYLOS_CODEX_APP_SERVER_REAL_EVIDENCE=`. Emitted credential state is the fixed enum
+`authenticated`; raw login-status output is used only for the local prerequisite check.
 
 ## Real target evidence
 
@@ -41,15 +43,15 @@ The 2026-07-21 acceptance run passed the following through the installed officia
 | Scenario | Evidence |
 |---|---|
 | initialize and connect | initialize response returned the fixed target `userAgent` |
-| new thread and early durable ID | Core durably bound the `thread/start` ID before its canonical `running/provider_started` event |
+| new thread and early durable ID | a temporary SQLite trigger rejected `running/provider_started` insertion unless the same native ID was already present in the durable lineage |
 | subsequent turn | a second exact-text turn used the same durable thread ID |
 | restart reload/reconnect | Core and SQLite were closed and reopened; the third exact-text turn resumed the same thread ID |
 | provider-neutral notifications | durable `turn_state_changed`, `text_delta`, and `text_snapshot` events were observed |
-| stop / timeout / steer | real `turn/interrupt` returned `interrupt_requested`, `provider_stopped`, and `interrupt_requested` respectively |
-| context invalid | a real `thread/resume` for a missing rollout returned `provider_context_invalid` |
-| authentication | an isolated unauthenticated target exhausted its retry notifications and returned `provider_auth_failed` |
-| transient provider failure | an isolated target connection refusal returned retryable `delivery_transient` before side effects |
-| side-effect unknown | the harness killed only its own executing app-server process group; the provider-neutral result was `side_effect_unknown` |
+| stop / timeout / steer | each real `turn/interrupt` was followed by the matching canonical `interrupted` terminal; request results were `interrupt_requested`, `provider_stopped`, and `interrupt_requested` |
+| context invalid | a real `thread/resume` for a missing rollout persisted `provider_context_invalid` through Core and ended `failed` |
+| authentication | an isolated unauthenticated target exhausted its retry notifications; Core persisted `provider_auth_failed` and ended `failed` |
+| transient provider failure | an isolated target connection refusal persisted retryable `delivery_transient`; Core scheduled the safe retry |
+| side-effect unknown | the harness killed only its own executing app-server process group; Core persisted `side_effect_unknown` and entered `recovering` |
 
 The real test asserts all three successful turns have exactly one native thread ID. The emitted
 evidence intentionally records the ID for that invocation rather than committing a machine-local

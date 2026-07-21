@@ -1139,18 +1139,6 @@ export function createCodexAppServerAdapter({
         failureCode,
         'Codex app-server reported a classified execution error.',
       );
-      if (params.willRetry === true) return;
-      run.terminal_status = 'failed';
-      terminalRuns.set(coreAttemptKey(run.context.turn_id, run.context.attempt), run);
-      rememberConnectionFence(target, target.retired_run_keys, runKey);
-      discardProviderRequestsForRun(target, run, run.last_provider_failure);
-      const failureOutcome = run.context.reportProviderFailure?.(run.last_provider_failure);
-      if (failureOutcome?.status === 'recovering') {
-        terminalRuns.delete(coreAttemptKey(run.context.turn_id, run.context.attempt));
-      }
-      activeRuns.delete(runKey);
-      run.rejectTerminal(run.last_provider_failure);
-      run.queue.fail(run.last_provider_failure);
       return;
     }
     if (method === 'turn/completed') {
@@ -1177,10 +1165,13 @@ export function createCodexAppServerAdapter({
           sideEffectObserved: run.side_effect_observed,
         })
         : 'side_effect_unknown';
-      const failure = run.last_provider_failure ?? new CodexAppServerAdapterError(
+      const terminalFailure = new CodexAppServerAdapterError(
         failureCode,
         `Codex app-server completed the turn with status ${String(status)}.`,
       );
+      const failure = status === 'failed' && !isRecord(terminalError)
+        ? run.last_provider_failure ?? terminalFailure
+        : terminalFailure;
       rememberConnectionFence(target, target.retired_run_keys, runKey);
       const discardedRequestCount = discardProviderRequestsForRun(target, run, failure);
       const completionIsInvalid = status !== 'completed' || discardedRequestCount > 0;
