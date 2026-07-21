@@ -812,4 +812,32 @@ describe('one-time lifecycle cleanup', () => {
       fs.rmSync(externalDirectory, { recursive: true, force: true });
     }
   });
+
+  test('fails closed rather than rewriting a multiply linked hook configuration', () => {
+    const state = fixture();
+    const externalDirectory = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-external-hooks-'));
+    const externalConfig = path.join(externalDirectory, 'hooks.json');
+    fs.writeFileSync(externalConfig, JSON.stringify({
+      hooks: {
+        SessionStart: [{ hooks: [{
+          type: 'command',
+          command: `node ${path.join(state.directory, '.claude', 'skills', 'activity-monitor', 'scripts', 'session-start-orchestrator.js')}`,
+        }] }],
+      },
+    }));
+    const codexHooks = path.join(state.directory, '.codex', 'hooks.json');
+    fs.mkdirSync(path.dirname(codexHooks), { recursive: true });
+    fs.linkSync(externalConfig, codexHooks);
+
+    try {
+      expect(() => cleanupObsoleteLifecycleArtifacts({
+        zylosDir: state.directory,
+        upgradeState: 'committed',
+      })).toThrow('unexpected hook configuration type');
+      expect(JSON.parse(fs.readFileSync(externalConfig, 'utf8')).hooks.SessionStart[0].hooks)
+        .toHaveLength(1);
+    } finally {
+      fs.rmSync(externalDirectory, { recursive: true, force: true });
+    }
+  });
 });

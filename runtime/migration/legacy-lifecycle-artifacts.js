@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -121,25 +122,72 @@ function isContainedPath(root, candidate) {
     && relative !== '..' && !path.isAbsolute(relative));
 }
 
+function writeHookConfigurationAtomically({ file, root, parent, sourceStat, content }) {
+  const currentParent = fs.realpathSync(path.dirname(file));
+  if (currentParent !== parent || !isContainedPath(root, currentParent)) {
+    throw new Error(`Hook configuration parent changed before cleanup: ${file}`);
+  }
+  const target = path.join(parent, path.basename(file));
+  const current = fs.lstatSync(target);
+  if (!current.isFile() || current.nlink !== 1
+    || current.dev !== sourceStat.dev || current.ino !== sourceStat.ino) {
+    throw new Error(`Hook configuration changed before cleanup: ${file}`);
+  }
+  const temporary = path.join(parent, `.${path.basename(file)}.${process.pid}.${crypto.randomUUID()}.partial`);
+  let descriptor = null;
+  try {
+    descriptor = fs.openSync(
+      temporary,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+      0o600,
+    );
+    fs.writeFileSync(descriptor, content, 'utf8');
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = null;
+    if (fs.realpathSync(path.dirname(file)) !== parent) {
+      throw new Error(`Hook configuration parent changed before cleanup: ${file}`);
+    }
+    const beforeReplace = fs.lstatSync(target);
+    if (!beforeReplace.isFile() || beforeReplace.nlink !== 1
+      || beforeReplace.dev !== sourceStat.dev || beforeReplace.ino !== sourceStat.ino) {
+      throw new Error(`Hook configuration changed before cleanup: ${file}`);
+    }
+    fs.renameSync(temporary, target);
+  } finally {
+    if (descriptor !== null) fs.closeSync(descriptor);
+    try { fs.unlinkSync(temporary); } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
+}
+
 function cleanupObsoleteHooksInFile(file, root, homeDir, removed) {
   try {
-    const stat = fs.lstatSync(file);
-    if (stat.isSymbolicLink()) {
-      throw new Error(`Refusing to follow symlinked hook configuration: ${file}`);
-    }
-    if (!stat.isFile()) {
-      throw new Error(`Refusing to rewrite unexpected hook configuration type: ${file}`);
-    }
     const realRoot = fs.realpathSync(root);
     const realParent = fs.realpathSync(path.dirname(file));
     if (!isContainedPath(realRoot, realParent)) {
       throw new Error(`Refusing to rewrite hook configuration outside installation root: ${file}`);
     }
-    const document = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    let sourceStat;
+    let document;
+    try {
+      sourceStat = fs.fstatSync(descriptor);
+      if (!sourceStat.isFile() || sourceStat.nlink !== 1) {
+        throw new Error(`Refusing to rewrite unexpected hook configuration type: ${file}`);
+      }
+      document = JSON.parse(fs.readFileSync(descriptor, 'utf8'));
+    } finally {
+      fs.closeSync(descriptor);
+    }
     if (Array.isArray(document)) {
       const retained = document.filter((hook) => !isObsoleteInstalledHook(hook?.command, root, homeDir));
       if (retained.length !== document.length) {
-        fs.writeFileSync(file, `${JSON.stringify(retained, null, 2)}\n`, { mode: 0o600 });
+        writeHookConfigurationAtomically({
+          file, root: realRoot, parent: realParent, sourceStat,
+          content: `${JSON.stringify(retained, null, 2)}\n`,
+        });
         removed.push(file);
       }
       return;
@@ -166,10 +214,16 @@ function cleanupObsoleteHooksInFile(file, root, homeDir, removed) {
       }
     }
     if (changed) {
-      fs.writeFileSync(file, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
+      writeHookConfigurationAtomically({
+        file, root: realRoot, parent: realParent, sourceStat,
+        content: `${JSON.stringify(document, null, 2)}\n`,
+      });
       removed.push(file);
     }
   } catch (error) {
+    if (error?.code === 'ELOOP') {
+      throw new Error(`Refusing to follow symlinked hook configuration: ${file}`);
+    }
     if (error?.code !== 'ENOENT') throw error;
   }
 }
