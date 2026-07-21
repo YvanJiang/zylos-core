@@ -383,6 +383,19 @@ The gate scans every tracked text file and every file reported by each
 repository's `npm pack --dry-run`. Its allowlist is exact, purpose-bearing, and
 limited to isolated one-time migration records or negative proofs.
 
+## Claude Agent SDK real-integration gate
+
+The credential-dependent Claude target gate validates the pinned SDK and
+bundled executable, runs focused deterministic fault injection, and then uses
+the official SDK through the production Core seam. It fails closed when the
+real-provider lane is unavailable or incomplete.
+
+```bash
+npm run test:integration:claude-sdk
+```
+
+See [the evidence lanes, prerequisites, and residual risks](docs/claude-agent-sdk-real-integration.md).
+
 ## Uninstall
 
 ```bash
