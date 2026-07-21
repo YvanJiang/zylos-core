@@ -168,4 +168,6 @@ are rejected instead of fabricating an acknowledgement or collapsing distinct qu
 Real local verification requires an authenticated Codex
 installation and exercises only safe read-only prompts and explicit negative/interrupt protocol
 paths; approval, user-input, and MCP elicitation require a controlled provider/tool fixture before
-they can be asserted end to end without creating external side effects.
+they can be asserted end to end without creating external side effects. The fixed target,
+prerequisites, machine-readable runner, completed matrix, unrun cases, and residual risks are
+recorded in [`codex-app-server-real-integration.md`](./codex-app-server-real-integration.md).

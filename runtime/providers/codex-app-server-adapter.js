@@ -31,6 +31,15 @@ const DEFAULT_ENV_ALLOWLIST = Object.freeze([
 ]);
 
 function providerErrorFor(code) {
+  if (code === 'provider_auth_failed') {
+    return {
+      code: 'provider_auth_failed',
+      category: 'authentication',
+      retryable: false,
+      side_effect_status: 'none',
+      user_message: 'Codex authentication failed.',
+    };
+  }
   if (code === 'provider_context_invalid') {
     return {
       code: 'provider_context_invalid',
@@ -38,6 +47,15 @@ function providerErrorFor(code) {
       retryable: false,
       side_effect_status: 'none',
       user_message: 'The provider conversation could not be loaded safely.',
+    };
+  }
+  if (code === 'delivery_transient') {
+    return {
+      code: 'delivery_transient',
+      category: 'provider',
+      retryable: true,
+      side_effect_status: 'none',
+      user_message: 'Codex encountered a transient provider failure before any tool side effect.',
     };
   }
   if (code === 'unsupported_capability') {
@@ -56,6 +74,55 @@ function providerErrorFor(code) {
     side_effect_status: 'unknown',
     user_message: 'The provider connection failed after side effects may have occurred.',
   };
+}
+
+function providerErrorText(value) {
+  if (!isRecord(value)) return '';
+  return [value.message, value.additionalDetails]
+    .filter((part) => typeof part === 'string')
+    .join('\n');
+}
+
+function providerHttpStatus(value) {
+  const nested = value?.codexErrorInfo?.responseStreamDisconnected?.httpStatusCode;
+  if (Number.isSafeInteger(nested)) return nested;
+  const match = providerErrorText(value).match(/(?:status|http)\s+(\d{3})\b/i);
+  return match === null ? null : Number(match[1]);
+}
+
+function classifyProviderFailure(value, {
+  method = null,
+  sideEffectObserved = false,
+  willRetry = false,
+} = {}) {
+  if (sideEffectObserved) return 'side_effect_unknown';
+  const text = providerErrorText(value);
+  const httpStatus = providerHttpStatus(value);
+  if (
+    httpStatus === 401
+    || httpStatus === 403
+    || /\b(?:unauthorized|forbidden|authentication|missing bearer)\b/i.test(text)
+  ) {
+    return 'provider_auth_failed';
+  }
+  if (
+    /\b(?:no rollout found|context (?:length|window)|maximum context)\b/i.test(text)
+  ) {
+    return 'provider_context_invalid';
+  }
+  if (
+    willRetry
+    || httpStatus === 408
+    || httpStatus === 409
+    || httpStatus === 425
+    || httpStatus === 429
+    || (httpStatus !== null && httpStatus >= 500)
+    || /\b(?:rate limit|timed? out|temporar(?:y|ily)|connection (?:closed|reset)|disconnected|unavailable)\b/i.test(text)
+  ) {
+    return 'delivery_transient';
+  }
+  if (method === 'thread/resume') return 'provider_context_invalid';
+  return 'side_effect_unknown';
 }
 
 export class CodexAppServerAdapterError extends Error {
@@ -963,6 +1030,7 @@ export function createCodexAppServerAdapter({
           item: structuredClone(item),
           specification,
         });
+        if (specification.sideEffect !== 'none') run.side_effect_observed = true;
         run.queue.push(toolDescriptor(run, item.id, specification, 'tool_started', 'started'));
       } else if (!IGNORED_ITEM_TYPES.has(item?.type)) {
         failConnection(target, new CodexAppServerAdapterError(
@@ -1053,11 +1121,36 @@ export function createCodexAppServerAdapter({
       return;
     }
     if (method === 'error') {
-      const failure = new CodexAppServerAdapterError(
-        'provider_execution_failed',
-        'Codex app-server reported an execution error.',
+      if (
+        !isRecord(params?.error)
+        || (params.willRetry !== undefined && typeof params.willRetry !== 'boolean')
+      ) {
+        failConnection(target, new CodexAppServerAdapterError(
+          'provider_protocol_invalid',
+          'Codex app-server reported an invalid execution error.',
+        ));
+        return;
+      }
+      const failureCode = classifyProviderFailure(params.error, {
+        sideEffectObserved: run.side_effect_observed,
+        willRetry: params.willRetry === true,
+      });
+      run.last_provider_failure = new CodexAppServerAdapterError(
+        failureCode,
+        'Codex app-server reported a classified execution error.',
       );
-      failConnection(target, failure);
+      if (params.willRetry === true) return;
+      run.terminal_status = 'failed';
+      terminalRuns.set(coreAttemptKey(run.context.turn_id, run.context.attempt), run);
+      rememberConnectionFence(target, target.retired_run_keys, runKey);
+      discardProviderRequestsForRun(target, run, run.last_provider_failure);
+      const failureOutcome = run.context.reportProviderFailure?.(run.last_provider_failure);
+      if (failureOutcome?.status === 'recovering') {
+        terminalRuns.delete(coreAttemptKey(run.context.turn_id, run.context.attempt));
+      }
+      activeRuns.delete(runKey);
+      run.rejectTerminal(run.last_provider_failure);
+      run.queue.fail(run.last_provider_failure);
       return;
     }
     if (method === 'turn/completed') {
@@ -1078,8 +1171,14 @@ export function createCodexAppServerAdapter({
       }
       run.terminal_status = status;
       terminalRuns.set(coreAttemptKey(run.context.turn_id, run.context.attempt), run);
-      const failure = new CodexAppServerAdapterError(
-        'provider_execution_failed',
+      const terminalError = params.turn?.error;
+      const failureCode = status === 'failed'
+        ? classifyProviderFailure(terminalError, {
+          sideEffectObserved: run.side_effect_observed,
+        })
+        : 'side_effect_unknown';
+      const failure = run.last_provider_failure ?? new CodexAppServerAdapterError(
+        failureCode,
         `Codex app-server completed the turn with status ${String(status)}.`,
       );
       rememberConnectionFence(target, target.retired_run_keys, runKey);
@@ -1851,8 +1950,9 @@ export function createCodexAppServerAdapter({
       rememberConnectionFence(target, target.settled_client_request_ids, responseId);
       target.pending.delete(responseId);
       if (hasError) {
+        const failureCode = classifyProviderFailure(message.error, { method: pending.method });
         pending.reject(new CodexAppServerAdapterError(
-          'provider_request_failed',
+          failureCode,
           `Codex app-server rejected ${pending.method}.`,
         ));
         return;
@@ -2141,6 +2241,8 @@ export function createCodexAppServerAdapter({
       tool_items: new Map(),
       turn_id: null,
       terminal_status: null,
+      last_provider_failure: null,
+      side_effect_observed: false,
     };
     inFlightTurnStarts.add(run);
     try {

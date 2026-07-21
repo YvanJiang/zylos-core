@@ -16,4 +16,5 @@
 test/
 **/__tests__/
 scripts/e2e/
+scripts/lib/codex-app-server-real-integration.js
 **/node_modules/

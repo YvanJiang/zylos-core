@@ -13,6 +13,7 @@
     "test": "npm run test:jest && npm run test:node",
     "test:jest": "node --experimental-vm-modules node_modules/.bin/jest",
     "test:node": "node scripts/run-node-tests.js",
+    "test:integration:codex-app-server:real": "ZYLOS_RUN_CODEX_APP_SERVER_REAL_INTEGRATION=1 node --experimental-vm-modules node_modules/.bin/jest --runInBand test/codex-app-server-real-integration.test.js",
     "test:contracts:five-repo": "node scripts/verify-five-repo-contracts.js",
     "test:release:retired-runtime": "node --experimental-vm-modules node_modules/.bin/jest --runInBand test/five-repo-retired-runtime-gate.test.js test/runtime-normal-path-static.test.js && node scripts/verify-five-repo-retired-runtime.js"
   },

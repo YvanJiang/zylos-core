@@ -16,6 +16,7 @@ function createFakeAppServer({
   respondToInterrupt = true,
   respondToTurnStart = true,
   resumeTurns = [],
+  threadResumeError = null,
   turnStartResponsePatch = {},
 } = {}) {
   const child = new EventEmitter();
@@ -49,6 +50,10 @@ function createFakeAppServer({
         send({ id: message.id, result: { thread: { id: 'codex-thread-1' } } });
       } else if (message.method === 'thread/resume') {
         const threadId = message.params.threadId;
+        if (threadResumeError !== null) {
+          send({ id: message.id, error: threadResumeError });
+          continue;
+        }
         send({
           id: message.id,
           result: { thread: { id: threadId, turns: resumeTurns } },
@@ -241,6 +246,114 @@ function sendStartedCommand({ send, threadId, turnId }, itemId, {
 }
 
 describe('Codex app-server provider adapter', () => {
+  test('classifies the target app-server missing-rollout response as context invalid', async () => {
+    const server = createFakeAppServer({
+      threadResumeError: {
+        code: -32600,
+        message: 'no rollout found for thread id codex-thread-missing',
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(executeAdapter(adapter, executionContext({
+      lineage: { provider_native_id: 'codex-thread-missing' },
+    })))).rejects.toMatchObject({
+      code: 'provider_context_invalid',
+      providerError: {
+        code: 'provider_context_invalid',
+        category: 'provider',
+        retryable: false,
+        side_effect_status: 'none',
+      },
+    });
+  });
+
+  test('keeps a transient resume rejection retryable instead of treating it as lost context', async () => {
+    const server = createFakeAppServer({
+      threadResumeError: {
+        code: -32603,
+        message: 'provider unavailable with HTTP status 503',
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(executeAdapter(adapter, executionContext({
+      lineage: { provider_native_id: 'codex-thread-existing' },
+    })))).rejects.toMatchObject({
+      code: 'delivery_transient',
+      providerError: {
+        code: 'delivery_transient',
+        category: 'provider',
+        retryable: true,
+        side_effect_status: 'none',
+      },
+    });
+  });
+
+  test('waits through retry progress and classifies the target app-server final 401 as auth', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'error',
+          params: {
+            error: {
+              message: 'Reconnecting... 2/5',
+              codexErrorInfo: {
+                responseStreamDisconnected: { httpStatusCode: 401 },
+              },
+              additionalDetails: 'redacted target app-server authentication failure',
+            },
+            willRetry: true,
+            threadId,
+            turnId,
+          },
+        });
+        send({
+          method: 'error',
+          params: {
+            error: {
+              message: 'unexpected status 401 Unauthorized',
+              codexErrorInfo: 'other',
+              additionalDetails: null,
+            },
+            willRetry: false,
+            threadId,
+            turnId,
+          },
+        });
+        send({
+          method: 'turn/completed',
+          params: {
+            threadId,
+            turn: {
+              id: turnId,
+              status: 'failed',
+              items: [],
+              error: {
+                message: 'unexpected status 401 Unauthorized',
+                codexErrorInfo: 'other',
+                additionalDetails: null,
+              },
+            },
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(executeAdapter(adapter, executionContext())))
+      .rejects.toMatchObject({
+        code: 'provider_auth_failed',
+        providerError: {
+          code: 'provider_auth_failed',
+          category: 'authentication',
+          retryable: false,
+          side_effect_status: 'none',
+        },
+      });
+    expect(server.child.kill).not.toHaveBeenCalled();
+  });
+
   test('advertises the workspace access enforced by its configured sandbox', () => {
     const spawnProcess = jest.fn();
 
