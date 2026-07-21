@@ -139,6 +139,10 @@ describe('normal product paths have no retired runtime authority', () => {
     const outboxSource = fs.readFileSync(
       path.resolve('runtime/delivery/outbox-service.js'), 'utf8',
     );
+    const shellSource = fs.readFileSync(path.resolve('cli/commands/shell.js'), 'utf8');
+    const snapshotSource = fs.readFileSync(
+      path.resolve('runtime/observability/snapshot-publisher.js'), 'utf8',
+    );
     const mailboxSource = fs.readFileSync(
       path.resolve('skills/web-console/scripts/db.js'), 'utf8',
     );
@@ -166,6 +170,18 @@ describe('normal product paths have no retired runtime authority', () => {
       /pre_action_fenced_at = CASE WHEN \? = 1[\s\S]*COALESCE\(pre_action_fenced_at,[\s\S]*lease_expires_at IS NOT NULL AND lease_expires_at > \?/,
     );
     expect(outboxSource).toMatch(/candidate\.pre_action_fenced_at IS NULL/);
+    expect(outboxSource).toMatch(/expiredClaimRecovery = 'fenced'/);
+    expect(ownerSource).toMatch(/expiredClaimRecovery: 'same_delivery_id'/);
+    expect(ownerSource).toMatch(/supportsPlatformIdempotency: true/);
+    expect(mailboxSource).toMatch(/delivery_id TEXT UNIQUE/);
+    expect(mailboxSource).toMatch(/row\.delivery_id !== scopedDeliveryId/);
+    expect(shellSource).not.toMatch(/same_delivery_id|supportsPlatformIdempotency:\s*true/);
+    expect(snapshotSource).toMatch(
+      /pre_action_fenced_at !== null[\s\S]*\? 'delivery_unknown'/,
+    );
+    expect(snapshotSource).toMatch(
+      /status === 'delivery_unknown'[\s\S]*return 'degraded'/,
+    );
     expect(outboxSource).toMatch(
       /row\.lease_expires_at === null[\s\S]*row\.lease_expires_at <= appliedAt/,
     );

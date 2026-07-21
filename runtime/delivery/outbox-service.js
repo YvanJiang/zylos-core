@@ -257,6 +257,7 @@ export function createOutboxService({
   generateId = defaultGenerateId,
   leaseDurationMs = 10_000,
   throttleMs = 1_500,
+  expiredClaimRecovery = 'fenced',
 }) {
   if (!database || typeof database.transaction !== 'function') {
     throw new TypeError('database must be a better-sqlite3 connection');
@@ -286,6 +287,9 @@ export function createOutboxService({
   if (renderer !== undefined && typeof renderer?.deliver !== 'function') {
     throw new TypeError('renderer.deliver must be a function');
   }
+  if (!['fenced', 'same_delivery_id'].includes(expiredClaimRecovery)) {
+    throw new TypeError('expiredClaimRecovery must be fenced or same_delivery_id');
+  }
   initializeRuntimePersistence(database);
 
   function claimNext() {
@@ -308,7 +312,10 @@ export function createOutboxService({
             candidate.status = 'delivering'
             AND candidate.lease_expires_at IS NOT NULL
             AND candidate.lease_expires_at <= ?
-            AND candidate.pre_action_fenced_at IS NULL
+            AND (
+              candidate.pre_action_fenced_at IS NULL
+              OR ? = 'same_delivery_id'
+            )
           )
         )
         AND (
@@ -339,6 +346,7 @@ export function createOutboxService({
       `).get(
         claimedAt,
         claimedAt,
+        expiredClaimRecovery,
         claimedAt,
         channel,
         channel,

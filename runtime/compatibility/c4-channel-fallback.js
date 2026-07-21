@@ -92,6 +92,7 @@ function renderText(command) {
 export function createChannelNeutralTextRenderer({
   sendText,
   beforeSend,
+  supportsPlatformIdempotency = false,
   now = () => new Date().toISOString(),
 }) {
   if (typeof sendText !== 'function') {
@@ -102,6 +103,9 @@ export function createChannelNeutralTextRenderer({
   }
   if (typeof beforeSend !== 'function') {
     throw new TypeError('beforeSend must be a function');
+  }
+  if (typeof supportsPlatformIdempotency !== 'boolean') {
+    throw new TypeError('supportsPlatformIdempotency must be a boolean');
   }
 
   async function deliver(command) {
@@ -146,7 +150,7 @@ export function createChannelNeutralTextRenderer({
       renderer_capabilities: {
         supports_update: false,
         supports_actions: false,
-        supports_platform_idempotency: false,
+        supports_platform_idempotency: supportsPlatformIdempotency,
         supports_platform_version: false,
       },
       result_at: deliveredAt,

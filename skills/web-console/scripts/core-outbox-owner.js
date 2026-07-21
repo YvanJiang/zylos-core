@@ -26,6 +26,7 @@ export function createWebConsoleOutboxOwner({
   let owner;
   const textRenderer = createChannelNeutralTextRenderer({
     now,
+    supportsPlatformIdempotency: true,
     beforeSend(command) {
       owner.assertCurrentClaim(command);
     },
@@ -55,6 +56,7 @@ export function createWebConsoleOutboxOwner({
     targetBotId: botId,
     serviceInstanceId,
     now,
+    expiredClaimRecovery: 'same_delivery_id',
     renderer: {
       async deliver(command) {
         owner.assertCurrentClaim(command, { sideEffectBoundary: false });

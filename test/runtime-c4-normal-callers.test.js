@@ -8,6 +8,7 @@ import { afterEach, describe, test } from '@jest/globals';
 import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/index.js';
 import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { createWebConsoleOutboxOwner } from '../skills/web-console/scripts/core-outbox-owner.js';
+import { DeliveryMailbox, openDb } from '../skills/web-console/scripts/db.js';
 
 const receiveCli = path.resolve('skills/comm-bridge/scripts/c4-receive.js');
 const sendCli = path.resolve('skills/comm-bridge/scripts/c4-send.js');
@@ -345,6 +346,70 @@ describe('normal C4 callers use durable Core contracts', () => {
     assert.equal(database.prepare(`
       SELECT COUNT(*) AS count FROM runtime_message_mappings WHERE turn_id = ?
     `).get(accepted.turn_id).count, 1);
+    database.close();
+  });
+
+  test('the Web Console owner safely recovers an unknown mailbox acknowledgement after restart', async () => {
+    const { zylosDir, env } = fixture();
+    const acceptedProcess = run(receiveCli, [
+      '--channel', 'web-console', '--endpoint', 'console',
+      '--message-id', 'web-owner-unknown-ack', '--actor-id', 'fixture-user',
+      '--occurred-at', '2026-07-21T00:20:30.000Z', '--content', 'unknown mailbox ack', '--json',
+    ], env);
+    assert.equal(acceptedProcess.status, 0, acceptedProcess.stderr);
+    const accepted = JSON.parse(acceptedProcess.stdout.trim());
+    const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
+    const mailboxDatabase = openDb(path.join(zylosDir, 'web-console', 'mailbox.db'));
+    const mailbox = new DeliveryMailbox(mailboxDatabase, {
+      region: 'global', tenantId: 'tenant-c4', botId: 'bot-c4',
+    });
+    const claimTime = claimTimeFor(database, 'web-console', 'console');
+    let deliveryCalls = 0;
+    const deliverToMailbox = (message, delivery) => {
+      deliveryCalls += 1;
+      const effect = mailbox.deliver({
+        deliveryId: delivery.delivery_id,
+        endpointId: message.endpoint_id,
+        content: message.content,
+        timestamp: message.timestamp,
+      });
+      if (deliveryCalls === 1) throw new Error('mailbox acknowledgement was lost');
+      return effect;
+    };
+    const firstOwner = createWebConsoleOutboxOwner({
+      database,
+      region: 'global', tenantId: 'tenant-c4', botId: 'bot-c4',
+      serviceInstanceId: 'web-console-owner-before-restart',
+      now: () => claimTime,
+      projectInbound() {},
+      deliverMessage: deliverToMailbox,
+    });
+
+    await assert.rejects(firstOwner.drain(), /acknowledgement was lost/);
+    assert.equal(mailbox.list().length, 1);
+    assert.deepEqual({ ...database.prepare(`
+      SELECT status, result_json, pre_action_fenced_at
+      FROM runtime_outbox WHERE turn_id = ?
+    `).get(accepted.turn_id) }, {
+      status: 'delivering', result_json: null, pre_action_fenced_at: claimTime,
+    });
+
+    const recoveryTime = new Date(Date.parse(claimTime) + 11_000).toISOString();
+    const restartedOwner = createWebConsoleOutboxOwner({
+      database,
+      region: 'global', tenantId: 'tenant-c4', botId: 'bot-c4',
+      serviceInstanceId: 'web-console-owner-after-restart',
+      now: () => recoveryTime,
+      projectInbound() {},
+      deliverMessage: deliverToMailbox,
+    });
+    assert.deepEqual(await restartedOwner.drain(), { status: 'delivered', delivered: 1 });
+    assert.equal(deliveryCalls, 2);
+    assert.equal(mailbox.list().length, 1);
+    assert.equal(database.prepare(`
+      SELECT status FROM runtime_outbox WHERE turn_id = ?
+    `).get(accepted.turn_id).status, 'delivered');
+    mailboxDatabase.close();
     database.close();
   });
 

@@ -161,6 +161,13 @@ lane once so its v1.0 conversation identity is fenced before an exact `update_ma
 The validator also validates the provider-neutral render model, recomputes the delivery
 idempotency key, and enforces the operation matrix:
 
+Immediately before projection or an irreversible send, a delivery owner must transactionally
+renew the exact current claim using its owner, epoch, full command snapshot, and snapshot hash.
+An expired non-idempotent pre-send claim remains fenced from automatic replay and is published as
+provider-neutral outbox `delivery_unknown`, which degrades Core health pending reconciliation.
+Only an owner whose durable sink proves exact same-`delivery_id` idempotency may reclaim that
+expired claim; replay must return the original effect or fail on conflicting content.
+
 - `create_main` and `send_text` have no platform target or predecessor;
 - `update_main` names both the exact platform message and predecessor delivery;
 - `send_fallback` creates a new mapping and names the failed or exhausted predecessor;
