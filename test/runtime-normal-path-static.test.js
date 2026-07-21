@@ -37,7 +37,7 @@ const normalRuntimeFiles = [
   'README.zh-CN.md',
 ];
 
-const retiredRuntimeAuthority = new RegExp([
+const retiredRuntimeIdentifier = new RegExp([
   'tmux',
   'capture-pane',
   'send-keys',
@@ -50,6 +50,28 @@ const retiredRuntimeAuthority = new RegExp([
   'activity[ _-]monitor',
   'c4[ _-](?:dispatcher|control|session[ _-]init)',
 ].join('|'), 'i');
+
+const retiredDocumentationAuthority = new RegExp([
+  'input[ _-](?:box|state)',
+  'cursor_[xy]',
+  'prompt_y',
+  'status[ _-]line layout',
+  'attach[^\\n]*overlay',
+  'unaccepted prompt',
+  'block[ _-]queue[ _-]until[ _-]idle',
+  'require[ _-]idle',
+  'idle_seconds',
+  'sustained idle',
+  'control queue',
+  'periodic task dispatch',
+  'monitor/dispatcher',
+].join('|'), 'i');
+
+function containsRetiredAuthority(file) {
+  const source = fs.readFileSync(path.resolve(file), 'utf8');
+  return retiredRuntimeIdentifier.test(source)
+    || (file.endsWith('.md') && retiredDocumentationAuthority.test(source));
+}
 
 let cachedPackedFiles = null;
 function packedFiles() {
@@ -104,9 +126,7 @@ describe('normal product paths have no retired runtime authority', () => {
     const violations = repositoryFiles()
       .filter(isScannableText)
       .filter((file) => !migrationOnlyRepositoryFiles.has(file))
-      .filter((file) => retiredRuntimeAuthority.test(
-        fs.readFileSync(path.resolve(file), 'utf8'),
-      ));
+      .filter(containsRetiredAuthority);
     expect(violations).toEqual([]);
   });
 
@@ -349,9 +369,7 @@ describe('normal product paths have no retired runtime authority', () => {
     const violations = files
       .filter(isScannableText)
       .filter((file) => !migrationOnly.has(file))
-      .filter((file) => retiredRuntimeAuthority.test(
-        fs.readFileSync(path.resolve(file), 'utf8'),
-      ));
+      .filter(containsRetiredAuthority);
     expect(violations).toEqual([]);
   });
 });
