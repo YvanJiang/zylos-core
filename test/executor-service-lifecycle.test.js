@@ -560,6 +560,46 @@ describe('executor daemon resource ownership', () => {
     expect(events).toEqual(['database-close']);
   });
 
+  test('recovers a committed upgrade until postcommit cleanup is durable', async () => {
+    const state = fixture();
+    const events = [];
+    const database = {
+      close: () => events.push('database-close'),
+      prepare: (sql) => ({ get: () => (sql.includes('sqlite_master')
+        ? { present: 1 } : (sql.includes('SELECT run.upgrade_id') ? { upgrade_id: 'upgrade-pending' } : undefined)) }),
+    };
+    const handler = async () => ({ state: 'committed' });
+    handler.resumeBlocking = async () => { events.push('upgrade-resume'); return { state: 'committed' }; };
+    const daemon = await runExecutorDaemon({
+      zylosDir: state.directory, Database: function DatabaseFixture() { return database; },
+      createUpgradeHandler: () => handler,
+      createHost: () => { throw new Error('host must not start'); },
+    });
+    expect(daemon.restartRequired).toBe(true);
+    expect(events).toEqual(['upgrade-resume', 'database-close']);
+  });
+
+  test('ignores a stale terminal upgrade plan after durable cleanup', async () => {
+    const state = fixture();
+    fs.mkdirSync(path.join(state.directory, 'runtime', 'upgrade-plans'), { recursive: true });
+    fs.writeFileSync(path.join(state.directory, 'runtime', 'upgrade-plans', 'finished.json'), '{}\n');
+    const events = [];
+    const database = {
+      close: () => events.push('database-close'),
+      prepare: (sql) => ({ get: () => (sql.includes('sqlite_master')
+        ? { present: 1 } : (sql.includes('SELECT state') ? { state: 'rolled_back' } : undefined)) }),
+    };
+    const host = { closed: Promise.resolve(), async start() { events.push('host-start'); }, async close() {} };
+    const daemon = await runExecutorDaemon({
+      zylosDir: state.directory, Database: function DatabaseFixture() { return database; },
+      createAdapter: () => inertAdapter(),
+      createPrerequisiteOwner: () => ({ async start() {}, health() { return { ok: true }; }, async close() {} }),
+      createHost: () => host,
+    });
+    expect(events).toEqual(['host-start']);
+    await daemon.close();
+  });
+
   test('gives the service host sole ownership of closing the Core database', async () => {
     const state = fixture();
     const events = [];
