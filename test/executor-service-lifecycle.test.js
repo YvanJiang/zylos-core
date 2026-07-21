@@ -704,7 +704,7 @@ describe('one-time lifecycle cleanup', () => {
         SessionStart: [{ hooks: [
           {
             type: 'command',
-            command: `node ${path.join(state.directory, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-session-init.js')}`,
+            command: `node ${path.join(state.directory, '.codex', 'skills', 'comm-bridge', 'scripts', 'c4-session-init.js')}`,
           },
           { type: 'command', command: 'node retained-hook.js' },
         ] }],
@@ -743,5 +743,37 @@ describe('one-time lifecycle cleanup', () => {
         SessionStart: [{ hooks: [{ type: 'command', command: 'node retained-claude-hook.js' }] }],
       },
     });
+  });
+
+  test('removes exact owned home-relative hooks from the supported flat Codex config', () => {
+    const state = fixture();
+    const homeDir = path.dirname(state.directory);
+    const relativeRoot = path.basename(state.directory);
+    const codexHooks = path.join(state.directory, '.codex', 'hooks.json');
+    fs.mkdirSync(path.dirname(codexHooks), { recursive: true });
+    fs.writeFileSync(codexHooks, JSON.stringify([
+        {
+          event: 'SessionStart',
+          command: `node ~/${relativeRoot}/.codex/skills/activity-monitor/scripts/session-start-orchestrator.js`,
+        },
+        {
+          event: 'PreToolUse',
+          command: `node $HOME/${relativeRoot}/.claude/skills/activity-monitor/scripts/hook-activity.js`,
+        },
+        {
+          event: 'PostToolUse',
+          command: `node \${HOME}/${relativeRoot}/.claude/skills/zylos-memory/scripts/session-start-inject.js`,
+        },
+        { event: 'SessionStart', command: 'node retained-flat-hook.js' },
+    ]));
+
+    expect(cleanupObsoleteLifecycleArtifacts({
+      zylosDir: state.directory,
+      upgradeState: 'committed',
+      homeDir,
+    })).toEqual({ removed: [codexHooks] });
+    expect(JSON.parse(fs.readFileSync(codexHooks, 'utf8'))).toEqual([
+      { event: 'SessionStart', command: 'node retained-flat-hook.js' },
+    ]);
   });
 });

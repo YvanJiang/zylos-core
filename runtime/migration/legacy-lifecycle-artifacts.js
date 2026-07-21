@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 function requireZylosDir(zylosDir) {
@@ -76,19 +77,46 @@ export function legacyLifecycleArtifactPaths(zylosDir) {
   ]);
 }
 
-function isObsoleteInstalledHook(command, root) {
-  if (typeof command !== 'string') return false;
-  const normalized = command.replaceAll('\\', '/');
-  return OBSOLETE_HOOK_BASE_KEYS.some((key) => normalized.includes(
-    path.join(root, '.claude', key).replaceAll('\\', '/'),
+function obsoleteInstalledHookPaths(root, homeDir) {
+  const normalizedRoot = root.replaceAll('\\', '/');
+  const paths = ['.claude', '.codex'].flatMap((directory) => OBSOLETE_HOOK_BASE_KEYS.map(
+    (key) => path.join(normalizedRoot, directory, key).replaceAll('\\', '/'),
   ));
+  const relativeToHome = path.relative(homeDir, root).replaceAll('\\', '/');
+  if (relativeToHome !== '..' && !relativeToHome.startsWith('../') && !path.isAbsolute(relativeToHome)) {
+    const homeRelativeRoot = relativeToHome.length === 0 ? '~' : `~/${relativeToHome}`;
+    const environmentRelativeRoot = relativeToHome.length === 0 ? '$HOME' : `$HOME/${relativeToHome}`;
+    const braceEnvironmentRelativeRoot = relativeToHome.length === 0 ? '${HOME}' : `\${HOME}/${relativeToHome}`;
+    for (const directory of ['.claude', '.codex']) {
+      for (const key of OBSOLETE_HOOK_BASE_KEYS) {
+        paths.push(`${homeRelativeRoot}/${directory}/${key}`);
+        paths.push(`${environmentRelativeRoot}/${directory}/${key}`);
+        paths.push(`${braceEnvironmentRelativeRoot}/${directory}/${key}`);
+      }
+    }
+  }
+  return paths;
 }
 
-function cleanupObsoleteHooksInFile(file, root, removed) {
+function isObsoleteInstalledHook(command, root, homeDir) {
+  if (typeof command !== 'string') return false;
+  const normalized = command.replaceAll('\\', '/');
+  return obsoleteInstalledHookPaths(root, homeDir).some((ownedPath) => normalized.includes(ownedPath));
+}
+
+function cleanupObsoleteHooksInFile(file, root, homeDir, removed) {
   try {
     const document = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (!document || typeof document !== 'object' || Array.isArray(document)
-      || !document.hooks || typeof document.hooks !== 'object' || Array.isArray(document.hooks)) {
+    if (Array.isArray(document)) {
+      const retained = document.filter((hook) => !isObsoleteInstalledHook(hook?.command, root, homeDir));
+      if (retained.length !== document.length) {
+        fs.writeFileSync(file, `${JSON.stringify(retained, null, 2)}\n`, { mode: 0o600 });
+        removed.push(file);
+      }
+      return;
+    }
+    if (!document || typeof document !== 'object' || !document.hooks
+      || typeof document.hooks !== 'object' || Array.isArray(document.hooks)) {
       return;
     }
     let changed = false;
@@ -97,7 +125,7 @@ function cleanupObsoleteHooksInFile(file, root, removed) {
       const retainedGroups = groups.map((group) => {
         if (!Array.isArray(group?.hooks)) return group;
         const hooks = group.hooks.filter(
-          (hook) => !isObsoleteInstalledHook(hook?.command, root),
+          (hook) => !isObsoleteInstalledHook(hook?.command, root, homeDir),
         );
         if (hooks.length !== group.hooks.length) changed = true;
         return { ...group, hooks };
@@ -117,14 +145,19 @@ function cleanupObsoleteHooksInFile(file, root, removed) {
   }
 }
 
-export function cleanupObsoleteLifecycleArtifacts({ zylosDir, upgradeState }) {
+export function cleanupObsoleteLifecycleArtifacts({
+  zylosDir,
+  upgradeState,
+  homeDir = os.homedir(),
+}) {
   if (upgradeState !== 'committed') {
     throw new Error('Obsolete lifecycle artifacts may be removed only after the upgrade is durably committed.');
   }
   const root = requireZylosDir(zylosDir);
+  const normalizedHome = requireZylosDir(homeDir);
   const removed = [];
-  cleanupObsoleteHooksInFile(path.join(root, '.codex', 'hooks.json'), root, removed);
-  cleanupObsoleteHooksInFile(path.join(root, '.claude', 'settings.json'), root, removed);
+  cleanupObsoleteHooksInFile(path.join(root, '.codex', 'hooks.json'), root, normalizedHome, removed);
+  cleanupObsoleteHooksInFile(path.join(root, '.claude', 'settings.json'), root, normalizedHome, removed);
   for (const artifact of legacyLifecycleArtifactPaths(zylosDir)) {
     let stat;
     try {
