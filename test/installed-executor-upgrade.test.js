@@ -308,6 +308,16 @@ describe('installed executor production upgrade owner', () => {
         fs.writeFileSync(artifact, 'obsolete');
       }
     }
+    const codexHooks = path.join(zylosDir, '.codex', 'hooks.json');
+    fs.mkdirSync(path.dirname(codexHooks), { recursive: true });
+    fs.writeFileSync(codexHooks, JSON.stringify({
+      hooks: {
+        SessionStart: [{ hooks: [
+          { type: 'command', command: 'node session-start-orchestrator.js' },
+          { type: 'command', command: 'node retained-hook.js' },
+        ] }],
+      },
+    }));
     const commands = [];
     const commandStates = [];
     const commandDirectories = [];
@@ -415,6 +425,11 @@ describe('installed executor production upgrade owner', () => {
     ));
     expect(commandOptions[strictPostinstallIndex].env.ZYLOS_POSTINSTALL_STRICT).toBe('1');
     expect(obsoleteArtifacts.every((artifact) => !fs.existsSync(artifact))).toBe(true);
+    expect(JSON.parse(fs.readFileSync(codexHooks, 'utf8'))).toEqual({
+      hooks: {
+        SessionStart: [{ hooks: [{ type: 'command', command: 'node retained-hook.js' }] }],
+      },
+    });
     expect(JSON.parse(fs.readFileSync(
       path.join(zylosDir, 'runtime', 'active-release.json'), 'utf8',
     ))).toMatchObject({ release_ref: 'release-B', upgrade_id: expect.stringMatching(/^upgrade-/) });

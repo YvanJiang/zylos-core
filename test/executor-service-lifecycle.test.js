@@ -696,6 +696,16 @@ describe('one-time lifecycle cleanup', () => {
         fs.writeFileSync(artifact, 'legacy');
       }
     }
+    const codexHooks = path.join(state.directory, '.codex', 'hooks.json');
+    fs.mkdirSync(path.dirname(codexHooks), { recursive: true });
+    fs.writeFileSync(codexHooks, JSON.stringify({
+      hooks: {
+        SessionStart: [{ hooks: [
+          { type: 'command', command: 'node session-start-orchestrator.js' },
+          { type: 'command', command: 'node retained-hook.js' },
+        ] }],
+      },
+    }));
 
     expect(() => cleanupObsoleteLifecycleArtifacts({
       zylosDir: state.directory,
@@ -706,7 +716,12 @@ describe('one-time lifecycle cleanup', () => {
     expect(cleanupObsoleteLifecycleArtifacts({
       zylosDir: state.directory,
       upgradeState: 'committed',
-    })).toEqual({ removed: artifacts });
+    })).toEqual({ removed: [codexHooks, ...artifacts] });
     expect(artifacts.every((artifact) => !fs.existsSync(artifact))).toBe(true);
+    expect(JSON.parse(fs.readFileSync(codexHooks, 'utf8'))).toEqual({
+      hooks: {
+        SessionStart: [{ hooks: [{ type: 'command', command: 'node retained-hook.js' }] }],
+      },
+    });
   });
 });

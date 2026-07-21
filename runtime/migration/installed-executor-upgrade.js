@@ -12,7 +12,10 @@ import {
 } from './runtime-upgrade-coordinator.js';
 import { createInstalledRuntimeUpgradeHost } from './installed-runtime-upgrade-host.js';
 import { driveInstalledRuntimeUpgrade } from './executor-upgrade-driver.js';
-import { legacyLifecycleArtifactPaths } from './legacy-lifecycle-artifacts.js';
+import {
+  cleanupObsoleteLifecycleArtifacts,
+  legacyLifecycleArtifactPaths,
+} from './legacy-lifecycle-artifacts.js';
 import {
   fenceLegacyBaseBatch,
   readLegacyBaseBatch,
@@ -406,10 +409,15 @@ function decorateReleaseAdapter(adapter, activeReleaseFile, execFileSyncFn, {
         installRoot: false,
       });
       const result = await adapter.cleanup(request);
+      const lifecycleCleanup = cleanupObsoleteLifecycleArtifacts({
+        zylosDir,
+        upgradeState: 'committed',
+      });
       const registrations = removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn });
       return Object.freeze({
         ...result,
         ...registrations,
+        lifecycle_cleanup: lifecycleCleanup,
         deployed_ecosystem_config: deployedConfig,
       });
     },
