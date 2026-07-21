@@ -285,6 +285,10 @@ function mailboxCursorError(res, error) {
   });
 }
 
+function requireMailboxMutationScope(cursorScope) {
+  deliveryMailbox.assertCursorScope(cursorScope);
+}
+
 function parseProjectionCursor(value) {
   if (value === undefined) return 0;
   const cursor = Number(value);
@@ -578,6 +582,7 @@ wss.on('connection', (ws, req) => {
       } else if (msg.type === 'send') {
         const tempId = msg.tempId; // Track client's temp ID
         try {
+          requireMailboxMutationScope(msg.cursor_scope);
           await sendConsoleMessage({
             content: msg.content || '',
             attachmentIds: msg.attachments,
@@ -653,6 +658,12 @@ app.get('/api/conversations/recent', (req, res) => {
  * Upload one attachment for a later send call
  */
 app.post('/api/upload', (req, res) => {
+  try {
+    requireMailboxMutationScope(req.get('X-Zylos-Mailbox-Cursor-Scope'));
+  } catch (error) {
+    mailboxCursorError(res, error);
+    return;
+  }
   upload.single('file')(req, res, (err) => {
     if (err) {
       if (err.code === 'LIMIT_FILE_SIZE') {
@@ -696,6 +707,12 @@ app.post('/api/upload', (req, res) => {
  * Send message to Claude (HTTP fallback)
  */
 app.post('/api/send', (req, res) => {
+  try {
+    requireMailboxMutationScope(req.get('X-Zylos-Mailbox-Cursor-Scope'));
+  } catch (error) {
+    mailboxCursorError(res, error);
+    return;
+  }
   sendConsoleMessage({
     content: req.body.message || '',
     attachmentIds: req.body.attachments,
@@ -724,6 +741,8 @@ app.get('/api/inbound-media/:filename', (req, res) => {
 
     const allowedPath = resolveAllowedPathSync(target, [MEDIA_DIR]);
     if (!allowedPath) return res.sendStatus(404);
+    if (!uploadRegistry.getForMediaPath(target)
+      && !uploadRegistry.getForMediaPath(allowedPath)) return res.sendStatus(404);
 
     let stat;
     try {

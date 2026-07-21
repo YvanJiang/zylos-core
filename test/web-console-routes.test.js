@@ -135,7 +135,11 @@ async function startServer({
     if (child.exitCode !== null) throw new Error(`server exited early: ${output}`);
     try {
       const res = await fetch(`${baseUrl}/api/health`);
-      if (res.ok) return { root, dbPath, skillsDir, port, baseUrl, child };
+      if (res.ok) {
+        const scopeResponse = await fetch(`${baseUrl}/api/conversations/recent?limit=1`);
+        const cursorScope = scopeResponse.headers.get('x-zylos-mailbox-cursor-scope');
+        return { root, dbPath, skillsDir, port, baseUrl, child, cursorScope };
+      }
     } catch {
       // Retry until server is listening.
     }
@@ -178,14 +182,21 @@ function rows(dbPath) {
 async function uploadFile(active, { name = 'report.txt', type = 'text/plain', content = 'hello' } = {}) {
   const form = new FormData();
   form.append('file', new Blob([content], { type }), name);
-  const res = await fetch(`${active.baseUrl}/api/upload`, { method: 'POST', body: form });
+  const res = await fetch(`${active.baseUrl}/api/upload`, {
+    method: 'POST',
+    headers: { 'X-Zylos-Mailbox-Cursor-Scope': active.cursorScope },
+    body: form,
+  });
   return { res, body: await res.json() };
 }
 
 async function sendHttp(active, payload) {
   const res = await fetch(`${active.baseUrl}/api/send`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Zylos-Mailbox-Cursor-Scope': active.cursorScope,
+    },
     body: JSON.stringify(payload)
   });
   return { res, body: await res.json() };
@@ -344,6 +355,7 @@ describe('web-console attachment routes', () => {
       content: '',
       attachments: [upload.body.id],
       tempId: 'actual-ws-attachment',
+      cursor_scope: ctx.cursorScope,
     }));
 
     const deadline = Date.now() + 5000;
@@ -474,7 +486,11 @@ describe('web-console attachment routes', () => {
     const form = new FormData();
     form.append('file', new Blob(['x'.repeat(1024 * 1024 + 1)], { type: 'text/plain' }), 'large.txt');
 
-    const res = await fetch(`${ctx.baseUrl}/api/upload`, { method: 'POST', body: form });
+    const res = await fetch(`${ctx.baseUrl}/api/upload`, {
+      method: 'POST',
+      headers: { 'X-Zylos-Mailbox-Cursor-Scope': ctx.cursorScope },
+      body: form,
+    });
     const body = await res.json();
 
     expect(res.status).toBe(413);
@@ -503,7 +519,10 @@ describe('web-console attachment routes', () => {
       const timer = setTimeout(() => reject(new Error('timed out waiting for sent ack')), 3000);
       ws.on('open', () => {
         ws.send(JSON.stringify({ type: 'subscribe', since_id: 0 }));
-        ws.send(JSON.stringify({ type: 'send', content: '', attachments: [upload.body.id], tempId: 't1' }));
+        ws.send(JSON.stringify({
+          type: 'send', content: '', attachments: [upload.body.id], tempId: 't1',
+          cursor_scope: ctx.cursorScope,
+        }));
       });
       ws.on('message', (raw) => {
         const msg = JSON.parse(raw.toString());
@@ -562,6 +581,123 @@ describe('web-console attachment routes', () => {
     expect(accepted.res.status).toBe(200);
   });
 
+  test('HTTP, WebSocket, and upload mutations reject a stale or missing mailbox scope', async () => {
+    ctx = await startServer({ actualC4Receive: true, tenantId: 'mutation-tenant-a' });
+    const sharedRoot = ctx.root;
+    const aScopeResponse = await fetch(`${ctx.baseUrl}/api/conversations/recent?limit=1`);
+    const scopeA = aScopeResponse.headers.get('x-zylos-mailbox-cursor-scope');
+    await stopServer(ctx, { preserveRoot: true });
+
+    ctx = await startServer({
+      root: sharedRoot, actualC4Receive: true, tenantId: 'mutation-tenant-b',
+    });
+    const bScopeResponse = await fetch(`${ctx.baseUrl}/api/conversations/recent?limit=1`);
+    const scopeB = bScopeResponse.headers.get('x-zylos-mailbox-cursor-scope');
+    expect(scopeB).not.toBe(scopeA);
+
+    const staleHttp = await fetch(`${ctx.baseUrl}/api/send`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Zylos-Mailbox-Cursor-Scope': scopeA,
+      },
+      body: JSON.stringify({ message: 'stale A HTTP mutation' }),
+    });
+    expect(staleHttp.status).toBe(409);
+    const missingHttp = await fetch(`${ctx.baseUrl}/api/send`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'missing scope mutation' }),
+    });
+    expect(missingHttp.status).toBe(409);
+
+    const staleForm = new FormData();
+    staleForm.append('file', new Blob(['stale A bytes'], { type: 'text/plain' }), 'stale-a.txt');
+    const staleUpload = await fetch(`${ctx.baseUrl}/api/upload`, {
+      method: 'POST',
+      headers: { 'X-Zylos-Mailbox-Cursor-Scope': scopeA },
+      body: staleForm,
+    });
+    expect(staleUpload.status).toBe(409);
+    const missingForm = new FormData();
+    missingForm.append('file', new Blob(['missing scope'], { type: 'text/plain' }), 'missing.txt');
+    const missingUpload = await fetch(`${ctx.baseUrl}/api/upload`, {
+      method: 'POST', body: missingForm,
+    });
+    expect(missingUpload.status).toBe(409);
+    expect(fs.readdirSync(path.join(ctx.root, 'web-console', 'media'))).toEqual([]);
+
+    async function wsMutation(payload) {
+      return new Promise((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${ctx.port}/`);
+      const timer = setTimeout(() => reject(new Error('timed out waiting for stale WS ack')), 3000);
+      ws.once('open', () => ws.send(JSON.stringify(payload)));
+      ws.on('message', (raw) => {
+        const event = JSON.parse(raw.toString());
+        if (event.type !== 'sent') return;
+        clearTimeout(timer);
+        ws.close();
+        resolve(event);
+      });
+      ws.once('error', reject);
+      });
+    }
+    const wsAck = await wsMutation({
+      type: 'send', content: 'stale A WS mutation', tempId: 'stale-a-ws',
+      cursor_scope: scopeA,
+    });
+    expect(wsAck).toMatchObject({
+      success: false, error: 'mailbox_cursor_scope_mismatch', tempId: 'stale-a-ws',
+    });
+    const missingWsAck = await wsMutation({
+      type: 'send', content: 'missing scope WS mutation', tempId: 'missing-scope-ws',
+    });
+    expect(missingWsAck).toMatchObject({
+      success: false, error: 'mailbox_cursor_scope_required', tempId: 'missing-scope-ws',
+    });
+
+    const currentHttp = await fetch(`${ctx.baseUrl}/api/send`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Zylos-Mailbox-Cursor-Scope': scopeB,
+      },
+      body: JSON.stringify({ message: 'current B mutation' }),
+    });
+    expect(currentHttp.status).toBe(200);
+    const mailbox = await (await fetch(`${ctx.baseUrl}/api/poll?since_id=0`)).json();
+    expect(mailbox.some(({ content }) => content === 'current B mutation')).toBe(true);
+    expect(mailbox.some(({ content }) => content.includes('stale A'))).toBe(false);
+    expect(mailbox.some(({ content }) => content.includes('missing scope'))).toBe(false);
+  });
+
+  test('consumed media remains readable only in its exact Core scope', async () => {
+    ctx = await startServer({ actualC4Receive: true, tenantId: 'media-tenant-a' });
+    const sharedRoot = ctx.root;
+    const upload = await uploadFile(ctx, { name: 'secret-a.txt', content: 'secret-a' });
+    const sent = await sendHttp(ctx, {
+      message: 'project scoped media', attachments: [upload.body.id],
+      message_id: 'scoped-media-a',
+    });
+    expect(sent.res.status).toBe(200);
+    const aMailbox = await (await fetch(`${ctx.baseUrl}/api/poll?since_id=0`)).json();
+    const href = aMailbox.find(({ direction }) => direction === 'in').attachments[0].href;
+    expect((await fetch(`${ctx.baseUrl}${href}`)).status).toBe(200);
+    await stopServer(ctx, { preserveRoot: true });
+
+    ctx = await startServer({
+      root: sharedRoot, actualC4Receive: true, tenantId: 'media-tenant-b',
+    });
+    expect((await fetch(`${ctx.baseUrl}${href}`)).status).toBe(404);
+    await stopServer(ctx, { preserveRoot: true });
+
+    ctx = await startServer({
+      root: sharedRoot, actualC4Receive: true, tenantId: 'media-tenant-a',
+    });
+    const restored = await fetch(`${ctx.baseUrl}${href}`);
+    expect(restored.status).toBe(200);
+    expect(await restored.text()).toBe('secret-a');
+  });
+
   test('GET /api/media/:messageId fails closed for retired legacy media rows', async () => {
     ctx = await startServer();
     const imagePath = path.join(ctx.root, 'out.png');
@@ -599,6 +735,22 @@ describe('web-console attachment routes', () => {
     fs.writeFileSync(pngFile, pngBytes);
     const txtFile = path.join(mediaDir, 'wc-test-doc.txt');
     fs.writeFileSync(txtFile, 'hello');
+    const mailboxDb = new Database(path.join(ctx.root, 'web-console', 'web-console.db'));
+    const register = mailboxDb.prepare(`
+      INSERT INTO scoped_uploads (
+        id, session_token, path, name, size, size_label, mime, kind,
+        region, tenant_id, bot_id, created_at, consumed
+      ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'global', 'default', 'zylos', ?, 1)
+    `);
+    register.run(
+      'owned-test-image', pngFile, 'wc-test-image.png', pngBytes.length,
+      `${pngBytes.length}B`, 'image/png', 'image', Date.now(),
+    );
+    register.run(
+      'owned-test-file', txtFile, 'wc-test-doc.txt', 5, '5B',
+      'text/plain', 'file', Date.now(),
+    );
+    mailboxDb.close();
 
     const imgRes = await fetch(`${ctx.baseUrl}/api/inbound-media/wc-test-image.png`);
     expect(imgRes.status).toBe(200);

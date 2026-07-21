@@ -30,6 +30,18 @@ function openDb(dbPath = DB_PATH) {
       size_label TEXT,
       mime TEXT,
       kind TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      consumed INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS scoped_uploads (
+      id TEXT PRIMARY KEY,
+      session_token TEXT,
+      path TEXT NOT NULL,
+      name TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      size_label TEXT,
+      mime TEXT,
+      kind TEXT NOT NULL,
       region TEXT NOT NULL,
       tenant_id TEXT NOT NULL,
       bot_id TEXT NOT NULL,
@@ -69,14 +81,46 @@ function openDb(dbPath = DB_PATH) {
   const uploadColumns = new Set(
     db.prepare('PRAGMA table_info(uploads)').all().map(({ name }) => name),
   );
-  for (const column of ['region', 'tenant_id', 'bot_id']) {
-    if (!uploadColumns.has(column)) {
-      db.exec(`ALTER TABLE uploads ADD COLUMN ${column} TEXT`);
-    }
+  if (uploadColumns.has('region')) {
+    db.transaction(() => {
+      db.exec(`
+        INSERT OR IGNORE INTO scoped_uploads (
+          id, session_token, path, name, size, size_label, mime, kind,
+          region, tenant_id, bot_id, created_at, consumed
+        )
+        SELECT id, session_token, path, name, size, size_label, mime, kind,
+          region, tenant_id, bot_id, created_at, consumed
+        FROM uploads
+        WHERE region IS NOT NULL AND tenant_id IS NOT NULL AND bot_id IS NOT NULL;
+
+        CREATE TABLE uploads_rollback_compatible (
+          id TEXT PRIMARY KEY,
+          session_token TEXT,
+          path TEXT NOT NULL,
+          name TEXT NOT NULL,
+          size INTEGER NOT NULL,
+          size_label TEXT,
+          mime TEXT,
+          kind TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          consumed INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT OR IGNORE INTO uploads_rollback_compatible (
+          id, session_token, path, name, size, size_label, mime, kind, created_at, consumed
+        )
+        SELECT id, session_token, path, name, size, size_label, mime, kind, created_at, consumed
+        FROM uploads
+        WHERE region IS NULL OR tenant_id IS NULL OR bot_id IS NULL;
+        DROP TABLE uploads;
+        ALTER TABLE uploads_rollback_compatible RENAME TO uploads;
+      `);
+    })();
   }
   db.exec(`
-    CREATE INDEX IF NOT EXISTS uploads_scope_capability
-    ON uploads (region, tenant_id, bot_id, id, session_token, consumed)
+    CREATE INDEX IF NOT EXISTS scoped_uploads_scope_capability
+    ON scoped_uploads (region, tenant_id, bot_id, id, session_token, consumed);
+    CREATE INDEX IF NOT EXISTS scoped_uploads_scope_path
+    ON scoped_uploads (region, tenant_id, bot_id, path)
   `);
   return db;
 }
@@ -201,6 +245,23 @@ export class DeliveryMailbox {
     });
   }
 
+  assertCursorScope(cursorScope) {
+    if (typeof cursorScope !== 'string' || cursorScope.length === 0) {
+      const error = new Error('The durable mailbox cursor scope is required.');
+      error.code = 'mailbox_cursor_scope_required';
+      error.status = 409;
+      error.cursorScope = this.cursorScope;
+      throw error;
+    }
+    if (cursorScope !== this.cursorScope) {
+      const error = new Error('The durable mailbox cursor scope does not match this owner.');
+      error.code = 'mailbox_cursor_scope_mismatch';
+      error.status = 409;
+      error.cursorScope = this.cursorScope;
+      throw error;
+    }
+  }
+
   list({ sinceId = 0, limit = 100, latest = false, cursorScope = null } = {}) {
     if (!Number.isSafeInteger(sinceId) || sinceId < 0) {
       throw new TypeError('sinceId must be a non-negative safe integer');
@@ -305,19 +366,21 @@ export class PersistentUploadRegistry {
     this.tenantId = tenantId;
     this.botId = botId;
     this._stmts = {
-      add: db.prepare(`INSERT INTO uploads (
+      add: db.prepare(`INSERT INTO scoped_uploads (
         id, session_token, path, name, size, size_label, mime, kind,
         region, tenant_id, bot_id, created_at, consumed
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`),
-      get: db.prepare(`SELECT * FROM uploads
+      get: db.prepare(`SELECT * FROM scoped_uploads
         WHERE id = ? AND region = ? AND tenant_id = ? AND bot_id = ? AND consumed = 0`),
-      getStored: db.prepare(`SELECT * FROM uploads
+      getStored: db.prepare(`SELECT * FROM scoped_uploads
         WHERE id = ? AND region = ? AND tenant_id = ? AND bot_id = ?`),
-      consume: db.prepare(`UPDATE uploads SET consumed = 1
+      getMedia: db.prepare(`SELECT * FROM scoped_uploads
+        WHERE path = ? AND region = ? AND tenant_id = ? AND bot_id = ?`),
+      consume: db.prepare(`UPDATE scoped_uploads SET consumed = 1
         WHERE id = ? AND region = ? AND tenant_id = ? AND bot_id = ? AND consumed = 0`),
-      restore: db.prepare(`UPDATE uploads SET consumed = 0
+      restore: db.prepare(`UPDATE scoped_uploads SET consumed = 0
         WHERE id = ? AND region = ? AND tenant_id = ? AND bot_id = ?`),
-      cleanup: db.prepare(`DELETE FROM uploads
+      cleanup: db.prepare(`DELETE FROM scoped_uploads
         WHERE region = ? AND tenant_id = ? AND bot_id = ? AND consumed = 0 AND created_at < ?`),
     };
   }
@@ -391,6 +454,15 @@ export class PersistentUploadRegistry {
       kind: row.kind,
       consumed: row.consumed === 1,
     };
+  }
+
+  getForMediaPath(mediaPath) {
+    if (typeof mediaPath !== 'string' || mediaPath.length === 0) return null;
+    const row = this._stmts.getMedia.get(
+      mediaPath, this.region, this.tenantId, this.botId,
+    );
+    if (!row) return null;
+    return { id: row.id, path: row.path, consumed: row.consumed === 1 };
   }
 }
 

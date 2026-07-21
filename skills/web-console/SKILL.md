@@ -84,6 +84,8 @@ from cursor zero in the returned opaque scope.
 Upload IDs are channel-private capabilities bound to the same exact Core
 region/tenant/bot scope and browser session. Scope changes clear the draft and
 staged attachments; an ID created in one scope is invalid in every other scope.
+Every upload/send mutation carries the current opaque cursor scope, and media
+downloads are authorized against the same scoped capability record.
 
 ## Environment Variables
 

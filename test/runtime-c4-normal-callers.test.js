@@ -123,6 +123,18 @@ describe('normal C4 callers use durable Core contracts', () => {
     assert.equal(envelope.content.text, '--literal-text');
   });
 
+  test('compatibility ingress still rejects option-like control and identity values', () => {
+    const { zylosDir, env } = fixture();
+    const result = run(receiveCli, [
+      '--channel', '--json', '--endpoint', 'console',
+      '--message-id', 'malformed-route', '--actor-id', 'actor',
+      '--content', 'hello',
+    ], env);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /--channel requires a value/);
+    assert.equal(fs.existsSync(path.join(zylosDir, 'comm-bridge', 'c4.db')), false);
+  });
+
   test('compatibility ingress preserves validated public attachment facts', () => {
     const { zylosDir, env } = fixture();
     const attachments = [{

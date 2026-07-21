@@ -155,12 +155,15 @@ describe('normal product paths have no retired runtime authority', () => {
     expect(mailboxSource).toMatch(/region = \? AND tenant_id = \? AND bot_id = \?/);
     expect(mailboxSource).toMatch(/delivery_mailbox_scope_cursor/);
     expect(mailboxSource).toMatch(/mailbox_cursor_scope_required/);
-    expect(mailboxSource).toMatch(/uploads_scope_capability/);
+    expect(mailboxSource).toMatch(/scoped_uploads_scope_capability/);
+    expect(mailboxSource).toMatch(/uploads_rollback_compatible/);
     expect(mailboxSource).toMatch(/region = \? AND tenant_id = \? AND bot_id = \?/);
     expect(source).toMatch(/X-Zylos-Mailbox-Cursor-Scope/);
     expect(source).toMatch(/cursor_reset/);
     expect(source).toMatch(/type: 'messages', cursor_scope/);
     expect(source).toMatch(/requestUpdate/);
+    expect(source).toMatch(/requireMailboxMutationScope/);
+    expect(source).toMatch(/getForMediaPath/);
     expect(source).toMatch(/new PersistentUploadRegistry[\s\S]*CORE_REGION[\s\S]*CORE_TENANT_ID/);
     expect(source).not.toMatch(/getCoreMessages|event\.rowid|outbox_rowid|broadcast\('messages'/);
     expect(source).not.toMatch(/latest message|parent chat|c4-send/i);
@@ -169,6 +172,8 @@ describe('normal product paths have no retired runtime authority', () => {
     expect(appSource).toMatch(/scopeGeneration/);
     expect(appSource).toMatch(/connectionGeneration/);
     expect(appSource).toMatch(/pollInFlight/);
+    expect(appSource).toMatch(/X-Zylos-Mailbox-Cursor-Scope/);
+    expect(appSource).toMatch(/setRequestHeader\('X-Zylos-Mailbox-Cursor-Scope'/);
     expect(appSource).not.toMatch(/conversations\/recent\?limit=100/);
     expect(cursorSource).toMatch(/web-console-mailbox-v1/);
     expect(cursorSource).toMatch(/lastMessageId: reset \? 0/);
@@ -185,7 +190,7 @@ describe('normal product paths have no retired runtime authority', () => {
     const source = fs.readFileSync(
       path.resolve('skills/comm-bridge/scripts/c4-receive.js'), 'utf8',
     );
-    expect(source).not.toMatch(/value\.startsWith\(['"]--/);
+    expect(source).toMatch(/field !== 'content' && value\.startsWith\('--'\)/);
     expect(source).toMatch(/value === undefined/);
   });
 

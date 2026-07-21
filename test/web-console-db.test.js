@@ -85,11 +85,26 @@ describe('SessionStore', () => {
 
 describe('PersistentUploadRegistry', () => {
   test('creates scope-required upload rows and hides migrated legacy capabilities', () => {
-    const columns = Object.fromEntries(db.prepare('PRAGMA table_info(uploads)').all()
+    const legacyColumns = Object.fromEntries(db.prepare('PRAGMA table_info(uploads)').all()
+      .map((column) => [column.name, column]));
+    expect(legacyColumns.region).toBeUndefined();
+    expect(legacyColumns.tenant_id).toBeUndefined();
+    expect(legacyColumns.bot_id).toBeUndefined();
+    const columns = Object.fromEntries(db.prepare('PRAGMA table_info(scoped_uploads)').all()
       .map((column) => [column.name, column]));
     for (const column of ['region', 'tenant_id', 'bot_id']) {
       expect(columns[column].notnull).toBe(1);
     }
+    expect(() => db.prepare(`
+      INSERT INTO uploads (
+        id, session_token, path, name, size, size_label, mime, kind, created_at, consumed
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+    `).run(
+      'exact-base-upload', 'base-session', '/tmp/base.txt', 'base.txt',
+      4, '4B', 'text/plain', 'file', 0,
+    )).not.toThrow();
+    const currentRegistry = new PersistentUploadRegistry(db, TEST_MAILBOX_SCOPE);
+    expect(currentRegistry.getMany(['exact-base-upload'], 'base-session')).toEqual([]);
 
     const legacyPath = path.join(tempDir, 'legacy-uploads.db');
     const legacy = new Database(legacyPath);
@@ -109,9 +124,41 @@ describe('PersistentUploadRegistry', () => {
     const registry = new PersistentUploadRegistry(migrated, TEST_MAILBOX_SCOPE);
     expect(registry.getMany(['legacy-upload'], 'shared-session')).toEqual([]);
     expect(registry.getForProjection('legacy-upload')).toBeNull();
-    expect(migrated.prepare(`
-      SELECT region, tenant_id, bot_id FROM uploads WHERE id = 'legacy-upload'
-    `).get()).toEqual({ region: null, tenant_id: null, bot_id: null });
+    expect(migrated.prepare("SELECT id FROM uploads WHERE id = 'legacy-upload'").get())
+      .toEqual({ id: 'legacy-upload' });
+    expect(migrated.prepare('SELECT COUNT(*) AS count FROM scoped_uploads').get().count).toBe(0);
+    migrated.close();
+  });
+
+  test('migrates the rejected candidate schema into rollback-compatible storage', () => {
+    const candidatePath = path.join(tempDir, 'candidate-scoped-uploads.db');
+    const candidate = new Database(candidatePath);
+    candidate.exec(`
+      CREATE TABLE uploads (
+        id TEXT PRIMARY KEY, session_token TEXT, path TEXT NOT NULL, name TEXT NOT NULL,
+        size INTEGER NOT NULL, size_label TEXT, mime TEXT, kind TEXT NOT NULL,
+        region TEXT NOT NULL, tenant_id TEXT NOT NULL, bot_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO uploads VALUES (
+        'candidate-upload', 'candidate-session', '/tmp/candidate.txt', 'candidate.txt',
+        9, '9B', 'text/plain', 'file', 'global', 'test-tenant', 'test-bot', 0, 1
+      );
+    `);
+    candidate.close();
+
+    const migrated = openDb(candidatePath);
+    const legacyColumns = new Set(migrated.prepare('PRAGMA table_info(uploads)').all()
+      .map(({ name }) => name));
+    expect(legacyColumns.has('region')).toBe(false);
+    const registry = new PersistentUploadRegistry(migrated, TEST_MAILBOX_SCOPE);
+    expect(registry.getForProjection('candidate-upload'))
+      .toEqual(expect.objectContaining({ name: 'candidate.txt', consumed: true }));
+    expect(() => migrated.prepare(`
+      INSERT INTO uploads (
+        id, session_token, path, name, size, size_label, mime, kind, created_at, consumed
+      ) VALUES ('base-after-rollback', NULL, '/tmp/base', 'base', 1, '1B', NULL, 'file', 0, 0)
+    `).run()).not.toThrow();
     migrated.close();
   });
 
@@ -153,7 +200,7 @@ describe('PersistentUploadRegistry', () => {
     const registry = new PersistentUploadRegistry(db, { ttlMs: 100, ...TEST_MAILBOX_SCOPE });
     const entry = registry.add({ sessionId: 's1', path: '/tmp/c.txt', name: 'c.txt', size: 10, kind: 'file' });
 
-    db.prepare('UPDATE uploads SET created_at = ? WHERE id = ?')
+    db.prepare('UPDATE scoped_uploads SET created_at = ? WHERE id = ?')
       .run(Date.now() - 200, entry.id);
 
     expect(registry.consumeMany([entry.id], 's1')).toBeNull();

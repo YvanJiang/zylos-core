@@ -383,6 +383,7 @@ class ZylosConsole {
         // Note: Don't mark as sent immediately - wait for server confirmation
         // or for message to appear via polling
         const payload = { type: 'send', content: message, tempId };
+        payload.cursor_scope = this.cursorScope;
         if (attachmentIds.length > 0) payload.attachments = attachmentIds;
         this.ws.send(JSON.stringify(payload));
       } else {
@@ -391,7 +392,10 @@ class ZylosConsole {
         if (attachmentIds.length > 0) body.attachments = attachmentIds;
         const response = await fetch(`${this.basePath}/api/send`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Zylos-Mailbox-Cursor-Scope': this.cursorScope,
+          },
           body: JSON.stringify(body),
         });
 
@@ -467,6 +471,7 @@ class ZylosConsole {
     const xhr = new XMLHttpRequest();
     this.pendingUploads.set(item.localId, xhr);
     xhr.open('POST', `${this.basePath}/api/upload`);
+    xhr.setRequestHeader('X-Zylos-Mailbox-Cursor-Scope', this.cursorScope);
     xhr.upload.addEventListener('progress', (event) => {
       if (!globalThis.ZylosMailboxCursor.isCurrentGeneration(
         uploadGeneration, this.scopeGeneration,
