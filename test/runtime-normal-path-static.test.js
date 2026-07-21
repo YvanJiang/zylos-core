@@ -150,6 +150,8 @@ describe('normal product paths have no retired runtime authority', () => {
     );
     expect(source).toMatch(/DeliveryMailbox|deliveryMailbox\.list|syncCoreInbound/);
     expect(source).toMatch(/validateInboundEnvelope|projectCoreWebConsoleContent/);
+    expect(source).toMatch(/projectInbound\(\)[\s\S]*syncCoreInbound\(\)/);
+    expect(ownerSource).toMatch(/await projectInbound[\s\S]*await deliverMessage/);
     expect(source).toMatch(/CORE_REGION|CORE_TENANT_ID|CORE_BOT_ID/);
     expect(ownerSource).toMatch(/targetRegion|targetTenantId|targetBotId/);
     expect(mailboxSource).toMatch(/region = \? AND tenant_id = \? AND bot_id = \?/);

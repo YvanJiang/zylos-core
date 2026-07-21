@@ -337,6 +337,9 @@ const deliveryOwner = createWebConsoleOutboxOwner({
   tenantId: CORE_TENANT_ID,
   botId: CORE_BOT_ID,
   serviceInstanceId: `web-console-${SERVICE_BIRTH_ID}`,
+  projectInbound() {
+    syncCoreInbound();
+  },
   deliverMessage(message, delivery) {
     return deliveryMailbox.deliver({
       deliveryId: delivery.delivery_id,

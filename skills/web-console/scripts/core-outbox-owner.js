@@ -5,6 +5,7 @@ import { createOutboxService } from '../../../runtime/delivery/outbox-service.js
 
 export function createWebConsoleOutboxOwner({
   database,
+  projectInbound,
   deliverMessage,
   region,
   tenantId,
@@ -12,6 +13,7 @@ export function createWebConsoleOutboxOwner({
   serviceInstanceId = `web-console-${crypto.randomUUID()}`,
   now = () => new Date().toISOString(),
 }) {
+  if (typeof projectInbound !== 'function') throw new TypeError('projectInbound must be a function');
   if (typeof deliverMessage !== 'function') throw new TypeError('deliverMessage must be a function');
   for (const [fieldName, value] of [
     ['region', region], ['tenantId', tenantId], ['botId', botId],
@@ -41,6 +43,7 @@ export function createWebConsoleOutboxOwner({
           content: delivery.text,
           timestamp: now(),
         });
+        await projectInbound(message, delivery);
         const effect = await deliverMessage(message, delivery);
         if (!effect || typeof effect.platform_message_id !== 'string'
           || effect.platform_message_id.length === 0) {

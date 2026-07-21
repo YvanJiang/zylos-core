@@ -280,6 +280,7 @@ describe('normal C4 callers use durable Core contracts', () => {
       botId: 'bot-c4',
       serviceInstanceId: 'web-console-scoped-owner',
       now: () => new Date(Date.parse(lastAttempt) + 1).toISOString(),
+      projectInbound() {},
       deliverMessage(message) {
         deliveries.push(message);
         return { platform_message_id: `scoped-mailbox:${message.delivery_id}` };
@@ -315,6 +316,7 @@ describe('normal C4 callers use durable Core contracts', () => {
       SELECT status FROM runtime_outbox WHERE turn_id = ?
     `).get(accepted.turn_id).status, 'pending');
     const browserDeliveries = [];
+    const projectionOrder = [];
     const claimTime = claimTimeFor(database, 'web-console', 'console');
     const owner = createWebConsoleOutboxOwner({
       database,
@@ -323,12 +325,17 @@ describe('normal C4 callers use durable Core contracts', () => {
       botId: 'bot-c4',
       serviceInstanceId: 'web-console-owner-round-trip',
       now: () => claimTime,
+      projectInbound() {
+        projectionOrder.push('inbound');
+      },
       deliverMessage(message, delivery) {
+        projectionOrder.push('outbox');
         browserDeliveries.push(message);
         return { platform_message_id: `mailbox:${delivery.delivery_id}` };
       },
     });
     assert.deepEqual(await owner.drain(), { status: 'delivered', delivered: 1 });
+    assert.deepEqual(projectionOrder, ['inbound', 'outbox']);
     assert.match(browserDeliveries[0].content, /Message received/);
     assert.equal(database.prepare(`
       SELECT status FROM runtime_outbox WHERE turn_id = ?
