@@ -240,7 +240,17 @@ export function reconcileLegacyServicesForExecutorStart({
   execFileSyncFn = execFileSync,
 }) {
   assertLegacyServicesInactive({ zylosDir, execFileSyncFn });
-  return removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn });
+  const result = removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn });
+  if (inspectLegacyServiceRegistrations({ zylosDir, execFileSyncFn }).length > 0) {
+    throw new Error('Obsolete runtime registrations remained after reconciliation.');
+  }
+  const fencePath = path.join(zylosDir, 'runtime', 'executor-start-fence.json');
+  atomicJson(fencePath, {
+    contract: 'zylos.executor-start-fence@1',
+    runtime_generation: 'executor_only',
+    reconciled_at: new Date().toISOString(),
+  });
+  return Object.freeze({ ...result, executor_start_fence_path: fencePath });
 }
 
 export function removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn = execFileSync }) {

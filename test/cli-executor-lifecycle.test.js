@@ -99,6 +99,7 @@ describe('executor lifecycle CLI boundary', () => {
       execFileSyncFn: pm2Fixture(commands, { registered: false }),
       requestFn: async () => health('executor-new'),
       retryDelaysMs: [0],
+      assertStartFence: () => {},
     });
 
     expect(commands).toEqual([
@@ -107,6 +108,19 @@ describe('executor lifecycle CLI boundary', () => {
       ['pm2', ['save']],
     ]);
     expect(result).toMatchObject({ ok: true, serviceInstanceId: 'executor-new', health: 'healthy' });
+  });
+
+  test('does not start an executor until one-time reconciliation has written its fence', async () => {
+    const commands = [];
+    const result = await startExecutorService({
+      zylosDir: '/tmp/zylos-cli-fence-missing',
+      execFileSyncFn: pm2Fixture(commands, { registered: false }),
+      requestFn: async () => health('executor-new'),
+      retryDelaysMs: [0],
+    });
+
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining('one-time runtime reconciliation') });
+    expect(commands).toEqual([]);
   });
 
   test('stop reports failure when Core cannot acknowledge shutdown', async () => {
@@ -289,6 +303,7 @@ describe('executor lifecycle CLI boundary', () => {
       execFileSyncFn: pm2Fixture(repairedCommands, { registered: false }),
       requestFn: () => replies.shift(),
       retryDelaysMs: [0],
+      assertStartFence: () => {},
     })).resolves.toMatchObject({ ok: true, repaired: true, serviceInstanceId: 'executor-repaired' });
     expect(repairedCommands[1]).toEqual([
       'pm2', ['start', '/tmp/zylos-cli-fixture/pm2/ecosystem.config.cjs', '--only', EXECUTOR_SERVICE_NAME],
@@ -357,7 +372,7 @@ describe('executor lifecycle CLI boundary', () => {
 
   test('all supervisor mutations fail closed on a foreign generic-name collision', async () => {
     for (const operation of [
-      (options) => startExecutorService(options),
+      (options) => startExecutorService({ ...options, assertStartFence: () => {} }),
       (options) => stopExecutorService(options),
       (options) => restartExecutorService(options),
       (options) => Promise.resolve(removeExecutorServiceRegistration(options)),

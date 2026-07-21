@@ -246,7 +246,15 @@ describe('installed executor production upgrade owner', () => {
       };
       if (status === 'stopped') {
         expect(reconcileLegacyServicesForExecutorStart({ zylosDir, execFileSyncFn }))
-          .toEqual({ removed_services: ['c4-dispatcher'] });
+          .toMatchObject({
+            removed_services: ['c4-dispatcher'],
+            executor_start_fence_path: path.join(zylosDir, 'runtime', 'executor-start-fence.json'),
+          });
+        expect(JSON.parse(fs.readFileSync(
+          path.join(zylosDir, 'runtime', 'executor-start-fence.json'), 'utf8',
+        ))).toMatchObject({
+          contract: 'zylos.executor-start-fence@1', runtime_generation: 'executor_only',
+        });
         expect(commands).toContainEqual(['pm2', ['delete', 'c4-dispatcher']]);
       } else {
         expect(() => reconcileLegacyServicesForExecutorStart({ zylosDir, execFileSyncFn }))

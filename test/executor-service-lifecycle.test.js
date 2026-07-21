@@ -47,6 +47,12 @@ function fixture() {
   const tempRoot = fs.existsSync('/tmp') ? fs.realpathSync('/tmp') : os.tmpdir();
   const directory = fs.mkdtempSync(path.join(tempRoot, 'zylos-executor-host-'));
   directories.push(directory);
+  fs.mkdirSync(path.join(directory, 'runtime'), { recursive: true });
+  fs.writeFileSync(path.join(directory, 'runtime', 'executor-start-fence.json'), JSON.stringify({
+    contract: 'zylos.executor-start-fence@1',
+    runtime_generation: 'executor_only',
+    reconciled_at: '2026-07-21T00:00:00.000Z',
+  }));
   return {
     directory,
     database: new Database(path.join(directory, 'c4.db')),
@@ -499,6 +505,59 @@ describe('executor daemon resource ownership', () => {
 
     expect(daemon.restartRequired).toBe(true);
     expect(events).toEqual(['upgrade-resume', 'database-close']);
+  });
+
+  test('resumes an orphaned durable upgrade plan before starting normal runtime work', async () => {
+    const state = fixture();
+    fs.mkdirSync(path.join(state.directory, 'runtime', 'upgrade-plans'), { recursive: true });
+    fs.writeFileSync(path.join(state.directory, 'runtime', 'upgrade-plans', 'orphan.json'), '{}\n');
+    const events = [];
+    const database = { close: () => events.push('database-close') };
+    const upgradeHandler = async () => ({ state: 'committed' });
+    upgradeHandler.resumeBlocking = async () => {
+      events.push('upgrade-resume');
+      return { state: 'rolled_back' };
+    };
+    const daemon = await runExecutorDaemon({
+      zylosDir: state.directory,
+      Database: function DatabaseFixture() { return database; },
+      createAdapter: () => { throw new Error('normal adapter must not be created'); },
+      createUpgradeHandler: () => upgradeHandler,
+      createHost: () => { throw new Error('normal host must not be created'); },
+    });
+
+    expect(daemon.restartRequired).toBe(true);
+    expect(events).toEqual(['upgrade-resume', 'database-close']);
+  });
+
+  test('fails closed when durable-upgrade probing fails', async () => {
+    const state = fixture();
+    const events = [];
+    const database = { close: () => events.push('database-close') };
+    await expect(runExecutorDaemon({
+      zylosDir: state.directory,
+      Database: function DatabaseFixture() { return database; },
+      hasResumableUpgrade: () => { throw new Error('upgrade probe unavailable'); },
+      createAdapter: () => { throw new Error('normal adapter must not be created'); },
+      createPrerequisiteOwner: () => { throw new Error('prerequisites must not start'); },
+      createHost: () => { throw new Error('normal host must not be created'); },
+    })).rejects.toThrow('upgrade probe unavailable');
+    expect(events).toEqual(['database-close']);
+  });
+
+  test('does not start executor prerequisites without the one-time reconciliation fence', async () => {
+    const state = fixture();
+    fs.rmSync(path.join(state.directory, 'runtime', 'executor-start-fence.json'));
+    const events = [];
+    const database = { close: () => events.push('database-close') };
+    await expect(runExecutorDaemon({
+      zylosDir: state.directory,
+      Database: function DatabaseFixture() { return database; },
+      createAdapter: () => { throw new Error('normal adapter must not be created'); },
+      createPrerequisiteOwner: () => { throw new Error('prerequisites must not start'); },
+      createHost: () => { throw new Error('normal host must not be created'); },
+    })).rejects.toThrow('one-time runtime reconciliation');
+    expect(events).toEqual(['database-close']);
   });
 
   test('gives the service host sole ownership of closing the Core database', async () => {

@@ -435,6 +435,6 @@ describe('normal product paths have no retired runtime authority', () => {
     const daemon = fs.readFileSync(path.resolve('runtime/executor/daemon.js'), 'utf8');
     expect(daemon).not.toMatch(/import\s+[^'";]+['"][^'"]*runtime\/migration\//);
     expect(daemon).toMatch(/async function onUpgrade\(request\)[\s\S]*await getUpgradeHandler\(\)/);
-    expect(daemon).toMatch(/if \(hasResumableUpgrade\(database\)\)[\s\S]*await getUpgradeHandler\(\)/);
+    expect(daemon).toMatch(/if \(hasResumableUpgrade\(\{ database, zylosDir \}\)\)[\s\S]*await getUpgradeHandler\(\)/);
   });
 });

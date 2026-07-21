@@ -13,6 +13,7 @@ import { createClaudeConversationAdapter } from '../providers/claude/conversatio
 import { createCodexAppServerAdapter } from '../providers/codex-app-server-adapter.js';
 import { createExecutorServiceHost } from './service-host.js';
 import { createExecutorPrerequisiteOwner } from './prerequisite-owner.js';
+import { assertExecutorStartFence } from './start-fence.js';
 
 const require = createRequire(new URL('../../skills/comm-bridge/package.json', import.meta.url));
 
@@ -44,21 +45,28 @@ export function createConfiguredProviderAdapter({ provider, zylosDir, environmen
   throw new Error(`Unsupported executor provider: ${provider}`);
 }
 
-function hasResumableRuntimeUpgrade(database) {
-  if (typeof database?.prepare !== 'function') return false;
-  try {
+function hasResumableRuntimeUpgrade({ database, zylosDir }) {
+  let hasActiveRun = false;
+  if (typeof database?.prepare === 'function') {
     const table = database.prepare(`
       SELECT 1 FROM sqlite_master
       WHERE type = 'table' AND name = 'runtime_upgrade_runs'
     `).get();
-    if (table === undefined) return false;
-    return database.prepare(`
-      SELECT 1 FROM runtime_upgrade_runs
-      WHERE state NOT IN ('committed', 'rolled_back') LIMIT 1
-    `).get() !== undefined;
-  } catch {
-    return false;
+    if (table !== undefined) {
+      hasActiveRun = database.prepare(`
+        SELECT 1 FROM runtime_upgrade_runs
+        WHERE state NOT IN ('committed', 'rolled_back') LIMIT 1
+      `).get() !== undefined;
+    }
   }
+  const planDirectory = path.join(zylosDir, 'runtime', 'upgrade-plans');
+  let plans = [];
+  try {
+    plans = fs.readdirSync(planDirectory).filter((entry) => entry.endsWith('.json'));
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  return hasActiveRun || plans.length > 0;
 }
 
 async function loadInstalledExecutorUpgradeHandler() {
@@ -125,7 +133,7 @@ export async function runExecutorDaemon({
   }
   let resumed = null;
   try {
-    if (hasResumableUpgrade(database)) {
+    if (hasResumableUpgrade({ database, zylosDir })) {
       const handler = await getUpgradeHandler();
       if (typeof handler.resumeBlocking !== 'function') {
         throw new Error('Runtime upgrade recovery handler is unavailable.');
@@ -154,8 +162,10 @@ export async function runExecutorDaemon({
     });
   }
   let host = null;
-  const prerequisiteOwner = createPrerequisiteOwner({ zylosDir });
+  let prerequisiteOwner = null;
   try {
+    assertExecutorStartFence({ zylosDir });
+    prerequisiteOwner = createPrerequisiteOwner({ zylosDir });
     await prerequisiteOwner.start();
     const adapter = createAdapter({ provider, zylosDir, environment: process.env });
     host = createHost({
@@ -181,7 +191,7 @@ export async function runExecutorDaemon({
     await host.start();
   } catch (error) {
     if (host === null) {
-      await prerequisiteOwner.close().catch(() => {});
+      await prerequisiteOwner?.close().catch(() => {});
       closeDatabase();
     }
     else await host.close().catch(() => closeDatabase());
