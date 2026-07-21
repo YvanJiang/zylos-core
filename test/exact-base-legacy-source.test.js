@@ -1,7 +1,6 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 
 import { afterEach, describe, expect, test } from '@jest/globals';
 import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/index.js';
@@ -10,7 +9,6 @@ import {
   extractAndFenceLegacyBaseBatch,
   reconcileLegacyBaseRollback,
 } from '../runtime/migration/legacy-base-source.js';
-import { createLegacyProviderQuiescence } from '../runtime/migration/legacy-provider-quiescence.js';
 import { createInstalledExecutorUpgradeHandler } from '../runtime/migration/installed-executor-upgrade.js';
 import { readChannelAuthorityManifest } from '../runtime/migration/channel-authority-manifest.js';
 import { createExecutorService } from '../runtime/executor/service.js';
@@ -19,16 +17,8 @@ import { validateInboundEnvelope } from '../contracts/public/index.js';
 import { deliveredResult } from './helpers/delivered-result.js';
 
 const roots = [];
-const tmuxServers = new Map();
 
 afterEach(() => {
-  for (const [server, serverPid] of tmuxServers) {
-    try { process.kill(serverPid, 'SIGCONT'); } catch (error) {
-      if (error?.code !== 'ESRCH') throw error;
-    }
-    try { execFileSync('tmux', ['-L', server, 'kill-server'], { stdio: 'ignore' }); } catch {}
-  }
-  tmuxServers.clear();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -75,8 +65,8 @@ function writeRelease(root, { legacy = false } = {}) {
       name: `fixture-${skill}`, version: '1.0.0',
     }));
   }
-  fs.writeFileSync(path.join(root, 'retired-tmux-runtime.js'), 'must not enter active release\n');
-  fs.writeFileSync(path.join(root, '.npmignore'), 'retired-tmux-runtime.js\n');
+  fs.writeFileSync(path.join(root, 'retired-runtime.js'), 'must not enter active release\n');
+  fs.writeFileSync(path.join(root, '.npmignore'), 'retired-runtime.js\n');
 }
 
 function channelAuthority() {
@@ -199,157 +189,7 @@ describe('exact-base durable source fencing', () => {
     database.close();
   });
 
-  test('suspends and resumes the exact disposable provider process, then removes it only on commit', () => {
-    const server = `zylos-issue27-${process.pid}-${Date.now()}`;
-    execFileSync('tmux', [
-      '-L', server, '-f', '/dev/null', 'new-session', '-d', '-s', 'claude-main',
-      // Preserve the child identity across suspend/resume assertions under
-      // parallel test load; ESRCH and PID-reuse paths are injected below.
-      'while :; do sleep 30; done',
-    ]);
-    tmuxServers.set(server, Number(execFileSync(
-      'tmux', ['-L', server, 'display-message', '-p', '#{pid}'], { encoding: 'utf8' },
-    ).trim()));
-    const signals = [];
-    const calls = [];
-    let stopAttempts = 0;
-    const quiescence = createLegacyProviderQuiescence({
-      provider: 'claude',
-      execFileSyncFn(file, args, options) {
-        calls.push([file, args]);
-        return execFileSync(file, args, options);
-      },
-      tmuxArgsPrefix: ['-L', server],
-      signalProcess(pid, signal) {
-        signals.push([pid, signal]);
-        if (signal === 'SIGSTOP' && ++stopAttempts === 3) {
-          throw Object.assign(new Error('fixture process exited before signal'), { code: 'ESRCH' });
-        }
-        process.kill(pid, signal);
-      },
-    });
-    const phases = [];
-    const phaseJournal = { onPhase: (phase) => phases.push(phase) };
-    const suspended = quiescence.suspend(null, phaseJournal);
-    expect(stopAttempts).toBeGreaterThanOrEqual(3);
-    expect(suspended).toMatchObject({ active: true, suspended: true, session: 'claude-main' });
-    expect(suspended.process_group_id).toBe(suspended.pane.pgid);
-    expect(new Set(suspended.members.map(({ pgid }) => pgid))).toEqual(
-      new Set([suspended.process_group_id]),
-    );
-    const state = execFileSync('ps', ['-o', 'state=', '-p', String(suspended.pane.pid)], {
-      encoding: 'utf8',
-    }).trim();
-    expect(state).toMatch(/^T/);
-    const reusedIdentity = {
-      ...suspended,
-      members: suspended.members.map((member, index) => (
-        index === 0 ? { ...member, birth_identity: 'reused process identity' } : member
-      )),
-    };
-    expect(() => quiescence.resume(reusedIdentity, phaseJournal)).toThrow('reused or changed identity');
-    expect(execFileSync('ps', ['-o', 'state=', '-p', String(suspended.pane.pid)], {
-      encoding: 'utf8',
-    }).trim()).toMatch(/^T/);
-    const missingIdentity = {
-      ...suspended,
-      members: [...suspended.members, {
-        ...suspended.members.at(-1), pid: 999_999, birth_identity: 'missing exact member',
-      }],
-    };
-    const signalsBeforeMissingResume = signals.length;
-    expect(() => quiescence.resume(missingIdentity, phaseJournal))
-      .toThrow('unowned members before resume');
-    expect(signals).toHaveLength(signalsBeforeMissingResume);
-    phaseJournal.onPhase('resuming');
-    process.kill(suspended.pane.pid, 'SIGCONT');
-    expect(quiescence.resume(suspended, { phase: 'resuming', ...phaseJournal }))
-      .toMatchObject({ resumed: true });
-    const signalsAfterResume = signals.length;
-    expect(quiescence.resume(suspended, { phase: 'resumed', ...phaseJournal }))
-      .toMatchObject({ resumed: true, already_resumed: true });
-    expect(signals).toHaveLength(signalsAfterResume);
-    expect(signals.every(([pid]) => pid > 1)).toBe(true);
-    expect(execFileSync('ps', ['-o', 'state=', '-p', String(suspended.pane.pid)], {
-      encoding: 'utf8',
-    }).trim()).not.toMatch(/^T/);
-    const suspendedAgain = quiescence.suspend(null, phaseJournal);
-    const partialCommitRetry = {
-      ...suspendedAgain,
-      members: [...suspendedAgain.members, {
-        ...suspendedAgain.members.at(-1), pid: 999_998, birth_identity: 'already removed member',
-      }],
-    };
-    expect(quiescence.commit(partialCommitRetry, { phase: 'committing', ...phaseJournal }))
-      .toMatchObject({ removed: true });
-    const [pid, ppid, pgid, sid] = execFileSync('ps', [
-      '-o', 'pid=,ppid=,pgid=,sess=', '-p', String(process.pid),
-    ], { encoding: 'utf8' }).trim().split(/\s+/).map(Number);
-    const reusedAfterRemoval = {
-      ...suspendedAgain,
-      members: [...suspendedAgain.members, {
-        pid, ppid, pgid, sid, state: 'R', birth_identity: 'retired provider identity',
-      }],
-    };
-    const signalsBeforeReusedPid = signals.length;
-    expect(quiescence.commit(reusedAfterRemoval, { phase: 'removed', ...phaseJournal }))
-      .toMatchObject({ removed: true, already_removed: true });
-    expect(signals).toHaveLength(signalsBeforeReusedPid);
-    expect(quiescence.inspect()).toMatchObject({ active: false });
-    expect(calls.some(([file, args]) => file === 'tmux' && args.includes('kill-session')))
-      .toBe(false);
-    for (const pid of suspendedAgain.members.map(({ pid }) => pid)) {
-      expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
-    }
-    expect(phases).toEqual([
-      'suspending', 'suspended', 'resuming', 'resumed',
-      'suspending', 'suspended', 'committing', 'removed',
-    ]);
-  });
-
-  test('waits for delayed stopped-state observation before declaring the exact tree suspended', () => {
-    const rows = [
-      { pid: 100, ppid: 1, pgid: 100, sid: 100 },
-      { pid: 101, ppid: 100, pgid: 101, sid: 100 },
-      { pid: 102, ppid: 101, pgid: 101, sid: 100 },
-    ];
-    const stopped = new Set();
-    let stoppedSnapshots = 0;
-    const execFileSyncFn = (file, args) => {
-      if (file === 'tmux') {
-        if (args[0] === 'has-session') return '';
-        if (args[0] === 'list-sessions') return 'claude-main\n';
-        if (args[0] === 'display-message') return '100\n';
-        if (args[0] === 'list-panes') return 'claude-main\t101\n';
-      }
-      if (file === 'ps' && args[0] === '-axo') {
-        if (stopped.size === rows.length) stoppedSnapshots += 1;
-        const visibleStopped = stoppedSnapshots > 80;
-        return rows.map(({ pid, ppid, pgid, sid }) => (
-          `${pid} ${ppid} ${pgid} ${sid} ${visibleStopped && stopped.has(pid) ? 'T' : 'S'}`
-        )).join('\n');
-      }
-      if (file === 'ps' && args[0] === '-o' && args[1] === 'lstart=') {
-        return 'Mon Jul 21 00:00:00 2026\n';
-      }
-      throw new Error(`unexpected fixture command: ${file} ${args.join(' ')}`);
-    };
-    const quiescence = createLegacyProviderQuiescence({
-      provider: 'claude', execFileSyncFn, wait: () => {},
-      signalProcess(pid, signal) {
-        expect(signal).toBe('SIGSTOP');
-        stopped.add(pid);
-      },
-    });
-
-    const suspended = quiescence.suspend();
-
-    expect(stoppedSnapshots).toBeGreaterThan(80);
-    expect(suspended).toMatchObject({ active: true, suspended: true });
-    expect(suspended.members.map(({ pid }) => pid)).toEqual([101, 102]);
-  });
-
-  test('commits an exact-base SQLite, PM2, and disposable provider fixture without old/new overlap', async () => {
+  test('keeps exact-base data fenced and old services inert through rollback and commit', async () => {
     const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'zylos-exact-base-commit-'));
     roots.push(root);
     const zylosDir = path.join(root, 'zylos');
@@ -379,21 +219,11 @@ describe('exact-base durable source fencing', () => {
       VALUES ('in', 'feishu', 'chat-running|type:p2p|msg:message-running', 'uncertain running work', 'running'),
              ('in', 'feishu', 'chat-commit|type:p2p|msg:message-commit', 'pending commit work', 'pending');
     `);
-    const server = `zylos-issue27-commit-${process.pid}-${Date.now()}`;
-    execFileSync('tmux', [
-      '-L', server, '-f', '/dev/null', 'new-session', '-d', '-s', 'claude-main',
-      // Keep a real child process without churning its PID between two full
-      // ownership snapshots when the parallel suite delays `ps` observation.
-      'while :; do sleep 30; done',
-    ]);
-    tmuxServers.set(server, Number(execFileSync(
-      'tmux', ['-L', server, 'display-message', '-p', '#{pid}'], { encoding: 'utf8' },
-    ).trim()));
     const expectedScripts = new Map([
       ['activity-monitor', path.join(zylosDir, '.claude', 'skills', 'activity-monitor', 'scripts', 'activity-monitor.js')],
       ['c4-dispatcher', path.join(zylosDir, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-dispatcher.js')],
     ]);
-    const processes = new Map([['activity-monitor', 'online'], ['c4-dispatcher', 'online']]);
+    const processes = new Map([['activity-monitor', 'stopped'], ['c4-dispatcher', 'stopped']]);
     const calls = [];
     const fixtureExec = (file, args, options) => {
       calls.push([file, args]);
@@ -402,8 +232,6 @@ describe('exact-base durable source fencing', () => {
           name, pm2_env: { status, pm_exec_path: expectedScripts.get(name) },
         })));
         if (args[0] === 'delete') processes.delete(args[1]);
-        if (args[0] === 'start') processes.set(args[args.indexOf('--only') + 1], 'online');
-        if (args[0] === 'stop') processes.set(args[1], 'stopped');
         return '';
       }
       if (file === 'npm' || (file === process.execPath && args[0] === '-e')
@@ -411,7 +239,6 @@ describe('exact-base durable source fencing', () => {
       return execFileSync(file, args, options);
     };
     const packageCalls = [];
-    let failProviderResumeOnce = true;
     let healthShouldPass = false;
     let deliveryEnabled = false;
     let stopDeliveryOwner = false;
@@ -437,9 +264,6 @@ describe('exact-base durable source fencing', () => {
       }
     })().catch((error) => { deliveryOwnerError = error; });
     try {
-      const providerQuiescence = createLegacyProviderQuiescence({
-        provider: 'claude', execFileSyncFn: fixtureExec, tmuxArgsPrefix: ['-L', server],
-      });
       expect(() => createInstalledExecutorUpgradeHandler({
         database, Database, zylosDir,
         currentReleasePath: fromRelease,
@@ -449,7 +273,6 @@ describe('exact-base durable source fencing', () => {
           document: channelAuthority(),
           provider_binding: 'owner_only_exact_path_authenticated_event',
         },
-        legacyProviderQuiescence: providerQuiescence,
       })).toThrow('requires verified channel prerequisite authority');
       const authorityFile = path.join(zylosDir, 'runtime', 'channel-authority.json');
       fs.mkdirSync(path.dirname(authorityFile), { recursive: true });
@@ -464,17 +287,6 @@ describe('exact-base durable source fencing', () => {
         provider: 'claude', allowLegacyFromRelease: true,
         legacyChannelAuthority: certifiedAuthority,
         execFileSyncFn: fixtureExec,
-        legacyProviderQuiescence: {
-          ...providerQuiescence,
-          resume(record, journal) {
-            const result = providerQuiescence.resume(record, journal);
-            if (failProviderResumeOnce) {
-              failProviderResumeOnce = false;
-              throw new Error('fixture interruption after durable provider resume');
-            }
-            return result;
-          },
-        },
         noticeDeliveryTimeoutMs: 50,
         packageLifecycle: {
           async activate() { packageCalls.push('activate'); return { installed: true }; },
@@ -534,19 +346,11 @@ describe('exact-base durable source fencing', () => {
       expect(processes.size).toBe(0);
 
       deliveryEnabled = true;
-      const interruptedRollback = await handler.resumeBlocking();
-      expect(interruptedRollback).toMatchObject({ success: false, state: 'rollback_failed' });
-      expect(interruptedRollback.rollback?.error).toContain(
-        'fixture interruption after durable provider resume',
-      );
+      const recoveredRollback = await handler.resumeBlocking();
       expect(database.prepare('SELECT status FROM conversations WHERE id = 1').get().status)
         .toBe('failed');
       expect(database.prepare('SELECT status FROM conversations WHERE id = 2').get().status)
         .toBe('pending');
-      expect(execFileSync('ps', ['-o', 'state=', '-p', String(tmuxServers.get(server))], {
-        encoding: 'utf8',
-      }).trim()).not.toMatch(/^T/);
-      const recoveredRollback = await handler.resumeBlocking();
       expect(deliveryOwnerError).toBeNull();
       expect(database.prepare(`
         SELECT status FROM runtime_outbox ORDER BY created_at, outbox_id
@@ -554,12 +358,7 @@ describe('exact-base durable source fencing', () => {
       expect(recoveredRollback.rollback?.error ?? null).toBeNull();
       expect(recoveredRollback).toMatchObject({ success: false, state: 'rolled_back' });
       expect(packageCalls).toEqual(['activate', 'restore']);
-      expect(processes).toEqual(new Map([
-        ['activity-monitor', 'online'], ['c4-dispatcher', 'online'],
-      ]));
-      expect(() => execFileSync(
-        'tmux', ['-L', server, 'has-session', '-t', '=claude-main'], { stdio: 'ignore' },
-      )).not.toThrow();
+      expect(processes).toEqual(new Map());
       expect(database.prepare('SELECT status FROM conversations WHERE id = 1').get().status)
         .toBe('failed');
       expect(database.prepare('SELECT status FROM conversations WHERE id = 2').get().status)
@@ -592,14 +391,10 @@ describe('exact-base durable source fencing', () => {
         }),
       ]));
       expect(processes.size).toBe(0);
-      expect(() => execFileSync(
-        'tmux', ['-L', server, 'has-session', '-t', '=claude-main'], { stdio: 'ignore' },
-      ))
-        .toThrow();
       const active = JSON.parse(fs.readFileSync(
         path.join(zylosDir, 'runtime', 'active-release.json'), 'utf8',
       ));
-      expect(fs.existsSync(path.join(active.release_path, 'retired-tmux-runtime.js'))).toBe(false);
+      expect(fs.existsSync(path.join(active.release_path, 'retired-runtime.js'))).toBe(false);
       expect(database.prepare(`
         SELECT disposition FROM runtime_legacy_migration_records
         WHERE legacy_kind = 'c4' AND legacy_record_id = 'conversation:2'

@@ -23,7 +23,6 @@ import { fileURLToPath } from 'url';
 import { hookScriptKey, hookScriptBaseKey, getCommandHooks } from './hook-utils.js';
 import { getZylosConfig, updateZylosConfig } from './config.js';
 import { renderCodexProjectConfig, renderCodexGlobalConfig, writeCodexConfig } from './runtime-setup.js';
-import { obsoleteHookBaseKeys } from '../../runtime/migration/legacy-lifecycle-artifacts.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ZYLOS_DIR = path.resolve(process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos'));
@@ -31,7 +30,7 @@ const TEMPLATE_SETTINGS = path.join(__dirname, '..', '..', 'templates', '.claude
 const INSTALLED_SETTINGS = path.join(ZYLOS_DIR, '.claude', 'settings.json');
 
 const MAX_SAFE_1M_THRESHOLD = 30;
-export const CORE_MANAGED_HOOKS = obsoleteHookBaseKeys();
+export const CORE_MANAGED_HOOKS = new Set();
 
 export function isCoreManaged(hook, { zylosDir = ZYLOS_DIR } = {}) {
   // Base key (shard-arg stripped): every --shard variant of a core-managed

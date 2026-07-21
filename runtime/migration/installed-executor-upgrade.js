@@ -165,10 +165,9 @@ function readUpgradePlan(planFile, expectedUpgradeId, {
     throw new Error(`Runtime upgrade plan ${expectedUpgradeId} has an invalid source kind.`);
   }
   if (fromReleaseKind === 'legacy_base') {
-    if (typeof plan.legacy_provider_execution_active !== 'boolean'
-      || typeof plan.legacy_source_fenced !== 'boolean'
+    if (typeof plan.legacy_source_fenced !== 'boolean'
       || typeof plan.legacy_observed_at !== 'string') {
-      throw new Error(`Runtime upgrade plan ${expectedUpgradeId} lacks legacy execution facts.`);
+      throw new Error(`Runtime upgrade plan ${expectedUpgradeId} lacks legacy source facts.`);
     }
     const authority = validateChannelAuthorityManifest(plan.channel_authority);
     if (authority.sha256 !== plan.channel_authority_sha256) {
@@ -351,7 +350,6 @@ function decorateReleaseAdapter(adapter, activeReleaseFile, execFileSyncFn, {
   zylosDir,
   targetReleasePath,
   packageLifecycle,
-  finalizeLegacyExecution,
 }) {
   return Object.freeze({
     async activate(request) {
@@ -398,12 +396,10 @@ function decorateReleaseAdapter(adapter, activeReleaseFile, execFileSyncFn, {
         installRoot: false,
       });
       const result = await adapter.cleanup(request);
-      const legacyExecution = await finalizeLegacyExecution(request);
       const registrations = removeLegacyServiceRegistrations({ zylosDir, execFileSyncFn });
       return Object.freeze({
         ...result,
         ...registrations,
-        legacy_execution: legacyExecution,
         deployed_ecosystem_config: deployedConfig,
       });
     },
@@ -557,7 +553,6 @@ export function createInstalledExecutorUpgradeHandler({
   execFileSyncFn = execFileSync,
   packlistFn = execFileSync,
   packageLifecycle = null,
-  legacyProviderQuiescence = null,
   legacyChannelAuthority = null,
   noticeDeliveryTimeoutMs = 30_000,
   startTargetHealth = startTargetHealthProcess,
@@ -572,13 +567,6 @@ export function createInstalledExecutorUpgradeHandler({
   if (packageLifecycle !== null && (typeof packageLifecycle.activate !== 'function'
     || typeof packageLifecycle.restore !== 'function')) {
     throw new TypeError('packageLifecycle must expose activate and restore');
-  }
-  if (allowLegacyFromRelease && (legacyProviderQuiescence === null
-    || typeof legacyProviderQuiescence.inspect !== 'function'
-    || typeof legacyProviderQuiescence.suspend !== 'function'
-    || typeof legacyProviderQuiescence.resume !== 'function'
-    || typeof legacyProviderQuiescence.commit !== 'function')) {
-    throw new TypeError('legacyProviderQuiescence is required for exact-base migration');
   }
   if (allowLegacyFromRelease && !isCertifiedChannelAuthority(legacyChannelAuthority, {
     installationRoot,
@@ -602,7 +590,6 @@ export function createInstalledExecutorUpgradeHandler({
   const snapshotDirectory = path.join(installationRoot, 'runtime', 'upgrade-snapshots');
   const releaseRoot = path.join(installationRoot, 'runtime', 'releases');
   const planDirectory = path.join(installationRoot, 'runtime', 'upgrade-plans');
-  const providerQuiescence = allowLegacyFromRelease ? legacyProviderQuiescence : null;
 
   function legacyServiceStateFile(upgradeId) {
     return path.join(installationRoot, 'runtime', 'legacy-upgrade-audit', `${upgradeId}-services.json`);
@@ -610,16 +597,6 @@ export function createInstalledExecutorUpgradeHandler({
 
   function readLegacyServiceState(upgradeId) {
     return JSON.parse(fs.readFileSync(legacyServiceStateFile(upgradeId), 'utf8'));
-  }
-
-  function providerPhaseJournal(stateFile, state) {
-    return Object.freeze({
-      onPhase(phase, providerExecution) {
-        state.provider_phase = phase;
-        if (providerExecution?.active === true) state.provider_execution = providerExecution;
-        atomicJson(stateFile, state);
-      },
-    });
   }
 
   function stopOwnedLegacyServices({ upgradeId, stepId }) {
@@ -636,46 +613,30 @@ export function createInstalledExecutorUpgradeHandler({
           zylosDir: installationRoot,
           execFileSyncFn,
         }),
-        provider_execution: null,
-        provider_suspended: false,
-        provider_phase: 'observed',
         recorded_at: now(),
       };
-      const activityMonitorOwned = state.services.some(({ name }) => name === 'activity-monitor');
-      const providerExecution = providerQuiescence?.inspect() ?? { active: false };
-      if (allowLegacyFromRelease) {
-        const durablePlan = JSON.parse(fs.readFileSync(
-          upgradePlanPath(planDirectory, upgradeId), 'utf8',
-        ));
-        const expectedActive = durablePlan.legacy_provider_execution_active;
-        if (providerExecution.active !== expectedActive) {
-          throw new Error('Legacy provider execution changed after durable source fencing.');
-        }
-      }
-      if (providerExecution.active && !activityMonitorOwned) {
-        throw new Error('Refusing to suspend an unowned legacy provider session.');
-      }
-      state.provider_execution = providerExecution;
       atomicJson(stateFile, state);
     }
     if (state.upgrade_id !== upgradeId || !Array.isArray(state.services)) {
       throw new Error('Legacy service ownership record conflicts with the upgrade.');
     }
-    if (!['observed', 'suspending', 'suspended'].includes(state.provider_phase ?? 'observed')) {
-      throw new Error('Legacy provider suspension phase conflicts with the upgrade.');
-    }
-    if (allowLegacyFromRelease && state.provider_execution?.active === true
-      && state.provider_suspended !== true) {
-      state.provider_execution = providerQuiescence.suspend(
-        state.provider_execution,
-        providerPhaseJournal(stateFile, state),
+    let currentlyOwned = inspectLegacyServiceRegistrations({
+      zylosDir: installationRoot,
+      execFileSyncFn,
+    });
+    const active = currentlyOwned.filter(({ was_running: wasRunning }) => wasRunning);
+    if (active.length > 0) {
+      throw new Error(
+        `Legacy runtime must be stopped before migration: ${active.map(({ name }) => name).join(', ')}.`,
       );
-      state.provider_suspended = true;
+    }
+    if (state.services.some(({ was_running: wasRunning }) => wasRunning)) {
+      state = { ...state, services: currentlyOwned, recorded_at: now() };
       atomicJson(stateFile, state);
     }
     // Re-inspect before any destructive command so generic-name collisions
     // always fail closed and remain untouched.
-    const currentlyOwned = inspectLegacyServiceRegistrations({
+    currentlyOwned = inspectLegacyServiceRegistrations({
       zylosDir: installationRoot,
       execFileSyncFn,
     });
@@ -700,57 +661,18 @@ export function createInstalledExecutorUpgradeHandler({
     });
   }
 
-  function restartOwnedLegacyServices({ upgradeId, stepId }) {
-    const state = readLegacyServiceState(upgradeId);
+  function restoreLegacySourceData({ upgradeId, stepId }) {
     const sourceQueue = JSON.parse(fs.readFileSync(
       path.join(installationRoot, 'runtime', 'upgrade-input', `${upgradeId}.json`), 'utf8',
     ));
     if (allowLegacyFromRelease) {
       reconcileLegacyBaseRollback({ database, rollbackBatch: sourceQueue });
-      providerQuiescence.resume(
-        state.provider_execution,
-        {
-          phase: state.provider_phase,
-          ...providerPhaseJournal(legacyServiceStateFile(upgradeId), state),
-        },
-      );
     }
-    const ecosystem = path.join(installationRoot, 'pm2', 'ecosystem.config.cjs');
-    inspectLegacyServiceRegistrations({ zylosDir: installationRoot, execFileSyncFn });
-    for (const serviceState of state.services) {
-      execFileSyncFn('pm2', ['start', ecosystem, '--only', serviceState.name], {
-        stdio: 'pipe', timeout: 30_000,
-      });
-      if (!serviceState.was_running) {
-        execFileSyncFn('pm2', ['stop', serviceState.name], { stdio: 'pipe', timeout: 30_000 });
-      }
+    const registered = inspectLegacyServiceRegistrations({ zylosDir: installationRoot, execFileSyncFn });
+    if (registered.length > 0) {
+      throw new Error('Legacy runtime registrations must remain removed after rollback.');
     }
-    if (state.services.length > 0) {
-      execFileSyncFn('pm2', ['save'], { stdio: 'pipe', timeout: 30_000 });
-    }
-    const restored = inspectLegacyServiceRegistrations({
-      zylosDir: installationRoot,
-      execFileSyncFn,
-    });
-    for (const expected of state.services) {
-      const actual = restored.find(({ name }) => name === expected.name);
-      if (!actual || actual.was_running !== expected.was_running) {
-        throw new Error(`Legacy service ${expected.name} did not restore its recorded state.`);
-      }
-    }
-    return Object.freeze({ step_id: stepId, restarted: true, restarted_at: now() });
-  }
-
-  async function finalizeLegacyExecution({ upgrade_id: upgradeId }) {
-    if (!allowLegacyFromRelease) return Object.freeze({ removed: false });
-    const state = readLegacyServiceState(upgradeId);
-    return providerQuiescence.commit(
-      state.provider_execution,
-      {
-        phase: state.provider_phase,
-        ...providerPhaseJournal(legacyServiceStateFile(upgradeId), state),
-      },
-    );
+    return Object.freeze({ step_id: stepId, source_data_restored: true, restarted: false, restarted_at: now() });
   }
 
   async function executePlan(plan) {
@@ -789,7 +711,6 @@ export function createInstalledExecutorUpgradeHandler({
         zylosDir: installationRoot,
         targetReleasePath: plan.to_release_path,
         packageLifecycle,
-        finalizeLegacyExecution,
       },
     );
     const legacySourceAdapter = createLegacySourceQueueAdapter({
@@ -799,7 +720,7 @@ export function createInstalledExecutorUpgradeHandler({
         upgradeId: plan.upgrade_id,
         stepId,
       }),
-      restartLegacyDispatcher: async ({ step_id: stepId }) => restartOwnedLegacyServices({
+      restartLegacyDispatcher: async ({ step_id: stepId }) => restoreLegacySourceData({
         upgradeId: plan.upgrade_id,
         stepId,
       }),
@@ -952,11 +873,8 @@ export function createInstalledExecutorUpgradeHandler({
     });
     const upgradeId = `upgrade-${crypto.randomUUID()}`;
     const observedAt = now();
-    let providerExecution;
     let legacyBatch;
     try {
-      providerExecution = allowLegacyFromRelease
-        ? providerQuiescence.inspect() : Object.freeze({ active: false });
       legacyBatch = allowLegacyFromRelease
         ? readLegacyBaseBatch({
           database, batchId: `${upgradeId}-legacy-base`, provider,
@@ -1002,7 +920,6 @@ export function createInstalledExecutorUpgradeHandler({
       provider,
       from_release_kind: allowLegacyFromRelease ? 'legacy_base' : 'executor',
       ...(allowLegacyFromRelease ? {
-        legacy_provider_execution_active: providerExecution.active,
         legacy_source_fenced: false,
         legacy_observed_at: observedAt,
         channel_authority: channelAuthority.document,

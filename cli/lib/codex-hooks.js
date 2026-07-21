@@ -4,7 +4,6 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { parse, stringify } from 'smol-toml';
-import { isObsoleteProviderSessionHook } from '../../runtime/migration/legacy-lifecycle-artifacts.js';
 
 const SESSION_START = 'SessionStart';
 const CODEX_EVENT_KEYS = {
@@ -83,7 +82,9 @@ export function coreSessionStartCommands(zylosDir) {
 }
 
 export function isCoreCodexHook(command, zylosDir) {
-  return isObsoleteProviderSessionHook(command, path.resolve(zylosDir));
+  void command;
+  void zylosDir;
+  return false;
 }
 
 export function readCodexHooksConfig(filePath) {

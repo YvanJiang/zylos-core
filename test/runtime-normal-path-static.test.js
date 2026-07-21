@@ -118,7 +118,6 @@ const migrationOnlyRepositoryFiles = new Set([
   'test/runtime-upgrade-coordinator.test.js',
   'runtime/migration/installed-executor-upgrade.js',
   'runtime/migration/legacy-lifecycle-artifacts.js',
-  'runtime/migration/legacy-provider-quiescence.js',
 ]);
 
 describe('normal product paths have no retired runtime authority', () => {
@@ -371,6 +370,7 @@ describe('normal product paths have no retired runtime authority', () => {
       'cli/lib/__tests__/codex.test.js',
       'runtime/migration/legacy-c4-runtime-config.js',
       'runtime/migration/legacy-c4-diagnostic.js',
+      'runtime/migration/legacy-provider-quiescence.js',
     ]) {
       expect([...tracked].some((file) => file === retired || file.startsWith(retired))).toBe(false);
       expect(files.some((file) => file === retired || file.startsWith(retired))).toBe(false);
@@ -383,7 +383,6 @@ describe('normal product paths have no retired runtime authority', () => {
       'scripts/installed-runtime-inventory.js',
       'runtime/migration/installed-executor-upgrade.js',
       'runtime/migration/legacy-lifecycle-artifacts.js',
-      'runtime/migration/legacy-provider-quiescence.js',
     ]);
     const files = packedFiles();
     expect(files).toContain('CHANGELOG.md');
@@ -392,5 +391,33 @@ describe('normal product paths have no retired runtime authority', () => {
       .filter((file) => !migrationOnly.has(file))
       .filter(containsRetiredAuthority);
     expect(violations).toEqual([]);
+  });
+
+  test('one-time migration has no executable tmux or provider-session authority', () => {
+    const bootstrap = fs.readFileSync(
+      path.resolve('scripts/bootstrap-executor-lifecycle.js'), 'utf8',
+    );
+    const upgrade = fs.readFileSync(
+      path.resolve('runtime/migration/installed-executor-upgrade.js'), 'utf8',
+    );
+    expect(bootstrap).not.toMatch(/tmux|providerquiescence|provider[_ -]?(?:session|suspend|resume)/i);
+    expect(upgrade).not.toMatch(/tmux|providerquiescence|provider[_ -]?(?:session|suspend|resume)/i);
+    expect(upgrade).not.toMatch(/execFileSyncFn\('pm2', \['start'/);
+  });
+
+  test('normal CLI, installer, and runtime entrypoints do not import migration code', () => {
+    for (const file of [
+      'cli/commands/init.js',
+      'cli/commands/doctor.js',
+      'cli/commands/self-uninstall.js',
+      'cli/lib/codex-hooks.js',
+      'cli/lib/sync-settings-hooks.js',
+      'scripts/install.sh',
+      'scripts/postinstall.js',
+      ...normalRuntimeFiles,
+    ]) {
+      const source = fs.readFileSync(path.resolve(file), 'utf8');
+      expect(source).not.toMatch(/(?:from|import)\s+['"][^'"]*runtime\/migration\//);
+    }
   });
 });
