@@ -737,7 +737,9 @@ app.get('/api/media/:messageId', (req, res) => {
  */
 app.get('/api/inbound-media/:filename', (req, res) => {
   try {
-    const filename = path.basename(req.params.filename);
+    const requestedFilename = req.params.filename;
+    const filename = path.basename(requestedFilename);
+    if (requestedFilename !== filename) return res.sendStatus(404);
     if (!filename || filename === '.' || filename === '..') return res.sendStatus(404);
     const target = path.join(MEDIA_DIR, filename);
 

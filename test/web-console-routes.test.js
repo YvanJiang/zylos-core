@@ -829,6 +829,15 @@ describe('web-console attachment routes', () => {
     const missing = await fetch(`${ctx.baseUrl}/api/inbound-media/nonexistent.png`);
     expect(missing.status).toBe(404);
 
+    const parentAlias = await fetch(
+      `${ctx.baseUrl}/api/inbound-media/..%2Fwc-test-doc.txt`,
+    );
+    expect(parentAlias.status).toBe(404);
+    const nestedAlias = await fetch(
+      `${ctx.baseUrl}/api/inbound-media/nested%2Fwc-test-doc.txt`,
+    );
+    expect(nestedAlias.status).toBe(404);
+
     const traversal = await fetch(`${ctx.baseUrl}/api/inbound-media/..%2F..%2F.env`);
     expect(traversal.status).toBe(404);
   });
