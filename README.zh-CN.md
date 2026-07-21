@@ -201,7 +201,7 @@ graph TB
     end
 
     subgraph Zylos["🧬 Zylos — 生命系统"]
-        C4["C4 通信桥<br/>(统一网关 · SQLite 审计)"]
+        C4["C4 兼容入口<br/>(持久化信封)"]
         MEM["记忆<br/>(Inside Out 架构)"]
         SCH["调度器<br/>(自主任务派发)"]
         AM["Executor Service<br/>(健康 · 控制 · 恢复)"]
@@ -213,7 +213,9 @@ graph TB
     end
 
     TG & LK & WC --> C4
-    C4 <--> CC
+    C4 --> CC
+    CC --> C4OUT["Core 持久化发件箱"]
+    C4OUT --> TG & LK & WC
     MEM <--> CC
     SCH --> CC
     AM --> CC
@@ -222,9 +224,9 @@ graph TB
 
 | 组件 | 职责 | 关键技术 |
 |------|------|----------|
-| C4 通信桥 | 统一消息网关，带审计追踪 | SQLite、优先级队列 |
+| C4 兼容入口 | 经过验证的入站信封和持久化投递目标 | Core SQLite 合约 |
 | 记忆 | 跨重启的持久身份和上下文 | Inside Out 分层架构 |
-| 调度器 | 你不在时自主派发任务 | Cron、自然语言输入、空闲门控 |
+| 调度器 | 持久化 occurrence 入队并按 Core 状态协调 | Cron、Core 队列与维护状态合约 |
 | Executor Service | 持久执行、健康、控制和恢复 | Core SQLite、PM2 监督 |
 | HTTP 层 | Web 访问、文件共享、组件路由 | Caddy、自动 HTTPS |
 
@@ -232,13 +234,13 @@ graph TB
 
 ## 特性
 
-### 一个 AI，一个意识
+### 一个身份，隔离的对话
 
 <div align="center">
 <img src="./assets/posters/unified-context-zh.png" alt="统一上下文" width="360">
 </div>
 
-大多数智能体框架按通道隔离会话 — 你在 Telegram 上的 AI 不知道你在 Slack 上说了什么。Zylos 以智能体为中心：你的 AI 在所有通道上是同一个人。C4 通信桥将所有消息路由到统一网关 — 一个对话、一份记忆、一个人格。每条消息都持久化到 SQLite，完全可查询。
+Zylos 保留同一个持久身份和记忆，同时按对话隔离执行。每个原生聊天或主题都有独立的串行 lineage 和 executor。Core 持久化入站信封、turn、映射、租约以及精确回复目标，因此任何通道都不能借用另一个对话的上下文或投递目标。
 
 ### 你的上下文，有保障
 
@@ -280,7 +282,7 @@ zylos add lark
 ```
 
 ### 自定义通道
-所有通道通过 C4 通信桥连接。要添加新通道（Slack、Discord、WhatsApp 等），实现 C4 协议 — 一个简单的 HTTP 接口，将消息推入统一网关。你的自定义通道获得与其他通道相同的统一会话、审计追踪和记忆。
+通道提交标准的已认证入站信封，并消费 Core 持久化发件箱命令。通道适配器负责渲染并记录投递结果；它必须使用明确的原生线程根消息与回复目标消息事实，绝不能推断“最新消息”或回退到父聊天。每次投递尝试都由 UTC 时刻租约和不可变的完整命令快照共同隔离；过期或被篡改的 claim 不能授权渲染、投递或结果写入。
 
 ---
 
@@ -294,13 +296,13 @@ Zylos 已全面兼容 [OpenClaw](https://github.com/openclaw/openclaw) 生态。
 |---|---|---|
 | Skills / ClawHub | 组件系统 + [注册表](https://github.com/zylos-ai/zylos-registry) | ✅ 已有 |
 | 多智能体路由 | [HXA-Connect](https://github.com/coco-xyz/hxa-connect) B2B 协议 | ✅ 已有 |
-| Gateway（控制面） | C4 通信桥（统一网关、SQLite 审计） | ✅ 已有 |
+| Gateway（控制面） | Core 入口、executor 队列与持久化发件箱 | ✅ 已有 |
 | 记忆 / 持久化 | Inside Out 记忆架构（5 层） | ✅ 已有 |
 | 上下文压缩 | 自动记忆保存 + 无限上下文 | ✅ 已有 |
 | 浏览器自动化 | [zylos-browser](https://github.com/zylos-ai/zylos-browser) | ✅ 已有 |
-| 定时任务 / Webhooks | 调度器（Cron、自然语言输入、空闲门控） | ✅ 已有 |
+| 定时任务 / Webhooks | 调度器（Cron、持久化 occurrence 入队） | ✅ 已有 |
 
-> **架构差异说明：** OpenClaw 支持多会话路由到隔离工作区。Zylos 采用不同方案——统一会话（一个 AI、一个意识、跨所有通道）。这是刻意的架构选择，而非功能缺失。
+> **架构差异说明：** Zylos 使用彼此独立的持久化对话 lineage，同时共享身份和记忆。共享工作区写入由带 fencing 的租约串行化，而不是把所有通道折叠到同一运行时。
 
 ### OpenClaw 用户
 
@@ -322,7 +324,7 @@ cd hxa-connect && npm install
 zylos add hxa-connect
 ```
 
-你的 Zylos 智能体即可与同一 HXA-Connect 网络上的任何 OpenClaw 智能体通信 — 统一会话、统一记忆、统一人格。
+你的 Zylos 智能体即可与同一 HXA-Connect 网络上的任何 OpenClaw 智能体通信；身份与记忆保持一致，每个对话的执行 lineage 和回复目标仍彼此隔离。
 
 ---
 

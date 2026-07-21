@@ -8,19 +8,186 @@
 import readline from 'node:readline';
 import net from 'node:net';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { bold, dim, cyan } from '../lib/colors.js';
+import { createOutboxService } from '../../runtime/delivery/outbox-service.js';
+import { createChannelNeutralTextRenderer } from '../../runtime/compatibility/c4-channel-fallback.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const C4_RECEIVE = path.join(ZYLOS_DIR, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-receive.js');
+const CORE_DATABASE_PATH = path.join(ZYLOS_DIR, 'comm-bridge', 'c4.db');
+const CORE_REGION = process.env.ZYLOS_REGION ?? 'global';
+const CORE_TENANT_ID = process.env.ZYLOS_TENANT_ID ?? 'default';
+const CORE_BOT_ID = process.env.ZYLOS_BOT_ID ?? 'zylos';
+
+function deliverToSocket(socketPath, message) {
+  return new Promise((resolve, reject) => {
+    const client = net.createConnection({ path: socketPath }, () => client.end(message));
+    client.once('error', reject);
+    client.once('close', () => resolve());
+  });
+}
+
+export function createShellRuntimeIdentity({
+  randomUUID = crypto.randomUUID,
+  temporaryDirectory = os.tmpdir,
+} = {}) {
+  const birthId = randomUUID();
+  return Object.freeze({
+    birthId,
+    socketPath: path.join(temporaryDirectory(), `zylos-shell-${birthId}.sock`),
+    serviceInstanceId: `shell-${birthId}`,
+  });
+}
+
+export function createDeliveryDrain({ dispatchNext, onError = () => {} }) {
+  if (typeof dispatchNext !== 'function') throw new TypeError('dispatchNext must be a function');
+  if (typeof onError !== 'function') throw new TypeError('onError must be a function');
+  let stopped = false;
+  let inFlight = null;
+
+  function drain() {
+    if (stopped) return inFlight ?? Promise.resolve();
+    if (inFlight !== null) return inFlight;
+    inFlight = (async () => {
+      try {
+        for (let count = 0; count < 20; count += 1) {
+          const result = await dispatchNext();
+          if (stopped || result.status === 'idle') break;
+        }
+      } catch (error) {
+        onError(error);
+      } finally {
+        inFlight = null;
+      }
+    })();
+    return inFlight;
+  }
+
+  async function stop() {
+    stopped = true;
+    if (inFlight !== null) await inFlight;
+  }
+
+  return Object.freeze({ drain, stop });
+}
+
+export function createShellOutboxOwner({
+  database,
+  socketPath,
+  serviceInstanceId,
+  region = CORE_REGION,
+  tenantId = CORE_TENANT_ID,
+  botId = CORE_BOT_ID,
+  now = () => new Date().toISOString(),
+  leaseDurationMs = 10_000,
+  sendToSocket = deliverToSocket,
+}) {
+  if (typeof sendToSocket !== 'function') {
+    throw new TypeError('sendToSocket must be a function');
+  }
+  let owner;
+  owner = createOutboxService({
+    database,
+    channel: 'shell',
+    targetChatId: socketPath,
+    targetRegion: region,
+    targetTenantId: tenantId,
+    targetBotId: botId,
+    serviceInstanceId,
+    now,
+    leaseDurationMs,
+    renderer: createChannelNeutralTextRenderer({
+      beforeSend(command) {
+        owner.assertCurrentClaim(command);
+      },
+      async sendText(delivery) {
+        if (delivery.target.chat_id !== socketPath) {
+          throw new Error('Shell delivery target does not match this shell owner.');
+        }
+        await sendToSocket(socketPath, delivery.text);
+        return { platform_message_id: `shell:${delivery.delivery_id}` };
+      },
+    }),
+  });
+  return owner;
+}
 
 export async function shellCommand() {
-  const socketPath = path.join(os.tmpdir(), `zylos-shell-${process.pid}.sock`);
+  const { default: Database } = await import(new URL(
+    '../../skills/comm-bridge/node_modules/better-sqlite3/lib/index.js',
+    import.meta.url,
+  ));
+  const { socketPath, serviceInstanceId } = createShellRuntimeIdentity();
 
-  // Clean up stale socket files from previous sessions (e.g. kill -9)
-  cleanStaleSockets();
+  // Install stop fencing before any socket, database owner, or polling timer
+  // can exist. Node delivers signals between turns, so all resources registered
+  // during this synchronous startup are visible to the same cleanup barrier.
+  let server = null;
+  let serverState = 'absent';
+  let database = null;
+  let deliveryDrain = null;
+  let deliveryTimer = null;
+  let rl = null;
+  let cleanupPromise = null;
+  let stopping = false;
+  let pendingResponse = null;
+
+  function cancelPendingResponse(reason = new Error('shell stopped')) {
+    if (pendingResponse === null) return;
+    const pending = pendingResponse;
+    pendingResponse = null;
+    clearTimeout(pending.timer);
+    pending.reject(reason);
+  }
+
+  function cleanup() {
+    if (cleanupPromise !== null) return cleanupPromise;
+    if (deliveryTimer !== null) clearInterval(deliveryTimer);
+    cleanupPromise = (async () => {
+      if (deliveryDrain !== null) await deliveryDrain.stop();
+      if (server !== null) {
+        await new Promise((resolve) => {
+          const close = () => {
+            server.off('error', close);
+            if (server.listening) {
+              server.close(() => {
+                serverState = 'closed';
+                resolve();
+              });
+            } else {
+              resolve();
+            }
+          };
+          if (server.listening) close();
+          else if (serverState === 'failed' || serverState === 'closed') resolve();
+          else {
+            server.once('listening', close);
+            server.once('error', close);
+          }
+        });
+      }
+      if (database !== null) database.close();
+      try { fs.unlinkSync(socketPath); } catch {}
+    })();
+    return cleanupPromise;
+  }
+
+  let shutdownPromise = null;
+  function shutdown() {
+    if (shutdownPromise === null) {
+      stopping = true;
+      cancelPendingResponse();
+      shutdownPromise = cleanup();
+      if (rl !== null && !rl.closed) rl.close();
+    }
+    return shutdownPromise;
+  }
+  process.once('SIGINT', () => { void shutdown(); });
+  process.once('SIGTERM', () => { void shutdown(); });
 
   // Clean up own socket file if it exists
   try { fs.unlinkSync(socketPath); } catch {}
@@ -32,94 +199,112 @@ export async function shellCommand() {
   }
 
   // Start Unix socket server to receive responses
-  let pendingResolve = null;
-
-  const server = net.createServer((conn) => {
+  server = net.createServer((conn) => {
     let data = '';
     conn.setEncoding('utf8');
     conn.on('error', () => {}); // ignore client disconnect errors
     conn.on('data', (chunk) => { data += chunk; });
     conn.on('end', () => {
-      if (data && pendingResolve) {
-        pendingResolve(data);
-        pendingResolve = null;
+      if (stopping) return;
+      if (data && pendingResponse !== null) {
+        const pending = pendingResponse;
+        pendingResponse = null;
+        clearTimeout(pending.timer);
+        pending.resolve(data);
       } else if (data) {
         // Response arrived without a pending prompt (e.g. proactive agent message,
-        // or a late reply after the 120s timeout cleared pendingResolve).
+        // or a late reply after the 120s timeout cleared the pending response).
         // Print immediately and restore the prompt so the user can keep typing.
         process.stdout.write(`\n${formatResponse(data)}\n\n`);
-        rl.prompt();
+        if (!stopping && rl !== null && !rl.closed) rl.prompt();
       }
     });
   });
+  serverState = 'starting';
+  server.once('close', () => { serverState = 'closed'; });
 
   // Set umask before listen to create socket with correct permissions (owner-only)
   const oldMask = process.umask(0o177);
   server.listen(socketPath, () => {
-    process.umask(oldMask);
+    serverState = 'listening';
   });
+  process.umask(oldMask);
 
   server.on('error', (err) => {
-    process.umask(oldMask);
+    serverState = 'failed';
     console.error(`Error: could not start shell server — ${err.message}`);
-    process.exit(1);
+    process.exitCode = 1;
+    void shutdown();
   });
 
-  // Cleanup on exit (guard against double invocation)
-  let cleaned = false;
-  function cleanup() {
-    if (cleaned) return;
-    cleaned = true;
-    server.close();
-    try { fs.unlinkSync(socketPath); } catch {}
+  try {
+    fs.mkdirSync(path.dirname(CORE_DATABASE_PATH), { recursive: true });
+    database = new Database(CORE_DATABASE_PATH);
+    database.pragma('journal_mode = WAL');
+    database.pragma('busy_timeout = 5000');
+    database.pragma('foreign_keys = ON');
+    const deliveryOwner = createShellOutboxOwner({
+      database,
+      socketPath,
+      serviceInstanceId,
+    });
+    deliveryDrain = createDeliveryDrain({
+      dispatchNext: () => deliveryOwner.dispatchNext(),
+      onError(error) {
+        console.error(`Shell delivery owner: ${error.message}`);
+      },
+    });
+    deliveryTimer = setInterval(() => { void deliveryDrain.drain(); }, 250);
+
+    console.log(bold('Zylos Shell'));
+    console.log(dim('Interactive mode — type your message and press Enter.'));
+    console.log(dim('Commands: /quit to exit, /help for help'));
+    console.log();
+
+    rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+      prompt: cyan('you> '),
+      terminal: process.stdin.isTTY !== false,
+    });
+  } catch (error) {
+    process.exitCode = 1;
+    await shutdown();
+    throw error;
   }
-  process.on('SIGINT', () => { cleanup(); process.exit(0); });
-  process.on('SIGTERM', () => { cleanup(); process.exit(0); });
-  process.on('exit', cleanup);
-
-  // Print banner
-  console.log(bold('Zylos Shell'));
-  console.log(dim('Interactive mode — type your message and press Enter.'));
-  console.log(dim('Commands: /quit to exit, /help for help'));
-  console.log();
-
-  // Start REPL
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    prompt: cyan('you> '),
-    terminal: process.stdin.isTTY !== false,
-  });
 
   rl.prompt();
 
   rl.on('line', async (line) => {
+    if (stopping) return;
     const input = line.trim();
 
     if (!input) {
-      rl.prompt();
+      if (!stopping && !rl.closed) rl.prompt();
       return;
     }
 
     // Handle local commands
     if (input === '/quit' || input === '/exit' || input === '/q') {
       console.log(dim('Goodbye.'));
-      cleanup();
-      process.exit(0);
+      await shutdown();
+      return;
     }
 
     if (input === '/help') {
       printHelp();
-      rl.prompt();
+      if (!stopping && !rl.closed) rl.prompt();
       return;
     }
 
     // Send message via C4
     try {
-      execFileSync('node', [
+      execFileSync(process.execPath, [
         C4_RECEIVE,
         '--channel', 'shell',
         '--endpoint', socketPath,
+        '--message-id', `shell-${crypto.randomUUID()}`,
+        '--actor-id', 'local-shell-user',
         '--content', input,
         '--json',
       ], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
@@ -135,7 +320,7 @@ export async function shellCommand() {
         if (stderr) errorMsg = stderr.trim();
       }
       console.log(`\n${dim('Error:')} ${errorMsg}\n`);
-      rl.prompt();
+      if (!stopping && !rl.closed) rl.prompt();
       return;
     }
 
@@ -144,6 +329,7 @@ export async function shellCommand() {
 
     try {
       const response = await waitForResponse(120000);
+      if (stopping) return;
       // Clear "thinking..." and print response
       if (process.stdout.isTTY) {
         readline.clearLine(process.stdout, 0);
@@ -153,6 +339,7 @@ export async function shellCommand() {
       }
       console.log(formatResponse(response));
     } catch {
+      if (stopping) return;
       if (process.stdout.isTTY) {
         readline.clearLine(process.stdout, 0);
         readline.cursorTo(process.stdout, 0);
@@ -162,56 +349,35 @@ export async function shellCommand() {
       console.log(dim('  (no response within timeout — message is queued, check back later)'));
     }
 
+    if (stopping) return;
     console.log();
-    rl.prompt();
+    if (!rl.closed) rl.prompt();
   });
 
   rl.on('close', () => {
-    cleanup();
-    process.exit(0);
+    void shutdown();
   });
 
   function waitForResponse(timeoutMs) {
     return new Promise((resolve, reject) => {
-      // Reject any previously pending promise to avoid memory leaks
-      if (pendingResolve) {
-        pendingResolve = null;
+      if (stopping) {
+        reject(new Error('shell stopped'));
+        return;
       }
+      cancelPendingResponse(new Error('response superseded'));
 
       const timer = setTimeout(() => {
-        pendingResolve = null;
+        pendingResponse = null;
         reject(new Error('timeout'));
       }, timeoutMs);
 
-      pendingResolve = (data) => {
-        clearTimeout(timer);
-        resolve(data);
-      };
+      pendingResponse = { resolve, reject, timer };
     });
   }
 }
 
 function formatResponse(text) {
   return `${bold('zylos>')} ${text}`;
-}
-
-function cleanStaleSockets() {
-  const tmpDir = os.tmpdir();
-  try {
-    const files = fs.readdirSync(tmpDir);
-    for (const file of files) {
-      const match = file.match(/^zylos-shell-(\d+)\.sock$/);
-      if (!match) continue;
-      const pid = Number(match[1]);
-      // Check if the process is still running
-      try {
-        process.kill(pid, 0);
-      } catch {
-        // Process doesn't exist — clean up stale socket
-        try { fs.unlinkSync(path.join(tmpDir, file)); } catch {}
-      }
-    }
-  } catch {}
 }
 
 function printHelp() {

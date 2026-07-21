@@ -469,9 +469,12 @@ function collectWorkspaceLeases(database) {
 
 function collectOutbox(database, generatedAt) {
   const rows = database.prepare(`
-    SELECT status, command_json, created_at
+    SELECT status, command_json, created_at, lease_expires_at,
+      lease_expires_epoch_ms, pre_action_fenced_at
     FROM runtime_outbox
-    WHERE status IN ('pending', 'delivering', 'retry_wait', 'dead_letter')
+    WHERE status IN (
+      'pending', 'delivering', 'retry_wait', 'dead_letter', 'delivery_unknown'
+    )
     ORDER BY created_at, outbox_id
   `).all();
   const grouped = new Map();
@@ -479,14 +482,20 @@ function collectOutbox(database, generatedAt) {
     const command = parseJson(row.command_json, 'outbox command');
     const channel = command?.target?.channel;
     requireNonEmptyString('outbox channel', channel);
-    const key = `${channel}\u0000${row.status}`;
+    const status = row.status === 'delivering'
+      && row.pre_action_fenced_at !== null
+      && row.lease_expires_epoch_ms !== null
+      && row.lease_expires_epoch_ms <= Date.parse(generatedAt)
+      ? 'delivery_unknown'
+      : row.status;
+    const key = `${channel}\u0000${status}`;
     const age = Math.max(
       0,
       Math.floor((Date.parse(generatedAt) - Date.parse(row.created_at)) / 1000),
     );
     const current = grouped.get(key) ?? {
       channel,
-      status: row.status,
+      status,
       count: 0,
       oldest_age_seconds: 0,
     };
@@ -606,6 +615,9 @@ function deriveServiceHealth(sections, serviceDegraded, serviceOffline) {
     return 'degraded';
   }
   if (sections.outbox.dead_letter_count > 0) return 'degraded';
+  if (sections.outbox.items.some(({ status }) => status === 'delivery_unknown')) {
+    return 'degraded';
+  }
   return 'healthy';
 }
 

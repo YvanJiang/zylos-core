@@ -21,17 +21,25 @@ import { fileURLToPath } from 'url';
 import {
   MAX_ATTACHMENTS,
   buildAnnotatedContent,
-  classifyConversationMessage,
   contentDisposition,
+  createCoreWebConsoleAttachment,
   generateStoredFileName,
-  parseMediaContent,
+  projectCoreWebConsoleContent,
   resolveAllowedPathSync,
   sanitizeDisplayName,
   sniffImage,
-  splitContentAndAttachments,
   uploadKind
 } from './attachment-utils.js';
-import { openDb, SessionStore, PersistentUploadRegistry } from './db.js';
+import {
+  DeliveryMailbox,
+  openDb,
+  SessionStore,
+  PersistentUploadRegistry,
+} from './db.js';
+import { readExecutorObservability } from '../../../runtime/observability/executor-snapshot-client.js';
+import { projectRuntimeHealth } from '../../../runtime/observability/health-projection.js';
+import { createDrainBarrier, createWebConsoleOutboxOwner } from './core-outbox-owner.js';
+import { validateInboundEnvelope } from '../../../contracts/public/index.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -41,17 +49,29 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 const PORT = process.env.WEB_CONSOLE_PORT || 3456;
+const SERVICE_BIRTH_ID = crypto.randomUUID();
 
 // Paths
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const SKILLS_DIR = process.env.WEB_CONSOLE_SKILLS_DIR || path.join(os.homedir(), 'zylos', '.claude', 'skills');
 const DB_DIR = path.join(ZYLOS_DIR, 'comm-bridge');
 const DB_PATH = path.join(DB_DIR, 'c4.db');
-const STATUS_FILE = path.join(ZYLOS_DIR, 'activity-monitor', 'agent-status.json');
 const MEDIA_DIR = path.join(ZYLOS_DIR, 'web-console', 'media');
 const MAX_UPLOAD_MB = Number.parseInt(process.env.WEB_CONSOLE_MAX_UPLOAD_MB || '20', 10);
 const MAX_UPLOAD_BYTES = Math.max(1, MAX_UPLOAD_MB) * 1024 * 1024;
 const C4_SCRIPT_DIR = path.join(SKILLS_DIR, 'comm-bridge', 'scripts');
+const CORE_REGION = process.env.ZYLOS_REGION ?? 'global';
+const CORE_TENANT_ID = process.env.ZYLOS_TENANT_ID ?? 'default';
+const CORE_BOT_ID = process.env.ZYLOS_BOT_ID ?? 'zylos';
+for (const [fieldName, value] of [
+  ['ZYLOS_REGION', CORE_REGION],
+  ['ZYLOS_TENANT_ID', CORE_TENANT_ID],
+  ['ZYLOS_BOT_ID', CORE_BOT_ID],
+]) {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new TypeError(`${fieldName} must be a non-empty Core scope identifier`);
+  }
+}
 
 // Paths - __dirname is scripts/, public/ is one level up
 const SKILL_ROOT = path.join(__dirname, '..');
@@ -79,7 +99,16 @@ const AUTH_ENABLED = AUTH_PASSWORD.length > 0;
 
 const wcDb = openDb();
 const sessionStore = new SessionStore(wcDb);
-const uploadRegistry = new PersistentUploadRegistry(wcDb);
+const uploadRegistry = new PersistentUploadRegistry(wcDb, {
+  region: CORE_REGION,
+  tenantId: CORE_TENANT_ID,
+  botId: CORE_BOT_ID,
+});
+const deliveryMailbox = new DeliveryMailbox(wcDb, {
+  region: CORE_REGION,
+  tenantId: CORE_TENANT_ID,
+  botId: CORE_BOT_ID,
+});
 
 fs.mkdirSync(MEDIA_DIR, { recursive: true });
 
@@ -135,110 +164,189 @@ const upload = multer({
 // Initialize database connection
 let db;
 try {
-  // Verify database file exists
-  if (!fs.existsSync(DB_PATH)) {
-    console.error(`Database not found: ${DB_PATH}`);
-    console.error('Make sure comm-bridge is initialized first (run c4-db.js init)');
-    process.exit(1);
-  }
-
+  fs.mkdirSync(DB_DIR, { recursive: true });
   db = new Database(DB_PATH, { readonly: false });
-
-  // Verify schema exists
-  const tableCheck = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'").get();
-  if (!tableCheck) {
-    console.error('Database schema not initialized');
-    console.error('Run: node ~/zylos/.claude/skills/comm-bridge/scripts/c4-db.js init');
-    process.exit(1);
-  }
+  db.pragma('journal_mode = WAL');
+  db.pragma('busy_timeout = 5000');
+  db.pragma('foreign_keys = ON');
 } catch (err) {
   console.error(`Failed to open database: ${err.message}`);
-  console.error('Make sure comm-bridge is initialized first');
   process.exit(1);
 }
 
 // Track connected WebSocket clients
 const clients = new Set();
+const clientCursors = new WeakMap();
 
 // Last known state for change detection
 let lastStatus = null;
-let lastMessageId = 0;
 
 /**
- * Read current Claude status
+ * Read provider-neutral Core runtime health.
  */
-function readStatus() {
-  try {
-    if (fs.existsSync(STATUS_FILE)) {
-      return JSON.parse(fs.readFileSync(STATUS_FILE, 'utf8'));
-    }
-    return { state: 'unknown', message: 'Status file not found' };
-  } catch (err) {
-    return { state: 'error', message: err.message };
-  }
-}
+let cachedStatus = null;
+let cachedStatusUntil = 0;
+let statusReadInFlight = null;
 
-/**
- * Strip internal routing info from message content for display
- */
-function stripReplyVia(content) {
-  // Remove "---- reply via: ..." suffix
-  const idx = content.indexOf(' ---- reply via:');
-  if (idx !== -1) {
-    return content.substring(0, idx);
-  }
-  return content;
-}
-
-/**
- * Clean message for display (strip internal routing info)
- */
-function cleanMessageForDisplay(msg) {
-  const cleaned = {
-    ...msg,
-    content: stripReplyVia(msg.content)
-  };
-  const classified = classifyConversationMessage(cleaned);
-  if (classified.kind === 'media') return classified;
-  if (cleaned.direction === 'in') {
-    const parsed = splitContentAndAttachments(cleaned.content);
-    if (parsed.attachments.length > 0) {
-      return {
-        ...cleaned,
-        content: parsed.content,
-        attachments: parsed.attachments.map((attachment) => {
-          const result = {
-            kind: attachment.kind,
-            name: attachment.name,
-            size_label: attachment.sizeLabel
-          };
-          const basename = path.basename(attachment.path || '');
-          if (basename && attachment.path === path.join(MEDIA_DIR, basename)) {
-            result.href = `/api/inbound-media/${encodeURIComponent(basename)}`;
-          }
-          return result;
-        })
+async function readStatus() {
+  if (cachedStatus !== null && Date.now() < cachedStatusUntil) return cachedStatus;
+  if (statusReadInFlight !== null) return statusReadInFlight;
+  statusReadInFlight = (async () => {
+    try {
+      cachedStatus = projectRuntimeHealth(
+        await readExecutorObservability({ zylosDir: ZYLOS_DIR }),
+      );
+    } catch (err) {
+      cachedStatus = {
+        contract: 'zylos.observability-health-projection',
+        contract_version: '1.0',
+        state: 'unavailable',
+        service: null,
+        executors: null,
+        turns: null,
+        outbox: null,
+        error: { code: 'executor_observability_unavailable', user_message: err.message },
       };
     }
+    cachedStatusUntil = Date.now() + 2000;
+    return cachedStatus;
+  })();
+  try {
+    return await statusReadInFlight;
+  } finally {
+    statusReadInFlight = null;
   }
-  return cleaned;
 }
 
 /**
- * Get new messages since given ID
+ * Idempotently project canonical Core inbound facts into the channel-owned
+ * durable mailbox. The mailbox assigns visibility cursors only when a message
+ * becomes observable to this channel.
  */
-function getNewMessages(sinceId) {
-  try {
-    const stmt = db.prepare(`
-      SELECT id, direction, channel, endpoint_id, content, timestamp
-      FROM conversations
-      WHERE channel = 'web-console' AND id > ?
-      ORDER BY timestamp ASC
-    `);
-    return stmt.all(sinceId).map(cleanMessageForDisplay);
-  } catch (err) {
-    return [];
+function syncCoreInbound(requiredInboundEventId = null) {
+  if (requiredInboundEventId !== null
+    && (typeof requiredInboundEventId !== 'string' || requiredInboundEventId.length === 0)) {
+    throw new TypeError('requiredInboundEventId must be a non-empty string or null');
   }
+  let requiredProjected = false;
+  const rows = db.prepare(`
+    SELECT inbound.inbound_event_id, inbound.envelope_json,
+      conversation.chat_id AS endpoint_id,
+      inbound.committed_at AS timestamp
+    FROM runtime_inbound_events AS inbound
+    JOIN runtime_turns AS turn ON turn.inbound_event_id = inbound.inbound_event_id
+    JOIN runtime_conversations AS conversation
+      ON conversation.conversation_id = turn.conversation_id
+    WHERE json_extract(inbound.envelope_json, '$.channel') = 'web-console'
+      AND conversation.chat_id = 'console'
+      AND json_extract(inbound.envelope_json, '$.region') = ?
+      AND json_extract(inbound.envelope_json, '$.tenant_id') = ?
+      AND json_extract(inbound.envelope_json, '$.bot_id') = ?
+    ORDER BY conversation.conversation_id ASC, turn.queue_sequence ASC
+  `).all(CORE_REGION, CORE_TENANT_ID, CORE_BOT_ID);
+  for (const row of rows) {
+    try {
+      const envelope = JSON.parse(row.envelope_json);
+      validateInboundEnvelope(envelope);
+      const projected = projectCoreWebConsoleContent(envelope.content, {
+        lookupUpload: (attachmentId) => uploadRegistry.getForProjection(attachmentId),
+        mediaDir: MEDIA_DIR,
+        maxBytes: MAX_UPLOAD_BYTES,
+      });
+      deliveryMailbox.projectInbound({
+        inboundEventId: row.inbound_event_id,
+        endpointId: row.endpoint_id,
+        content: projected.content,
+        attachments: projected.attachments,
+        timestamp: row.timestamp,
+      });
+      if (row.inbound_event_id === requiredInboundEventId) requiredProjected = true;
+    } catch (error) {
+      if (row.inbound_event_id === requiredInboundEventId) throw error;
+      // Channel-private attachment capabilities fail closed. Core retains the
+      // authoritative event for reconciliation without exposing local paths.
+    }
+  }
+  if (requiredInboundEventId !== null && !requiredProjected) {
+    throw new Error('The mapped Core inbound is outside this mailbox owner or unavailable.');
+  }
+}
+
+function getMailboxMessages({
+  channel = 'web-console', sinceId = 0, limit = 100, latest = false, cursorScope = null,
+} = {}) {
+  if (channel !== 'web-console') return [];
+  return deliveryMailbox.list({ sinceId, limit, latest, cursorScope });
+}
+
+function getNewMessages(sinceId, cursorScope = deliveryMailbox.cursorScope) {
+  return getMailboxMessages({ sinceId, limit: 100, cursorScope });
+}
+
+function setMailboxCursorScope(res) {
+  res.setHeader('X-Zylos-Mailbox-Cursor-Scope', deliveryMailbox.cursorScope);
+}
+
+function mailboxCursorError(res, error) {
+  setMailboxCursorScope(res);
+  return res.status(error.status || 500).json({
+    error: error.code || 'mailbox_cursor_error',
+    cursor_scope: error.cursorScope || deliveryMailbox.cursorScope,
+  });
+}
+
+function requireMailboxMutationScope(cursorScope) {
+  deliveryMailbox.assertCursorScope(cursorScope);
+}
+
+function projectInboundForDelivery(command) {
+  const source = db.prepare(`
+    SELECT outbox.turn_id, turn.inbound_event_id, outbox.command_json,
+      outbox.aggregate_type, outbox.aggregate_id, outbox.aggregate_version,
+      json_extract(outbox.command_json, '$.outbox_id') AS command_outbox_id,
+      json_extract(outbox.command_json, '$.delivery_id') AS command_delivery_id,
+      json_extract(outbox.command_json, '$.mapping.turn_id') AS command_turn_id,
+      json_extract(outbox.command_json, '$.aggregate_type') AS command_aggregate_type,
+      json_extract(outbox.command_json, '$.aggregate_id') AS command_aggregate_id,
+      json_extract(outbox.command_json, '$.aggregate_version') AS command_aggregate_version
+    FROM runtime_outbox AS outbox
+    LEFT JOIN runtime_turns AS turn ON turn.turn_id = outbox.turn_id
+    WHERE outbox.outbox_id = ? AND outbox.delivery_id = ?
+  `).get(command.outbox_id, command.delivery_id);
+  if (!source) throw new Error('The Core outbox delivery source is missing.');
+  if (source.command_json !== JSON.stringify(command)
+    || source.command_outbox_id !== command.outbox_id
+    || source.command_delivery_id !== command.delivery_id
+    || source.turn_id !== command.mapping.turn_id
+    || source.command_turn_id !== command.mapping.turn_id
+    || source.aggregate_type !== command.aggregate_type
+    || source.command_aggregate_type !== command.aggregate_type
+    || source.aggregate_id !== command.aggregate_id
+    || source.command_aggregate_id !== command.aggregate_id
+    || source.aggregate_version !== command.aggregate_version
+    || source.command_aggregate_version !== command.aggregate_version) {
+    throw new Error('The Core outbox delivery identity is inconsistent.');
+  }
+  if (source.turn_id === null) {
+    syncCoreInbound();
+    return;
+  }
+  syncCoreInbound(source.inbound_event_id);
+  if (typeof source.inbound_event_id !== 'string'
+    || !deliveryMailbox.hasInboundEvent(source.inbound_event_id)) {
+    throw new Error('The mapped Core inbound is not durably projected for this delivery.');
+  }
+}
+
+function parseProjectionCursor(value) {
+  if (value === undefined) return 0;
+  const cursor = Number(value);
+  if (!Number.isSafeInteger(cursor) || cursor < 0) {
+    const error = new TypeError('since_id must be a non-negative safe integer');
+    error.status = 400;
+    throw error;
+  }
+  return cursor;
 }
 
 /**
@@ -246,11 +354,54 @@ function getNewMessages(sinceId) {
  */
 function broadcast(type, data) {
   const message = JSON.stringify({ type, data });
+  let delivered = 0;
   for (const client of clients) {
     if (client.readyState === 1) { // WebSocket.OPEN
-      client.send(message);
+      try {
+        client.send(message);
+        if (type === 'messages' && Array.isArray(data) && data.length > 0) {
+          const current = clientCursors.get(client) ?? {
+            cursorScope: deliveryMailbox.cursorScope, id: 0,
+          };
+          clientCursors.set(client, {
+            cursorScope: deliveryMailbox.cursorScope,
+            id: Math.max(
+            current.id,
+            ...data.map(({ id }) => id),
+            ),
+          });
+        }
+        delivered += 1;
+      } catch {
+        clients.delete(client);
+      }
     }
   }
+  return delivered;
+}
+
+const deliveryOwner = createWebConsoleOutboxOwner({
+  database: db,
+  region: CORE_REGION,
+  tenantId: CORE_TENANT_ID,
+  botId: CORE_BOT_ID,
+  serviceInstanceId: `web-console-${SERVICE_BIRTH_ID}`,
+  projectInbound(command) {
+    projectInboundForDelivery(command);
+  },
+  deliverMessage(message, delivery) {
+    return deliveryMailbox.deliver({
+      deliveryId: delivery.delivery_id,
+      endpointId: message.endpoint_id,
+      content: message.content,
+      timestamp: message.timestamp,
+    });
+  },
+});
+const deliveryBarrier = createDrainBarrier({ drain: (options) => deliveryOwner.drain(options) });
+
+async function drainWebOutbox() {
+  return deliveryBarrier.run();
 }
 
 function normalizeAttachmentIds(value) {
@@ -285,7 +436,14 @@ function buildSendContent(content, attachmentEntries) {
   return message;
 }
 
-function sendToC4(content) {
+function webMessageId(value) {
+  if (typeof value !== 'string' || value.length === 0) {
+    return `web-console-${crypto.randomUUID()}`;
+  }
+  return `web-console-${crypto.createHash('sha256').update(value).digest('hex')}`;
+}
+
+function sendToC4(content, attachments, messageId) {
   const c4Receive = path.join(C4_SCRIPT_DIR, 'c4-receive.js');
 
   return new Promise((resolve, reject) => {
@@ -293,6 +451,9 @@ function sendToC4(content) {
       c4Receive,
       '--channel', 'web-console',
       '--endpoint', 'console',
+      '--message-id', messageId,
+      '--actor-id', 'web-console-user',
+      '--attachments-json', JSON.stringify(attachments),
       '--content', content
     ], { stdio: 'pipe' });
 
@@ -316,7 +477,7 @@ function sendToC4(content) {
   });
 }
 
-async function sendConsoleMessage({ content, attachmentIds, sessionId }) {
+async function sendConsoleMessage({ content, attachmentIds, sessionId, messageId }) {
   const ids = normalizeAttachmentIds(attachmentIds);
   validateSendPayload(content, ids);
 
@@ -332,6 +493,10 @@ async function sendConsoleMessage({ content, attachmentIds, sessionId }) {
   }
 
   const combined = buildSendContent(content, attachmentEntries);
+  const coreAttachments = attachmentEntries.map((entry) => createCoreWebConsoleAttachment(entry, {
+    mediaDir: MEDIA_DIR,
+    maxBytes: MAX_UPLOAD_BYTES,
+  }));
   if (ids.length > 0) {
     attachmentEntries = uploadRegistry.consumeMany(ids, sessionId);
     if (!attachmentEntries) {
@@ -342,18 +507,14 @@ async function sendConsoleMessage({ content, attachmentIds, sessionId }) {
     }
   }
   try {
-    await sendToC4(combined);
+    await sendToC4(combined, coreAttachments, webMessageId(messageId));
   } catch (err) {
     uploadRegistry.restoreMany(attachmentEntries);
     throw err;
   }
   return {
     content: combined,
-    attachments: attachmentEntries.map((entry) => ({
-      kind: entry.kind,
-      name: entry.name,
-      size_label: entry.sizeLabel || null
-    }))
+    attachments: coreAttachments
   };
 }
 
@@ -365,52 +526,61 @@ function jsonError(res, err) {
   });
 }
 
-function getMediaRow(messageId) {
-  const row = db.prepare(`
-    SELECT id, direction, channel, endpoint_id, content, timestamp
-    FROM conversations
-    WHERE id = ?
-  `).get(messageId);
-
-  if (!row || row.direction !== 'out' || row.channel !== 'web-console' || row.endpoint_id !== 'console') {
-    return null;
-  }
-
-  const media = parseMediaContent(row.content);
-  if (!media) return null;
-  return { row, media };
-}
-
 /**
  * Check for status changes and new messages
  */
-function checkUpdates() {
+async function checkUpdates({ force = false } = {}) {
+  if (clients.size === 0 && !force) return;
   // Check status changes
-  const currentStatus = readStatus();
-  if (!lastStatus || currentStatus.state !== lastStatus.state) {
-    lastStatus = currentStatus;
-    broadcast('status', currentStatus);
+  if (clients.size > 0) {
+    const currentStatus = await readStatus();
+    if (!lastStatus || currentStatus.snapshot_id !== lastStatus.snapshot_id
+      || currentStatus.state !== lastStatus.state) {
+      lastStatus = currentStatus;
+      broadcast('status', currentStatus);
+    }
   }
 
-  // Check for new messages
-  const newMessages = getNewMessages(lastMessageId);
-  if (newMessages.length > 0) {
-    lastMessageId = Math.max(...newMessages.map(m => m.id));
-    broadcast('messages', newMessages);
+  function flushClient(client) {
+    const cursor = clientCursors.get(client);
+    if (!cursor || cursor.cursorScope !== deliveryMailbox.cursorScope) return;
+    const newMessages = getNewMessages(cursor.id, cursor.cursorScope);
+    if (newMessages.length === 0 || client.readyState !== 1) return;
+    try {
+      client.send(JSON.stringify({
+        type: 'messages', cursor_scope: deliveryMailbox.cursorScope, data: newMessages,
+      }));
+      clientCursors.set(client, {
+        cursorScope: cursor.cursorScope,
+        id: Math.max(cursor.id, ...newMessages.map(({ id }) => id)),
+      });
+    } catch {
+      clients.delete(client);
+    }
   }
+
+  syncCoreInbound();
+  for (const client of clients) flushClient(client);
+  try {
+    await drainWebOutbox();
+  } catch (error) {
+    console.error(`Web Console outbox delivery remains retryable: ${error.message}`);
+  }
+  for (const client of clients) flushClient(client);
 }
 
-// Start update checker (every 500ms for responsiveness)
-setInterval(checkUpdates, 500);
-
-// Initialize lastMessageId
-try {
-  const stmt = db.prepare(`SELECT MAX(id) as maxId FROM conversations WHERE channel = 'web-console'`);
-  const result = stmt.get();
-  lastMessageId = result?.maxId || 0;
-} catch (err) {
-  // Ignore
+// Poll only while there are subscribed consumers. This bounds snapshot work
+// and avoids advancing durable observability snapshots for an unused console.
+let updateInFlight = null;
+function requestUpdate(options) {
+  if (updateInFlight !== null) return updateInFlight;
+  updateInFlight = checkUpdates(options).finally(() => { updateInFlight = null; });
+  return updateInFlight;
 }
+const updateTimer = setInterval(() => {
+  if (clients.size === 0) return;
+  requestUpdate().catch(() => {});
+}, 2000);
 
 /**
  * WebSocket connection handler
@@ -426,25 +596,54 @@ wss.on('connection', (ws, req) => {
     sessionStore.touch(cookies.wc_session);
   }
 
-  clients.add(ws);
-  console.log(`WebSocket client connected (${clients.size} total)`);
+  console.log('WebSocket client connected');
 
   // Send current status immediately
-  const status = readStatus();
-  ws.send(JSON.stringify({ type: 'status', data: status }));
+  readStatus().then((status) => {
+    if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'status', data: status }));
+  }).catch(() => {});
 
   // Handle client messages
   ws.on('message', async (data) => {
     try {
       const msg = JSON.parse(data);
 
-      if (msg.type === 'send') {
+      if (msg.type === 'subscribe') {
+        clients.delete(ws);
+        clientCursors.delete(ws);
+        const sinceId = Number(msg.since_id);
+        if (!Number.isSafeInteger(sinceId) || sinceId < 0) {
+          ws.close(1008, 'Invalid durable projection cursor');
+          return;
+        }
+        const cursorScope = typeof msg.cursor_scope === 'string' ? msg.cursor_scope : null;
+        try {
+          deliveryMailbox.list({ sinceId, limit: 1, cursorScope });
+        } catch (error) {
+          if (error.code === 'mailbox_cursor_scope_mismatch'
+            || error.code === 'mailbox_cursor_scope_required') {
+            ws.send(JSON.stringify({
+              type: 'cursor_reset', cursor_scope: deliveryMailbox.cursorScope,
+            }));
+            return;
+          }
+          throw error;
+        }
+        clientCursors.set(ws, { cursorScope: deliveryMailbox.cursorScope, id: sinceId });
+        clients.add(ws);
+        ws.send(JSON.stringify({
+          type: 'subscribed', cursor_scope: deliveryMailbox.cursorScope,
+        }));
+        requestUpdate().catch(() => {});
+      } else if (msg.type === 'send') {
         const tempId = msg.tempId; // Track client's temp ID
         try {
+          requireMailboxMutationScope(msg.cursor_scope);
           await sendConsoleMessage({
             content: msg.content || '',
             attachmentIds: msg.attachments,
-            sessionId: getSessionId(req)
+            sessionId: getSessionId(req),
+            messageId: tempId,
           });
           ws.send(JSON.stringify({ type: 'sent', success: true, tempId }));
         } catch (err) {
@@ -453,6 +652,8 @@ wss.on('connection', (ws, req) => {
             success: false,
             error: err.code || err.message,
             message: err.message,
+            status: err.status || 500,
+            cursor_scope: err.cursorScope || deliveryMailbox.cursorScope,
             tempId
           }));
         }
@@ -477,7 +678,9 @@ wss.on('connection', (ws, req) => {
  * Get Claude status (HTTP fallback)
  */
 app.get('/api/status', (req, res) => {
-  res.json(readStatus());
+  readStatus().then((status) => res.json(status)).catch((err) => {
+    res.status(503).json({ state: 'unavailable', error: err.message });
+  });
 });
 
 /**
@@ -487,19 +690,9 @@ app.get('/api/conversations', (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
     const channel = req.query.channel || 'web-console';
-
-    // channel is caller-controlled; 'void' is the internal record-only
-    // channel (#689) and must never reach a display surface.
-    const stmt = db.prepare(`
-      SELECT id, direction, channel, endpoint_id, content, timestamp
-      FROM conversations
-      WHERE channel = ? AND channel != 'void'
-      ORDER BY timestamp DESC
-      LIMIT ?
-    `);
-
-    const conversations = stmt.all(channel, limit).map(cleanMessageForDisplay);
-    res.json(conversations.reverse());
+    syncCoreInbound();
+    setMailboxCursorScope(res);
+    res.json(getMailboxMessages({ channel, limit, latest: true }));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -511,17 +704,9 @@ app.get('/api/conversations', (req, res) => {
 app.get('/api/conversations/recent', (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 100;
-
-    const stmt = db.prepare(`
-      SELECT id, direction, channel, endpoint_id, content, timestamp
-      FROM conversations
-      WHERE channel = 'web-console'
-      ORDER BY timestamp DESC
-      LIMIT ?
-    `);
-
-    const conversations = stmt.all(limit).map(cleanMessageForDisplay);
-    res.json(conversations.reverse());
+    syncCoreInbound();
+    setMailboxCursorScope(res);
+    res.json(getMailboxMessages({ limit, latest: true }));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -531,6 +716,12 @@ app.get('/api/conversations/recent', (req, res) => {
  * Upload one attachment for a later send call
  */
 app.post('/api/upload', (req, res) => {
+  try {
+    requireMailboxMutationScope(req.get('X-Zylos-Mailbox-Cursor-Scope'));
+  } catch (error) {
+    mailboxCursorError(res, error);
+    return;
+  }
   upload.single('file')(req, res, (err) => {
     if (err) {
       if (err.code === 'LIMIT_FILE_SIZE') {
@@ -574,10 +765,17 @@ app.post('/api/upload', (req, res) => {
  * Send message to Claude (HTTP fallback)
  */
 app.post('/api/send', (req, res) => {
+  try {
+    requireMailboxMutationScope(req.get('X-Zylos-Mailbox-Cursor-Scope'));
+  } catch (error) {
+    mailboxCursorError(res, error);
+    return;
+  }
   sendConsoleMessage({
     content: req.body.message || '',
     attachmentIds: req.body.attachments,
-    sessionId: getSessionId(req)
+    sessionId: getSessionId(req),
+    messageId: req.body.message_id,
   }).then(() => {
     res.json({ success: true, message: 'Message sent to Claude' });
   }).catch((err) => jsonError(res, err));
@@ -587,41 +785,7 @@ app.post('/api/send', (req, res) => {
  * Serve an outbound media row by message id
  */
 app.get('/api/media/:messageId', (req, res) => {
-  try {
-    const messageId = Number.parseInt(req.params.messageId, 10);
-    if (!Number.isSafeInteger(messageId)) return res.sendStatus(404);
-
-    const result = getMediaRow(messageId);
-    if (!result) return res.sendStatus(404);
-
-    const allowedPath = resolveAllowedPathSync(result.media.path, [ZYLOS_DIR, '/tmp']);
-    if (!allowedPath) {
-      console.warn(`Blocked web-console media path outside allowlist: ${result.media.path}`);
-      return res.sendStatus(404);
-    }
-
-    let stat;
-    try {
-      stat = fs.statSync(allowedPath);
-    } catch {
-      return res.sendStatus(404);
-    }
-    if (!stat.isFile()) return res.sendStatus(404);
-
-    const fd = fs.openSync(allowedPath, 'r');
-    const head = Buffer.alloc(Math.min(16, stat.size));
-    fs.readSync(fd, head, 0, head.length, 0);
-    fs.closeSync(fd);
-
-    const image = result.media.media_type === 'image' ? sniffImage(head) : null;
-    const disposition = image ? 'inline' : 'attachment';
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Content-Type', image?.mime || 'application/octet-stream');
-    res.setHeader('Content-Disposition', contentDisposition(disposition, result.media.name));
-    res.sendFile(allowedPath);
-  } catch {
-    res.sendStatus(404);
-  }
+  res.sendStatus(404);
 });
 
 /**
@@ -629,12 +793,21 @@ app.get('/api/media/:messageId', (req, res) => {
  */
 app.get('/api/inbound-media/:filename', (req, res) => {
   try {
-    const filename = path.basename(req.params.filename);
+    const requestedFilename = req.params.filename;
+    const filename = path.basename(requestedFilename);
+    if (requestedFilename !== filename) return res.sendStatus(404);
     if (!filename || filename === '.' || filename === '..') return res.sendStatus(404);
     const target = path.join(MEDIA_DIR, filename);
 
     const allowedPath = resolveAllowedPathSync(target, [MEDIA_DIR]);
     if (!allowedPath) return res.sendStatus(404);
+    const upload = uploadRegistry.getForMediaPath(target)
+      || uploadRegistry.getForMediaPath(allowedPath);
+    if (!upload?.consumed) return res.sendStatus(404);
+    if (!deliveryMailbox.hasInboundAttachment({
+      attachmentId: upload.id,
+      href: `/api/inbound-media/${filename}`,
+    })) return res.sendStatus(404);
 
     let stat;
     try {
@@ -663,12 +836,23 @@ app.get('/api/inbound-media/:filename', (req, res) => {
 /**
  * Poll for new messages since given ID (HTTP fallback)
  */
-app.get('/api/poll', (req, res) => {
+app.get('/api/poll', async (req, res) => {
   try {
-    const sinceId = parseInt(req.query.since_id) || 0;
-    res.json(getNewMessages(sinceId));
+    const sinceId = parseProjectionCursor(req.query.since_id);
+    const cursorScope = typeof req.query.cursor_scope === 'string'
+      ? req.query.cursor_scope : null;
+    // Fence the client's namespace before any projection or delivery work.
+    deliveryMailbox.list({ sinceId, limit: 1, cursorScope });
+    await requestUpdate({ force: true });
+    setMailboxCursorScope(res);
+    res.json(getNewMessages(sinceId, cursorScope));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    if (err.code === 'mailbox_cursor_scope_mismatch'
+      || err.code === 'mailbox_cursor_scope_required') {
+      mailboxCursorError(res, err);
+      return;
+    }
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 
@@ -737,14 +921,28 @@ server.listen(PORT, BIND_HOST, () => {
   console.log(`Database: ${DB_PATH}`);
 });
 
-// Graceful shutdown
+// Graceful shutdown: stop new claims, await every fenced dispatch result, then
+// close channel/Core databases. This prevents a normal stop from stranding a
+// command after its durable mailbox side effect but before Core recordResult.
+let shutdownPromise = null;
 function shutdown() {
+  if (shutdownPromise !== null) return shutdownPromise;
   console.log('Shutting down...');
-  wss.close();
-  if (db) db.close();
-  if (wcDb) wcDb.close();
-  process.exit(0);
+  clearInterval(updateTimer);
+  const serverClosed = server.listening
+    ? new Promise((resolve) => server.close(() => resolve()))
+    : Promise.resolve();
+  for (const client of wss.clients) client.close(1001, 'Server shutting down');
+  shutdownPromise = (async () => {
+    await deliveryBarrier.stop();
+    if (updateInFlight !== null) await updateInFlight;
+    await serverClosed;
+    wss.close();
+    if (db) db.close();
+    if (wcDb) wcDb.close();
+  })();
+  return shutdownPromise;
 }
 
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+process.once('SIGINT', () => { void shutdown(); });
+process.once('SIGTERM', () => { void shutdown(); });

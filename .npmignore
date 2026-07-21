@@ -11,32 +11,9 @@
 
 # Environment
 .env
-CHANGELOG.md
-docs/dev-plan-issue-722.md
 
 # Repository-only tests and destructive fixtures are never product payloads.
 test/
 **/__tests__/
 scripts/e2e/
 **/node_modules/
-
-# Retired runtime implementations remain in the source repository only for
-# historical characterization. They are never shipped in the product package.
-skills/activity-monitor/
-skills/comm-bridge/scripts/c4-dispatcher.js
-skills/comm-bridge/scripts/tmux-input-state.js
-skills/comm-bridge/scripts/c4-control.js
-skills/comm-bridge/references/c4-control.md
-cli/lib/tmux-input-state.js
-cli/lib/runtime/base.js
-cli/lib/runtime/claude.js
-cli/lib/runtime/codex.js
-cli/lib/runtime/context-monitor-base.js
-cli/lib/runtime/claude-context-monitor.js
-cli/lib/runtime/codex-context-monitor.js
-cli/lib/runtime/session-handoff.js
-cli/lib/runtime/tmux-env.js
-cli/lib/runtime/tmux-helpers.js
-cli/lib/runtime/tmux-launcher.js
-cli/lib/heartbeat/claude-probe.js
-cli/lib/heartbeat/codex-probe.js

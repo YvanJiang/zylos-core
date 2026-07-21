@@ -175,6 +175,7 @@ function supersedeOrdinaryPending(database, laneKey, updatedAt) {
   database.prepare(`
     UPDATE runtime_outbox
     SET status = 'superseded', lease_owner = NULL, lease_expires_at = NULL,
+      lease_expires_epoch_ms = NULL,
       updated_at = ?
     WHERE lane_key = ? AND supersedable = 1
       AND status IN ('pending', 'retry_wait')
@@ -241,7 +242,8 @@ export function materializeNextStagedMainProjection(
   const active = database.prepare(`
     SELECT outbox_id
     FROM runtime_outbox
-    WHERE lane_key = ? AND status IN ('pending', 'delivering', 'retry_wait')
+    WHERE lane_key = ?
+      AND status IN ('pending', 'delivering', 'retry_wait', 'delivery_unknown')
     LIMIT 1
   `).get(laneKey);
   if (active) return null;

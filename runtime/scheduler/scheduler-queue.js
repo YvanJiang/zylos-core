@@ -1,6 +1,7 @@
 import {
   createIdempotencyKey,
   validateInboundEnvelope,
+  validateOpaqueId,
 } from '../../contracts/public/index.js';
 import { acceptNormalInbound } from '../persistence/inbound-acceptance.js';
 
@@ -17,7 +18,7 @@ function requireTimestamp(name, value) {
   return value;
 }
 
-function createBoundConversationIdentity(occurrence) {
+export function createBoundConversationIdentity(occurrence) {
   const bound = occurrence.bound_conversation;
   if (bound === null || bound === undefined) return null;
   if (!bound || typeof bound !== 'object' || Array.isArray(bound)) {
@@ -25,23 +26,39 @@ function createBoundConversationIdentity(occurrence) {
   }
   const fields = [
     'channel', 'chat_type', 'chat_id', 'native_thread_or_topic_id', 'message_id',
+    'root_message_id',
   ];
   for (const field of fields) {
     if (!Object.hasOwn(bound, field)) {
       throw new TypeError(`bound_conversation.${field} is required`);
     }
   }
-  if (bound.native_thread_or_topic_id !== null
-    && (typeof bound.native_thread_or_topic_id !== 'string'
-      || bound.native_thread_or_topic_id.length === 0)) {
-    throw new TypeError('bound_conversation.native_thread_or_topic_id must be a string or null');
+  const channel = validateOpaqueId('bound_conversation.channel', bound.channel);
+  if (channel === 'scheduler') {
+    throw new TypeError('bound_conversation.channel must identify a real channel adapter');
+  }
+  const chatType = validateOpaqueId('bound_conversation.chat_type', bound.chat_type);
+  if (!['dm', 'group', 'thread'].includes(chatType)) {
+    throw new TypeError('bound_conversation.chat_type must be dm, group, or thread');
+  }
+  if (chatType === 'thread') {
+    validateOpaqueId(
+      'bound_conversation.native_thread_or_topic_id',
+      bound.native_thread_or_topic_id,
+    );
+    validateOpaqueId('bound_conversation.root_message_id', bound.root_message_id);
+  } else if (bound.native_thread_or_topic_id !== null || bound.root_message_id !== null) {
+    throw new TypeError(
+      'bound_conversation native thread and root message ids must be null outside a thread',
+    );
   }
   return {
-    channel: requireNonEmptyString('bound_conversation.channel', bound.channel),
-    chat_type: requireNonEmptyString('bound_conversation.chat_type', bound.chat_type),
-    chat_id: requireNonEmptyString('bound_conversation.chat_id', bound.chat_id),
+    channel,
+    chat_type: chatType,
+    chat_id: validateOpaqueId('bound_conversation.chat_id', bound.chat_id),
     native_thread_or_topic_id: bound.native_thread_or_topic_id,
-    message_id: requireNonEmptyString('bound_conversation.message_id', bound.message_id),
+    message_id: validateOpaqueId('bound_conversation.message_id', bound.message_id),
+    root_message_id: bound.root_message_id ?? null,
   };
 }
 
@@ -91,7 +108,11 @@ export function createScheduledOccurrenceEnvelope(occurrence) {
       text: requireNonEmptyString('prompt', occurrence.prompt),
       attachments: [],
     },
-    reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+    reply: {
+      root_message_id: bound?.root_message_id ?? null,
+      parent_message_id: null,
+      reply_to_message_id: null,
+    },
     source: { kind: 'scheduler', source_ref: `schedule:${scheduleId}:${occurrenceId}` },
     schedule: {
       schedule_id: scheduleId,

@@ -2,10 +2,20 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, test } from '@jest/globals';
-import { openDb, SessionStore, PersistentUploadRegistry } from '../skills/web-console/scripts/db.js';
+import Database from '../skills/web-console/node_modules/better-sqlite3/lib/index.js';
+import {
+  DeliveryMailbox,
+  openDb,
+  SessionStore,
+  PersistentUploadRegistry,
+} from '../skills/web-console/scripts/db.js';
+import { createDrainBarrier } from '../skills/web-console/scripts/core-outbox-owner.js';
 
 let tempDir;
 let db;
+const TEST_MAILBOX_SCOPE = Object.freeze({
+  region: 'global', tenantId: 'test-tenant', botId: 'test-bot',
+});
 
 beforeEach(() => {
   tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wc-db-test-'));
@@ -74,8 +84,125 @@ describe('SessionStore', () => {
 });
 
 describe('PersistentUploadRegistry', () => {
+  test('creates scope-required upload rows and hides migrated legacy capabilities', () => {
+    const legacyColumns = Object.fromEntries(db.prepare('PRAGMA table_info(uploads)').all()
+      .map((column) => [column.name, column]));
+    expect(legacyColumns.region).toBeUndefined();
+    expect(legacyColumns.tenant_id).toBeUndefined();
+    expect(legacyColumns.bot_id).toBeUndefined();
+    const columns = Object.fromEntries(db.prepare('PRAGMA table_info(scoped_uploads)').all()
+      .map((column) => [column.name, column]));
+    for (const column of ['region', 'tenant_id', 'bot_id']) {
+      expect(columns[column].notnull).toBe(1);
+    }
+    expect(() => db.prepare(`
+      INSERT INTO uploads (
+        id, session_token, path, name, size, size_label, mime, kind, created_at, consumed
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+    `).run(
+      'exact-base-upload', 'base-session', '/tmp/base.txt', 'base.txt',
+      4, '4B', 'text/plain', 'file', 0,
+    )).not.toThrow();
+    const currentRegistry = new PersistentUploadRegistry(db, TEST_MAILBOX_SCOPE);
+    expect(currentRegistry.getMany(['exact-base-upload'], 'base-session')).toEqual([]);
+
+    const legacyPath = path.join(tempDir, 'legacy-uploads.db');
+    const legacy = new Database(legacyPath);
+    legacy.exec(`
+      CREATE TABLE uploads (
+        id TEXT PRIMARY KEY, session_token TEXT, path TEXT NOT NULL, name TEXT NOT NULL,
+        size INTEGER NOT NULL, size_label TEXT, mime TEXT, kind TEXT NOT NULL,
+        created_at INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO uploads VALUES (
+        'legacy-upload', 'shared-session', '/tmp/legacy.txt', 'legacy.txt',
+        6, '6B', 'text/plain', 'file', 0, 0
+      );
+    `);
+    legacy.close();
+    const migrated = openDb(legacyPath);
+    const registry = new PersistentUploadRegistry(migrated, TEST_MAILBOX_SCOPE);
+    expect(registry.getMany(['legacy-upload'], 'shared-session')).toEqual([]);
+    expect(registry.getForProjection('legacy-upload')).toBeNull();
+    expect(migrated.prepare("SELECT id FROM uploads WHERE id = 'legacy-upload'").get())
+      .toEqual({ id: 'legacy-upload' });
+    expect(migrated.prepare('SELECT COUNT(*) AS count FROM scoped_uploads').get().count).toBe(0);
+    migrated.close();
+  });
+
+  test('migrates the rejected candidate schema into rollback-compatible storage', () => {
+    const candidatePath = path.join(tempDir, 'candidate-scoped-uploads.db');
+    const candidate = new Database(candidatePath);
+    candidate.exec(`
+      CREATE TABLE uploads (
+        id TEXT PRIMARY KEY, session_token TEXT, path TEXT NOT NULL, name TEXT NOT NULL,
+        size INTEGER NOT NULL, size_label TEXT, mime TEXT, kind TEXT NOT NULL,
+        region TEXT NOT NULL, tenant_id TEXT NOT NULL, bot_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO uploads VALUES (
+        'candidate-upload', 'candidate-session', '/tmp/candidate.txt', 'candidate.txt',
+        9, '9B', 'text/plain', 'file', 'global', 'test-tenant', 'test-bot', 0, 1
+      );
+    `);
+    candidate.close();
+
+    const migrated = openDb(candidatePath);
+    const legacyColumns = new Set(migrated.prepare('PRAGMA table_info(uploads)').all()
+      .map(({ name }) => name));
+    expect(legacyColumns.has('region')).toBe(false);
+    const registry = new PersistentUploadRegistry(migrated, TEST_MAILBOX_SCOPE);
+    expect(registry.getForProjection('candidate-upload'))
+      .toEqual(expect.objectContaining({ name: 'candidate.txt', consumed: true }));
+    expect(() => migrated.prepare(`
+      INSERT INTO uploads (
+        id, session_token, path, name, size, size_label, mime, kind, created_at, consumed
+      ) VALUES ('base-after-rollback', NULL, '/tmp/base', 'base', 1, '1B', NULL, 'file', 0, 0)
+    `).run()).not.toThrow();
+    migrated.close();
+  });
+
+  test.each([
+    ['region'],
+    ['tenant_id'],
+    ['bot_id'],
+    ['region', 'tenant_id'],
+    ['region', 'bot_id'],
+    ['tenant_id', 'bot_id'],
+  ])('recovers and reopens an interrupted candidate migration with columns %j', (...scopeColumns) => {
+    const partialPath = path.join(tempDir, `partial-${scopeColumns.join('-')}.db`);
+    const partial = new Database(partialPath);
+    partial.exec(`
+      CREATE TABLE uploads (
+        id TEXT PRIMARY KEY, session_token TEXT, path TEXT NOT NULL, name TEXT NOT NULL,
+        size INTEGER NOT NULL, size_label TEXT, mime TEXT, kind TEXT NOT NULL,
+        created_at INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO uploads VALUES (
+        'partial-upload', 'partial-session', '/tmp/partial.txt', 'partial.txt',
+        7, '7B', 'text/plain', 'file', 0, 0
+      );
+    `);
+    for (const column of scopeColumns) partial.exec(`ALTER TABLE uploads ADD COLUMN ${column} TEXT`);
+    partial.close();
+
+    const recovered = openDb(partialPath);
+    expect(new Set(recovered.prepare('PRAGMA table_info(uploads)').all()
+      .map(({ name }) => name))).not.toContain('region');
+    expect(recovered.prepare("SELECT id FROM uploads WHERE id = 'partial-upload'").get())
+      .toEqual({ id: 'partial-upload' });
+    expect(new PersistentUploadRegistry(recovered, TEST_MAILBOX_SCOPE)
+      .getMany(['partial-upload'], 'partial-session')).toEqual([]);
+    recovered.close();
+
+    const reopened = openDb(partialPath);
+    expect(reopened.prepare("SELECT id FROM uploads WHERE id = 'partial-upload'").get())
+      .toEqual({ id: 'partial-upload' });
+    reopened.close();
+  });
+
   test('add, getMany, consumeMany work like in-memory registry', () => {
-    const registry = new PersistentUploadRegistry(db, { ttlMs: 30000 });
+    const registry = new PersistentUploadRegistry(db, { ttlMs: 30000, ...TEST_MAILBOX_SCOPE });
     const entry = registry.add({
       sessionId: 's1',
       path: '/tmp/a.txt',
@@ -99,7 +226,7 @@ describe('PersistentUploadRegistry', () => {
   });
 
   test('restoreMany re-enables consumed entries', () => {
-    const registry = new PersistentUploadRegistry(db, { ttlMs: 30000 });
+    const registry = new PersistentUploadRegistry(db, { ttlMs: 30000, ...TEST_MAILBOX_SCOPE });
     const entry = registry.add({ sessionId: 's1', path: '/tmp/b.txt', name: 'b.txt', size: 50, kind: 'file' });
     const consumed = registry.consumeMany([entry.id], 's1');
 
@@ -109,20 +236,258 @@ describe('PersistentUploadRegistry', () => {
   });
 
   test('expired entries are cleaned up', () => {
-    const registry = new PersistentUploadRegistry(db, { ttlMs: 100 });
+    const registry = new PersistentUploadRegistry(db, { ttlMs: 100, ...TEST_MAILBOX_SCOPE });
     const entry = registry.add({ sessionId: 's1', path: '/tmp/c.txt', name: 'c.txt', size: 10, kind: 'file' });
 
-    db.prepare('UPDATE uploads SET created_at = ? WHERE id = ?')
+    db.prepare('UPDATE scoped_uploads SET created_at = ? WHERE id = ?')
       .run(Date.now() - 200, entry.id);
 
     expect(registry.consumeMany([entry.id], 's1')).toBeNull();
   });
 
   test('persists uploads across registry instances', () => {
-    const reg1 = new PersistentUploadRegistry(db, { ttlMs: 30000 });
+    const reg1 = new PersistentUploadRegistry(db, { ttlMs: 30000, ...TEST_MAILBOX_SCOPE });
     const entry = reg1.add({ sessionId: 's1', path: '/tmp/d.txt', name: 'd.txt', size: 5, kind: 'file' });
 
-    const reg2 = new PersistentUploadRegistry(db, { ttlMs: 30000 });
+    const reg2 = new PersistentUploadRegistry(db, { ttlMs: 30000, ...TEST_MAILBOX_SCOPE });
     expect(reg2.getMany([entry.id], 's1')).toHaveLength(1);
+  });
+
+  test('fences lookup, consumption, restoration, and projection by Core mailbox scope', () => {
+    const scopeA = { region: 'global', tenantId: 'tenant-a', botId: 'bot-a' };
+    const scopeB = { region: 'global', tenantId: 'tenant-b', botId: 'bot-b' };
+    const registryA = new PersistentUploadRegistry(db, { ttlMs: 30000, ...scopeA });
+    const entry = registryA.add({
+      sessionId: 'shared-session', path: '/tmp/scoped.txt', name: 'scoped.txt',
+      size: 6, kind: 'file',
+    });
+    const consumed = registryA.consumeMany([entry.id], 'shared-session');
+    expect(consumed).toHaveLength(1);
+
+    const registryB = new PersistentUploadRegistry(db, { ttlMs: 30000, ...scopeB });
+    expect(registryB.getMany([entry.id], 'shared-session')).toEqual([]);
+    expect(registryB.consumeMany([entry.id], 'shared-session')).toBeNull();
+    expect(registryB.getForProjection(entry.id)).toBeNull();
+    registryB.restoreMany(consumed);
+    expect(registryA.getMany([entry.id], 'shared-session')).toEqual([]);
+
+    registryA.restoreMany(consumed);
+    expect(registryA.getMany([entry.id], 'shared-session'))
+      .toEqual([expect.objectContaining({ id: entry.id, name: 'scoped.txt' })]);
+  });
+});
+
+describe('DeliveryMailbox', () => {
+  test('migrates legacy unscoped rows as hidden records and admits a scoped reprojection', () => {
+    const legacyPath = path.join(tempDir, 'legacy-mailbox.db');
+    const legacyDb = new Database(legacyPath);
+    legacyDb.exec(`
+      CREATE TABLE delivery_mailbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_key TEXT NOT NULL UNIQUE,
+        delivery_id TEXT UNIQUE,
+        direction TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        endpoint_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        timestamp TEXT NOT NULL
+      );
+      INSERT INTO delivery_mailbox (
+        source_key, delivery_id, direction, channel, endpoint_id, content, timestamp
+      ) VALUES (
+        'inbound:legacy-unscoped', NULL, 'in', 'web-console', 'console',
+        'legacy scope unknown', '2026-07-21T00:00:00.000Z'
+      );
+    `);
+    legacyDb.close();
+
+    const migrated = openDb(legacyPath);
+    const mailbox = new DeliveryMailbox(migrated, TEST_MAILBOX_SCOPE);
+    expect(mailbox.list()).toEqual([]);
+    mailbox.projectInbound({
+      inboundEventId: 'legacy-unscoped', endpointId: 'console', content: 'scoped reprojection',
+      timestamp: '2026-07-21T00:00:01.000Z',
+    });
+    expect(mailbox.list().map(({ content }) => content)).toEqual(['scoped reprojection']);
+    expect(migrated.prepare(`
+      SELECT region, tenant_id, bot_id FROM delivery_mailbox WHERE content = ?
+    `).get('legacy scope unknown')).toEqual({ region: null, tenant_id: null, bot_id: null });
+    migrated.close();
+  });
+
+  test('isolates inbound and outbound rows across scope reconfiguration and reopen', () => {
+    const dbPath = path.join(tempDir, 'test.db');
+    const scopeA = { region: 'global', tenantId: 'tenant-a', botId: 'bot-a' };
+    const scopeB = { region: 'global', tenantId: 'tenant-b', botId: 'bot-b' };
+    const first = new DeliveryMailbox(db, scopeA);
+    first.projectInbound({
+      inboundEventId: 'shared-inbound-id', endpointId: 'console', content: 'tenant A inbound',
+      timestamp: '2026-07-21T00:00:00.000Z',
+    });
+    first.deliver({
+      deliveryId: 'shared-delivery-id', endpointId: 'console', content: 'tenant A outbound',
+      timestamp: '2026-07-21T00:00:01.000Z',
+    });
+    db.close();
+    db = openDb(dbPath);
+
+    const second = new DeliveryMailbox(db, scopeB);
+    expect(second.list()).toEqual([]);
+    second.projectInbound({
+      inboundEventId: 'shared-inbound-id', endpointId: 'console', content: 'tenant B inbound',
+      timestamp: '2026-07-21T00:00:02.000Z',
+    });
+    second.deliver({
+      deliveryId: 'shared-delivery-id', endpointId: 'console', content: 'tenant B outbound',
+      timestamp: '2026-07-21T00:00:03.000Z',
+    });
+    expect(second.list().map(({ content }) => content)).toEqual([
+      'tenant B inbound', 'tenant B outbound',
+    ]);
+    expect(new DeliveryMailbox(db, scopeA).list().map(({ content }) => content)).toEqual([
+      'tenant A inbound', 'tenant A outbound',
+    ]);
+  });
+
+  test('rejects a nonzero visibility cursor from another mailbox scope', () => {
+    const scopeA = { region: 'global', tenantId: 'tenant-a', botId: 'bot-a' };
+    const scopeB = { region: 'global', tenantId: 'tenant-b', botId: 'bot-b' };
+    const mailboxB = new DeliveryMailbox(db, scopeB);
+    mailboxB.projectInbound({
+      inboundEventId: 'b-old-inbound', endpointId: 'console', content: 'B inbound',
+      timestamp: '2026-07-21T00:00:00.000Z',
+    });
+    const mailboxA = new DeliveryMailbox(db, scopeA);
+    const newestA = mailboxA.deliver({
+      deliveryId: 'a-new-outbound', endpointId: 'console', content: 'A outbound',
+      timestamp: '2026-07-21T00:00:01.000Z',
+    });
+
+    expect(() => mailboxB.list({
+      sinceId: newestA.id,
+      cursorScope: mailboxA.cursorScope,
+    })).toThrow(/cursor scope/i);
+    expect(mailboxB.list({ sinceId: 0, cursorScope: mailboxB.cursorScope }))
+      .toEqual([expect.objectContaining({ content: 'B inbound' })]);
+  });
+
+  test('persists canonical attachment metadata across reopen and fences conflicting replay', () => {
+    const dbPath = path.join(tempDir, 'test.db');
+    const mailbox = new DeliveryMailbox(db, TEST_MAILBOX_SCOPE);
+    const attachment = {
+      attachment_id: 'upload-attachment-1',
+      kind: 'file',
+      name: 'report.txt',
+      media_type: 'text/plain',
+      size_bytes: 12,
+      size_label: '12B',
+      href: '/api/inbound-media/wc-2026-07-21-abcdef12.txt',
+    };
+    mailbox.projectInbound({
+      inboundEventId: 'inbound-attachment', endpointId: 'console', content: 'report',
+      attachments: [attachment], timestamp: '2026-07-21T00:00:00.000Z',
+    });
+    expect(mailbox.hasInboundEvent('inbound-attachment')).toBe(true);
+    expect(mailbox.hasInboundEvent('missing-inbound')).toBe(false);
+    expect(new DeliveryMailbox(db, {
+      region: 'global', tenantId: 'other-tenant', botId: 'test-bot',
+    }).hasInboundEvent('inbound-attachment')).toBe(false);
+    db.close();
+    db = openDb(dbPath);
+    const reopened = new DeliveryMailbox(db, TEST_MAILBOX_SCOPE);
+    expect(reopened.hasInboundEvent('inbound-attachment')).toBe(true);
+    expect(reopened.list()).toEqual([
+      expect.objectContaining({ content: 'report', attachments: [attachment] }),
+    ]);
+    expect(() => reopened.projectInbound({
+      inboundEventId: 'inbound-attachment', endpointId: 'console', content: 'report',
+      attachments: [{ ...attachment, href: '/api/inbound-media/wc-other-abcdef12.txt' }],
+      timestamp: '2026-07-21T00:00:00.000Z',
+    })).toThrow(/conflicts with its durable projection/);
+  });
+
+  test('assigns durable monotonic visibility cursors in actual mailbox order', () => {
+    const mailbox = new DeliveryMailbox(db, TEST_MAILBOX_SCOPE);
+    const firstInbound = mailbox.projectInbound({
+      inboundEventId: 'inbound-1', endpointId: 'console', content: 'first',
+      timestamp: '2026-07-21T00:00:00.000Z',
+    });
+    const secondInbound = mailbox.projectInbound({
+      inboundEventId: 'inbound-2', endpointId: 'console', content: 'second',
+      timestamp: '2026-07-21T00:00:01.000Z',
+    });
+    const delayedFirstReply = mailbox.deliver({
+      deliveryId: 'delivery-1', endpointId: 'console', content: 'first reply',
+      timestamp: '2026-07-21T00:00:02.000Z',
+    });
+
+    expect([firstInbound.id, secondInbound.id, delayedFirstReply.id]).toEqual([1, 2, 3]);
+    expect(mailbox.list({
+      sinceId: secondInbound.id, cursorScope: mailbox.cursorScope,
+    })).toEqual([
+      expect.objectContaining({ id: delayedFirstReply.id, content: 'first reply' }),
+    ]);
+  });
+
+  test('makes renderer retries idempotent and rejects conflicting replay content', () => {
+    const mailbox = new DeliveryMailbox(db, TEST_MAILBOX_SCOPE);
+    const delivery = {
+      deliveryId: 'delivery-retry', endpointId: 'console', content: 'rendered text',
+      timestamp: '2026-07-21T00:00:00.000Z',
+    };
+    const first = mailbox.deliver(delivery);
+    const replay = mailbox.deliver(delivery);
+    expect(replay).toEqual(first);
+    expect(mailbox.list()).toHaveLength(1);
+    expect(() => mailbox.deliver({ ...delivery, content: 'conflicting text' }))
+      .toThrow(/conflicts with its durable projection/);
+  });
+
+  test('paginates more than 100 unseen rows without a later reply skipping backlog', () => {
+    const mailbox = new DeliveryMailbox(db, TEST_MAILBOX_SCOPE);
+    for (let index = 1; index <= 150; index += 1) {
+      mailbox.projectInbound({
+        inboundEventId: `backlog-${index}`, endpointId: 'console', content: `message ${index}`,
+        timestamp: new Date(Date.UTC(2026, 6, 21, 0, 0, index)).toISOString(),
+      });
+    }
+    const reply = mailbox.deliver({
+      deliveryId: 'backlog-reply', endpointId: 'console', content: 'rendered reply',
+      timestamp: '2026-07-21T00:10:00.000Z',
+    });
+    const firstPage = mailbox.list({ sinceId: 0, limit: 100 });
+    const secondPage = mailbox.list({
+      sinceId: firstPage.at(-1).id, limit: 100, cursorScope: mailbox.cursorScope,
+    });
+
+    expect(firstPage).toHaveLength(100);
+    expect(secondPage).toHaveLength(51);
+    expect(secondPage.at(-1)).toMatchObject({ id: reply.id, content: 'rendered reply' });
+    expect(new Set([...firstPage, ...secondPage].map(({ id }) => id)).size).toBe(151);
+  });
+});
+
+describe('Web Console drain shutdown barrier', () => {
+  test('stop awaits the active fenced result and refuses every later claim', async () => {
+    let release;
+    let calls = 0;
+    const blocked = new Promise((resolve) => { release = resolve; });
+    const barrier = createDrainBarrier({
+      async drain() {
+        calls += 1;
+        await blocked;
+        return { status: 'delivered', delivered: 1 };
+      },
+    });
+    const active = barrier.run();
+    let stopped = false;
+    const stopping = barrier.stop().then(() => { stopped = true; });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+    expect(calls).toBe(1);
+    release();
+    await Promise.all([active, stopping]);
+    expect(await barrier.run()).toEqual({ status: 'stopped', delivered: 0 });
+    expect(calls).toBe(1);
   });
 });

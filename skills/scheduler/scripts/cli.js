@@ -4,10 +4,11 @@
  * Command-line interface for task creation, monitoring, and control
  */
 
-import { getDb, generateId, now } from './database.js';
+import { getDb, generateId, getSchedulerScope, now } from './database.js';
 import { getNextRun, isValidCron, describeCron, getDefaultTimezone } from './cron-utils.js';
 import { parseTime, parseDuration, formatTime, getRelativeTime } from './time-utils.js';
 import { loadTimezone } from './tz.js';
+import { createBoundConversationIdentity } from '../../../runtime/scheduler/scheduler-queue.js';
 
 const db = getDb();
 
@@ -17,8 +18,9 @@ function escapeLike(str) {
 }
 
 const ALLOWED_UPDATE_COLUMNS = new Set([
-  'name', 'prompt', 'priority', 'require_idle', 'reply_channel', 'reply_endpoint', 'bound_conversation_json',
-  'miss_threshold', 'type', 'cron_expression', 'interval_seconds', 'next_run_at', 'timezone', 'updated_at'
+  'name', 'prompt', 'priority', 'bound_conversation_json',
+  'miss_threshold', 'type', 'cron_expression', 'interval_seconds', 'next_run_at', 'timezone',
+  'requires_reconfiguration', 'requires_occurrence_advance', 'last_error', 'updated_at'
 ]);
 
 const HELP = `
@@ -31,7 +33,6 @@ Commands:
   add <prompt> [options]  Add a new task
   update <task-id> [options]  Update an existing task
   remove <task-id>        Remove a task
-  done <task-id>          Mark task as completed
   pause <task-id>         Pause a task
   resume <task-id>        Resume a paused task
   history [task-id]       Show execution history
@@ -45,29 +46,25 @@ Add Options:
   --every "<interval>"    Interval: repeat every X time (e.g., "2 hours")
   --priority <1-3>        Priority level (1=urgent, 2=high, 3=normal, default=3)
   --name "<name>"         Task name (optional)
-  --block-queue-until-idle
-                          Wait for sustained idle, then block subsequent dispatch until execution settles
-                          Legacy alias: --require-idle
-  --reply-channel "<source>"      Reply channel (e.g., "telegram", "lark")
-  --reply-endpoint "<endpoint>"  Reply endpoint (e.g., "8101553026", "chat_id topic_id")
   --bound-conversation-json "<json>"  Full Core conversation identity for a chat-bound occurrence
   --miss-threshold <seconds>  Skip if overdue by more than this (default=300)
 
 Update Options (same as Add, plus):
   --prompt "<prompt>"     Update task content
-  --no-block-queue-until-idle
-                          Disable block-queue-until-idle behavior
-                          Legacy alias: --no-require-idle
-  --clear-reply           Clear reply configuration
+  --use-synthetic-conversation  Explicitly use a scheduler-owned synthetic conversation
 
 Examples:
   ~/zylos/.claude/skills/scheduler/scripts/cli.js add "Say hello" --in "30 minutes"
   ~/zylos/.claude/skills/scheduler/scripts/cli.js add "Health check" --cron "0 8 * * *"
   ~/zylos/.claude/skills/scheduler/scripts/cli.js add "Check updates" --every "1 hour"
   ~/zylos/.claude/skills/scheduler/scripts/cli.js update task-abc --priority 1
-  ~/zylos/.claude/skills/scheduler/scripts/cli.js update task-abc --block-queue-until-idle
-  ~/zylos/.claude/skills/scheduler/scripts/cli.js done task-abc123
 `;
+
+const RETIRED_OPTIONS = new Set([
+  'block-queue-until-idle', 'no-block-queue-until-idle',
+  'require-idle', 'no-require-idle',
+  'reply-channel', 'reply-endpoint', 'clear-reply',
+]);
 
 function parseArgs(args) {
   const result = { command: null, args: [], options: {} };
@@ -84,7 +81,8 @@ function parseArgs(args) {
     'no-block-queue-until-idle',
     'require-idle',
     'no-require-idle',
-    'clear-reply'
+    'clear-reply',
+    'use-synthetic-conversation'
   ]);
 
   let i = 1;
@@ -205,20 +203,15 @@ function cmdAdd(args, options) {
     return;
   }
 
-  // Parse block-queue-until-idle flag (legacy alias: require-idle)
-  const requireIdle = (options['block-queue-until-idle'] || options['require-idle']) ? 1 : 0;
-
-  // Parse reply-channel and reply-endpoint
-  const replyChannel = options['reply-channel'] || null;
-  const replyEndpoint = options['reply-endpoint'] || null;
   let boundConversationJson = null;
   if (options['bound-conversation-json']) {
     try {
       const parsed = JSON.parse(options['bound-conversation-json']);
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not object');
-      boundConversationJson = JSON.stringify(parsed);
-    } catch {
-      console.error('Error: bound-conversation-json must be a JSON object');
+      const canonical = createBoundConversationIdentity({ bound_conversation: parsed });
+      boundConversationJson = JSON.stringify(canonical);
+    } catch (error) {
+      console.error(`Error: ${error.message}`);
+      process.exitCode = 2;
       return;
     }
   }
@@ -234,14 +227,15 @@ function cmdAdd(args, options) {
 
   const taskId = generateId();
   const currentTime = now();
+  const scope = getSchedulerScope();
 
   db.prepare(`
     INSERT INTO tasks (
       id, name, prompt, type,
       cron_expression, interval_seconds,
       next_run_at, priority, status,
-      require_idle, miss_threshold,
-      reply_channel, reply_endpoint, bound_conversation_json,
+      miss_threshold, bound_conversation_json,
+      scope_region, scope_tenant_id, scope_bot_id,
       created_at, updated_at, timezone
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
@@ -253,11 +247,11 @@ function cmdAdd(args, options) {
     intervalSeconds || null,
     nextRunAt,
     priority,
-    requireIdle,
     missThreshold,
-    replyChannel,
-    replyEndpoint,
     boundConversationJson,
+    scope.region,
+    scope.tenant_id,
+    scope.bot_id,
     currentTime,
     currentTime,
     getDefaultTimezone()
@@ -301,64 +295,6 @@ function cmdRemove(taskId) {
   console.log(`Removed task: ${tasks[0].id}`);
 }
 
-function cmdDone(taskId) {
-  if (!taskId) {
-    console.error('Error: Task ID is required');
-    return;
-  }
-
-  // Support partial ID match
-  const tasks = db.prepare(`
-    SELECT * FROM tasks WHERE id LIKE ? ESCAPE '!'
-  `).all(escapeLike(taskId) + '%');
-
-  if (tasks.length === 0) {
-    console.error(`Error: Task not found: ${taskId}`);
-    return;
-  }
-
-  if (tasks.length > 1) {
-    console.error(`Error: Ambiguous task ID prefix '${taskId}' matches multiple tasks:`);
-    tasks.forEach(t => console.error(`  - ${t.id}`));
-    console.error('Please provide a more specific prefix.');
-    return;
-  }
-
-  const task = tasks[0];
-
-  const currentTime = now();
-
-  // Update task status
-  db.prepare(`
-    UPDATE tasks
-    SET status = 'completed', last_run_at = ?, updated_at = ?
-    WHERE id = ?
-  `).run(currentTime, currentTime, task.id);
-
-  // Update history entry
-  const historyEntry = db.prepare(`
-    SELECT id, executed_at FROM task_history
-    WHERE task_id = ? AND status = 'started'
-    ORDER BY executed_at DESC LIMIT 1
-  `).get(task.id);
-
-  if (historyEntry) {
-    const durationMs = (currentTime - historyEntry.executed_at) * 1000;
-    db.prepare(`
-      UPDATE task_history
-      SET status = 'success', completed_at = ?, duration_ms = ?
-      WHERE id = ?
-    `).run(currentTime, durationMs, historyEntry.id);
-  }
-
-  console.log(`Completed task: ${task.id}`);
-
-  // If recurring/interval, scheduler will handle next run
-  if (task.type !== 'one-time') {
-    console.log('(Scheduler will calculate next run time)');
-  }
-}
-
 function cmdPause(taskId) {
   if (!taskId) {
     console.error('Error: Task ID is required');
@@ -395,7 +331,8 @@ function cmdResume(taskId) {
   }
 
   const tasks = db.prepare(`
-    SELECT id FROM tasks WHERE id LIKE ? ESCAPE '!' AND status = 'paused'
+    SELECT id, requires_reconfiguration, requires_occurrence_advance FROM tasks
+    WHERE id LIKE ? ESCAPE '!' AND status = 'paused'
   `).all(escapeLike(taskId) + '%');
 
   if (tasks.length === 0) {
@@ -410,8 +347,26 @@ function cmdResume(taskId) {
     return;
   }
 
+  if (tasks[0].requires_reconfiguration === 1) {
+    console.error(
+      'Error: Scheduler migration reconfiguration is required before resume; '
+      + 'run update with --bound-conversation-json or --use-synthetic-conversation.',
+    );
+    process.exitCode = 2;
+    return;
+  }
+  if (tasks[0].requires_occurrence_advance === 1) {
+    console.error(
+      'Error: Advance the task schedule before resume; the previous occurrence is a replay barrier.',
+    );
+    process.exitCode = 2;
+    return;
+  }
+
   db.prepare(`
-    UPDATE tasks SET status = 'pending', updated_at = ? WHERE id = ?
+    UPDATE tasks
+    SET status = 'pending', last_error = NULL, updated_at = ?
+    WHERE id = ?
   `).run(now(), tasks[0].id);
 
   console.log(`Resumed task: ${tasks[0].id}`);
@@ -500,19 +455,19 @@ function cmdRunning() {
     return;
   }
 
-  console.log('\n  ⚠️  Running Tasks (complete these before compacting!):\n');
-  console.log('  ID              | Started            | Name');
-  console.log('  ' + '-'.repeat(60));
+  console.log('\n  Running Tasks (authoritative state from Core):\n');
+  console.log('  ID              | Core state    | Wait reason       | Name');
+  console.log('  ' + '-'.repeat(82));
 
   for (const task of tasks) {
     const id = task.id.substring(0, 14).padEnd(14);
-    const started = formatTime(task.updated_at).padEnd(18);
+    const coreState = (task.last_core_state || 'unknown').padEnd(13);
+    const waitReason = (task.core_wait_reason || '-').padEnd(17);
     const name = task.name || task.prompt.substring(0, 30);
 
-    console.log(`  ${id} | ${started} | ${name}`);
+    console.log(`  ${id} | ${coreState} | ${waitReason} | ${name}`);
   }
-
-  console.log('\n  Run "cli.js done <task-id>" to complete them before /compact\n');
+  console.log();
 }
 
 function cmdUpdate(taskId, options) {
@@ -565,29 +520,50 @@ function cmdUpdate(taskId, options) {
     updatedFields.push('priority');
   }
 
-  // Update require_idle (external flag renamed to block-queue-until-idle)
-  if (options['block-queue-until-idle'] || options['require-idle']) {
-    updates.require_idle = 1;
-    updatedFields.push('require_idle');
-  } else if (options['no-block-queue-until-idle'] || options['no-require-idle']) {
-    updates.require_idle = 0;
-    updatedFields.push('require_idle');
+  if (options['bound-conversation-json'] && options['use-synthetic-conversation']) {
+    console.error(
+      'Error: Choose either --bound-conversation-json or --use-synthetic-conversation.',
+    );
+    process.exitCode = 2;
+    return;
   }
 
-  // Update reply configuration
-  if (options['clear-reply']) {
-    updates.reply_channel = null;
-    updates.reply_endpoint = null;
-    updatedFields.push('reply_channel', 'reply_endpoint');
-  } else {
-    if (options['reply-channel']) {
-      updates.reply_channel = options['reply-channel'];
-      updatedFields.push('reply_channel');
+  if ((options['bound-conversation-json'] || options['use-synthetic-conversation'])
+    && task.status === 'running' && task.requires_reconfiguration === 1) {
+    console.error(
+      'Error: The admitted legacy turn is still running; wait for its Core terminal state, '
+      + 'then reconfigure and explicitly resume the paused task.',
+    );
+    process.exitCode = 2;
+    return;
+  }
+  if ((options.in || options.at || options.cron || options.every) && task.status === 'running') {
+    console.error('Error: A running task schedule cannot change before its Core turn is terminal.');
+    process.exitCode = 2;
+    return;
+  }
+
+  if (options['bound-conversation-json']) {
+    try {
+      const parsed = JSON.parse(options['bound-conversation-json']);
+      updates.bound_conversation_json = JSON.stringify(
+        createBoundConversationIdentity({ bound_conversation: parsed }),
+      );
+      updates.requires_reconfiguration = 0;
+      if (task.requires_reconfiguration === 1) updates.last_error = null;
+      updatedFields.push('bound_conversation_json');
+    } catch (error) {
+      console.error(`Error: ${error.message}`);
+      process.exitCode = 2;
+      return;
     }
-    if (options['reply-endpoint']) {
-      updates.reply_endpoint = options['reply-endpoint'];
-      updatedFields.push('reply_endpoint');
-    }
+  }
+
+  if (options['use-synthetic-conversation']) {
+    updates.bound_conversation_json = null;
+    updates.requires_reconfiguration = 0;
+    if (task.requires_reconfiguration === 1) updates.last_error = null;
+    updatedFields.push('synthetic_conversation');
   }
 
   // Update miss_threshold
@@ -650,7 +626,19 @@ function cmdUpdate(taskId, options) {
   }
 
   if (scheduleUpdated) {
+    const nextOccurrenceId = `${task.id}:${updates.next_run_at}`;
+    if (task.requires_occurrence_advance === 1
+      && (!Number.isSafeInteger(updates.next_run_at)
+        || updates.next_run_at <= task.next_run_at
+        || nextOccurrenceId === task.current_occurrence_id)) {
+      console.error(
+        'Error: The new schedule must be strictly after the fenced occurrence.',
+      );
+      process.exitCode = 2;
+      return;
+    }
     updates.timezone = getDefaultTimezone();
+    updates.requires_occurrence_advance = 0;
     updatedFields.push('type', 'schedule');
   }
 
@@ -699,6 +687,20 @@ function main() {
 
   const { command, args, options } = parseArgs(process.argv.slice(2));
 
+  const retired = Object.keys(options).find((name) => RETIRED_OPTIONS.has(name));
+  if (retired) {
+    console.error(
+      `Error: --${retired} is retired; use --bound-conversation-json with a complete Core identity.`,
+    );
+    process.exitCode = 2;
+    return;
+  }
+  if (options['use-synthetic-conversation'] && command !== 'update') {
+    console.error('Error: --use-synthetic-conversation is only valid for update.');
+    process.exitCode = 2;
+    return;
+  }
+
   switch (command) {
     case 'list':
       cmdList();
@@ -713,10 +715,6 @@ function main() {
     case 'rm':
     case 'delete':
       cmdRemove(args[0]);
-      break;
-    case 'done':
-    case 'complete':
-      cmdDone(args[0]);
       break;
     case 'pause':
       cmdPause(args[0]);

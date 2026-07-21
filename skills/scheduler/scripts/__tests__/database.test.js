@@ -47,8 +47,11 @@ describe('getDb', () => {
 
       // Dynamic import to pick up new ZYLOS_DIR
       const cacheBuster = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      const { getDb } = await import(new URL(`../database.js?${cacheBuster}`, import.meta.url));
+      const { getDb, migrateLegacyTaskScopes } = await import(
+        new URL(`../database.js?${cacheBuster}`, import.meta.url)
+      );
       const db = getDb();
+      assert.equal(migrateLegacyTaskScopes(db), 0);
 
       // Verify directory and file were created
       assert.ok(fs.existsSync(dbPath));
@@ -66,7 +69,15 @@ describe('getDb', () => {
       assert.ok(cols.includes('timezone'));
       assert.ok(cols.includes('next_run_at'));
       assert.ok(cols.includes('priority'));
-      assert.ok(cols.includes('reply_channel'));
+      assert.ok(cols.includes('bound_conversation_json'));
+      assert.ok(cols.includes('requires_reconfiguration'));
+      assert.ok(cols.includes('requires_occurrence_advance'));
+      assert.ok(cols.includes('scope_region'));
+      assert.ok(cols.includes('scope_tenant_id'));
+      assert.ok(cols.includes('scope_bot_id'));
+      assert.ok(!cols.includes('require_idle'));
+      assert.ok(!cols.includes('reply_channel'));
+      assert.ok(!cols.includes('reply_endpoint'));
 
       db.close();
     } finally {
@@ -76,6 +87,106 @@ describe('getDb', () => {
       } else {
         process.env.ZYLOS_DIR = originalZylosDir;
       }
+    }
+  });
+
+  it('pauses and clears active tasks carrying retired idle or primitive reply controls', async () => {
+    const originalZylosDir = process.env.ZYLOS_DIR;
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scheduler-db-legacy-controls-'));
+    const schedulerDir = path.join(tmpDir, 'scheduler');
+    fs.mkdirSync(schedulerDir, { recursive: true });
+    const dbPath = path.join(schedulerDir, 'scheduler.db');
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT, prompt TEXT NOT NULL,
+        type TEXT NOT NULL, cron_expression TEXT, interval_seconds INTEGER, timezone TEXT,
+        next_run_at INTEGER NOT NULL, last_run_at INTEGER, priority INTEGER, status TEXT,
+        require_idle INTEGER DEFAULT 0, miss_threshold INTEGER DEFAULT 300,
+        reply_channel TEXT, reply_endpoint TEXT, bound_conversation_json TEXT,
+        retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 3,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_error TEXT, failed_at INTEGER
+      );
+      CREATE TABLE task_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, executed_at INTEGER NOT NULL,
+        completed_at INTEGER, status TEXT NOT NULL, duration_ms INTEGER, error TEXT
+      );
+      CREATE TABLE system_state (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);
+      INSERT INTO tasks (
+        id, name, prompt, type, timezone, next_run_at, priority, status,
+        require_idle, reply_channel, reply_endpoint, created_at, updated_at
+      ) VALUES
+        ('legacy-idle', 'legacy idle', 'work', 'recurring', 'UTC', 100, 3, 'pending', 1, NULL, NULL, 1, 1),
+        ('legacy-reply', 'legacy reply', 'work', 'recurring', 'UTC', 100, 3, 'running', 0, 'lark', 'chat-only', 1, 1),
+        ('legacy-paused', 'legacy paused', 'work', 'recurring', 'UTC', 100, 3, 'paused', 1, NULL, NULL, 1, 1),
+        ('legacy-completed', 'legacy completed', 'work', 'recurring', 'UTC', 100, 3, 'completed', 0, 'lark', 'chat-only', 1, 1),
+        ('legacy-one-time-done', 'legacy one-time done', 'work', 'one-time', 'UTC', 100, 3, 'completed', 1, NULL, NULL, 1, 1),
+        ('canonical', 'canonical', 'work', 'recurring', 'UTC', 100, 3, 'pending', 0, NULL, NULL, 1, 1);
+    `);
+    legacy.close();
+
+    try {
+      process.env.ZYLOS_DIR = tmpDir;
+      const cacheBuster = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const { getDb, migrateLegacyTaskScopes } = await import(
+        new URL(`../database.js?${cacheBuster}`, import.meta.url)
+      );
+      const db = getDb();
+      assert.equal(migrateLegacyTaskScopes(db), 6);
+      const rows = db.prepare(`
+        SELECT id, status, require_idle, reply_channel, reply_endpoint,
+               requires_reconfiguration, last_error,
+               scope_region, scope_tenant_id, scope_bot_id
+        FROM tasks ORDER BY id
+      `).all();
+      assert.deepEqual(rows, [
+        {
+          id: 'canonical', status: 'pending', require_idle: 0,
+          reply_channel: null, reply_endpoint: null,
+          requires_reconfiguration: 0, last_error: null,
+          scope_region: 'global', scope_tenant_id: 'default', scope_bot_id: 'zylos',
+        },
+        {
+          id: 'legacy-completed', status: 'paused', require_idle: 0,
+          reply_channel: null, reply_endpoint: null,
+          requires_reconfiguration: 1,
+          last_error: 'Paused during migration: retired scheduler controls require explicit canonical reconfiguration.',
+          scope_region: 'global', scope_tenant_id: 'default', scope_bot_id: 'zylos',
+        },
+        {
+          id: 'legacy-idle', status: 'paused', require_idle: 0,
+          reply_channel: null, reply_endpoint: null,
+          requires_reconfiguration: 1,
+          last_error: 'Paused during migration: retired scheduler controls require explicit canonical reconfiguration.',
+          scope_region: 'global', scope_tenant_id: 'default', scope_bot_id: 'zylos',
+        },
+        {
+          id: 'legacy-one-time-done', status: 'completed', require_idle: 0,
+          reply_channel: null, reply_endpoint: null,
+          requires_reconfiguration: 1,
+          last_error: 'Paused during migration: retired scheduler controls require explicit canonical reconfiguration.',
+          scope_region: 'global', scope_tenant_id: 'default', scope_bot_id: 'zylos',
+        },
+        {
+          id: 'legacy-paused', status: 'paused', require_idle: 0,
+          reply_channel: null, reply_endpoint: null,
+          requires_reconfiguration: 1,
+          last_error: 'Paused during migration: retired scheduler controls require explicit canonical reconfiguration.',
+          scope_region: 'global', scope_tenant_id: 'default', scope_bot_id: 'zylos',
+        },
+        {
+          id: 'legacy-reply', status: 'running', require_idle: 0,
+          reply_channel: null, reply_endpoint: null,
+          requires_reconfiguration: 1,
+          last_error: 'Paused during migration: retired scheduler controls require explicit canonical reconfiguration.',
+          scope_region: 'global', scope_tenant_id: 'default', scope_bot_id: 'zylos',
+        },
+      ]);
+      db.close();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      if (originalZylosDir === undefined) delete process.env.ZYLOS_DIR;
+      else process.env.ZYLOS_DIR = originalZylosDir;
     }
   });
 });

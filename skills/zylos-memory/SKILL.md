@@ -44,10 +44,9 @@ When triggered, run it before handling queued user messages.
 
 ### Trigger Paths
 
-1. Session init: if C4 unsummarized count is over threshold, launch memory sync.
-2. Scheduled context check: if context usage is high, launch memory sync.
-
-Both launch a background subagent using the current runtime's supported subagent mechanism with this file's Sync Flow as the prompt.
+Memory sync is explicit and scoped to the current task/conversation. It may be
+requested by the user or by a canonical Core lifecycle interaction. Do not infer
+a trigger from provider files, terminal state, or a global conversation backlog.
 
 ### Codex Background Execution
 
@@ -67,31 +66,27 @@ that in the handoff/status.
 
 1. Rotate session log if needed:
    `node ~/zylos/.claude/skills/zylos-memory/scripts/rotate-session.js`
-2. Fetch unsummarized conversations from C4:
-   `node ~/zylos/.claude/skills/comm-bridge/scripts/c4-fetch.js --unsummarized`
-   If output says "No unsummarized conversations.", skip to step 5
-   (still save current state). Otherwise, note the `end_id` from the
-   `[Unsummarized Range]` line.
-3. Read memory files (`identity.md`, `state.md`, `references.md`, user profiles, `reference/*`, `sessions/current.md`).
-4. Extract and classify updates from conversations into the correct files.
-5. Write memory updates (always — even without new conversations,
+2. Read the current authorized conversation/task context and memory files
+   (`identity.md`, `state.md`, `references.md`, user profiles, `reference/*`,
+   `sessions/current.md`). Never scan other conversations or choose a latest
+   provider session.
+3. Extract and classify updates from the current scoped context into the correct files.
+4. Write memory updates (always,
    update `state.md` and `sessions/current.md` with current context).
-6. Audit `references.md` against its content rules
+5. Audit `references.md` against its content rules
    (`references/references-file-format.md`): relocate rule-violating
    entries to their routed destination (`reference/decisions.md`,
    `archive/`, or a pointer to the config file) instead of leaving or
    appending them. If the file exceeds the 8KB warn threshold
    (`memory-status.js` reports WARN), trim until it is back under.
-7. Audit `state.md` against its content rules
+6. Audit `state.md` against its content rules
    (`references/state-format.md`): relocate rule-violating content to its
    routed destination (`reference/projects.md`, `reference/decisions.md`,
    `archive/`, or a pointer to the on-demand file that already holds it)
    instead of leaving or appending it. If the file exceeds the 10KB warn
    threshold (`memory-status.js` reports WARN), trim until it is back
    under.
-8. Create checkpoint (only if conversations were fetched in step 2):
-   `node ~/zylos/.claude/skills/comm-bridge/scripts/c4-checkpoint.js create <end_id> --summary "SUMMARY"`
-9. Confirm completion.
+7. Confirm completion in the current task only.
 
 ## Classification Rules
 
@@ -136,10 +131,6 @@ worked example in `examples/`:
 - `memory-status.js`: quick health summary.
   Use when you need a fast manual check of core file sizes and budget status.
   If it reports `OVER`, run `consolidate.js` and perform the needed cleanup.
-
-C4 scripts used by sync flow (provided by comm-bridge skill):
-- `c4-fetch.js --unsummarized`: fetch unsummarized conversations and range.
-- `c4-checkpoint.js create <end_id> --summary "..."`: create sync checkpoint.
 
 ## Consolidation Review
 

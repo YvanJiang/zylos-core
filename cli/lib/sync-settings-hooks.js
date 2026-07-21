@@ -23,6 +23,7 @@ import { fileURLToPath } from 'url';
 import { hookScriptKey, hookScriptBaseKey, getCommandHooks } from './hook-utils.js';
 import { getZylosConfig, updateZylosConfig } from './config.js';
 import { renderCodexProjectConfig, renderCodexGlobalConfig, writeCodexConfig } from './runtime-setup.js';
+import { obsoleteHookBaseKeys } from '../../runtime/migration/legacy-lifecycle-artifacts.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ZYLOS_DIR = path.resolve(process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos'));
@@ -30,19 +31,7 @@ const TEMPLATE_SETTINGS = path.join(__dirname, '..', '..', 'templates', '.claude
 const INSTALLED_SETTINGS = path.join(ZYLOS_DIR, '.claude', 'settings.json');
 
 const MAX_SAFE_1M_THRESHOLD = 30;
-export const CORE_MANAGED_HOOKS = new Set([
-  // Current template hooks. Keep this append-only: when a core hook is retired,
-  // leave its path here so upgrades can still remove stale installed copies.
-  'skills/activity-monitor/scripts/context-monitor.js',
-  'skills/activity-monitor/scripts/hook-activity.js',
-  'skills/activity-monitor/scripts/hook-auth-prompt.js',
-  'skills/activity-monitor/scripts/session-start-orchestrator.js',
-  // Retired SessionStart hooks replaced by the orchestrator.
-  'skills/zylos-memory/scripts/session-start-inject.js',
-  'skills/comm-bridge/scripts/c4-session-init.js',
-  'skills/activity-monitor/scripts/session-foreground.js',
-  'skills/activity-monitor/scripts/session-start-prompt.js',
-]);
+export const CORE_MANAGED_HOOKS = obsoleteHookBaseKeys();
 
 export function isCoreManaged(hook, { zylosDir = ZYLOS_DIR } = {}) {
   // Base key (shard-arg stripped): every --shard variant of a core-managed
@@ -56,8 +45,8 @@ export function isCoreManaged(hook, { zylosDir = ZYLOS_DIR } = {}) {
 
 /**
  * The canonical instruction assembler is the only normal SessionStart hook.
- * Legacy activity-monitor shard hooks remain registry entries solely so an
- * upgrade can remove installed copies; they are never generated here.
+ * Obsolete hook paths remain migration registry entries solely so an upgrade
+ * can remove installed copies; they are never generated here.
  */
 export function desiredSessionStartHooks({
   zylosDir = ZYLOS_DIR,
@@ -364,8 +353,7 @@ export function syncCodexConfig({
  * may claim its own old hook paths (relative to ~/zylos/.claude, enforced at
  * declaration validation), and everything unclaimed — user hooks, undeclared
  * component hooks, anything outside the zylos .claude root — is preserved.
- * Component shard declarations belonged to the retired activity-monitor
- * dispatcher and can no longer claim or replace normal runtime hooks.
+ * Retired component declarations can no longer claim or replace runtime hooks.
  */
 export function claimedHookBaseKeys({ zylosDir = ZYLOS_DIR } = {}) {
   void zylosDir;

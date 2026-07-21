@@ -1,3 +1,5 @@
+import crypto from 'node:crypto';
+
 import {
   createDeliveryLaneKey,
   createDeliveryLaneKeyFromIdentity,
@@ -15,6 +17,7 @@ const OUTBOX_TABLE_SCHEMA = `(
     aggregate_version INTEGER NOT NULL CHECK (aggregate_version > 0),
     status TEXT NOT NULL,
     command_json TEXT NOT NULL,
+    claimed_command_hash TEXT,
     priority INTEGER NOT NULL DEFAULT 0,
     supersedable INTEGER NOT NULL DEFAULT 0 CHECK (supersedable IN (0, 1)),
     terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1)),
@@ -26,6 +29,8 @@ const OUTBOX_TABLE_SCHEMA = `(
     outbox_lease_epoch INTEGER NOT NULL DEFAULT 0 CHECK (outbox_lease_epoch >= 0),
     lease_owner TEXT,
     lease_expires_at TEXT,
+    lease_expires_epoch_ms INTEGER,
+    pre_action_fenced_at TEXT,
     last_attempt_at TEXT,
     next_attempt_at TEXT,
     last_error_json TEXT,
@@ -944,6 +949,18 @@ const RUNTIME_SCHEMA = `
 
   CREATE TABLE IF NOT EXISTS runtime_outbox ${OUTBOX_TABLE_SCHEMA};
 
+  CREATE TABLE IF NOT EXISTS runtime_outbox_claim_snapshots (
+    outbox_id TEXT NOT NULL,
+    delivery_attempt_id TEXT NOT NULL UNIQUE,
+    delivery_attempt_no INTEGER NOT NULL CHECK (delivery_attempt_no > 0),
+    outbox_lease_epoch INTEGER NOT NULL CHECK (outbox_lease_epoch > 0),
+    lease_owner TEXT NOT NULL,
+    command_json TEXT NOT NULL,
+    command_hash TEXT NOT NULL,
+    claimed_at TEXT NOT NULL,
+    PRIMARY KEY (outbox_id, outbox_lease_epoch)
+  );
+
   CREATE TABLE IF NOT EXISTS runtime_delivery_lanes (
     lane_key TEXT PRIMARY KEY,
     turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
@@ -1133,6 +1150,7 @@ const OUTBOX_COLUMNS = Object.freeze([
   'aggregate_version',
   'status',
   'command_json',
+  'claimed_command_hash',
   'priority',
   'supersedable',
   'terminal',
@@ -1142,6 +1160,8 @@ const OUTBOX_COLUMNS = Object.freeze([
   'outbox_lease_epoch',
   'lease_owner',
   'lease_expires_at',
+  'lease_expires_epoch_ms',
+  'pre_action_fenced_at',
   'last_attempt_at',
   'next_attempt_at',
   'last_error_json',
@@ -1468,6 +1488,88 @@ function migrateLegacyOutboxConstraint(database) {
     database.exec(RUNTIME_SCHEMA);
   });
   migrate.immediate();
+}
+
+function backfillOutboxLeaseEpochs(database) {
+  const rows = database.prepare(`
+    SELECT outbox_id, lease_expires_at
+    FROM runtime_outbox
+    WHERE lease_expires_at IS NOT NULL AND lease_expires_epoch_ms IS NULL
+  `).all();
+  const update = database.prepare(`
+    UPDATE runtime_outbox
+    SET lease_expires_epoch_ms = ?
+    WHERE outbox_id = ? AND lease_expires_at = ? AND lease_expires_epoch_ms IS NULL
+  `);
+  for (const row of rows) {
+    const epochMs = Date.parse(row.lease_expires_at);
+    if (Number.isFinite(epochMs)) {
+      update.run(epochMs, row.outbox_id, row.lease_expires_at);
+    }
+  }
+}
+
+export function quarantineUnverifiableOutboxClaims(database) {
+  const quarantine = () => {
+    const rows = database.prepare(`
+      SELECT outbox.outbox_id, outbox.status, outbox.delivery_attempt_id,
+        outbox.delivery_attempt_no, outbox.outbox_lease_epoch,
+        outbox.lease_owner, outbox.command_json, outbox.claimed_command_hash,
+        outbox.last_attempt_at, outbox.created_at,
+        snapshot.command_json AS snapshot_command_json,
+        snapshot.command_hash AS snapshot_command_hash,
+        snapshot.lease_owner AS snapshot_lease_owner
+      FROM runtime_outbox AS outbox
+      LEFT JOIN runtime_outbox_claim_snapshots AS snapshot
+        ON snapshot.outbox_id = outbox.outbox_id
+        AND snapshot.delivery_attempt_id = outbox.delivery_attempt_id
+        AND snapshot.delivery_attempt_no = outbox.delivery_attempt_no
+        AND snapshot.outbox_lease_epoch = outbox.outbox_lease_epoch
+      WHERE outbox.status IN ('delivering', 'retry_wait')
+    `).all();
+    const update = database.prepare(`
+      UPDATE runtime_outbox
+      SET status = 'delivery_unknown', next_attempt_at = NULL,
+        last_error_json = COALESCE(last_error_json, ?),
+        updated_at = COALESCE(updated_at, last_attempt_at, created_at)
+      WHERE outbox_id = ? AND status = ?
+        AND delivery_attempt_id IS ? AND delivery_attempt_no IS ?
+        AND outbox_lease_epoch = ? AND lease_owner IS ?
+        AND command_json = ? AND claimed_command_hash IS ?
+    `);
+    for (const row of rows) {
+      const snapshotHash = row.snapshot_command_json === null
+        ? null
+        : crypto.createHash('sha256').update(row.snapshot_command_json).digest('hex');
+      const verified = row.snapshot_command_json !== null
+        && (row.status === 'retry_wait' || row.snapshot_lease_owner === row.lease_owner)
+        && row.snapshot_command_json === row.command_json
+        && row.snapshot_command_hash === row.claimed_command_hash
+        && snapshotHash === row.snapshot_command_hash;
+      if (verified) continue;
+      const occurredAt = row.last_attempt_at ?? row.created_at;
+      update.run(
+        JSON.stringify({
+          code: 'delivery_claim_authority_unverifiable',
+          category: 'internal',
+          retryable: false,
+          side_effect_status: 'unknown',
+          user_message: 'Delivery acknowledgement is unknown and requires reconciliation.',
+          occurred_at: occurredAt,
+        }),
+        row.outbox_id,
+        row.status,
+        row.delivery_attempt_id,
+        row.delivery_attempt_no,
+        row.outbox_lease_epoch,
+        row.lease_owner,
+        row.command_json,
+        row.claimed_command_hash,
+      );
+    }
+  };
+  if (database.inTransaction) return quarantine();
+  return database.transaction(quarantine).immediate();
 }
 
 function backfillDeliveryLanes(database) {
@@ -2396,10 +2498,14 @@ export function initializeRuntimePersistence(database) {
   );
   addColumnIfMissing(database, 'runtime_outbox', 'lease_owner', 'TEXT');
   addColumnIfMissing(database, 'runtime_outbox', 'lease_expires_at', 'TEXT');
+  addColumnIfMissing(database, 'runtime_outbox', 'lease_expires_epoch_ms', 'INTEGER');
+  backfillOutboxLeaseEpochs(database);
+  addColumnIfMissing(database, 'runtime_outbox', 'pre_action_fenced_at', 'TEXT');
   addColumnIfMissing(database, 'runtime_outbox', 'last_attempt_at', 'TEXT');
   addColumnIfMissing(database, 'runtime_outbox', 'next_attempt_at', 'TEXT');
   addColumnIfMissing(database, 'runtime_outbox', 'last_error_json', 'TEXT');
   addColumnIfMissing(database, 'runtime_outbox', 'result_json', 'TEXT');
+  addColumnIfMissing(database, 'runtime_outbox', 'claimed_command_hash', 'TEXT');
   addColumnIfMissing(database, 'runtime_outbox', 'updated_at', 'TEXT');
   addColumnIfMissing(
     database,
@@ -2419,6 +2525,7 @@ export function initializeRuntimePersistence(database) {
     'terminal',
     'INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1))',
   );
+  quarantineUnverifiableOutboxClaims(database);
   migrateLegacyOutboxConstraint(database);
   backfillDeliveryLanes(database);
   migrateDeliveryLaneIdentity(database);
@@ -2428,9 +2535,11 @@ export function initializeRuntimePersistence(database) {
       WHERE provider IS NOT NULL AND provider_native_id IS NOT NULL;
     DROP INDEX IF EXISTS runtime_outbox_dispatch;
     CREATE INDEX IF NOT EXISTS runtime_outbox_dispatch
-      ON runtime_outbox(status, next_attempt_at, priority, created_at);
+      ON runtime_outbox(status, next_attempt_at, lease_expires_epoch_ms, priority, created_at);
     CREATE INDEX IF NOT EXISTS runtime_outbox_lane
       ON runtime_outbox(lane_key, aggregate_version, status);
+    CREATE INDEX IF NOT EXISTS runtime_outbox_claim_snapshot_attempt
+      ON runtime_outbox_claim_snapshots(outbox_id, delivery_attempt_id, outbox_lease_epoch);
     CREATE INDEX IF NOT EXISTS runtime_reply_mapping_recovery_dispatch
       ON runtime_reply_mapping_recoveries(state, created_at);
     CREATE INDEX IF NOT EXISTS runtime_reply_mapping_recovery_source
@@ -2502,6 +2611,38 @@ export function initializeRuntimePersistence(database) {
     )
     BEGIN
       SELECT RAISE(ABORT, 'bound outbox mapping is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_outbox_claim_snapshot_update_immutable
+    BEFORE UPDATE ON runtime_outbox_claim_snapshots
+    BEGIN
+      SELECT RAISE(ABORT, 'outbox claim snapshot is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_outbox_claim_snapshot_insert_once
+    BEFORE INSERT ON runtime_outbox_claim_snapshots
+    WHEN EXISTS (
+      SELECT 1 FROM runtime_outbox_claim_snapshots
+      WHERE (outbox_id = NEW.outbox_id AND outbox_lease_epoch = NEW.outbox_lease_epoch)
+        OR delivery_attempt_id = NEW.delivery_attempt_id
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'outbox claim snapshot is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_outbox_claim_snapshot_delete_immutable
+    BEFORE DELETE ON runtime_outbox_claim_snapshots
+    WHEN EXISTS (
+      SELECT 1 FROM runtime_outbox WHERE outbox_id = OLD.outbox_id
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'active outbox claim snapshot cannot be deleted');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_outbox_claim_snapshot_cleanup
+    AFTER DELETE ON runtime_outbox
+    BEGIN
+      DELETE FROM runtime_outbox_claim_snapshots WHERE outbox_id = OLD.outbox_id;
     END;
 
     DROP TRIGGER IF EXISTS runtime_bound_reply_recovery_immutable;

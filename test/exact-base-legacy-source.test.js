@@ -203,7 +203,9 @@ describe('exact-base durable source fencing', () => {
     const server = `zylos-issue27-${process.pid}-${Date.now()}`;
     execFileSync('tmux', [
       '-L', server, '-f', '/dev/null', 'new-session', '-d', '-s', 'claude-main',
-      'while :; do sleep 1; done',
+      // Preserve the child identity across suspend/resume assertions under
+      // parallel test load; ESRCH and PID-reuse paths are injected below.
+      'while :; do sleep 30; done',
     ]);
     tmuxServers.set(server, Number(execFileSync(
       'tmux', ['-L', server, 'display-message', '-p', '#{pid}'], { encoding: 'utf8' },
@@ -305,6 +307,48 @@ describe('exact-base durable source fencing', () => {
     ]);
   });
 
+  test('waits for delayed stopped-state observation before declaring the exact tree suspended', () => {
+    const rows = [
+      { pid: 100, ppid: 1, pgid: 100, sid: 100 },
+      { pid: 101, ppid: 100, pgid: 101, sid: 100 },
+      { pid: 102, ppid: 101, pgid: 101, sid: 100 },
+    ];
+    const stopped = new Set();
+    let stoppedSnapshots = 0;
+    const execFileSyncFn = (file, args) => {
+      if (file === 'tmux') {
+        if (args[0] === 'has-session') return '';
+        if (args[0] === 'list-sessions') return 'claude-main\n';
+        if (args[0] === 'display-message') return '100\n';
+        if (args[0] === 'list-panes') return 'claude-main\t101\n';
+      }
+      if (file === 'ps' && args[0] === '-axo') {
+        if (stopped.size === rows.length) stoppedSnapshots += 1;
+        const visibleStopped = stoppedSnapshots > 80;
+        return rows.map(({ pid, ppid, pgid, sid }) => (
+          `${pid} ${ppid} ${pgid} ${sid} ${visibleStopped && stopped.has(pid) ? 'T' : 'S'}`
+        )).join('\n');
+      }
+      if (file === 'ps' && args[0] === '-o' && args[1] === 'lstart=') {
+        return 'Mon Jul 21 00:00:00 2026\n';
+      }
+      throw new Error(`unexpected fixture command: ${file} ${args.join(' ')}`);
+    };
+    const quiescence = createLegacyProviderQuiescence({
+      provider: 'claude', execFileSyncFn, wait: () => {},
+      signalProcess(pid, signal) {
+        expect(signal).toBe('SIGSTOP');
+        stopped.add(pid);
+      },
+    });
+
+    const suspended = quiescence.suspend();
+
+    expect(stoppedSnapshots).toBeGreaterThan(80);
+    expect(suspended).toMatchObject({ active: true, suspended: true });
+    expect(suspended.members.map(({ pid }) => pid)).toEqual([101, 102]);
+  });
+
   test('commits an exact-base SQLite, PM2, and disposable provider fixture without old/new overlap', async () => {
     const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'zylos-exact-base-commit-'));
     roots.push(root);
@@ -338,7 +382,9 @@ describe('exact-base durable source fencing', () => {
     const server = `zylos-issue27-commit-${process.pid}-${Date.now()}`;
     execFileSync('tmux', [
       '-L', server, '-f', '/dev/null', 'new-session', '-d', '-s', 'claude-main',
-      'while :; do sleep 1; done',
+      // Keep a real child process without churning its PID between two full
+      // ownership snapshots when the parallel suite delays `ps` observation.
+      'while :; do sleep 30; done',
     ]);
     tmuxServers.set(server, Number(execFileSync(
       'tmux', ['-L', server, 'display-message', '-p', '#{pid}'], { encoding: 'utf8' },

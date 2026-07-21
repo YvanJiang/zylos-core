@@ -921,29 +921,6 @@ function printWebConsoleInfo() {
   console.log(line);
 }
 
-// ── Database initialization ─────────────────────────────────────
-
-/**
- * Initialize databases for skills that require them.
- */
-function initializeDatabases() {
-  const dbInitScript = path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-db.js');
-  const dbInitSql = path.join(SKILLS_DIR, 'comm-bridge', 'init-db.sql');
-  if (!fs.existsSync(dbInitSql) || !fs.existsSync(dbInitScript)) return;
-
-  try {
-    execSync(`node "${dbInitScript}" init`, {
-      cwd: path.join(SKILLS_DIR, 'comm-bridge'),
-      stdio: 'pipe',
-      timeout: 10000,
-    });
-    console.log(`  ${success('Database initialized')}`);
-  } catch (err) {
-    const msg = err.stderr?.toString().trim() || err.stdout?.toString().trim() || err.message;
-    console.log(`  ${warn(`Database init failed: ${msg}`)}`);
-  }
-}
-
 // ── Service startup ─────────────────────────────────────────────
 
 export function requireHealthyExecutorStart(result) {
@@ -962,7 +939,6 @@ export function requireHealthyExecutorStart(result) {
  */
 async function startCoreServices() {
   installSkillDependencies();
-  initializeDatabases();
 
   const ecosystemPath = path.join(ZYLOS_DIR, 'pm2', 'ecosystem.config.cjs');
   if (!fs.existsSync(ecosystemPath)) {

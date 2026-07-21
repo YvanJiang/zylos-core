@@ -42,10 +42,9 @@ Server binds to `127.0.0.1` by default for security.
 ## Architecture
 
 ```
-Browser ──► Web Console Server ──► C4 Bridge ──► Claude
-                  │
-                  ▼
-               SQLite (c4.db)
+Browser ──► Core ingress ──► conversation executor ──► Core outbox
+   ▲                                                    │
+   └──────── Web Console channel owner ◄────────────────┘
 ```
 
 ## API Endpoints
@@ -56,8 +55,8 @@ Browser ──► Web Console Server ──► C4 Bridge ──► Claude
 | `/api/conversations/recent` | GET | Get recent conversation history |
 | `/api/upload` | POST | Upload one attachment for the next message |
 | `/api/send` | POST | Send message to Claude |
-| `/api/media/:messageId` | GET | Download/render an outbound media message |
-| `/api/poll?since_id=N` | GET | Poll for new messages |
+| `/api/media/:messageId` | GET | Retired legacy endpoint; always fails closed |
+| `/api/poll?since_id=N&cursor_scope=S` | GET | Poll the durable mailbox; nonzero cursors require the opaque scope returned in `X-Zylos-Mailbox-Cursor-Scope` |
 | `/api/health` | GET | Server health check |
 
 ## Files
@@ -68,12 +67,25 @@ Browser ──► Web Console Server ──► C4 Bridge ──► Claude
 ├── package.json
 ├── scripts/
 │   ├── server.js      # Express API server
-│   └── send.js        # CLI message sender
+│   ├── core-outbox-owner.js # Channel-scoped renderer/delivery owner
+│   └── send.js        # Retired fail-closed direct-send command
 └── public/
     ├── index.html     # Chat UI
     ├── styles.css     # Styling
+    ├── mailbox-cursor.js # Scope-bound durable cursor state/reset
     └── app.js         # Frontend logic
 ```
+
+The mailbox cursor is the pair `(X-Zylos-Mailbox-Cursor-Scope, message id)`.
+After a Core scope reconfiguration, HTTP returns `409 mailbox_cursor_scope_mismatch`
+and WebSocket returns `cursor_reset`; clients must clear the prior view and reload
+from cursor zero in the returned opaque scope.
+
+Upload IDs are channel-private capabilities bound to the same exact Core
+region/tenant/bot scope and browser session. Scope changes clear the draft and
+staged attachments; an ID created in one scope is invalid in every other scope.
+Every upload/send mutation carries the current opaque cursor scope, and media
+downloads are authorized against the same scoped capability record.
 
 ## Environment Variables
 
@@ -83,6 +95,9 @@ Browser ──► Web Console Server ──► C4 Bridge ──► Claude
 | `ZYLOS_WEB_PASSWORD` | (empty) | Set to enable password protection (also reads `WEB_CONSOLE_PASSWORD` as fallback) |
 | `WEB_CONSOLE_BIND` | 127.0.0.1 | Bind address |
 | `ZYLOS_DIR` | ~/zylos | Data directory |
+| `ZYLOS_REGION` | global | Exact durable Core region owned by this console |
+| `ZYLOS_TENANT_ID` | default | Exact durable Core tenant owned by this console |
+| `ZYLOS_BOT_ID` | zylos | Exact durable Core bot owned by this console |
 | `WEB_CONSOLE_MAX_UPLOAD_MB` | 20 | Max size per uploaded attachment |
 
 ## Authentication
@@ -95,12 +110,11 @@ To enable password protection (recommended when exposing externally):
 
 ## Features
 
-- Real-time status indicator (busy/idle/offline)
+- Provider-neutral Core service, executor, turn, queue, and outbox status
 - Message polling every 2 seconds
 - Auto-resizing input
 - Browser file/image upload via attach button, drag/drop, and paste
-- Inline rendering for image replies sent as `[MEDIA:image]/absolute/path`
-- Download chips for file replies sent as `[MEDIA:file]/absolute/path`
+- Durable provider-neutral text fallback rendered from Core outbox commands
 - Mobile-friendly responsive design
 - Dark theme
 
@@ -113,11 +127,8 @@ Browser uploads are stored under `~/zylos/web-console/media/` and delivered to t
 [attachment:file /Users/howard/zylos/web-console/media/wc-...pdf name="report.pdf" 1.2MB]
 ```
 
-Agent replies can include a single media row using the same C4 convention as other channels:
-
-```bash
-node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js web-console console "[MEDIA:image]/absolute/path/to/image.png"
-node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js web-console console "[MEDIA:file]/absolute/path/to/report.pdf"
-```
-
-The browser only requests media by C4 message id. The server rechecks the row is an outbound web-console console message, resolves the target with `realpath`, and serves only paths under `ZYLOS_DIR` or `/tmp`.
+Core persists replies in its durable outbox. The Web Console channel owner
+claims only `web-console` commands, renders the text model, delivers to a
+connected browser, and records the fenced result. The agent never invokes a
+direct send script. Rich outbound media needs an explicit future Core contract;
+the retired marker-based legacy endpoint fails closed.

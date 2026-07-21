@@ -73,6 +73,7 @@ const OUTBOX_STATUSES = Object.freeze([
   'delivered',
   'superseded',
   'dead_letter',
+  'delivery_unknown',
 ]);
 
 export const OBSERVABILITY_SNAPSHOT_V1_SCHEMA = deepFreeze({

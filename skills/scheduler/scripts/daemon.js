@@ -4,16 +4,29 @@
  * Main orchestrator for autonomous task execution
  */
 
-import { getDb, cleanupHistory, now } from './database.js';
-import { getNextRun } from './cron-utils.js';
-import { dispatchMissedScheduledTaskNotice, dispatchScheduledTask } from './runtime.js';
+import { getDb, cleanupHistory, migrateLegacyTaskScopes, now } from './database.js';
+import {
+  dispatchMissedScheduledTaskNotice,
+  dispatchScheduledTask,
+  recoverLegacyRunningTasksFromCore,
+} from './runtime.js';
 import { decideScheduledOccurrence } from '../../../runtime/scheduler/scheduler-queue.js';
-import { formatTime } from './time-utils.js';
+import { readExecutorObservability } from '../../../runtime/scheduler/scheduler-observability.js';
 import { loadTimezone } from './tz.js';
-import { updateNextRunTime as _updateNextRunTime, processCompletedTasks as _processCompletedTasks, handleStaleRunningTasks as _handleStaleRunningTasks, TASK_TIMEOUT } from './daemon-tasks.js';
+import {
+  processCompletedTasks as _processCompletedTasks,
+  reconcileRunningTasks,
+  recordMissedNoticeTerminalRejection,
+  recordScheduledAdmission,
+  scheduleMissedNoticeRetry,
+  updateNextRunTime as _updateNextRunTime,
+} from './daemon-tasks.js';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 const CHECK_INTERVAL = 5000;  // 5 seconds
 const CLEANUP_INTERVAL = 3600000;  // 1 hour
+const ZYLOS_DIR = process.env.ZYLOS_DIR || join(homedir(), 'zylos');
 
 let db;
 let running = true;
@@ -36,9 +49,10 @@ function getNextPendingTask() {
     SELECT * FROM tasks
     WHERE status = 'pending'
     AND next_run_at <= ?
+    AND (missed_notice_retry_at IS NULL OR missed_notice_retry_at <= ?)
     ORDER BY priority ASC, next_run_at ASC
     LIMIT 1
-  `).get(currentTime);
+  `).get(currentTime, currentTime);
 }
 
 /**
@@ -47,64 +61,24 @@ function getNextPendingTask() {
 function dispatchTask(task) {
   console.log(`[${new Date().toISOString()}] Dispatching task: ${task.id} (${task.name})`);
 
-  // Atomically claim the task (only if still pending)
-  const claim = db.prepare(`
-    UPDATE tasks
-    SET status = 'running', updated_at = ?
-    WHERE id = ? AND status = 'pending'
-  `).run(now(), task.id);
-
-  if (claim.changes === 0) {
-    console.log(`[${new Date().toISOString()}] Task ${task.id} already claimed/modified, skipping`);
-    return false;
-  }
-
-  // Create history entry
-  db.prepare(`
-    INSERT INTO task_history (task_id, executed_at, status)
-    VALUES (?, ?, 'started')
-  `).run(task.id, now());
-
   let admission;
   try {
     admission = dispatchScheduledTask(task);
   } catch (error) {
     console.error(`Failed to admit task ${task.id}:`, error.message);
-    console.error(`Failed to dispatch task ${task.id}`);
-
-    // Revert to pending
-    db.prepare(`
-      UPDATE tasks
-      SET status = 'pending', last_error = 'Failed to dispatch message', updated_at = ?
-      WHERE id = ?
-    `).run(now(), task.id);
-
-    // Mark task_history as failed (latest entry only)
-    const historyEntry = db.prepare(`
-      SELECT id FROM task_history
-      WHERE task_id = ? AND status = 'started'
-      ORDER BY executed_at DESC LIMIT 1
-    `).get(task.id);
-
-    if (historyEntry) {
-      db.prepare(`
-        UPDATE task_history
-        SET status = 'failed', completed_at = ?
-        WHERE id = ?
-      `).run(now(), historyEntry.id);
-    }
+    // Leave the local occurrence pending. A later attempt uses the same Core
+    // occurrence ID and exact envelope, so acceptance is safely replayable.
     return false;
   }
+  const recorded = recordScheduledAdmission(db, task, admission);
   if (admission.status === 'rejected') {
     console.error(`Task ${task.id} was rejected by the durable queue: ${admission.error.user_message}`);
-    db.prepare(`
-      UPDATE tasks
-      SET status = 'failed', last_error = ?, updated_at = ?
-      WHERE id = ?
-    `).run(admission.error.user_message, now(), task.id);
     return false;
   }
-  return true;
+  if (!recorded) {
+    console.log(`[${new Date().toISOString()}] Task ${task.id} already claimed/modified, skipping`);
+  }
+  return recorded;
 }
 
 function updateNextRunTime(task) {
@@ -125,6 +99,11 @@ function persistMissedTaskNotice(task) {
     const admission = dispatchMissedScheduledTaskNotice(task, notice);
     if (admission.status === 'rejected') {
       console.error(`Missed-task notice for ${task.id} was rejected by the durable queue: ${admission.error.user_message}`);
+      if (admission.error.code === 'queue_full') {
+        scheduleMissedNoticeRetry(db, task, admission.error);
+      } else {
+        recordMissedNoticeTerminalRejection(db, task, admission);
+      }
       return false;
     }
     return true;
@@ -149,7 +128,8 @@ function handleMissedTasks() {
     WHERE status = 'pending'
     AND type IN ('recurring', 'interval')
     AND next_run_at < ?
-  `).all(recentMissedThreshold);
+    AND (missed_notice_retry_at IS NULL OR missed_notice_retry_at <= ?)
+  `).all(recentMissedThreshold, currentTime);
 
   for (const task of missedTasks) {
     const decision = decideScheduledOccurrence({
@@ -178,8 +158,9 @@ function handleMissedTasks() {
   }
 }
 
-function handleStaleRunningTasks() {
-  _handleStaleRunningTasks(db);
+async function reconcileCoreState() {
+  const snapshot = await readExecutorObservability({ zylosDir: ZYLOS_DIR });
+  return reconcileRunningTasks(db, snapshot);
 }
 
 /**
@@ -189,10 +170,6 @@ async function mainLoop() {
   console.log(`[${new Date().toISOString()}] Scheduler V2 started (TZ: ${process.env.TZ})`);
   console.log(`Check interval: ${CHECK_INTERVAL}ms`);
 
-  // Clean up stale running tasks on startup
-  console.log(`[${new Date().toISOString()}] Checking for stale running tasks...`);
-  handleStaleRunningTasks();
-
   let lastCleanup = Date.now();
 
   while (running) {
@@ -200,7 +177,7 @@ async function mainLoop() {
       // The durable Core queue accepts work during maintenance or overload; execution claims later.
       const task = getNextPendingTask();
 
-      // Dispatch if task is due and runtime is alive
+      // Persist a due occurrence regardless of transient executor availability.
       if (task) {
         const currentTime = now();
         const decision = decideScheduledOccurrence({
@@ -213,18 +190,18 @@ async function mainLoop() {
         if (decision.status === 'skipped') {
           // Skip this task
           console.log(`[${new Date().toISOString()}] Task ${task.id} (${task.name}) missed its occurrence; avoiding catch-up replay.`);
-          if (!persistMissedTaskNotice(task)) continue;
-
-          if (task.type === 'one-time') {
-            // One-time tasks: mark as failed
-            db.prepare(`
-              UPDATE tasks
-              SET status = 'failed', last_error = 'Missed execution window', updated_at = ?
-              WHERE id = ?
-            `).run(currentTime, task.id);
-          } else {
-            // Recurring/interval tasks: schedule next run
-            updateNextRunTime(task);
+          if (persistMissedTaskNotice(task)) {
+            if (task.type === 'one-time') {
+              // One-time tasks: mark as failed
+              db.prepare(`
+                UPDATE tasks
+                SET status = 'failed', last_error = 'Missed execution window', updated_at = ?
+                WHERE id = ?
+              `).run(currentTime, task.id);
+            } else {
+              // Recurring/interval tasks: schedule next run
+              updateNextRunTime(task);
+            }
           }
         } else {
           // Within threshold: dispatch normally
@@ -232,14 +209,14 @@ async function mainLoop() {
         }
       }
 
+      // Only authoritative Core terminal states complete local occurrences.
+      await reconcileCoreState();
+
       // Process completed tasks (update recurring schedules)
       processCompletedTasks();
 
       // Handle missed tasks
       handleMissedTasks();
-
-      // Handle stale running tasks (orphaned due to compaction/crash)
-      handleStaleRunningTasks();
 
       // Periodic cleanup of old history
       if (Date.now() - lastCleanup > CLEANUP_INTERVAL) {
@@ -275,6 +252,8 @@ process.on('SIGTERM', () => {
 
 // Start the scheduler
 db = getDb();
+migrateLegacyTaskScopes(db);
+recoverLegacyRunningTasksFromCore(db);
 mainLoop().then(() => {
   console.log('Scheduler stopped');
   if (db) db.close();

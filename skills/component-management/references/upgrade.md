@@ -252,7 +252,7 @@ Template changes:
 - Updated: CLAUDE.md, .claude/settings.json
 
 Local skill modifications:
-  M activity-monitor/scripts/heartbeat.js
+  M my-component/scripts/worker.js
 
 Smart merge will handle modifications automatically.
 

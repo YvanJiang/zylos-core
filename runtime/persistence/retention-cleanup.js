@@ -79,7 +79,9 @@ function turnIsProtected(database, turnId) {
   `).get(turnId)) return true;
   if (database.prepare(`
     SELECT 1 FROM runtime_outbox
-    WHERE turn_id = ? AND status IN ('pending', 'delivering', 'retry_wait') LIMIT 1
+    WHERE turn_id = ?
+      AND status IN ('pending', 'delivering', 'retry_wait', 'delivery_unknown')
+    LIMIT 1
   `).get(turnId)) return true;
   if (database.prepare(`
     SELECT 1 FROM runtime_provider_attempts

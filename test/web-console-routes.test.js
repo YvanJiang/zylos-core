@@ -1,14 +1,23 @@
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import vm from 'node:vm';
 import { afterEach, beforeEach, describe, expect, test } from '@jest/globals';
 import Database from '../skills/web-console/node_modules/better-sqlite3/lib/index.js';
 import WebSocket from '../skills/web-console/node_modules/ws/wrapper.mjs';
+import { createIdempotencyKey } from '../contracts/public/index.js';
+import { acceptCompatibilityInbound } from '../runtime/compatibility/c4-channel-fallback.js';
+import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { DeliveryMailbox } from '../skills/web-console/scripts/db.js';
 
 const SERVER_PATH = path.resolve('skills/web-console/scripts/server.js');
 const SQLITE_MODULE = path.resolve('skills/web-console/node_modules/better-sqlite3/lib/index.js');
+const RECONCILIATION_PATH = path.resolve(
+  'skills/web-console/public/message-reconciliation.js',
+);
 
 let ctx;
 
@@ -79,15 +88,26 @@ db.close();
   fs.writeFileSync(path.join(scriptDir, 'c4-send.js'), '');
 }
 
-async function startServer({ maxUploadMb = 20 } = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wc-routes-'));
+async function startServer({
+  maxUploadMb = 20,
+  actualC4Receive = false,
+  region = 'global',
+  tenantId = 'default',
+  botId = 'zylos',
+  root: existingRoot = null,
+} = {}) {
+  const root = existingRoot || fs.mkdtempSync(path.join(os.tmpdir(), 'wc-routes-'));
   const dbPath = path.join(root, 'comm-bridge', 'c4.db');
   const skillsDir = path.join(root, 'skills');
-  fs.mkdirSync(path.join(root, 'activity-monitor'), { recursive: true });
-  fs.writeFileSync(path.join(root, '.env'), '');
-  fs.writeFileSync(path.join(root, 'activity-monitor', 'agent-status.json'), '{"state":"idle"}');
-  createDb(dbPath);
-  createFakeC4Receive(skillsDir, dbPath);
+  if (!existingRoot) {
+    fs.writeFileSync(path.join(root, '.env'), '');
+    createDb(dbPath);
+  }
+  if (actualC4Receive) {
+    fs.mkdirSync(skillsDir, { recursive: true });
+  } else {
+    createFakeC4Receive(skillsDir, dbPath);
+  }
   const port = await freePort();
 
   const child = spawn(process.execPath, [SERVER_PATH], {
@@ -95,10 +115,13 @@ async function startServer({ maxUploadMb = 20 } = {}) {
     env: {
       ...process.env,
       ZYLOS_DIR: root,
-      WEB_CONSOLE_SKILLS_DIR: skillsDir,
+      WEB_CONSOLE_SKILLS_DIR: actualC4Receive ? path.resolve('skills') : skillsDir,
       WEB_CONSOLE_PORT: String(port),
       WEB_CONSOLE_BIND: '127.0.0.1',
-      WEB_CONSOLE_MAX_UPLOAD_MB: String(maxUploadMb)
+      WEB_CONSOLE_MAX_UPLOAD_MB: String(maxUploadMb),
+      ZYLOS_REGION: region,
+      ZYLOS_TENANT_ID: tenantId,
+      ZYLOS_BOT_ID: botId,
     },
     stdio: ['ignore', 'pipe', 'pipe']
   });
@@ -113,7 +136,11 @@ async function startServer({ maxUploadMb = 20 } = {}) {
     if (child.exitCode !== null) throw new Error(`server exited early: ${output}`);
     try {
       const res = await fetch(`${baseUrl}/api/health`);
-      if (res.ok) return { root, dbPath, skillsDir, port, baseUrl, child };
+      if (res.ok) {
+        const scopeResponse = await fetch(`${baseUrl}/api/conversations/recent?limit=1`);
+        const cursorScope = scopeResponse.headers.get('x-zylos-mailbox-cursor-scope');
+        return { root, dbPath, skillsDir, port, baseUrl, child, cursorScope };
+      }
     } catch {
       // Retry until server is listening.
     }
@@ -124,10 +151,26 @@ async function startServer({ maxUploadMb = 20 } = {}) {
   throw new Error(`server did not start: ${output}`);
 }
 
-function stopServer(active) {
+async function stopServer(active, { preserveRoot = false } = {}) {
   if (!active) return;
-  active.child.kill('SIGTERM');
-  fs.rmSync(active.root, { recursive: true, force: true });
+  if (active.child.exitCode === null) {
+    let forced = false;
+    active.child.kill('SIGTERM');
+    await new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        if (active.child.exitCode === null) {
+          forced = true;
+          active.child.kill('SIGKILL');
+        }
+      }, 3000);
+      active.child.once('close', () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
+    if (forced) throw new Error('Web Console did not complete its drain shutdown barrier');
+  }
+  if (!preserveRoot) fs.rmSync(active.root, { recursive: true, force: true });
 }
 
 function rows(dbPath) {
@@ -140,14 +183,21 @@ function rows(dbPath) {
 async function uploadFile(active, { name = 'report.txt', type = 'text/plain', content = 'hello' } = {}) {
   const form = new FormData();
   form.append('file', new Blob([content], { type }), name);
-  const res = await fetch(`${active.baseUrl}/api/upload`, { method: 'POST', body: form });
+  const res = await fetch(`${active.baseUrl}/api/upload`, {
+    method: 'POST',
+    headers: { 'X-Zylos-Mailbox-Cursor-Scope': active.cursorScope },
+    body: form,
+  });
   return { res, body: await res.json() };
 }
 
 async function sendHttp(active, payload) {
   const res = await fetch(`${active.baseUrl}/api/send`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Zylos-Mailbox-Cursor-Scope': active.cursorScope,
+    },
     body: JSON.stringify(payload)
   });
   return { res, body: await res.json() };
@@ -157,11 +207,381 @@ beforeEach(() => {
   ctx = null;
 });
 
-afterEach(() => {
-  stopServer(ctx);
+afterEach(async () => {
+  await stopServer(ctx);
 });
 
 describe('web-console attachment routes', () => {
+  test('actual mailbox and outbox ownership reject the same endpoint from another Core scope', async () => {
+    ctx = await startServer({
+      actualC4Receive: true,
+      region: 'global',
+      tenantId: 'tenant-local',
+      botId: 'bot-local',
+    });
+    const coreDb = new Database(ctx.dbPath);
+    const foreign = [
+      ['region-foreign', 'tenant-local', 'bot-local', 'region'],
+      ['global', 'tenant-foreign', 'bot-local', 'tenant'],
+      ['global', 'tenant-local', 'bot-foreign', 'bot'],
+    ].map(([region, tenantId, botId, suffix]) => acceptCompatibilityInbound(coreDb, {
+      inbound_event_id: `foreign-console-${suffix}`,
+      trace_id: `foreign-console-${suffix}-trace`,
+      occurred_at: '2026-07-21T00:00:00.000Z', received_at: '2026-07-21T00:00:00.000Z',
+      region, tenant_id: tenantId, channel: 'web-console', bot_id: botId,
+      chat_type: 'dm', chat_id: 'console', native_thread_or_topic_id: null,
+      message_id: `foreign-console-${suffix}-message`,
+      actor: { type: 'user', actor_id: 'foreign-user', authenticated: true, roles: [] },
+      content: {
+        kind: 'text', text: `foreign ${suffix} scope must stay hidden`, attachments: [],
+      },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source_ref: `foreign-console-${suffix}-source`,
+    }, { now: () => '2026-07-21T00:00:00.000Z' }));
+    coreDb.close();
+    const local = await sendHttp(ctx, {
+      message: 'local scope is visible', message_id: 'local-console-scope',
+    });
+    expect(local.res.status).toBe(200);
+
+    const response = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    expect(response.status).toBe(200);
+    const messages = await response.json();
+    expect(messages.some(({ content }) => content === 'local scope is visible')).toBe(true);
+    expect(messages.some(({ content }) => content.includes('must stay hidden'))).toBe(false);
+
+    const reopened = new Database(ctx.dbPath);
+    for (const accepted of foreign) {
+      expect(reopened.prepare('SELECT status FROM runtime_outbox WHERE turn_id = ?')
+        .get(accepted.turn_id).status).toBe('pending');
+    }
+    reopened.close();
+  });
+
+  test('actual Web ingress preserves option-like normal text', async () => {
+    ctx = await startServer({ actualC4Receive: true, tenantId: 'option-text-tenant' });
+    const sent = await sendHttp(ctx, {
+      message: '--literal-web-text', message_id: 'option-like-web-text',
+    });
+    expect(sent.res.status).toBe(200);
+    const mailbox = await (await fetch(`${ctx.baseUrl}/api/poll?since_id=0`)).json();
+    expect(mailbox).toEqual(expect.arrayContaining([
+      expect.objectContaining({ direction: 'in', content: '--literal-web-text' }),
+    ]));
+  });
+
+  test('actual Core ingress projects safe attachment metadata through the durable mailbox', async () => {
+    ctx = await startServer({ actualC4Receive: true });
+    const upload = await uploadFile(ctx, {
+      name: 'quarterly report.txt',
+      type: 'text/plain',
+      content: 'durable attachment bytes',
+    });
+    const sent = await sendHttp(ctx, {
+      message: 'Review this report',
+      attachments: [upload.body.id],
+      message_id: 'actual-http-attachment',
+    });
+
+    expect(sent.res.status).toBe(200);
+    const response = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    expect(response.status).toBe(200);
+    const mailbox = await response.json();
+    const inbound = mailbox.find(({ direction }) => direction === 'in');
+    expect(inbound).toMatchObject({
+      channel: 'web-console',
+      endpoint_id: 'console',
+      content: 'Review this report',
+      attachments: [{
+        attachment_id: upload.body.id,
+        kind: 'file',
+        name: 'quarterly report.txt',
+        media_type: 'text/plain',
+        size_bytes: 24,
+        size_label: '24B',
+      }],
+    });
+    expect(inbound.attachments[0].href).toMatch(
+      /^\/api\/inbound-media\/wc-.*-[0-9a-f]{8}\.txt$/,
+    );
+    expect(inbound.content).not.toContain('[attachment:');
+    const downloaded = await fetch(`${ctx.baseUrl}${inbound.attachments[0].href}`);
+    expect(downloaded.status).toBe(200);
+    expect(await downloaded.text()).toBe('durable attachment bytes');
+    expect(mailbox.filter(({ direction }) => direction === 'out')).toEqual([
+      expect.objectContaining({ attachments: [] }),
+    ]);
+
+    const coreDb = new Database(ctx.dbPath);
+    const envelope = JSON.parse(coreDb.prepare(`
+      SELECT envelope_json FROM runtime_inbound_events
+      WHERE inbound_event_id = ?
+    `).get(`web-console-${crypto.createHash('sha256')
+      .update('actual-http-attachment').digest('hex')}`).envelope_json);
+    coreDb.close();
+    expect(envelope.content.attachments).toEqual([expect.objectContaining({
+      attachment_id: upload.body.id,
+      name: 'quarterly report.txt',
+      media_type: 'text/plain',
+    })]);
+    expect(envelope.reply).toEqual({
+      root_message_id: null,
+      parent_message_id: null,
+      reply_to_message_id: null,
+    });
+  });
+
+  test('actual WebSocket ingress reconciles one matching optimistic attachment message', async () => {
+    ctx = await startServer({ actualC4Receive: true });
+    const upload = await uploadFile(ctx, {
+      name: 'diagram.png',
+      type: 'image/png',
+      content: 'image payload',
+    });
+    const received = [];
+    const acknowledgements = [];
+    const ws = new WebSocket(`ws://127.0.0.1:${ctx.port}/`);
+    await new Promise((resolve, reject) => {
+      ws.once('open', resolve);
+      ws.once('error', reject);
+    });
+    ws.on('message', (raw) => {
+      const event = JSON.parse(raw.toString());
+      if (event.type === 'messages') received.push(...event.data);
+      if (event.type === 'sent') acknowledgements.push(event);
+    });
+    ws.send(JSON.stringify({ type: 'subscribe', since_id: 0 }));
+    ws.send(JSON.stringify({
+      type: 'send',
+      content: '',
+      attachments: [upload.body.id],
+      tempId: 'actual-ws-attachment',
+      cursor_scope: ctx.cursorScope,
+    }));
+
+    const deadline = Date.now() + 5000;
+    while ((!acknowledgements.some(({ success }) => success)
+      || !received.some((message) => message.direction === 'in'
+        && message.attachments?.[0]?.attachment_id === upload.body.id))
+      && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    ws.close();
+    const canonical = received.find((message) => message.direction === 'in'
+      && message.attachments?.[0]?.attachment_id === upload.body.id);
+    expect(canonical).toMatchObject({
+      content: '',
+      attachments: [{ attachment_id: upload.body.id, kind: 'image', name: 'diagram.png' }],
+    });
+
+    const browser = {};
+    vm.runInNewContext(fs.readFileSync(RECONCILIATION_PATH, 'utf8'), browser);
+    const optimistic = [
+      { tempId: 'unrelated', content: '', attachments: [{ attachment_id: crypto.randomUUID() }] },
+      { tempId: 'actual-ws-attachment', content: '', attachments: [{ attachment_id: upload.body.id }] },
+    ];
+    const reconcile = browser.ZylosMessageReconciliation.reconcileOptimisticMessages;
+    const reconcileElements = browser.ZylosMessageReconciliation.reconcileOptimisticElements;
+    const safeHref = browser.ZylosMessageReconciliation.safeAttachmentHref;
+    expect(safeHref(canonical.attachments[0].href)).toBe(canonical.attachments[0].href);
+    expect(safeHref('javascript:alert(1)')).toBeNull();
+    expect(safeHref('https://attacker.invalid/file')).toBeNull();
+    expect(safeHref('/api/inbound-media/../../secret')).toBeNull();
+    expect(reconcile(optimistic, canonical)).toBe(true);
+    expect(optimistic.map(({ tempId }) => tempId)).toEqual(['unrelated']);
+    expect(reconcile(optimistic, canonical)).toBe(false);
+    expect(optimistic.map(({ tempId }) => tempId)).toEqual(['unrelated']);
+
+    const rows = [
+      { dataset: { rawContent: '', attachmentKey: JSON.stringify([crypto.randomUUID()]) } },
+      { dataset: { rawContent: '', attachmentKey: JSON.stringify([upload.body.id]) } },
+    ];
+    for (const row of rows) {
+      row.remove = () => rows.splice(rows.indexOf(row), 1);
+    }
+    expect(reconcileElements(rows, canonical)).toBe(true);
+    expect(rows).toHaveLength(1);
+    expect(reconcileElements(rows, canonical)).toBe(false);
+    expect(rows).toHaveLength(1);
+  });
+
+  test('Core mailbox projection rejects unowned attachment paths and URLs without blocking safe ingress', async () => {
+    ctx = await startServer({ actualC4Receive: true });
+    const upload = await uploadFile(ctx, {
+      name: 'safe.txt', type: 'text/plain', content: 'safe bytes',
+    });
+    const coreDb = new Database(ctx.dbPath);
+    acceptCompatibilityInbound(coreDb, {
+      inbound_event_id: 'unsafe-web-attachment', trace_id: 'unsafe-web-attachment-trace',
+      occurred_at: '2026-07-21T00:00:00.000Z', received_at: '2026-07-21T00:00:00.000Z',
+      region: 'global', tenant_id: 'default', channel: 'web-console',
+      bot_id: 'zylos', chat_type: 'dm', chat_id: 'console',
+      native_thread_or_topic_id: null, message_id: 'unsafe-web-message',
+      actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
+      content: {
+        kind: 'mixed',
+        text: 'never display\n[attachment:file /private/etc/passwd name="safe.txt" 10B]',
+        attachments: [{
+          attachment_id: upload.body.id,
+          media_type: 'text/plain',
+          name: 'safe.txt',
+          content_ref: 'https://attacker.invalid/secret',
+          size_bytes: 10,
+          href: 'javascript:alert(1)',
+        }],
+      },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source_ref: 'unsafe-web-source',
+    }, { now: () => '2026-07-21T00:00:00.000Z' });
+    coreDb.close();
+
+    const firstPoll = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    expect(firstPoll.status).toBe(200);
+    const firstMessages = await firstPoll.json();
+    expect(firstMessages.some(({ content }) => content.includes('never display'))).toBe(false);
+    expect(firstMessages.some(({ direction }) => direction === 'out')).toBe(false);
+    const retryDb = new Database(ctx.dbPath);
+    const unsafeDelivery = retryDb.prepare(`
+      SELECT outbox.status, outbox.result_json, outbox.lease_expires_at
+      FROM runtime_outbox AS outbox
+      JOIN runtime_turns AS turn ON turn.turn_id = outbox.turn_id
+      WHERE turn.inbound_event_id = 'unsafe-web-attachment'
+    `).get();
+    retryDb.close();
+    expect(unsafeDelivery.status).toBe('delivering');
+    expect(unsafeDelivery.result_json).toBeNull();
+    expect(unsafeDelivery.lease_expires_at).not.toBeNull();
+
+    const sent = await sendHttp(ctx, {
+      message: 'safe display',
+      attachments: [upload.body.id],
+      message_id: 'safe-after-unsafe-attachment',
+    });
+    expect(sent.res.status).toBe(200);
+    const safePoll = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    expect(safePoll.status).toBe(200);
+    const messages = await safePoll.json();
+    expect(messages.some(({ content }) => content.includes('never display'))).toBe(false);
+    expect(messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        direction: 'in',
+        content: 'safe display',
+        attachments: [expect.objectContaining({
+          attachment_id: upload.body.id,
+          href: expect.stringMatching(/^\/api\/inbound-media\/wc-/),
+        })],
+      }),
+    ]));
+    expect(JSON.stringify(messages)).not.toContain('javascript:');
+    expect(JSON.stringify(messages)).not.toContain('/private/etc/passwd');
+    expect(JSON.stringify(messages)).not.toContain('attacker.invalid');
+  });
+
+  test('a conflicting durable inbound projection cannot authorize its mapped reply', async () => {
+    ctx = await startServer({ actualC4Receive: true });
+    const coreDb = new Database(ctx.dbPath);
+    acceptCompatibilityInbound(coreDb, {
+      inbound_event_id: 'conflicting-web-inbound', trace_id: 'conflicting-web-trace',
+      occurred_at: '2026-07-21T00:00:00.000Z', received_at: '2026-07-21T00:00:00.000Z',
+      region: 'global', tenant_id: 'default', channel: 'web-console',
+      bot_id: 'zylos', chat_type: 'dm', chat_id: 'console',
+      native_thread_or_topic_id: null, message_id: 'conflicting-web-message',
+      actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
+      content: { kind: 'text', text: 'canonical Core inbound', attachments: [] },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source_ref: 'conflicting-web-source',
+    }, { now: () => '2026-07-21T00:00:00.000Z' });
+    coreDb.close();
+
+    const mailboxDb = new Database(path.join(ctx.root, 'web-console', 'web-console.db'));
+    new DeliveryMailbox(mailboxDb, {
+      region: 'global', tenantId: 'default', botId: 'zylos',
+    }).projectInbound({
+      inboundEventId: 'conflicting-web-inbound', endpointId: 'console',
+      content: 'stale conflicting projection', timestamp: '2026-07-21T00:00:00.000Z',
+    });
+    mailboxDb.close();
+
+    const response = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    expect(response.status).toBe(200);
+    const messages = await response.json();
+    expect(messages).toEqual([
+      expect.objectContaining({ direction: 'in', content: 'stale conflicting projection' }),
+    ]);
+    const retryDb = new Database(ctx.dbPath);
+    const delivery = retryDb.prepare(`
+      SELECT outbox.status, outbox.result_json, outbox.lease_expires_at
+      FROM runtime_outbox AS outbox
+      JOIN runtime_turns AS turn ON turn.turn_id = outbox.turn_id
+      WHERE turn.inbound_event_id = 'conflicting-web-inbound'
+    `).get();
+    retryDb.close();
+    expect(delivery).toMatchObject({ status: 'delivering', result_json: null });
+    expect(delivery.lease_expires_at).not.toBeNull();
+  });
+
+  test('an outbox row cannot borrow another turn identity to authorize its reply', async () => {
+    ctx = await startServer({ actualC4Receive: true });
+    const coreDb = new Database(ctx.dbPath);
+    const acceptText = (suffix, text, timestamp) => acceptCompatibilityInbound(coreDb, {
+      inbound_event_id: `identity-${suffix}-inbound`, trace_id: `identity-${suffix}-trace`,
+      occurred_at: timestamp, received_at: timestamp,
+      region: 'global', tenant_id: 'default', channel: 'web-console',
+      bot_id: 'zylos', chat_type: 'dm', chat_id: 'console',
+      native_thread_or_topic_id: null, message_id: `identity-${suffix}-message`,
+      actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
+      content: { kind: 'text', text, attachments: [] },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source_ref: `identity-${suffix}-source`,
+    }, { now: () => timestamp });
+    const first = acceptText(
+      'first', 'canonical first inbound', '2026-07-21T00:00:00.000Z',
+    );
+    const second = acceptText(
+      'second', 'safe second inbound', '2026-07-21T00:00:01.000Z',
+    );
+    const firstDeliveryId = coreDb.prepare(`
+      SELECT delivery_id FROM runtime_outbox
+      WHERE json_extract(command_json, '$.mapping.turn_id') = ?
+    `).get(first.turn_id).delivery_id;
+    coreDb.prepare('UPDATE runtime_outbox SET turn_id = ? WHERE turn_id = ?')
+      .run(second.turn_id, first.turn_id);
+    coreDb.close();
+
+    const mailboxDb = new Database(path.join(ctx.root, 'web-console', 'web-console.db'));
+    const mailbox = new DeliveryMailbox(mailboxDb, {
+      region: 'global', tenantId: 'default', botId: 'zylos',
+    });
+    const scopedFirstDeliveryId = `scope:${mailbox.scopeKey}:${firstDeliveryId}`;
+    mailbox.projectInbound({
+      inboundEventId: 'identity-first-inbound', endpointId: 'console',
+      content: 'stale first projection', timestamp: '2026-07-21T00:00:00.000Z',
+    });
+    mailboxDb.close();
+
+    const response = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    expect(response.status).toBe(200);
+    const messages = await response.json();
+    expect(messages.filter(({ direction }) => direction === 'out')).toEqual([]);
+    expect(messages.filter(({ direction }) => direction === 'in').map(({ content }) => content))
+      .toEqual(['stale first projection', 'safe second inbound']);
+    const verifyMailboxDb = new Database(path.join(ctx.root, 'web-console', 'web-console.db'));
+    const firstMailboxDelivery = verifyMailboxDb.prepare(`
+      SELECT id FROM delivery_mailbox
+      WHERE delivery_id = ? AND region = 'global' AND tenant_id = 'default' AND bot_id = 'zylos'
+    `).get(scopedFirstDeliveryId);
+    verifyMailboxDb.close();
+    expect(firstMailboxDelivery).toBeUndefined();
+    const verifyDb = new Database(ctx.dbPath);
+    const firstDelivery = verifyDb.prepare(`
+      SELECT status, result_json, lease_expires_at FROM runtime_outbox
+      WHERE delivery_id = ?
+    `).get(firstDeliveryId);
+    verifyDb.close();
+    expect(firstDelivery).toMatchObject({ status: 'delivering', result_json: null });
+    expect(firstDelivery.lease_expires_at).not.toBeNull();
+  });
+
   test('POST /api/upload stores a UUID-named file and returns metadata', async () => {
     ctx = await startServer();
     const { res, body } = await uploadFile(ctx, { name: '../bad name.txt', content: 'abc' });
@@ -185,7 +605,11 @@ describe('web-console attachment routes', () => {
     const form = new FormData();
     form.append('file', new Blob(['x'.repeat(1024 * 1024 + 1)], { type: 'text/plain' }), 'large.txt');
 
-    const res = await fetch(`${ctx.baseUrl}/api/upload`, { method: 'POST', body: form });
+    const res = await fetch(`${ctx.baseUrl}/api/upload`, {
+      method: 'POST',
+      headers: { 'X-Zylos-Mailbox-Cursor-Scope': ctx.cursorScope },
+      body: form,
+    });
     const body = await res.json();
 
     expect(res.status).toBe(413);
@@ -213,7 +637,11 @@ describe('web-console attachment routes', () => {
       const ws = new WebSocket(`ws://127.0.0.1:${ctx.port}/`);
       const timer = setTimeout(() => reject(new Error('timed out waiting for sent ack')), 3000);
       ws.on('open', () => {
-        ws.send(JSON.stringify({ type: 'send', content: '', attachments: [upload.body.id], tempId: 't1' }));
+        ws.send(JSON.stringify({ type: 'subscribe', since_id: 0 }));
+        ws.send(JSON.stringify({
+          type: 'send', content: '', attachments: [upload.body.id], tempId: 't1',
+          cursor_scope: ctx.cursorScope,
+        }));
       });
       ws.on('message', (raw) => {
         const msg = JSON.parse(raw.toString());
@@ -250,7 +678,186 @@ describe('web-console attachment routes', () => {
     expect(queuedRows[0].content).toContain('name="report.txt" 3B]');
   });
 
-  test('GET /api/media/:messageId serves only revalidated media rows', async () => {
+  test('staged upload capabilities cannot cross tenant scope after same-database restart', async () => {
+    ctx = await startServer({ tenantId: 'upload-tenant-a' });
+    const sharedRoot = ctx.root;
+    const upload = await uploadFile(ctx, { name: 'scoped.txt', content: 'scope A' });
+    expect(upload.res.status).toBe(200);
+    await stopServer(ctx, { preserveRoot: true });
+
+    ctx = await startServer({ root: sharedRoot, tenantId: 'upload-tenant-b' });
+    const rejected = await sendHttp(ctx, {
+      message: 'must fail in B', attachments: [upload.body.id],
+    });
+    expect(rejected.res.status).toBe(400);
+    expect(rejected.body.error).toBe('invalid_attachment');
+    await stopServer(ctx, { preserveRoot: true });
+
+    ctx = await startServer({ root: sharedRoot, tenantId: 'upload-tenant-a' });
+    const accepted = await sendHttp(ctx, {
+      message: 'valid again in A', attachments: [upload.body.id],
+    });
+    expect(accepted.res.status).toBe(200);
+  });
+
+  test('HTTP, WebSocket, and upload mutations reject a stale or missing mailbox scope', async () => {
+    ctx = await startServer({ actualC4Receive: true, tenantId: 'mutation-tenant-a' });
+    const sharedRoot = ctx.root;
+    const aScopeResponse = await fetch(`${ctx.baseUrl}/api/conversations/recent?limit=1`);
+    const scopeA = aScopeResponse.headers.get('x-zylos-mailbox-cursor-scope');
+    await stopServer(ctx, { preserveRoot: true });
+
+    ctx = await startServer({
+      root: sharedRoot, actualC4Receive: true, tenantId: 'mutation-tenant-b',
+    });
+    const bScopeResponse = await fetch(`${ctx.baseUrl}/api/conversations/recent?limit=1`);
+    const scopeB = bScopeResponse.headers.get('x-zylos-mailbox-cursor-scope');
+    expect(scopeB).not.toBe(scopeA);
+
+    const staleHttp = await fetch(`${ctx.baseUrl}/api/send`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Zylos-Mailbox-Cursor-Scope': scopeA,
+      },
+      body: JSON.stringify({ message: 'stale A HTTP mutation' }),
+    });
+    expect(staleHttp.status).toBe(409);
+    const missingHttp = await fetch(`${ctx.baseUrl}/api/send`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'missing scope mutation' }),
+    });
+    expect(missingHttp.status).toBe(409);
+
+    const staleForm = new FormData();
+    staleForm.append('file', new Blob(['stale A bytes'], { type: 'text/plain' }), 'stale-a.txt');
+    const staleUpload = await fetch(`${ctx.baseUrl}/api/upload`, {
+      method: 'POST',
+      headers: { 'X-Zylos-Mailbox-Cursor-Scope': scopeA },
+      body: staleForm,
+    });
+    expect(staleUpload.status).toBe(409);
+    const missingForm = new FormData();
+    missingForm.append('file', new Blob(['missing scope'], { type: 'text/plain' }), 'missing.txt');
+    const missingUpload = await fetch(`${ctx.baseUrl}/api/upload`, {
+      method: 'POST', body: missingForm,
+    });
+    expect(missingUpload.status).toBe(409);
+    expect(fs.readdirSync(path.join(ctx.root, 'web-console', 'media'))).toEqual([]);
+
+    async function wsMutation(payload) {
+      return new Promise((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${ctx.port}/`);
+      const timer = setTimeout(() => reject(new Error('timed out waiting for stale WS ack')), 3000);
+      ws.once('open', () => ws.send(JSON.stringify(payload)));
+      ws.on('message', (raw) => {
+        const event = JSON.parse(raw.toString());
+        if (event.type !== 'sent') return;
+        clearTimeout(timer);
+        ws.close();
+        resolve(event);
+      });
+      ws.once('error', reject);
+      });
+    }
+    const wsAck = await wsMutation({
+      type: 'send', content: 'stale A WS mutation', tempId: 'stale-a-ws',
+      cursor_scope: scopeA,
+    });
+    expect(wsAck).toMatchObject({
+      success: false, error: 'mailbox_cursor_scope_mismatch', status: 409,
+      cursor_scope: scopeB, tempId: 'stale-a-ws',
+    });
+    const missingWsAck = await wsMutation({
+      type: 'send', content: 'missing scope WS mutation', tempId: 'missing-scope-ws',
+    });
+    expect(missingWsAck).toMatchObject({
+      success: false, error: 'mailbox_cursor_scope_required', status: 409,
+      cursor_scope: scopeB, tempId: 'missing-scope-ws',
+    });
+
+    const currentHttp = await fetch(`${ctx.baseUrl}/api/send`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Zylos-Mailbox-Cursor-Scope': scopeB,
+      },
+      body: JSON.stringify({ message: 'current B mutation' }),
+    });
+    expect(currentHttp.status).toBe(200);
+    const mailbox = await (await fetch(`${ctx.baseUrl}/api/poll?since_id=0`)).json();
+    expect(mailbox.some(({ content }) => content === 'current B mutation')).toBe(true);
+    expect(mailbox.some(({ content }) => content.includes('stale A'))).toBe(false);
+    expect(mailbox.some(({ content }) => content.includes('missing scope'))).toBe(false);
+  });
+
+  test('consumed media remains readable only in its exact Core scope', async () => {
+    ctx = await startServer({ actualC4Receive: true, tenantId: 'media-tenant-a' });
+    const sharedRoot = ctx.root;
+    const upload = await uploadFile(ctx, { name: 'secret-a.txt', content: 'secret-a' });
+    const sent = await sendHttp(ctx, {
+      message: 'project scoped media', attachments: [upload.body.id],
+      message_id: 'scoped-media-a',
+    });
+    expect(sent.res.status).toBe(200);
+    const aMailbox = await (await fetch(`${ctx.baseUrl}/api/poll?since_id=0`)).json();
+    const href = aMailbox.find(({ direction }) => direction === 'in').attachments[0].href;
+    expect((await fetch(`${ctx.baseUrl}${href}`)).status).toBe(200);
+    await stopServer(ctx, { preserveRoot: true });
+
+    ctx = await startServer({
+      root: sharedRoot, actualC4Receive: true, tenantId: 'media-tenant-b',
+    });
+    expect((await fetch(`${ctx.baseUrl}${href}`)).status).toBe(404);
+    await stopServer(ctx, { preserveRoot: true });
+
+    ctx = await startServer({
+      root: sharedRoot, actualC4Receive: true, tenantId: 'media-tenant-a',
+    });
+    const restored = await fetch(`${ctx.baseUrl}${href}`);
+    expect(restored.status).toBe(200);
+    expect(await restored.text()).toBe('secret-a');
+  });
+
+  test('an uploaded attachment is not downloadable before Core admission consumes it', async () => {
+    ctx = await startServer();
+    const upload = await uploadFile(ctx, {
+      name: 'not-admitted.txt', content: 'not admitted',
+    });
+    expect(upload.res.status).toBe(200);
+    const filenames = fs.readdirSync(path.join(ctx.root, 'web-console', 'media'));
+    expect(filenames).toHaveLength(1);
+
+    const response = await fetch(
+      `${ctx.baseUrl}/api/inbound-media/${encodeURIComponent(filenames[0])}`,
+    );
+    expect(response.status).toBe(404);
+  });
+
+  test('a consumed attachment becomes downloadable only after its scoped mailbox projection', async () => {
+    ctx = await startServer({ actualC4Receive: true });
+    const upload = await uploadFile(ctx, {
+      name: 'projection-gated.txt', content: 'projection gated',
+    });
+    expect(upload.res.status).toBe(200);
+    const sent = await sendHttp(ctx, {
+      message: 'project this attachment', attachments: [upload.body.id],
+      message_id: 'projection-gated-message',
+    });
+    expect(sent.res.status).toBe(200);
+    const [filename] = fs.readdirSync(path.join(ctx.root, 'web-console', 'media'));
+    const href = `/api/inbound-media/${encodeURIComponent(filename)}`;
+
+    expect((await fetch(`${ctx.baseUrl}${href}`)).status).toBe(404);
+    const mailbox = await (await fetch(`${ctx.baseUrl}/api/poll?since_id=0`)).json();
+    expect(mailbox.find(({ direction }) => direction === 'in').attachments)
+      .toEqual([expect.objectContaining({ attachment_id: upload.body.id })]);
+    const projected = await fetch(`${ctx.baseUrl}${href}`);
+    expect(projected.status).toBe(200);
+    expect(await projected.text()).toBe('projection gated');
+  });
+
+  test('GET /api/media/:messageId fails closed for retired legacy media rows', async () => {
     ctx = await startServer();
     const imagePath = path.join(ctx.root, 'out.png');
     fs.writeFileSync(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
@@ -270,24 +877,15 @@ describe('web-console attachment routes', () => {
     const escapeId = insert.run('out', 'web-console', 'console', `[MEDIA:file]${escapePath}`, new Date().toISOString()).lastInsertRowid;
     db.close();
 
-    const image = await fetch(`${ctx.baseUrl}/api/media/${imageId}`);
-    expect(image.status).toBe(200);
-    expect(image.headers.get('content-type')).toBe('image/png');
-    expect(image.headers.get('content-disposition')).toBe('inline; filename="out.png"');
-
-    const file = await fetch(`${ctx.baseUrl}/api/media/${fileId}`);
-    expect(file.status).toBe(200);
-    expect(file.headers.get('content-type')).toBe('application/octet-stream');
-    expect(file.headers.get('content-disposition')).toBe('attachment; filename="out.txt"');
-    expect(await file.text()).toBe('download');
-
-    for (const id of [999999, inRowId, wrongChannelId, wrongEndpointId, notMediaId, escapeId]) {
+    for (const id of [
+      999999, imageId, fileId, inRowId, wrongChannelId, wrongEndpointId, notMediaId, escapeId,
+    ]) {
       const res = await fetch(`${ctx.baseUrl}/api/media/${id}`);
       expect(res.status).toBe(404);
     }
   });
 
-  test('GET /api/inbound-media/:filename serves uploaded files from media dir', async () => {
+  test('GET /api/inbound-media/:filename serves consumed uploads projected by its scoped mailbox', async () => {
     ctx = await startServer();
     const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
     const mediaDir = path.join(ctx.root, 'web-console', 'media');
@@ -296,6 +894,44 @@ describe('web-console attachment routes', () => {
     fs.writeFileSync(pngFile, pngBytes);
     const txtFile = path.join(mediaDir, 'wc-test-doc.txt');
     fs.writeFileSync(txtFile, 'hello');
+    const mailboxDb = new Database(path.join(ctx.root, 'web-console', 'web-console.db'));
+    const register = mailboxDb.prepare(`
+      INSERT INTO scoped_uploads (
+        id, session_token, path, name, size, size_label, mime, kind,
+        region, tenant_id, bot_id, created_at, consumed
+      ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'global', 'default', 'zylos', ?, 1)
+    `);
+    register.run(
+      'owned-test-image', pngFile, 'wc-test-image.png', pngBytes.length,
+      `${pngBytes.length}B`, 'image/png', 'image', Date.now(),
+    );
+    register.run(
+      'owned-test-file', txtFile, 'wc-test-doc.txt', 5, '5B',
+      'text/plain', 'file', Date.now(),
+    );
+    const mailbox = new DeliveryMailbox(mailboxDb, {
+      region: 'global', tenantId: 'default', botId: 'zylos',
+    });
+    const timestamp = new Date().toISOString();
+    mailbox.projectInbound({
+      inboundEventId: 'owned-test-image-event', endpointId: 'console', timestamp,
+      content: '',
+      attachments: [{
+        attachment_id: 'owned-test-image', kind: 'image', name: 'wc-test-image.png',
+        media_type: 'image/png', size_bytes: pngBytes.length,
+        size_label: `${pngBytes.length}B`, href: '/api/inbound-media/wc-test-image.png',
+      }],
+    });
+    mailbox.projectInbound({
+      inboundEventId: 'owned-test-file-event', endpointId: 'console', timestamp,
+      content: '',
+      attachments: [{
+        attachment_id: 'owned-test-file', kind: 'file', name: 'wc-test-doc.txt',
+        media_type: 'text/plain', size_bytes: 5,
+        size_label: '5B', href: '/api/inbound-media/wc-test-doc.txt',
+      }],
+    });
+    mailboxDb.close();
 
     const imgRes = await fetch(`${ctx.baseUrl}/api/inbound-media/wc-test-image.png`);
     expect(imgRes.status).toBe(200);
@@ -311,11 +947,20 @@ describe('web-console attachment routes', () => {
     const missing = await fetch(`${ctx.baseUrl}/api/inbound-media/nonexistent.png`);
     expect(missing.status).toBe(404);
 
+    const parentAlias = await fetch(
+      `${ctx.baseUrl}/api/inbound-media/..%2Fwc-test-doc.txt`,
+    );
+    expect(parentAlias.status).toBe(404);
+    const nestedAlias = await fetch(
+      `${ctx.baseUrl}/api/inbound-media/nested%2Fwc-test-doc.txt`,
+    );
+    expect(nestedAlias.status).toBe(404);
+
     const traversal = await fetch(`${ctx.baseUrl}/api/inbound-media/..%2F..%2F.env`);
     expect(traversal.status).toBe(404);
   });
 
-  test('display queries exclude void channel rows (#689)', async () => {
+  test('display queries ignore every retired legacy conversation row', async () => {
     ctx = await startServer();
 
     const db = new Database(ctx.dbPath);
@@ -325,27 +970,411 @@ describe('web-console attachment routes', () => {
     insert.run('out', 'void', 'session-handoff', 'internal handoff summary', new Date().toISOString());
     db.close();
 
-    // /api/conversations/recent is scoped to web-console — void rows never appear.
+    // History is projected only from delivered Core outbox commands.
     const recentRes = await fetch(`${ctx.baseUrl}/api/conversations/recent?limit=50`);
     expect(recentRes.status).toBe(200);
     const recentContents = (await recentRes.json()).map((row) => row.content);
-    expect(recentContents).toContain('visible console message');
-    expect(recentContents).toContain('null endpoint stays visible');
-    expect(recentContents).not.toContain('internal handoff summary');
+    expect(recentContents).toEqual([]);
 
     // The parameterized channel query must not expose void even when asked directly.
     const voidRes = await fetch(`${ctx.baseUrl}/api/conversations?channel=void&limit=50`);
     expect(voidRes.status).toBe(200);
     expect(await voidRes.json()).toEqual([]);
 
-    // Default channel query still returns web-console traffic.
+    // A legacy table cannot become a fallback for the default query.
     const defaultRes = await fetch(`${ctx.baseUrl}/api/conversations?limit=50`);
     const defaultContents = (await defaultRes.json()).map((row) => row.content);
-    expect(defaultContents).toContain('visible console message');
-    expect(defaultContents).not.toContain('internal handoff summary');
+    expect(defaultContents).toEqual([]);
   });
 
-  test('GET /api/conversations/recent includes inbound image href', async () => {
+  test('conversation history projects canonical Core inbound and delivered outbox facts', async () => {
+    ctx = await startServer({ tenantId: 'web-history-tenant' });
+    const db = new Database(ctx.dbPath);
+    const accepted = acceptCompatibilityInbound(db, {
+      inbound_event_id: 'web-history-event', trace_id: 'web-history-trace',
+      occurred_at: '2020-01-01T00:00:00.000Z', received_at: '2020-01-01T00:00:00.000Z',
+      region: 'global', tenant_id: 'web-history-tenant', channel: 'web-console',
+      bot_id: 'zylos', chat_type: 'dm', chat_id: 'console',
+      native_thread_or_topic_id: null, message_id: 'web-history-message',
+      actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
+      content: { kind: 'text', text: 'canonical inbound text', attachments: [] },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source_ref: 'web-history-source',
+    }, { now: () => '2020-01-01T00:00:00.000Z' });
+    db.close();
+
+    const poll = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    expect(poll.status).toBe(200);
+    const deliveredDb = new Database(ctx.dbPath);
+    expect(deliveredDb.prepare('SELECT status FROM runtime_outbox WHERE turn_id = ?')
+      .get(accepted.turn_id).status).toBe('delivered');
+    deliveredDb.close();
+
+    const response = await fetch(`${ctx.baseUrl}/api/conversations/recent?limit=10`);
+    expect(response.status).toBe(200);
+    const history = await response.json();
+    expect(history.map(({ direction, content }) => ({ direction, content }))).toEqual([
+      { direction: 'in', content: 'canonical inbound text' },
+      { direction: 'out', content: expect.stringContaining('Message received.') },
+    ]);
+  });
+
+  test('mailbox projection preserves Core queue FIFO when accepted timestamps run backward', async () => {
+    ctx = await startServer({ tenantId: 'web-fifo-tenant' });
+    const db = new Database(ctx.dbPath);
+    const base = {
+      region: 'global', tenant_id: 'web-fifo-tenant', channel: 'web-console',
+      bot_id: 'zylos', chat_type: 'dm', chat_id: 'console',
+      native_thread_or_topic_id: null,
+      actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+    };
+    acceptCompatibilityInbound(db, {
+      ...base,
+      inbound_event_id: 'web-fifo-first', trace_id: 'web-fifo-first-trace',
+      occurred_at: '2026-07-21T00:00:02.000Z', received_at: '2026-07-21T00:00:02.000Z',
+      message_id: 'web-fifo-first-message',
+      content: { kind: 'text', text: 'accepted first', attachments: [] },
+      source_ref: 'web-fifo-first-source',
+    }, { now: () => '2026-07-21T00:00:02.000Z' });
+    acceptCompatibilityInbound(db, {
+      ...base,
+      inbound_event_id: 'web-fifo-second', trace_id: 'web-fifo-second-trace',
+      occurred_at: '2026-07-21T00:00:01.000Z', received_at: '2026-07-21T00:00:01.000Z',
+      message_id: 'web-fifo-second-message',
+      content: { kind: 'text', text: 'accepted second', attachments: [] },
+      source_ref: 'web-fifo-second-source',
+    }, { now: () => '2026-07-21T00:00:01.000Z' });
+    db.close();
+
+    const messages = await (await fetch(`${ctx.baseUrl}/api/poll?since_id=0`)).json();
+    expect(messages.filter(({ direction }) => direction === 'in').map(({ content }) => content))
+      .toEqual(['accepted first', 'accepted second']);
+  });
+
+  test('HTTP polling consumes and renders the authoritative Core outbox without WebSocket clients', async () => {
+    ctx = await startServer({ tenantId: 'web-poll-tenant' });
+    const db = new Database(ctx.dbPath);
+    const accepted = acceptCompatibilityInbound(db, {
+      inbound_event_id: 'web-poll-event', trace_id: 'web-poll-trace',
+      occurred_at: '2020-01-01T00:00:00.000Z', received_at: '2020-01-01T00:00:00.000Z',
+      region: 'global', tenant_id: 'web-poll-tenant', channel: 'web-console',
+      bot_id: 'zylos', chat_type: 'dm', chat_id: 'console',
+      native_thread_or_topic_id: null, message_id: 'web-poll-message',
+      actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
+      content: { kind: 'text', text: 'poll-only inbound', attachments: [] },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source_ref: 'web-poll-source',
+    }, { now: () => '2020-01-01T00:00:00.000Z' });
+    expect(db.prepare('SELECT status FROM runtime_outbox WHERE turn_id = ?')
+      .get(accepted.turn_id).status).toBe('pending');
+    db.close();
+
+    const invalidCursor = await fetch(`${ctx.baseUrl}/api/poll?since_id=-1`);
+    expect(invalidCursor.status).toBe(400);
+    const unchanged = new Database(ctx.dbPath);
+    expect(unchanged.prepare('SELECT status FROM runtime_outbox WHERE turn_id = ?')
+      .get(accepted.turn_id).status).toBe('pending');
+    unchanged.close();
+
+    const response = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    expect(response.status).toBe(200);
+    const messages = await response.json();
+
+    const reopened = new Database(ctx.dbPath);
+    const deliveryState = reopened.prepare(`
+      SELECT outbox.status, outbox.attempt_count, outbox.command_json
+      FROM runtime_outbox AS outbox WHERE outbox.turn_id = ?
+    `).get(accepted.turn_id);
+    expect(deliveryState).toMatchObject({ status: 'delivered', attempt_count: 1 });
+    reopened.close();
+    expect(messages.map(({ direction, content }) => ({ direction, content }))).toEqual([
+      { direction: 'in', content: 'poll-only inbound' },
+      { direction: 'out', content: expect.stringContaining('Message received.') },
+    ]);
+  });
+
+  test('HTTP mailbox pagination exposes more than 100 mixed rows without a cursor gap', async () => {
+    ctx = await startServer();
+    const mailboxDb = new Database(path.join(ctx.root, 'web-console', 'web-console.db'));
+    const scopeKey = crypto.createHash('sha256').update(JSON.stringify([
+      'global', 'default', 'zylos', 'web-console', 'console',
+    ])).digest('hex');
+    const insert = mailboxDb.prepare(`
+      INSERT INTO delivery_mailbox (
+        source_key, delivery_id, direction, channel, endpoint_id,
+        region, tenant_id, bot_id, content, timestamp
+      ) VALUES (?, ?, ?, 'web-console', 'console', 'global', 'default', 'zylos', ?, ?)
+    `);
+    mailboxDb.transaction(() => {
+      for (let index = 1; index <= 151; index += 1) {
+        const outbound = index % 3 === 0;
+        insert.run(
+          `scope:${scopeKey}:route-backlog:${index}`,
+          outbound ? `scope:${scopeKey}:route-delivery:${index}` : null,
+          outbound ? 'out' : 'in',
+          `route message ${index}`,
+          new Date(Date.UTC(2026, 6, 21, 0, 0, index)).toISOString(),
+        );
+      }
+    })();
+    mailboxDb.close();
+
+    const firstResponse = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    const cursorScope = firstResponse.headers.get('x-zylos-mailbox-cursor-scope');
+    const first = await firstResponse.json();
+    const second = await (await fetch(
+      `${ctx.baseUrl}/api/poll?since_id=${first.at(-1).id}`
+        + `&cursor_scope=${encodeURIComponent(cursorScope)}`,
+    )).json();
+    const all = [...first, ...second];
+    expect(first).toHaveLength(100);
+    expect(second).toHaveLength(51);
+    expect(all.map(({ id }) => id)).toEqual(Array.from({ length: 151 }, (_, index) => index + 1));
+    expect(new Set(all.map(({ direction }) => direction))).toEqual(new Set(['in', 'out']));
+  });
+
+  test('HTTP polling renders a durable security notice with no turn event', async () => {
+    ctx = await startServer({ tenantId: 'web-security-tenant' });
+    const db = new Database(ctx.dbPath);
+    const envelope = {
+      contract: 'zylos.inbound-envelope', contract_version: '1.0',
+      inbound_event_id: 'web-security-event', trace_id: 'web-security-trace',
+      occurred_at: '2020-01-01T00:00:00.000Z', received_at: '2020-01-01T00:00:00.000Z',
+      region: 'global', tenant_id: 'web-security-tenant', channel: 'web-console',
+      bot_id: 'zylos', chat_type: 'dm', chat_id: 'console',
+      native_thread_or_topic_id: null, message_id: 'web-security-message',
+      actor: { type: 'user', actor_id: 'web-owner', authenticated: true, roles: ['bot_owner'] },
+      content: { kind: 'text', text: '/permission safe', attachments: [] },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source: { kind: 'platform_original', source_ref: 'web-security-source' },
+    };
+    envelope.idempotency_key = createIdempotencyKey('inbound', {
+      region: envelope.region, tenant_id: envelope.tenant_id, channel: envelope.channel,
+      bot_id: envelope.bot_id, inbound_event_id: envelope.inbound_event_id,
+    });
+    const accepted = acceptNormalInbound(db, envelope, {
+      now: () => '2020-01-01T00:00:00.000Z',
+    });
+    const row = db.prepare(`
+      SELECT outbox_id, command_json FROM runtime_outbox WHERE control_id = ?
+    `).get(accepted.control_id);
+    const command = JSON.parse(row.command_json);
+    expect(command.mapping.turn_id).toBeNull();
+    expect(command.event_sequence_through).toBeNull();
+    db.close();
+
+    const response = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    expect(response.status).toBe(200);
+    const delivered = await response.json();
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toMatchObject({ direction: 'out' });
+    expect(delivered[0].content).toContain(command.render_model.text);
+
+    const reopened = new Database(ctx.dbPath);
+    expect(reopened.prepare('SELECT status FROM runtime_outbox WHERE outbox_id = ?')
+      .get(row.outbox_id).status).toBe('delivered');
+    reopened.close();
+  });
+
+  test('WebSocket delivery projects the durable inbound before its outbox reply', async () => {
+    ctx = await startServer({ tenantId: 'web-ws-order-tenant' });
+    const messages = [];
+    const ws = new WebSocket(`ws://127.0.0.1:${ctx.port}/`);
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timed out opening WebSocket')), 3000);
+      ws.once('open', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      ws.once('error', reject);
+    });
+    ws.on('message', (raw) => {
+      const event = JSON.parse(raw.toString());
+      if (event.type === 'messages') messages.push(...event.data);
+    });
+    ws.send(JSON.stringify({ type: 'subscribe', since_id: 0 }));
+
+    const db = new Database(ctx.dbPath);
+    acceptCompatibilityInbound(db, {
+      inbound_event_id: 'web-ws-order-event', trace_id: 'web-ws-order-trace',
+      occurred_at: '2020-01-01T00:00:00.000Z', received_at: '2020-01-01T00:00:00.000Z',
+      region: 'global', tenant_id: 'web-ws-order-tenant', channel: 'web-console',
+      bot_id: 'zylos', chat_type: 'dm', chat_id: 'console',
+      native_thread_or_topic_id: null, message_id: 'web-ws-order-message',
+      actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
+      content: { kind: 'text', text: 'ordered inbound', attachments: [] },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source_ref: 'web-ws-order-source',
+    }, { now: () => '2020-01-01T00:00:00.000Z' });
+    db.close();
+
+    const deadline = Date.now() + 5000;
+    while ((!messages.some(({ direction }) => direction === 'in')
+      || !messages.some(({ direction }) => direction === 'out'))
+      && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    ws.close();
+    expect(messages[0]).toMatchObject({ direction: 'in', content: 'ordered inbound' });
+    expect(messages.slice(1).some(({ direction }) => direction === 'out')).toBe(true);
+  });
+
+  test('WebSocket clients advance independent durable projection cursors', async () => {
+    ctx = await startServer({ tenantId: 'web-cursor-tenant' });
+    const seedDb = new Database(ctx.dbPath);
+    acceptCompatibilityInbound(seedDb, {
+      inbound_event_id: 'web-cursor-seed', trace_id: 'web-cursor-seed-trace',
+      occurred_at: '2020-01-01T00:00:00.000Z', received_at: '2020-01-01T00:00:00.000Z',
+      region: 'global', tenant_id: 'web-cursor-tenant', channel: 'web-console',
+      bot_id: 'zylos', chat_type: 'dm', chat_id: 'console', native_thread_or_topic_id: null,
+      message_id: 'web-cursor-seed-message',
+      actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
+      content: { kind: 'text', text: 'cursor history only', attachments: [] },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source_ref: 'web-cursor-seed-source',
+    }, { now: () => '2020-01-01T00:00:00.000Z' });
+    seedDb.close();
+    await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    const historyResponse = await fetch(`${ctx.baseUrl}/api/conversations/recent?limit=100`);
+    const cursorScope = historyResponse.headers.get('x-zylos-mailbox-cursor-scope');
+    const history = await historyResponse.json();
+    const historyCursor = Math.max(...history.map(({ id }) => id));
+
+    async function subscribedClient(sinceId) {
+      const received = [];
+      const ws = new WebSocket(`ws://127.0.0.1:${ctx.port}/`);
+      await new Promise((resolve, reject) => {
+        ws.once('open', resolve);
+        ws.once('error', reject);
+      });
+      ws.on('message', (raw) => {
+        const event = JSON.parse(raw.toString());
+        if (event.type === 'messages') received.push(...event.data);
+      });
+      ws.send(JSON.stringify({
+        type: 'subscribe', since_id: sinceId, cursor_scope: cursorScope,
+      }));
+      return { ws, received };
+    }
+
+    const fromBeginning = await subscribedClient(0);
+    const fromCurrent = await subscribedClient(historyCursor);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const nextDb = new Database(ctx.dbPath);
+    acceptCompatibilityInbound(nextDb, {
+      inbound_event_id: 'web-cursor-next', trace_id: 'web-cursor-next-trace',
+      occurred_at: '2020-01-01T00:00:01.000Z', received_at: '2020-01-01T00:00:01.000Z',
+      region: 'global', tenant_id: 'web-cursor-tenant', channel: 'web-console',
+      bot_id: 'zylos', chat_type: 'dm', chat_id: 'console', native_thread_or_topic_id: null,
+      message_id: 'web-cursor-next-message',
+      actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
+      content: { kind: 'text', text: 'cursor visible to both', attachments: [] },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source_ref: 'web-cursor-next-source',
+    }, { now: () => '2020-01-01T00:00:01.000Z' });
+    nextDb.close();
+
+    const deadline = Date.now() + 5000;
+    while ((!fromBeginning.received.some(({ content }) => content === 'cursor visible to both')
+      || !fromCurrent.received.some(({ content }) => content === 'cursor visible to both'))
+      && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    fromBeginning.ws.close();
+    fromCurrent.ws.close();
+
+    expect(fromBeginning.received.some(({ content }) => content === 'cursor history only')).toBe(true);
+    expect(fromCurrent.received.some(({ content }) => content === 'cursor history only')).toBe(false);
+    expect(fromBeginning.received.some(({ content }) => content === 'cursor visible to both')).toBe(true);
+    expect(fromCurrent.received.some(({ content }) => content === 'cursor visible to both')).toBe(true);
+  });
+
+  test('scope-bound HTTP and WebSocket cursors reset across same-database B to A to B restart', async () => {
+    function acceptFor(active, tenantId, suffix) {
+      const coreDb = new Database(active.dbPath);
+      acceptCompatibilityInbound(coreDb, {
+        inbound_event_id: `scope-restart-${suffix}`, trace_id: `scope-restart-${suffix}-trace`,
+        occurred_at: '2026-07-21T00:00:00.000Z', received_at: '2026-07-21T00:00:00.000Z',
+        region: 'global', tenant_id: tenantId, channel: 'web-console', bot_id: 'zylos',
+        chat_type: 'dm', chat_id: 'console', native_thread_or_topic_id: null,
+        message_id: `scope-restart-${suffix}-message`,
+        actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
+        content: { kind: 'text', text: `${suffix} inbound`, attachments: [] },
+        reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+        source_ref: `scope-restart-${suffix}-source`,
+      }, { now: () => '2026-07-21T00:00:00.000Z' });
+      coreDb.close();
+    }
+
+    ctx = await startServer({ tenantId: 'tenant-b' });
+    const sharedRoot = ctx.root;
+    acceptFor(ctx, 'tenant-b', 'B');
+    const initialB = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    const bScope = initialB.headers.get('x-zylos-mailbox-cursor-scope');
+    const bMessages = await initialB.json();
+    expect(bScope).toMatch(/^web-console-mailbox-v1:[a-f0-9]{64}$/);
+    expect(bMessages.map(({ direction }) => direction)).toEqual(['in', 'out']);
+    await stopServer(ctx, { preserveRoot: true });
+
+    ctx = await startServer({ root: sharedRoot, tenantId: 'tenant-a' });
+    acceptFor(ctx, 'tenant-a', 'A');
+    const initialA = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    const aScope = initialA.headers.get('x-zylos-mailbox-cursor-scope');
+    const aMessages = await initialA.json();
+    const aCursor = aMessages.at(-1).id;
+    expect(aScope).not.toBe(bScope);
+    expect(aCursor).toBeGreaterThan(bMessages.at(-1).id);
+    await stopServer(ctx, { preserveRoot: true });
+
+    ctx = await startServer({ root: sharedRoot, tenantId: 'tenant-b' });
+    const staleHttp = await fetch(
+      `${ctx.baseUrl}/api/poll?since_id=${aCursor}&cursor_scope=${encodeURIComponent(aScope)}`,
+    );
+    expect(staleHttp.status).toBe(409);
+    const reset = await staleHttp.json();
+    expect(reset).toEqual({
+      error: 'mailbox_cursor_scope_mismatch', cursor_scope: bScope,
+    });
+    const reloadedB = await fetch(
+      `${ctx.baseUrl}/api/poll?since_id=0&cursor_scope=${encodeURIComponent(reset.cursor_scope)}`,
+    );
+    expect((await reloadedB.json()).map(({ direction, content }) => ({ direction, content })))
+      .toEqual(bMessages.map(({ direction, content }) => ({ direction, content })));
+
+    const wsEvents = [];
+    const ws = new WebSocket(`ws://127.0.0.1:${ctx.port}/`);
+    await new Promise((resolve, reject) => {
+      ws.once('open', resolve);
+      ws.once('error', reject);
+    });
+    ws.on('message', (raw) => {
+      const event = JSON.parse(raw.toString());
+      wsEvents.push(event);
+      if (event.type === 'cursor_reset') {
+        ws.send(JSON.stringify({
+          type: 'subscribe', since_id: 0, cursor_scope: event.cursor_scope,
+        }));
+      }
+    });
+    ws.send(JSON.stringify({
+      type: 'subscribe', since_id: aCursor, cursor_scope: aScope,
+    }));
+    const deadline = Date.now() + 5000;
+    while (!wsEvents.some((event) => event.type === 'messages') && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    ws.close();
+    expect(wsEvents.some((event) => event.type === 'cursor_reset'
+      && event.cursor_scope === bScope)).toBe(true);
+    const wsMessages = wsEvents.filter(({ type }) => type === 'messages')
+      .flatMap(({ data }) => data);
+    expect(wsMessages.map(({ direction, content }) => ({ direction, content })))
+      .toEqual(bMessages.map(({ direction, content }) => ({ direction, content })));
+  });
+
+  test('GET /api/conversations/recent does not project retired inbound rows', async () => {
     ctx = await startServer();
     const mediaDir = path.join(ctx.root, 'web-console', 'media');
     const imgFile = path.join(mediaDir, 'wc-uploaded.png');
@@ -360,11 +1389,6 @@ describe('web-console attachment routes', () => {
 
     const res = await fetch(`${ctx.baseUrl}/api/conversations/recent?limit=10`);
     const conversations = await res.json();
-    const last = conversations.at(-1);
-
-    expect(last.content).toBe('hello');
-    expect(last.attachments).toHaveLength(1);
-    expect(last.attachments[0].kind).toBe('image');
-    expect(last.attachments[0].href).toBe('/api/inbound-media/wc-uploaded.png');
+    expect(conversations).toEqual([]);
   });
 });
