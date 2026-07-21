@@ -4,6 +4,7 @@ import { existsSync } from 'fs';
 import Database from 'better-sqlite3';
 
 import { acceptScheduledOccurrence } from '../../../runtime/scheduler/scheduler-queue.js';
+import { validateOpaqueId } from '../../../contracts/public/index.js';
 import { recoverLegacyRunningTasks } from './daemon-tasks.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || join(homedir(), 'zylos');
@@ -37,9 +38,9 @@ function taskOccurrence(task, { notificationText = null } = {}) {
     occurred_at: scheduledAt,
     // A retry after a scheduler crash must reproduce the exact same envelope.
     received_at: scheduledAt,
-    region: process.env.ZYLOS_REGION ?? 'global',
-    tenant_id: process.env.ZYLOS_TENANT_ID ?? 'default',
-    bot_id: process.env.ZYLOS_BOT_ID ?? 'zylos',
+    region: validateOpaqueId('task.scope_region', task.scope_region),
+    tenant_id: validateOpaqueId('task.scope_tenant_id', task.scope_tenant_id),
+    bot_id: validateOpaqueId('task.scope_bot_id', task.scope_bot_id),
     bound_conversation: boundConversation,
     ...(notificationText === null ? {} : { notification_text: notificationText }),
   };

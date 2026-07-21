@@ -1,6 +1,7 @@
 import {
   createIdempotencyKey,
   validateInboundEnvelope,
+  validateOpaqueId,
 } from '../../contracts/public/index.js';
 import { acceptNormalInbound } from '../persistence/inbound-acceptance.js';
 
@@ -32,21 +33,20 @@ export function createBoundConversationIdentity(occurrence) {
       throw new TypeError(`bound_conversation.${field} is required`);
     }
   }
-  const channel = requireNonEmptyString('bound_conversation.channel', bound.channel);
+  const channel = validateOpaqueId('bound_conversation.channel', bound.channel);
   if (channel === 'scheduler') {
     throw new TypeError('bound_conversation.channel must identify a real channel adapter');
   }
-  if (!['dm', 'group', 'thread'].includes(bound.chat_type)) {
+  const chatType = validateOpaqueId('bound_conversation.chat_type', bound.chat_type);
+  if (!['dm', 'group', 'thread'].includes(chatType)) {
     throw new TypeError('bound_conversation.chat_type must be dm, group, or thread');
   }
-  if (bound.native_thread_or_topic_id !== null
-    && (typeof bound.native_thread_or_topic_id !== 'string'
-      || bound.native_thread_or_topic_id.length === 0)) {
-    throw new TypeError('bound_conversation.native_thread_or_topic_id must be a string or null');
-  }
-  if (bound.chat_type === 'thread') {
-    requireNonEmptyString('bound_conversation.native_thread_or_topic_id', bound.native_thread_or_topic_id);
-    requireNonEmptyString('bound_conversation.root_message_id', bound.root_message_id);
+  if (chatType === 'thread') {
+    validateOpaqueId(
+      'bound_conversation.native_thread_or_topic_id',
+      bound.native_thread_or_topic_id,
+    );
+    validateOpaqueId('bound_conversation.root_message_id', bound.root_message_id);
   } else if (bound.native_thread_or_topic_id !== null || bound.root_message_id !== null) {
     throw new TypeError(
       'bound_conversation native thread and root message ids must be null outside a thread',
@@ -54,10 +54,10 @@ export function createBoundConversationIdentity(occurrence) {
   }
   return {
     channel,
-    chat_type: requireNonEmptyString('bound_conversation.chat_type', bound.chat_type),
-    chat_id: requireNonEmptyString('bound_conversation.chat_id', bound.chat_id),
+    chat_type: chatType,
+    chat_id: validateOpaqueId('bound_conversation.chat_id', bound.chat_id),
     native_thread_or_topic_id: bound.native_thread_or_topic_id,
-    message_id: requireNonEmptyString('bound_conversation.message_id', bound.message_id),
+    message_id: validateOpaqueId('bound_conversation.message_id', bound.message_id),
     root_message_id: bound.root_message_id ?? null,
   };
 }

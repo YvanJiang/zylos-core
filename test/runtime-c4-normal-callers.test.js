@@ -36,6 +36,17 @@ function run(file, args, env, input = undefined) {
   });
 }
 
+function claimTimeFor(database, channel, chatId) {
+  const row = database.prepare(`
+    SELECT command_json, next_attempt_at FROM runtime_outbox WHERE status = 'pending'
+  `).all().find(({ command_json: commandJson }) => {
+    const target = JSON.parse(commandJson).target;
+    return target.channel === channel && target.chat_id === chatId;
+  });
+  assert.ok(row, `expected a pending ${channel}/${chatId} outbox command`);
+  return new Date(Date.parse(row.next_attempt_at) + 1).toISOString();
+}
+
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
     fs.rmSync(directory, { recursive: true, force: true });
@@ -144,12 +155,13 @@ describe('normal C4 callers use durable Core contracts', () => {
     }
 
     const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
+    const webClaimTime = claimTimeFor(database, 'web-console', 'console');
     const owner = createOutboxService({
       database,
       channel: 'web-console',
       targetChatId: 'console',
       serviceInstanceId: 'web-console-owner-fixture',
-      now: () => '2026-07-21T00:10:01.000Z',
+      now: () => webClaimTime,
     });
     const webCommand = owner.claimNext();
     assert.equal(webCommand.target.channel, 'web-console');
@@ -158,12 +170,13 @@ describe('normal C4 callers use durable Core contracts', () => {
       SELECT COUNT(*) AS count FROM runtime_outbox WHERE status = 'pending'
     `).get().count, 3);
 
+    const shellClaimTime = claimTimeFor(database, 'shell', '/tmp/disposable-shell.sock');
     const shellOwner = createOutboxService({
       database,
       channel: 'shell',
       targetChatId: '/tmp/disposable-shell.sock',
       serviceInstanceId: 'shell-owner-fixture',
-      now: () => '2026-07-21T00:10:01.000Z',
+      now: () => shellClaimTime,
     });
     assert.equal(shellOwner.claimNext().target.chat_id, '/tmp/disposable-shell.sock');
     assert.equal(shellOwner.claimNext(), null);
@@ -187,10 +200,11 @@ describe('normal C4 callers use durable Core contracts', () => {
       SELECT status FROM runtime_outbox WHERE turn_id = ?
     `).get(accepted.turn_id).status, 'pending');
     const browserDeliveries = [];
+    const claimTime = claimTimeFor(database, 'web-console', 'console');
     const owner = createWebConsoleOutboxOwner({
       database,
       serviceInstanceId: 'web-console-owner-round-trip',
-      now: () => '2026-07-21T00:20:01.000Z',
+      now: () => claimTime,
       deliverMessage(message, delivery) {
         browserDeliveries.push(message);
         return { platform_message_id: `mailbox:${delivery.delivery_id}` };

@@ -27,7 +27,8 @@ function database(filename = ':memory:') {
       priority INTEGER, status TEXT, require_idle INTEGER, miss_threshold INTEGER,
       bound_conversation_json TEXT, created_at INTEGER, updated_at INTEGER,
       last_error TEXT, current_occurrence_id TEXT, current_turn_id TEXT,
-      last_core_state TEXT, core_wait_reason TEXT, requires_reconfiguration INTEGER DEFAULT 0
+      last_core_state TEXT, core_wait_reason TEXT, requires_reconfiguration INTEGER DEFAULT 0,
+      requires_occurrence_advance INTEGER DEFAULT 0
     );
     CREATE TABLE task_history (
       id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
@@ -59,6 +60,116 @@ function snapshot(state, { maintenance = false, error = null } = {}) {
 }
 
 describe('scheduler Core admission and reconciliation', () => {
+  test('reopens a true pre-migration running row and adopts its original history in place', async () => {
+    const originalZylosDir = process.env.ZYLOS_DIR;
+    const originalRegion = process.env.ZYLOS_REGION;
+    const originalTenant = process.env.ZYLOS_TENANT_ID;
+    const originalBot = process.env.ZYLOS_BOT_ID;
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'scheduler-pre-migration-'));
+    const schedulerDirectory = path.join(directory, 'scheduler');
+    const schedulerPath = path.join(schedulerDirectory, 'scheduler.db');
+    fs.mkdirSync(schedulerDirectory, { recursive: true });
+    const legacy = new Database(schedulerPath);
+    legacy.exec(`
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT, prompt TEXT NOT NULL,
+        type TEXT NOT NULL, cron_expression TEXT, interval_seconds INTEGER, timezone TEXT,
+        next_run_at INTEGER NOT NULL, last_run_at INTEGER, priority INTEGER, status TEXT,
+        require_idle INTEGER DEFAULT 0, miss_threshold INTEGER DEFAULT 300,
+        reply_channel TEXT, reply_endpoint TEXT, bound_conversation_json TEXT,
+        retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 3,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_error TEXT, failed_at INTEGER
+      );
+      CREATE TABLE task_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+        executed_at INTEGER NOT NULL, completed_at INTEGER, status TEXT NOT NULL,
+        duration_ms INTEGER, error TEXT
+      );
+      CREATE TABLE system_state (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);
+      INSERT INTO tasks (
+        id, name, prompt, type, timezone, next_run_at, priority, status,
+        reply_channel, reply_endpoint, created_at, updated_at
+      ) VALUES (
+        'legacy-real', 'legacy real', 'work', 'recurring', 'UTC', 100, 3, 'running',
+        'lark', 'old-endpoint', 1, 1
+      );
+      INSERT INTO task_history (task_id, executed_at, status)
+      VALUES ('legacy-real', 5, 'started');
+    `);
+    legacy.close();
+    const core = new Database(path.join(directory, 'core.db'));
+    core.exec(`
+      CREATE TABLE runtime_scheduler_occurrences (
+        schedule_id TEXT, occurrence_id TEXT, task_id TEXT,
+        turn_id TEXT, status TEXT, envelope_json TEXT
+      );
+      CREATE TABLE runtime_turns (turn_id TEXT PRIMARY KEY, state TEXT NOT NULL);
+      CREATE TABLE runtime_turn_queue (turn_id TEXT PRIMARY KEY, wait_reason TEXT);
+      INSERT INTO runtime_turns VALUES ('turn-legacy-real', 'queued');
+    `);
+    core.prepare(`INSERT INTO runtime_scheduler_occurrences VALUES (?, ?, ?, ?, ?, ?)`).run(
+      'legacy-real', 'legacy-real:100', 'legacy-real', 'turn-legacy-real', 'accepted',
+      JSON.stringify({ schedule: {
+        schedule_id: 'legacy-real', occurrence_id: 'legacy-real:100', task_id: 'legacy-real',
+      } }),
+    );
+    try {
+      process.env.ZYLOS_DIR = directory;
+      process.env.ZYLOS_REGION = 'region-migrated';
+      process.env.ZYLOS_TENANT_ID = 'tenant-migrated';
+      process.env.ZYLOS_BOT_ID = 'bot-migrated';
+      const cacheBuster = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const migratedModule = await import(new URL(`../database.js?${cacheBuster}`, import.meta.url));
+      const migrated = migratedModule.getDb();
+      assert.deepEqual(migrated.prepare(`
+        SELECT scope_region, scope_tenant_id, scope_bot_id
+        FROM tasks WHERE id = 'legacy-real'
+      `).get(), {
+        scope_region: null, scope_tenant_id: null, scope_bot_id: null,
+      });
+      assert.equal(migratedModule.migrateLegacyTaskScopes(migrated), 1);
+      migrated.close();
+      process.env.ZYLOS_REGION = 'region-drifted';
+      process.env.ZYLOS_TENANT_ID = 'tenant-drifted';
+      process.env.ZYLOS_BOT_ID = 'bot-drifted';
+      const reopenBuster = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const reopenedModule = await import(new URL(`../database.js?${reopenBuster}`, import.meta.url));
+      const drifted = reopenedModule.getDb();
+      assert.equal(reopenedModule.migrateLegacyTaskScopes(drifted), 0);
+      drifted.close();
+      const reopened = new Database(schedulerPath);
+      assert.deepEqual(reopened.prepare(`
+        SELECT scope_region, scope_tenant_id, scope_bot_id, requires_reconfiguration
+        FROM tasks WHERE id = 'legacy-real'
+      `).get(), {
+        scope_region: 'region-migrated', scope_tenant_id: 'tenant-migrated',
+        scope_bot_id: 'bot-migrated', requires_reconfiguration: 1,
+      });
+      assert.deepEqual(recoverLegacyRunningTasks(reopened, core, { now: () => 10 }), {
+        adopted: 1, paused: 0, terminal: 0,
+      });
+      assert.deepEqual(reopened.prepare(`
+        SELECT COUNT(*) AS count, occurrence_id, turn_id, status
+        FROM task_history WHERE task_id = 'legacy-real'
+      `).get(), {
+        count: 1, occurrence_id: 'legacy-real:100', turn_id: 'turn-legacy-real',
+        status: 'started',
+      });
+      reopened.close();
+    } finally {
+      core.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+      if (originalZylosDir === undefined) delete process.env.ZYLOS_DIR;
+      else process.env.ZYLOS_DIR = originalZylosDir;
+      if (originalRegion === undefined) delete process.env.ZYLOS_REGION;
+      else process.env.ZYLOS_REGION = originalRegion;
+      if (originalTenant === undefined) delete process.env.ZYLOS_TENANT_ID;
+      else process.env.ZYLOS_TENANT_ID = originalTenant;
+      if (originalBot === undefined) delete process.env.ZYLOS_BOT_ID;
+      else process.env.ZYLOS_BOT_ID = originalBot;
+    }
+  });
+
   test('adopts an exact durable Core occurrence after restart without replay or duplicate history', () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'scheduler-adopt-'));
     const schedulerPath = path.join(directory, 'scheduler.db');
@@ -67,6 +178,10 @@ describe('scheduler Core admission and reconciliation', () => {
     scheduler.prepare(`
       UPDATE tasks SET status = 'running', requires_reconfiguration = 1
       WHERE id = 'task-A'
+    `).run();
+    scheduler.prepare(`
+      INSERT INTO task_history (task_id, executed_at, status)
+      VALUES ('task-A', 5, 'started')
     `).run();
     const core = new Database(corePath);
     core.exec(`
@@ -113,6 +228,9 @@ describe('scheduler Core admission and reconciliation', () => {
       adopted: 0, paused: 0, terminal: 0,
     });
     assert.equal(scheduler.prepare('SELECT COUNT(*) AS count FROM task_history').get().count, 1);
+    assert.deepEqual(scheduler.prepare(`
+      SELECT occurrence_id, turn_id FROM task_history WHERE task_id = 'task-A'
+    `).get(), { occurrence_id: 'task-A:100', turn_id: 'turn-adopted' });
 
     const maintenance = snapshot('queued', { maintenance: true });
     maintenance.turns.items[0].turn_id = 'turn-adopted';
@@ -191,6 +309,10 @@ describe('scheduler Core admission and reconciliation', () => {
     test(`pauses a legacy running task when the durable Core occurrence is ${scenario}`, () => {
       const scheduler = database();
       scheduler.prepare("UPDATE tasks SET status = 'running' WHERE id = 'task-A'").run();
+      scheduler.prepare(`
+        INSERT INTO task_history (task_id, executed_at, status)
+        VALUES ('task-A', 5, 'started')
+      `).run();
       const core = new Database(':memory:');
       core.exec(`
         CREATE TABLE runtime_scheduler_occurrences (
@@ -219,18 +341,61 @@ describe('scheduler Core admission and reconciliation', () => {
       });
       const task = scheduler.prepare(`
         SELECT status, requires_reconfiguration, current_occurrence_id,
-               current_turn_id, last_error FROM tasks WHERE id = 'task-A'
+               requires_occurrence_advance, current_turn_id, last_error
+        FROM tasks WHERE id = 'task-A'
       `).get();
       assert.equal(task.status, 'paused');
       assert.equal(task.requires_reconfiguration, 1);
+      assert.equal(task.requires_occurrence_advance, 1);
       assert.equal(task.current_occurrence_id, 'task-A:100');
       assert.equal(task.current_turn_id, null);
       assert.match(task.last_error, /exact admitted Core occurrence.*replay is forbidden/i);
-      assert.equal(scheduler.prepare('SELECT COUNT(*) AS count FROM task_history').get().count, 0);
+      assert.deepEqual(scheduler.prepare(`
+        SELECT status, completed_at, error FROM task_history WHERE task_id = 'task-A'
+      `).get(), {
+        status: 'failed', completed_at: 10,
+        error: 'Paused during migration: no exact admitted Core occurrence; replay is forbidden.',
+      });
       scheduler.close();
       core.close();
     });
   }
+
+  test('fails closed and settles ambiguous legacy started history before Core adoption', () => {
+    const scheduler = database();
+    scheduler.prepare("UPDATE tasks SET status = 'running' WHERE id = 'task-A'").run();
+    scheduler.prepare(`
+      INSERT INTO task_history (task_id, executed_at, status) VALUES
+        ('task-A', 4, 'started'), ('task-A', 5, 'started')
+    `).run();
+    const core = new Database(':memory:');
+    core.exec(`
+      CREATE TABLE runtime_scheduler_occurrences (
+        schedule_id TEXT, occurrence_id TEXT, task_id TEXT,
+        turn_id TEXT, status TEXT, envelope_json TEXT
+      );
+      CREATE TABLE runtime_turns (turn_id TEXT PRIMARY KEY, state TEXT NOT NULL);
+      CREATE TABLE runtime_turn_queue (turn_id TEXT PRIMARY KEY, wait_reason TEXT);
+      INSERT INTO runtime_turns VALUES ('turn-ambiguous', 'queued');
+    `);
+    core.prepare(`INSERT INTO runtime_scheduler_occurrences VALUES (?, ?, ?, ?, ?, ?)`).run(
+      'task-A', 'task-A:100', 'task-A', 'turn-ambiguous', 'accepted',
+      JSON.stringify({ schedule: {
+        schedule_id: 'task-A', occurrence_id: 'task-A:100', task_id: 'task-A',
+      } }),
+    );
+    assert.deepEqual(recoverLegacyRunningTasks(scheduler, core, { now: () => 10 }), {
+      adopted: 0, paused: 1, terminal: 0,
+    });
+    assert.deepEqual(scheduler.prepare(`
+      SELECT status, requires_occurrence_advance FROM tasks WHERE id = 'task-A'
+    `).get(), { status: 'paused', requires_occurrence_advance: 1 });
+    assert.deepEqual(scheduler.prepare(`
+      SELECT status, COUNT(*) AS count FROM task_history GROUP BY status
+    `).get(), { status: 'failed', count: 2 });
+    scheduler.close();
+    core.close();
+  });
 
   test('records the accepted occurrence and turn atomically and replays without duplicate history', () => {
     const db = database();

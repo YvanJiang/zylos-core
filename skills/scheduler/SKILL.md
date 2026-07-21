@@ -39,6 +39,10 @@ with `update --bound-conversation-json` or explicitly select the scheduler-owned
 synthetic conversation with `update --use-synthetic-conversation`; only then
 may `resume` make the next occurrence pending.
 
+The task captures `region`, `tenant_id`, and `bot_id` as durable Core scope at
+creation (or one-time migration). Retries and restarts reuse that stored scope;
+later process-environment changes cannot fork an occurrence's idempotency key.
+
 ## Timezone
 
 Timezone resolution is `~/zylos/.env` then `process.env.TZ`, then `UTC`. Times

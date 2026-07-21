@@ -47,8 +47,11 @@ describe('getDb', () => {
 
       // Dynamic import to pick up new ZYLOS_DIR
       const cacheBuster = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      const { getDb } = await import(new URL(`../database.js?${cacheBuster}`, import.meta.url));
+      const { getDb, migrateLegacyTaskScopes } = await import(
+        new URL(`../database.js?${cacheBuster}`, import.meta.url)
+      );
       const db = getDb();
+      assert.equal(migrateLegacyTaskScopes(db), 0);
 
       // Verify directory and file were created
       assert.ok(fs.existsSync(dbPath));
@@ -68,6 +71,10 @@ describe('getDb', () => {
       assert.ok(cols.includes('priority'));
       assert.ok(cols.includes('bound_conversation_json'));
       assert.ok(cols.includes('requires_reconfiguration'));
+      assert.ok(cols.includes('requires_occurrence_advance'));
+      assert.ok(cols.includes('scope_region'));
+      assert.ok(cols.includes('scope_tenant_id'));
+      assert.ok(cols.includes('scope_bot_id'));
       assert.ok(!cols.includes('require_idle'));
       assert.ok(!cols.includes('reply_channel'));
       assert.ok(!cols.includes('reply_endpoint'));
@@ -121,11 +128,15 @@ describe('getDb', () => {
     try {
       process.env.ZYLOS_DIR = tmpDir;
       const cacheBuster = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      const { getDb } = await import(new URL(`../database.js?${cacheBuster}`, import.meta.url));
+      const { getDb, migrateLegacyTaskScopes } = await import(
+        new URL(`../database.js?${cacheBuster}`, import.meta.url)
+      );
       const db = getDb();
+      assert.equal(migrateLegacyTaskScopes(db), 6);
       const rows = db.prepare(`
         SELECT id, status, require_idle, reply_channel, reply_endpoint,
-               requires_reconfiguration, last_error
+               requires_reconfiguration, last_error,
+               scope_region, scope_tenant_id, scope_bot_id
         FROM tasks ORDER BY id
       `).all();
       assert.deepEqual(rows, [
@@ -133,36 +144,42 @@ describe('getDb', () => {
           id: 'canonical', status: 'pending', require_idle: 0,
           reply_channel: null, reply_endpoint: null,
           requires_reconfiguration: 0, last_error: null,
+          scope_region: 'global', scope_tenant_id: 'default', scope_bot_id: 'zylos',
         },
         {
           id: 'legacy-completed', status: 'paused', require_idle: 0,
           reply_channel: null, reply_endpoint: null,
           requires_reconfiguration: 1,
           last_error: 'Paused during migration: retired scheduler controls require explicit canonical reconfiguration.',
+          scope_region: 'global', scope_tenant_id: 'default', scope_bot_id: 'zylos',
         },
         {
           id: 'legacy-idle', status: 'paused', require_idle: 0,
           reply_channel: null, reply_endpoint: null,
           requires_reconfiguration: 1,
           last_error: 'Paused during migration: retired scheduler controls require explicit canonical reconfiguration.',
+          scope_region: 'global', scope_tenant_id: 'default', scope_bot_id: 'zylos',
         },
         {
           id: 'legacy-one-time-done', status: 'completed', require_idle: 0,
           reply_channel: null, reply_endpoint: null,
           requires_reconfiguration: 1,
           last_error: 'Paused during migration: retired scheduler controls require explicit canonical reconfiguration.',
+          scope_region: 'global', scope_tenant_id: 'default', scope_bot_id: 'zylos',
         },
         {
           id: 'legacy-paused', status: 'paused', require_idle: 0,
           reply_channel: null, reply_endpoint: null,
           requires_reconfiguration: 1,
           last_error: 'Paused during migration: retired scheduler controls require explicit canonical reconfiguration.',
+          scope_region: 'global', scope_tenant_id: 'default', scope_bot_id: 'zylos',
         },
         {
           id: 'legacy-reply', status: 'running', require_idle: 0,
           reply_channel: null, reply_endpoint: null,
           requires_reconfiguration: 1,
           last_error: 'Paused during migration: retired scheduler controls require explicit canonical reconfiguration.',
+          scope_region: 'global', scope_tenant_id: 'default', scope_bot_id: 'zylos',
         },
       ]);
       db.close();

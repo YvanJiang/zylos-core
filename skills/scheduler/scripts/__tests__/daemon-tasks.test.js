@@ -8,6 +8,7 @@ import path from 'node:path';
 import {
   updateNextRunTime,
   processCompletedTasks,
+  recordMissedNoticeTerminalRejection,
   scheduleMissedNoticeRetry,
 } from '../daemon-tasks.js';
 import { now } from '../database.js';
@@ -216,6 +217,43 @@ describe('scheduler daemon failure backoff', () => {
         status: 'pending',
       });
       assert.equal(scheduleMissedNoticeRetry(database, task, { code: 'not_retryable' }), null);
+    });
+  });
+
+  it('terminalizes a non-retryable missed-notice rejection without a polling loop', async () => {
+    await withDb((database) => {
+      const task = insertTask(database, {
+        id: 'non-retryable-notice', next_run_at: 100, missed_notice_attempt: 1,
+      });
+      assert.equal(recordMissedNoticeTerminalRejection(database, task, {
+        status: 'rejected', turn_id: null,
+        error: { code: 'idempotency_conflict', user_message: 'Occurrence payload conflict.' },
+      }, { now: () => 1000 }), true);
+      assert.deepEqual(database.prepare(`
+        SELECT status, current_occurrence_id, current_turn_id,
+               last_core_state, last_error FROM tasks WHERE id = ?
+      `).get(task.id), {
+        status: 'failed',
+        current_occurrence_id: 'non-retryable-notice:100:missed-notice:1',
+        current_turn_id: null,
+        last_core_state: 'failed',
+        last_error: 'Occurrence payload conflict.',
+      });
+      assert.deepEqual(database.prepare(`
+        SELECT occurrence_id, turn_id, status, error FROM task_history WHERE task_id = ?
+      `).get(task.id), {
+        occurrence_id: 'non-retryable-notice:100:missed-notice:1',
+        turn_id: null, status: 'failed', error: 'Occurrence payload conflict.',
+      });
+      assert.equal(recordMissedNoticeTerminalRejection(database, task, {
+        status: 'rejected', turn_id: null,
+        error: { code: 'idempotency_conflict', user_message: 'Occurrence payload conflict.' },
+      }, { now: () => 1001 }), false);
+      assert.equal(
+        database.prepare('SELECT COUNT(*) AS count FROM task_history WHERE task_id = ?')
+          .get(task.id).count,
+        1,
+      );
     });
   });
 

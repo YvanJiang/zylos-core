@@ -4,7 +4,7 @@
  * Main orchestrator for autonomous task execution
  */
 
-import { getDb, cleanupHistory, now } from './database.js';
+import { getDb, cleanupHistory, migrateLegacyTaskScopes, now } from './database.js';
 import {
   dispatchMissedScheduledTaskNotice,
   dispatchScheduledTask,
@@ -16,6 +16,7 @@ import { loadTimezone } from './tz.js';
 import {
   processCompletedTasks as _processCompletedTasks,
   reconcileRunningTasks,
+  recordMissedNoticeTerminalRejection,
   recordScheduledAdmission,
   scheduleMissedNoticeRetry,
   updateNextRunTime as _updateNextRunTime,
@@ -98,7 +99,11 @@ function persistMissedTaskNotice(task) {
     const admission = dispatchMissedScheduledTaskNotice(task, notice);
     if (admission.status === 'rejected') {
       console.error(`Missed-task notice for ${task.id} was rejected by the durable queue: ${admission.error.user_message}`);
-      scheduleMissedNoticeRetry(db, task, admission.error);
+      if (admission.error.code === 'queue_full') {
+        scheduleMissedNoticeRetry(db, task, admission.error);
+      } else {
+        recordMissedNoticeTerminalRejection(db, task, admission);
+      }
       return false;
     }
     return true;
@@ -247,6 +252,7 @@ process.on('SIGTERM', () => {
 
 // Start the scheduler
 db = getDb();
+migrateLegacyTaskScopes(db);
 recoverLegacyRunningTasksFromCore(db);
 mainLoop().then(() => {
   console.log('Scheduler stopped');

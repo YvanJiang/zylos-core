@@ -41,6 +41,11 @@ pm2 restart scheduler
 
 SQLite at `~/zylos/scheduler/scheduler.db`
 
+Each task durably captures the Core `region`, `tenant_id`, and `bot_id` scope
+when it is created. A one-time schema migration captures the current configured
+scope for older tasks. Daemon restarts and later environment changes reuse the
+stored values so an occurrence's idempotency identity cannot fork.
+
 ## Priority Levels
 
 | Priority | Type | Description |
@@ -60,6 +65,10 @@ Scheduler uses an implicit retry mechanism based on `miss_threshold` (default 30
 2. Daemon retries with durable bounded backoff while within the `miss_threshold` window
 3. Core accepts within the window → task is idempotently enqueued
 4. Window expires → one-time tasks marked `failed`, recurring/interval skip to next schedule
+
+A missed-occurrence delivery notice rejected only for `queue_full` receives
+durable exponential backoff. Any non-retryable Core rejection terminalizes the
+local task and its history instead of polling the same rejected notice forever.
 
 The `retry_count` / `max_retries` columns in the database are reserved but unused. Adjust `--miss-threshold <seconds>` per task to control the retry window.
 

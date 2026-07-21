@@ -4,7 +4,7 @@
  * Command-line interface for task creation, monitoring, and control
  */
 
-import { getDb, generateId, now } from './database.js';
+import { getDb, generateId, getSchedulerScope, now } from './database.js';
 import { getNextRun, isValidCron, describeCron, getDefaultTimezone } from './cron-utils.js';
 import { parseTime, parseDuration, formatTime, getRelativeTime } from './time-utils.js';
 import { loadTimezone } from './tz.js';
@@ -20,7 +20,7 @@ function escapeLike(str) {
 const ALLOWED_UPDATE_COLUMNS = new Set([
   'name', 'prompt', 'priority', 'bound_conversation_json',
   'miss_threshold', 'type', 'cron_expression', 'interval_seconds', 'next_run_at', 'timezone',
-  'requires_reconfiguration', 'last_error', 'updated_at'
+  'requires_reconfiguration', 'requires_occurrence_advance', 'last_error', 'updated_at'
 ]);
 
 const HELP = `
@@ -227,6 +227,7 @@ function cmdAdd(args, options) {
 
   const taskId = generateId();
   const currentTime = now();
+  const scope = getSchedulerScope();
 
   db.prepare(`
     INSERT INTO tasks (
@@ -234,8 +235,9 @@ function cmdAdd(args, options) {
       cron_expression, interval_seconds,
       next_run_at, priority, status,
       miss_threshold, bound_conversation_json,
+      scope_region, scope_tenant_id, scope_bot_id,
       created_at, updated_at, timezone
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     taskId,
     options.name || prompt.substring(0, 40),  // Default name to truncated prompt
@@ -247,6 +249,9 @@ function cmdAdd(args, options) {
     priority,
     missThreshold,
     boundConversationJson,
+    scope.region,
+    scope.tenant_id,
+    scope.bot_id,
     currentTime,
     currentTime,
     getDefaultTimezone()
@@ -326,7 +331,7 @@ function cmdResume(taskId) {
   }
 
   const tasks = db.prepare(`
-    SELECT id, requires_reconfiguration FROM tasks
+    SELECT id, requires_reconfiguration, requires_occurrence_advance FROM tasks
     WHERE id LIKE ? ESCAPE '!' AND status = 'paused'
   `).all(escapeLike(taskId) + '%');
 
@@ -346,6 +351,13 @@ function cmdResume(taskId) {
     console.error(
       'Error: Scheduler migration reconfiguration is required before resume; '
       + 'run update with --bound-conversation-json or --use-synthetic-conversation.',
+    );
+    process.exitCode = 2;
+    return;
+  }
+  if (tasks[0].requires_occurrence_advance === 1) {
+    console.error(
+      'Error: Advance the task schedule before resume; the previous occurrence is a replay barrier.',
     );
     process.exitCode = 2;
     return;
@@ -516,6 +528,21 @@ function cmdUpdate(taskId, options) {
     return;
   }
 
+  if ((options['bound-conversation-json'] || options['use-synthetic-conversation'])
+    && task.status === 'running' && task.requires_reconfiguration === 1) {
+    console.error(
+      'Error: The admitted legacy turn is still running; wait for its Core terminal state, '
+      + 'then reconfigure and explicitly resume the paused task.',
+    );
+    process.exitCode = 2;
+    return;
+  }
+  if ((options.in || options.at || options.cron || options.every) && task.status === 'running') {
+    console.error('Error: A running task schedule cannot change before its Core turn is terminal.');
+    process.exitCode = 2;
+    return;
+  }
+
   if (options['bound-conversation-json']) {
     try {
       const parsed = JSON.parse(options['bound-conversation-json']);
@@ -600,6 +627,7 @@ function cmdUpdate(taskId, options) {
 
   if (scheduleUpdated) {
     updates.timezone = getDefaultTimezone();
+    updates.requires_occurrence_advance = 0;
     updatedFields.push('type', 'schedule');
   }
 

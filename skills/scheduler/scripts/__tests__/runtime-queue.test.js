@@ -13,7 +13,11 @@ test('the scheduler daemon admission seam persists one synthetic Core turn acros
   const database = new Database(path.join(directory, 'c4.db'));
   const task = {
     id: 'task-runtime-queue', prompt: 'Run the report.', next_run_at: 1_784_304_000,
+    scope_region: 'region-persisted', scope_tenant_id: 'tenant-persisted',
+    scope_bot_id: 'bot-persisted',
   };
+  const originalTenant = process.env.ZYLOS_TENANT_ID;
+  process.env.ZYLOS_TENANT_ID = 'tenant-first-process';
   const counts = new Map();
   const first = enqueueScheduledTask(database, task, {
     now: () => '2026-07-20T00:00:01.000Z',
@@ -27,14 +31,22 @@ test('the scheduler daemon admission seam persists one synthetic Core turn acros
     now: () => '2026-07-20T00:00:02.000Z',
     generateId: () => { throw new Error('a scheduler retry must not allocate Core IDs'); },
   });
+  process.env.ZYLOS_TENANT_ID = 'tenant-second-process';
+  const driftReplay = enqueueScheduledTask(database, task, {
+    now: () => '2026-07-20T00:00:02.000Z',
+    generateId: () => { throw new Error('scope drift must preserve Core idempotency'); },
+  });
   assert.equal(first.status, 'accepted');
   assert.deepEqual(replayed, { ...first, deduplicated: true });
+  assert.deepEqual(driftReplay, { ...first, deduplicated: true });
   assert.equal(database.prepare('SELECT COUNT(*) AS count FROM runtime_turns').get().count, 1);
   assert.equal(database.prepare(`
     SELECT chat_id FROM runtime_conversations WHERE conversation_id = ?
-  `).get(first.conversation_id).chat_id, 'scheduler:zylos:task-runtime-queue');
+  `).get(first.conversation_id).chat_id, 'scheduler:bot-persisted:task-runtime-queue');
   const bound = enqueueScheduledTask(database, {
     id: 'task-bound-queue', prompt: 'Run the group report.', next_run_at: 1_784_304_001,
+    scope_region: 'region-persisted', scope_tenant_id: 'tenant-persisted',
+    scope_bot_id: 'bot-persisted',
     bound_conversation_json: JSON.stringify({
       channel: 'telegram', chat_type: 'thread', chat_id: 'group-runtime-queue',
       native_thread_or_topic_id: 'native-topic-runtime-queue',
@@ -68,6 +80,8 @@ test('the scheduler daemon admission seam persists one synthetic Core turn acros
     native_thread_reply_target_message_id: 'scheduler-reply-target-runtime-queue',
   });
   database.close();
+  if (originalTenant === undefined) delete process.env.ZYLOS_TENANT_ID;
+  else process.env.ZYLOS_TENANT_ID = originalTenant;
   fs.rmSync(directory, { recursive: true, force: true });
 });
 
@@ -77,6 +91,7 @@ test('a missed occurrence persists one idempotent Core delivery notice instead o
   const task = {
     id: 'task-missed-notice', name: 'Daily report', prompt: 'Run the report.',
     next_run_at: 1_784_304_000,
+    scope_region: 'global', scope_tenant_id: 'default', scope_bot_id: 'zylos',
   };
   const notice = 'Scheduled task "Daily report" missed its occurrence and was skipped to avoid catch-up replay.';
   const ids = new Map();
@@ -109,6 +124,7 @@ test('a queue-full missed notice converges on a new durable backoff attempt afte
   const database = new Database(path.join(directory, 'c4.db'));
   const baseTask = {
     id: 'task-missed-recovery', name: 'Recovery report', prompt: 'Run the report.',
+    scope_region: 'global', scope_tenant_id: 'default', scope_bot_id: 'zylos',
   };
   for (let index = 0; index < 4; index += 1) {
     const admitted = enqueueScheduledTask(database, {

@@ -40,6 +40,31 @@ function exactCoreOccurrence(coreDb, task, occurrence) {
   return row;
 }
 
+const LEGACY_RECOVERY_BARRIER =
+  'Paused during migration: no exact admitted Core occurrence; replay is forbidden.';
+
+function pauseLegacyRecovery(schedulerDb, task, occurrence, recordedAt, reason) {
+  return schedulerDb.transaction(() => {
+    const update = schedulerDb.prepare(`
+      UPDATE tasks
+      SET status = 'paused', requires_reconfiguration = 1,
+          requires_occurrence_advance = 1,
+          current_occurrence_id = ?, current_turn_id = NULL,
+          last_core_state = 'unknown', core_wait_reason = NULL,
+          last_error = ?, updated_at = ?
+      WHERE id = ? AND status = 'running' AND current_turn_id IS NULL
+    `).run(occurrence, reason, recordedAt, task.id);
+    if (update.changes === 0) return false;
+    schedulerDb.prepare(`
+      UPDATE task_history
+      SET status = 'failed', completed_at = ?,
+          duration_ms = (? - executed_at) * 1000, error = ?
+      WHERE task_id = ? AND status = 'started'
+    `).run(recordedAt, recordedAt, reason, task.id);
+    return true;
+  })();
+}
+
 /**
  * Recover a pre-migration local `running` row only by adopting the exact
  * durable Core occurrence. Absence or mismatch is a replay barrier: the task
@@ -59,23 +84,44 @@ export function recoverLegacyRunningTasks(schedulerDb, coreDb, {
     const core = exactCoreOccurrence(coreDb, task, occurrence);
     const recordedAt = clock();
     if (!core) {
-      const update = schedulerDb.prepare(`
-        UPDATE tasks
-        SET status = 'paused', requires_reconfiguration = 1,
-            current_occurrence_id = ?, current_turn_id = NULL,
-            last_core_state = 'unknown', core_wait_reason = NULL,
-            last_error = ?, updated_at = ?
-        WHERE id = ? AND status = 'running' AND current_turn_id IS NULL
-      `).run(
-        occurrence,
-        'Paused during migration: no exact admitted Core occurrence; replay is forbidden.',
-        recordedAt,
-        task.id,
-      );
-      result.paused += update.changes;
+      if (pauseLegacyRecovery(
+        schedulerDb, task, occurrence, recordedAt, LEGACY_RECOVERY_BARRIER,
+      )) result.paused += 1;
       continue;
     }
     const recovery = schedulerDb.transaction(() => {
+      const startedRows = schedulerDb.prepare(`
+        SELECT id, occurrence_id, turn_id
+        FROM task_history
+        WHERE task_id = ? AND status = 'started'
+        ORDER BY id ASC
+      `).all(task.id);
+      const exactStarted = startedRows.length === 1
+        && startedRows[0].occurrence_id === occurrence
+        && startedRows[0].turn_id === core.turn_id;
+      const legacyStarted = startedRows.length === 1
+        && startedRows[0].occurrence_id === null
+        && startedRows[0].turn_id === null;
+      if (startedRows.length > 1 || (startedRows.length === 1 && !exactStarted && !legacyStarted)) {
+        const reason = 'Paused during migration: ambiguous legacy started history; replay is forbidden.';
+        const paused = schedulerDb.prepare(`
+          UPDATE tasks
+          SET status = 'paused', requires_reconfiguration = 1,
+              requires_occurrence_advance = 1,
+              current_occurrence_id = ?, current_turn_id = NULL,
+              last_core_state = 'unknown', core_wait_reason = NULL,
+              last_error = ?, updated_at = ?
+          WHERE id = ? AND status = 'running' AND current_turn_id IS NULL
+        `).run(occurrence, reason, recordedAt, task.id);
+        if (paused.changes === 0) return null;
+        schedulerDb.prepare(`
+          UPDATE task_history
+          SET status = 'failed', completed_at = ?,
+              duration_ms = (? - executed_at) * 1000, error = ?
+          WHERE task_id = ? AND status = 'started'
+        `).run(recordedAt, recordedAt, reason, task.id);
+        return { paused: true, terminal: false };
+      }
       const update = schedulerDb.prepare(`
         UPDATE tasks
         SET current_occurrence_id = ?, current_turn_id = ?,
@@ -90,12 +136,11 @@ export function recoverLegacyRunningTasks(schedulerDb, coreDb, {
         task.id,
       );
       if (update.changes === 0) return null;
-      const existing = schedulerDb.prepare(`
-        SELECT 1 FROM task_history
-        WHERE task_id = ? AND occurrence_id = ? AND turn_id = ?
-        LIMIT 1
-      `).get(task.id, occurrence, core.turn_id);
-      if (!existing) {
+      if (legacyStarted) {
+        schedulerDb.prepare(`
+          UPDATE task_history SET occurrence_id = ?, turn_id = ? WHERE id = ?
+        `).run(occurrence, core.turn_id, startedRows[0].id);
+      } else if (!exactStarted) {
         schedulerDb.prepare(`
           INSERT INTO task_history (
             task_id, occurrence_id, turn_id, executed_at, status
@@ -146,11 +191,14 @@ export function recoverLegacyRunningTasks(schedulerDb, coreDb, {
           core.turn_id,
         );
       }
-      return { terminal };
+      return { paused: false, terminal };
     })();
     if (recovery) {
-      result.adopted += 1;
-      if (recovery.terminal) result.terminal += 1;
+      if (recovery.paused) result.paused += 1;
+      else {
+        result.adopted += 1;
+        if (recovery.terminal) result.terminal += 1;
+      }
     }
   }
   return result;
@@ -186,6 +234,37 @@ export function scheduleMissedNoticeRetry(db, task, error, {
     retry_at: retryAt,
     delay_seconds: delaySeconds,
   });
+}
+
+export function recordMissedNoticeTerminalRejection(db, task, admission, {
+  now: clock = now,
+} = {}) {
+  if (admission?.status !== 'rejected' || admission.error?.code === 'queue_full') {
+    throw new TypeError('admission must be a non-retryable rejected Core result');
+  }
+  const attempt = task.missed_notice_attempt ?? 1;
+  if (!Number.isSafeInteger(attempt) || attempt < 1) {
+    throw new TypeError('task.missed_notice_attempt must be a positive safe integer');
+  }
+  const occurrence = `${occurrenceId(task)}:missed-notice:${attempt}`;
+  const recordedAt = clock();
+  const error = admission.error?.user_message ?? 'Core rejected the missed-occurrence notice.';
+  return db.transaction(() => {
+    const update = db.prepare(`
+      UPDATE tasks
+      SET status = 'failed', current_occurrence_id = ?, current_turn_id = ?,
+          last_core_state = 'failed', core_wait_reason = NULL,
+          last_error = ?, updated_at = ?
+      WHERE id = ? AND status = 'pending' AND missed_notice_attempt = ?
+    `).run(occurrence, admission.turn_id ?? null, error, recordedAt, task.id, attempt);
+    if (update.changes === 0) return false;
+    db.prepare(`
+      INSERT INTO task_history (
+        task_id, occurrence_id, turn_id, executed_at, completed_at, status, error
+      ) VALUES (?, ?, ?, ?, ?, 'failed', ?)
+    `).run(task.id, occurrence, admission.turn_id ?? null, recordedAt, recordedAt, error);
+    return true;
+  })();
 }
 
 /**

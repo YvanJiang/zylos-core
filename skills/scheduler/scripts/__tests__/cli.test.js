@@ -7,6 +7,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import Database from 'better-sqlite3';
+import { reconcileRunningTasks } from '../daemon-tasks.js';
+
+const observabilityFixtures = JSON.parse(fs.readFileSync(
+  new URL('../../../../contracts/public/fixtures/observability-v1.json', import.meta.url),
+  'utf8',
+));
 
 const CLI_PATH = fileURLToPath(new URL('../cli.js', import.meta.url));
 
@@ -50,6 +56,27 @@ describe('cli add', () => {
         assert.equal(task.cron_expression, '0 9 * * *');
         assert.equal(task.status, 'pending');
         assert.equal(task.priority, 3);
+      } finally {
+        db.close();
+      }
+    });
+  });
+
+  it('captures the canonical Core scope once when the task is created', () => {
+    withTmpDir(({ dbPath, env }) => {
+      cli(['add', 'scoped task', '--cron', '0 9 * * *'], {
+        ...env,
+        ZYLOS_REGION: 'region-task',
+        ZYLOS_TENANT_ID: 'tenant-task',
+        ZYLOS_BOT_ID: 'bot-task',
+      });
+      const db = new Database(dbPath);
+      try {
+        assert.deepEqual(db.prepare(`
+          SELECT scope_region, scope_tenant_id, scope_bot_id FROM tasks LIMIT 1
+        `).get(), {
+          scope_region: 'region-task', scope_tenant_id: 'tenant-task', scope_bot_id: 'bot-task',
+        });
       } finally {
         db.close();
       }
@@ -317,6 +344,31 @@ describe('cli pause and resume', () => {
       }
     });
   });
+
+  it('cannot resume a replay-barrier occurrence until its schedule advances', () => {
+    withTmpDir(({ dbPath, env }) => {
+      cli(['add', 'barrier task', '--cron', '0 9 * * *'], env);
+      const db = new Database(dbPath);
+      try {
+        const task = db.prepare('SELECT id, next_run_at FROM tasks LIMIT 1').get();
+        db.prepare(`
+          UPDATE tasks SET status = 'paused', requires_reconfiguration = 0,
+            requires_occurrence_advance = 1, current_occurrence_id = ?,
+            last_error = 'replay barrier' WHERE id = ?
+        `).run(`${task.id}:${task.next_run_at}`, task.id);
+        const refused = cliRaw(['resume', task.id], env);
+        assert.notEqual(refused.status, 0);
+        assert.match(refused.stderr, /advance.*schedule.*replay/i);
+        cli(['update', task.id, '--in', '30 minutes'], env);
+        cli(['resume', task.id], env);
+        assert.deepEqual(db.prepare(`
+          SELECT status, requires_occurrence_advance FROM tasks WHERE id = ?
+        `).get(task.id), { status: 'pending', requires_occurrence_advance: 0 });
+      } finally {
+        db.close();
+      }
+    });
+  });
 });
 
 describe('cli remove', () => {
@@ -405,6 +457,82 @@ describe('cli update', () => {
       }
     });
   });
+
+  it('cannot clear a legacy resume fence while its admitted turn is still running', () => {
+    withTmpDir(({ dbPath, env }) => {
+      cli(['add', 'running migration', '--cron', '0 9 * * *'], env);
+      let db = new Database(dbPath);
+      try {
+        const task = db.prepare('SELECT id, next_run_at FROM tasks LIMIT 1').get();
+        db.prepare(`
+          UPDATE tasks SET status = 'running', requires_reconfiguration = 1,
+            current_turn_id = 'turn-admitted', last_error = 'migration pause'
+          WHERE id = ?
+        `).run(task.id);
+        const result = cliRaw([
+          'update', task.id, '--use-synthetic-conversation',
+        ], env);
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /running.*terminal.*resume/i);
+        assert.deepEqual(db.prepare(`
+          SELECT status, requires_reconfiguration, last_error
+          FROM tasks WHERE id = ?
+        `).get(task.id), {
+          status: 'running', requires_reconfiguration: 1, last_error: 'migration pause',
+        });
+        const scheduleResult = cliRaw(['update', task.id, '--in', '30 minutes'], env);
+        assert.notEqual(scheduleResult.status, 0);
+        assert.match(scheduleResult.stderr, /running.*schedule/i);
+        assert.equal(
+          db.prepare('SELECT next_run_at FROM tasks WHERE id = ?').get(task.id).next_run_at,
+          task.next_run_at,
+        );
+        const terminal = structuredClone(observabilityFixtures.cases.complete);
+        terminal.turns.items[0] = {
+          ...terminal.turns.items[0], turn_id: 'turn-admitted',
+          state: 'completed', phase: 'completed', error: null,
+        };
+        assert.deepEqual(reconcileRunningTasks(db, terminal, { now: () => 100 }), {
+          pending: 0, terminal: 1, unavailable: 0,
+        });
+        db.close();
+        db = new Database(dbPath);
+        assert.deepEqual(db.prepare(`
+          SELECT status, requires_reconfiguration, last_core_state
+          FROM tasks WHERE id = ?
+        `).get(task.id), {
+          status: 'paused', requires_reconfiguration: 1, last_core_state: 'completed',
+        });
+      } finally {
+        db.close();
+      }
+    });
+  });
+
+  for (const [label, invalidId] of [
+    ['control characters', 'reply\u0007target'],
+    ['invalid Unicode', '\ud800'],
+  ]) {
+    it(`rejects bound identities with ${label} before persistence`, () => {
+      withTmpDir(({ dbPath, env }) => {
+        const identity = {
+          channel: 'lark', chat_type: 'dm', chat_id: 'chat-bound',
+          native_thread_or_topic_id: null, message_id: invalidId, root_message_id: null,
+        };
+        const result = cliRaw([
+          'add', 'invalid scalar', '--cron', '0 9 * * *',
+          '--bound-conversation-json', JSON.stringify(identity),
+        ], env);
+        assert.notEqual(result.status, 0);
+        const db = new Database(dbPath);
+        try {
+          assert.equal(db.prepare('SELECT COUNT(*) AS count FROM tasks').get().count, 0);
+        } finally {
+          db.close();
+        }
+      });
+    });
+  }
 
   it('updates task name', () => {
     withTmpDir(({ dbPath, env }) => {
