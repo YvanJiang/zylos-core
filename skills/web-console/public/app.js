@@ -191,7 +191,8 @@ class ZylosConsole {
 
       case 'sent':
         if (this.applyMutationScopeResponse(
-          msg.status, msg, this.scopeGeneration,
+          msg.status, msg,
+          this.pendingMessages.get(msg.tempId)?.scopeGeneration,
         ).handled) break;
         // Message send confirmation
         if (msg.success) {
@@ -388,13 +389,15 @@ class ZylosConsole {
       size_label: this.formatBytes(item.size),
       url: item.previewUrl || null
     }));
+    const sendGeneration = this.scopeGeneration;
     this.addTempMessage(message, tempId, tempAttachments);
-    this.pendingMessages.set(tempId, message);
+    this.pendingMessages.set(tempId, {
+      content: message,
+      scopeGeneration: sendGeneration,
+    });
     this.pendingAttachments = this.pendingAttachments.filter((item) => item.status !== 'ready');
     this.updateAttachmentTray();
     const attachmentIds = readyAttachments.map((item) => item.id);
-    const sendGeneration = this.scopeGeneration;
-
     try {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         // Send via WebSocket

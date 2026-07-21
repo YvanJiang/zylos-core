@@ -175,6 +175,10 @@ describe('normal product paths have no retired runtime authority', () => {
     expect(appSource).toMatch(/X-Zylos-Mailbox-Cursor-Scope/);
     expect(appSource).toMatch(/setRequestHeader\('X-Zylos-Mailbox-Cursor-Scope'/);
     expect(appSource).toMatch(/applyMutationScopeResponse/);
+    expect(appSource).toMatch(
+      /pendingMessages\.set\(tempId,\s*\{[\s\S]*scopeGeneration:\s*sendGeneration/,
+    );
+    expect(appSource).not.toMatch(/msg\.status,\s*msg,\s*this\.scopeGeneration/);
     expect(appSource).not.toMatch(/conversations\/recent\?limit=100/);
     expect(cursorSource).toMatch(/web-console-mailbox-v1/);
     expect(cursorSource).toMatch(/lastMessageId: reset \? 0/);

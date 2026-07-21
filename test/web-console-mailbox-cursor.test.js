@@ -4,11 +4,40 @@ import vm from 'node:vm';
 import { describe, expect, jest, test } from '@jest/globals';
 
 const CURSOR_PATH = path.resolve('skills/web-console/public/mailbox-cursor.js');
+const APP_PATH = path.resolve('skills/web-console/public/app.js');
 
 function loadCursorApi() {
   const browser = { globalThis: {} };
   vm.runInNewContext(fs.readFileSync(CURSOR_PATH, 'utf8'), browser);
   return browser.globalThis.ZylosMailboxCursor;
+}
+
+function loadConsoleClass() {
+  const browser = vm.createContext({
+    console: { error: jest.fn(), log: jest.fn() },
+    document: { addEventListener: jest.fn() },
+    window: {},
+  });
+  vm.runInContext(fs.readFileSync(CURSOR_PATH, 'utf8'), browser);
+  vm.runInContext(fs.readFileSync(APP_PATH, 'utf8'), browser);
+  return vm.runInContext('ZylosConsole', browser);
+}
+
+function createConsoleState(ZylosConsole, { scope, generation, pending }) {
+  const client = Object.create(ZylosConsole.prototype);
+  Object.assign(client, {
+    cursorScope: scope,
+    lastMessageId: 31,
+    scopeGeneration: generation,
+    messagesContainer: { replaceChildren: jest.fn() },
+    pendingMessages: new Map(pending),
+    pendingUploads: new Map(),
+    pendingAttachments: [],
+    messageInput: { value: '' },
+    updateAttachmentTray: jest.fn(),
+    showEmptyState: jest.fn(),
+  });
+  return client;
 }
 
 describe('Web Console mailbox cursor state', () => {
@@ -105,5 +134,41 @@ describe('Web Console mailbox cursor state', () => {
       lastMessageId: 0, scopeGeneration: 7,
     });
     expect(resets).toBe(1);
+  });
+
+  test('binds WebSocket sent rejections to the originating temp message generation', () => {
+    const ZylosConsole = loadConsoleClass();
+    const scopeA = `web-console-mailbox-v1:${'a'.repeat(64)}`;
+    const scopeB = `web-console-mailbox-v1:${'b'.repeat(64)}`;
+    const client = createConsoleState(ZylosConsole, {
+      scope: scopeA,
+      generation: 6,
+      pending: [['current', { content: 'draft', scopeGeneration: 6 }]],
+    });
+
+    client.handleWebSocketMessage({
+      type: 'sent', success: false, status: 409,
+      cursor_scope: scopeB, tempId: 'current',
+    });
+    expect(client.cursorScope).toBe(scopeB);
+    expect(client.scopeGeneration).toBe(7);
+    expect(client.messagesContainer.replaceChildren).toHaveBeenCalledTimes(1);
+    expect(client.pendingMessages.size).toBe(0);
+
+    client.handleWebSocketMessage({
+      type: 'sent', success: false, status: 409,
+      cursor_scope: scopeA, tempId: 'current',
+    });
+    client.handleWebSocketMessage({
+      type: 'sent', success: false, status: 409,
+      cursor_scope: scopeA, tempId: 'unknown',
+    });
+    client.handleWebSocketMessage({
+      type: 'sent', success: false, status: 409,
+      cursor_scope: scopeA,
+    });
+    expect(client.cursorScope).toBe(scopeB);
+    expect(client.scopeGeneration).toBe(7);
+    expect(client.messagesContainer.replaceChildren).toHaveBeenCalledTimes(1);
   });
 });
