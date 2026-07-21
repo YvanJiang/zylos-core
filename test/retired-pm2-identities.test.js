@@ -6,7 +6,7 @@ import {
   RETIRED_PM2_SERVICE_DESCRIPTORS,
   RETIRED_PM2_SERVICE_NAMES,
   retiredPm2ServicePaths,
-} from '../runtime/retired-pm2-identities.js';
+} from '../runtime/migration/retired-pm2-identities.js';
 
 describe('canonical retired PM2 identities', () => {
   test('derives every selected-installation identity from one immutable owner', () => {

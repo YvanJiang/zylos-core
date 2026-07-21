@@ -112,6 +112,7 @@ const migrationOnlyRepositoryFiles = new Set([
   'test/base-to-executor-bootstrap.test.js',
   'test/exact-base-legacy-source.test.js',
   'test/executor-service-lifecycle.test.js',
+  'test/five-repo-retired-runtime-gate.test.js',
   'test/installed-executor-upgrade.test.js',
   'test/installer-init-executor-lifecycle.test.js',
   'test/runtime-atomic-upgrade.test.js',
@@ -129,7 +130,7 @@ const migrationOnlyRepositoryFiles = new Set([
 // Keep its narrow exception paired with a mutation/import ban below.
 const readOnlyFreshFenceGuardFiles = new Set([
   'runtime/executor/start-fence.js',
-  'runtime/retired-pm2-identities.js',
+  'runtime/migration/retired-pm2-identities.js',
   'test/executor-start-fence.test.js',
   'test/retired-pm2-identities.test.js',
 ]);
@@ -161,7 +162,7 @@ describe('normal product paths have no retired runtime authority', () => {
   });
 
   test('fresh fencing, migration, and installer inventory share one read-only PM2 identity owner', () => {
-    const identitySource = fs.readFileSync(path.resolve('runtime/retired-pm2-identities.js'), 'utf8');
+    const identitySource = fs.readFileSync(path.resolve('runtime/migration/retired-pm2-identities.js'), 'utf8');
     expect(identitySource).toMatch(/RETIRED_PM2_SERVICE_NAMES/);
     expect(identitySource).toMatch(/retiredPm2ServicePaths/);
     expect(identitySource).not.toMatch(/node:fs|node:child_process|runtime\/migration|execFileSync|spawn/);
@@ -422,7 +423,7 @@ describe('normal product paths have no retired runtime authority', () => {
       'scripts/installed-runtime-inventory.js',
       'runtime/migration/installed-executor-upgrade.js',
       'runtime/migration/legacy-lifecycle-artifacts.js',
-      'runtime/retired-pm2-identities.js',
+      'runtime/migration/retired-pm2-identities.js',
     ]);
     const files = packedFiles();
     expect(files).toContain('CHANGELOG.md');

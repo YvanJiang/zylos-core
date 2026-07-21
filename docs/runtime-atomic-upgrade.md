@@ -62,7 +62,7 @@ immutable Core migration records, compact facts, 30-day detail, and 180-day runt
 unknown-side-effect notices must have durable delivery proof before release recovery can begin. The
 temporary mixed audit is then sealed. Queue restoration and inert source reconciliation are separate
 durable effects: the latter requires a `step_id` proof that the restored source is correct while the
-legacy runtime remains inactive, even if the restored queue has already progressed.
+the pre-upgrade execution route remains inactive, even if the restored queue has already progressed.
 Runtime control, ambiguous/running work, history, and unknown side effects can never re-enter the
 executable source. Commit deletes the unused rollback queue.
 

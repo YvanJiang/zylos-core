@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url';
 import {
   RETIRED_PM2_SERVICE_NAMES,
   retiredPm2ServicePaths,
-} from '../runtime/retired-pm2-identities.js';
+} from '../runtime/migration/retired-pm2-identities.js';
 
 function requireDirectory(name, value) {
   if (typeof value !== 'string' || !path.isAbsolute(value) || path.parse(value).root === value

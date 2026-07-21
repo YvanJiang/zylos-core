@@ -367,6 +367,22 @@ zylos search [keyword]        # Search component registry
 
 ---
 
+## Five-repository retired-runtime release gate
+
+Before release, run the source-and-package gate against explicit candidate
+directories for Core, Feishu, Lark, Dashboard, and Luna. Consumer directories
+are supplied through `ZYLOS_FEISHU_RETIRED_RUNTIME_REPO`,
+`ZYLOS_LARK_RETIRED_RUNTIME_REPO`, `ZYLOS_DASHBOARD_RETIRED_RUNTIME_REPO`, and
+`ZYLOS_LUNA_RETIRED_RUNTIME_REPO`; the Core directory is the current checkout.
+
+```bash
+npm run test:release:retired-runtime
+```
+
+The gate scans every tracked text file and every file reported by each
+repository's `npm pack --dry-run`. Its allowlist is exact, purpose-bearing, and
+limited to isolated one-time migration records or negative proofs.
+
 ## Uninstall
 
 ```bash
