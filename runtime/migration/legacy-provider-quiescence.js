@@ -1,5 +1,7 @@
 /** Isolated one-time exact-base provider suspension. Normal runtime never imports this module. */
 
+const STOP_STABILIZATION_ATTEMPTS = 100;
+
 function sessionFor(provider) {
   if (provider === 'claude') return 'claude-main';
   if (provider === 'codex') return 'codex-main';
@@ -195,7 +197,7 @@ export function createLegacyProviderQuiescence({
   function stableStoppedTree(record) {
     let previous = null;
     let identities = record.members.map((member) => ({ ...member }));
-    for (let attempt = 0; attempt < 8; attempt += 1) {
+    for (let attempt = 0; attempt < STOP_STABILIZATION_ATTEMPTS; attempt += 1) {
       const rows = processRows(execFileSyncFn);
       const tree = descendants(rows, record.pane.pid);
       if (tree.length === 0) throw new Error('Legacy provider pane disappeared while suspending.');
