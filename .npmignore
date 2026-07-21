@@ -11,7 +11,6 @@
 
 # Environment
 .env
-CHANGELOG.md
 
 # Repository-only tests and destructive fixtures are never product payloads.
 test/

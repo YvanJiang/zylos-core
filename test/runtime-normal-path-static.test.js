@@ -37,6 +37,20 @@ const normalRuntimeFiles = [
   'README.zh-CN.md',
 ];
 
+const retiredRuntimeAuthority = new RegExp([
+  'tmux',
+  'capture-pane',
+  'send-keys',
+  'paste-buffer',
+  'agent-status\\.json',
+  'global[ _-]session',
+  'terminal injection',
+  'input health',
+  'window health',
+  'activity[ _-]monitor',
+  'c4[ _-](?:dispatcher|control|session[ _-]init)',
+].join('|'), 'i');
+
 let cachedPackedFiles = null;
 function packedFiles() {
   if (cachedPackedFiles === null) {
@@ -61,8 +75,6 @@ function isScannableText(file) {
 }
 
 const migrationOnlyRepositoryFiles = new Set([
-  // Historical record: never imported, executed, packaged as an entrypoint, or dispatched.
-  'CHANGELOG.md',
   // Executable negative/migration proofs. These files are tests only; the
   // repository scan still covers every other tracked product, source, doc,
   // fixture, package, and test file.
@@ -89,11 +101,12 @@ const migrationOnlyRepositoryFiles = new Set([
 
 describe('normal product paths have no retired runtime authority', () => {
   test('the tracked repository contains retired identifiers only in isolated migration code or proofs', () => {
-    const banned = /tmux|capture-pane|send-keys|paste-buffer|agent-status\.json|global[ _-]session|terminal injection|activity-monitor|c4-dispatcher|c4-control|c4-session-init/i;
     const violations = repositoryFiles()
       .filter(isScannableText)
       .filter((file) => !migrationOnlyRepositoryFiles.has(file))
-      .filter((file) => banned.test(fs.readFileSync(path.resolve(file), 'utf8')));
+      .filter((file) => retiredRuntimeAuthority.test(
+        fs.readFileSync(path.resolve(file), 'utf8'),
+      ));
     expect(violations).toEqual([]);
   });
 
@@ -323,7 +336,7 @@ describe('normal product paths have no retired runtime authority', () => {
     }
   });
 
-  test('every reachable packaged caller is free of retired runtime authority', () => {
+  test('every packaged product and ordinary document is free of retired runtime authority', () => {
     const migrationOnly = new Set([
       'scripts/bootstrap-executor-lifecycle.js',
       'scripts/installed-runtime-inventory.js',
@@ -331,11 +344,14 @@ describe('normal product paths have no retired runtime authority', () => {
       'runtime/migration/legacy-lifecycle-artifacts.js',
       'runtime/migration/legacy-provider-quiescence.js',
     ]);
-    const banned = /tmux|capture-pane|send-keys|paste-buffer|global[ _-]session|terminal injection|agent-status\.json|input health|window health/i;
-    const violations = packedFiles()
+    const files = packedFiles();
+    expect(files).toContain('CHANGELOG.md');
+    const violations = files
       .filter(isScannableText)
       .filter((file) => !migrationOnly.has(file))
-      .filter((file) => banned.test(fs.readFileSync(path.resolve(file), 'utf8')));
+      .filter((file) => retiredRuntimeAuthority.test(
+        fs.readFileSync(path.resolve(file), 'utf8'),
+      ));
     expect(violations).toEqual([]);
   });
 });

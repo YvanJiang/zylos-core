@@ -22,7 +22,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Memory content rules**: sync-time audit enforcement for `state.md` and `references.md` — structural validation, size budgets, and classification rules checked during Memory Sync. (#697, #702, #704)
 
 ### Fixed
-- **Content filtering API error detection**: activity monitor now detects "API Error: 400 Output blocked by content filtering policy" and triggers automatic session restart. Widened the `APIError:` regex to also match `API Error:` (with space) and added a dedicated content filtering pattern. (#737)
 - **C-class migration prompt includes system template path**: the migration prompt now passes the installed `claude-system.md` path so the agent can read the actual system template and accurately separate system-managed content from user additions. Empty user content is accepted for C-class migrations where the old file contains no customizations. (#735)
 - **Session-start emits full original messages**: the c4-conversations shard now injects full original message content instead of compressed preview+pointer form. Messages are packed whole-message newest-first into the shard budget; only a lone message exceeding the entire budget falls back to preview. (#724, #725)
 - **Self-upgrade conflict backup preservation**: conflict backups are no longer silently deleted after a successful upgrade; identical-content conflicts are short-circuited without generating backup noise. (#717, #718)
@@ -53,7 +52,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Real-smoke and service-health integration scenarios**: opt-in live credential smoke tests for Claude and Codex runtimes, plus `better-sqlite3` per-skill isolation validation. (#647, #650)
 
 ### Fixed
-- **Tmux clean PATH node resolution**: `buildCleanEnv()` now prepends `dirname(process.execPath)` into the tmux clean PATH, and the tmux launcher command uses the absolute node binary path instead of bare `node`. Fixes `ERR_DLOPEN_FAILED` when PM2 strips nvm from PATH. (#445, #653)
 - **Runtime auth tristate**: `checkAuth()` unified into an explicit tristate (`authenticated` / `unauthenticated` / `uncertain`) with `--no-validate` flag, replacing ambiguous exit-code-based detection. (#640, #641, #642)
 - **GitHub API rate limiting**: `zylos add` and `zylos upgrade` now auto-retry GitHub API calls on rate limiting (HTTP 403/429) with exponential backoff. (#633)
 
@@ -69,9 +67,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.5.1] - 2026-05-25
 
-### Changed
-- **Activity Monitor user-facing messages**: translated runtime-facing status and route messages to English for consistency. (#591)
-
 ### Fixed
 - **Component upgrade post-upgrade hooks**: component upgrades now run `lifecycle.hooks.post-upgrade` inside the CLI upgrade pipeline before service restart, while preserving `--json` output as a single parseable JSON object. Hook stdout/stderr are captured into bounded step metadata, replayed only in human output mode, and hook failures remain non-fatal with diagnostics. Hook path validation now rejects both lexical escapes and symlink escapes outside the component directory. (#589)
 - **Web console dependencies**: updated `qs` to 6.15.2 via npm overrides to address CVE-2026-8723 / GHSA-q8mj-m7cp-5q26, and updated `ws` to 8.21.0 to clear the current web-console npm audit report.
@@ -79,36 +74,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.5.0] - 2026-05-14
 
 ### Added
-- **Tmux-launcher clean env**: agent sessions launch in a minimal, allowlisted environment instead of inheriting the full parent process env. Controlled by `ZYLOS_CLEAN_ENV` (default: `true`); set to `false` to fall back to compat mode. Includes `runtime-env.manifest` for declarative env var injection. (#576)
 - **Component configure hooks**: components can declare `lifecycle.hooks.configure` in SKILL.md to receive config values via stdin JSON during installation, replacing manual `.env` injection for supported components (#578)
 - **Health check toggle**: 24h health check can be disabled via `zylos config set health_check_enabled false` (default: on) (#586)
 - **Tool watchdog**: detects Claude web tool-use hangs and hardens tool event recovery (#500)
 
-### Changed
-- **Activity Monitor v3 — modular architecture**: extracted MonitorOrchestrator, HealthEngine, Guardian, MessageRouter, ToolPipeline, ProcSampler, and UsageMonitor into standalone modules with full unit test coverage. No behavioral changes to external APIs. (#545)
-
 ### Fixed
-- **PATH deduplication**: prevent PATH bloat across tmux session restarts (#499)
-- **Codex /exit treated as lifecycle control**: C4 dispatcher correctly handles Codex exit commands (#517)
 - **Caddy route prefix forwarding**: stripped route prefix now forwarded to upstream (#521)
 - **npm install timeout**: increased timeout and added progress indicator for slow networks (#522)
 - **Claude default model**: settings model defaults to Opus 4.6 on fresh installs (#567)
 - **Web console timezone**: respects TZ config for timestamp display (#568)
-- **Upgrade: activity monitor env verification**: verifies AM environment via `pm2 jlist` after restart (#570)
 - **Session handoff routing**: handoff summaries routed to internal web-console channel only (#571)
 - **Upgrade: post-install from new package**: self-upgrade runs post-install steps from the newly installed package (#572)
 - **Upgrade: symlinked skills rollback**: hardened rollback for symlinked skill directories (#577)
-- **Activity monitor: image dimension errors**: detects and handles image dimension limit errors from API (#579)
 
 ### Upgrade Notes
-- **⚠️ Upgrading from v0.4.13 or earlier**: you must stop the activity monitor before upgrading, then restart it after. Run: `pm2 stop activity-monitor`, then `zylos upgrade --self -y`, then `pm2 start activity-monitor`. Upgrading without stopping AM first will fail with `failed to verify activity-monitor PM2 env after restart`.
 - Clean env is now the default. If your setup relies on inherited environment variables, set `ZYLOS_CLEAN_ENV=false` in `~/zylos/.env` or add needed variables to `~/zylos/.zylos/runtime-env.manifest`.
 - **⚠️ Upgrading from v0.4.13 or earlier**: the `runtime-env.manifest` file will not be created automatically (the deploy logic runs from the old version which lacks it). After upgrading, copy the template manually: `cp $(npm root -g)/zylos/templates/runtime-env.manifest.example ~/zylos/.zylos/runtime-env.manifest`. Without this file, the agent session will lack `TZ` and any other manifest-declared variables.
 
 ## [0.4.13] - 2026-04-12
-
-### Fixed
-- **C4 dispatcher: Claude input-box fallback detection**: when running under the Claude runtime, the cursor-only input-box probe can misreport `has_content` due to a known tmux cursor-Y quirk with wrapped input. `checkInputBox()` now falls back to a text-window parser (`checkClaudeFallbackInputBox`) that reads the 10 characters to the right of the prompt marker to disambiguate. The Codex runtime path is unchanged (cursor-only). (#493)
 
 ### Changed
 - **C4 send retry reduced from 5 to 2**: repeated send retries past 2 attempts almost always indicated a stuck input state rather than a transient failure, so the outer `MAX_RETRIES` budget has been cut to fail faster and surface real delivery problems sooner. (#493)
@@ -152,8 +135,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Hook sync forward pass**: matcher-aware forward pass prevents incorrect hook synchronization (#462)
 - **Bootstrap restart enqueue**: restart enqueue moved into sync-settings-hooks to fix bootstrap ordering (#464)
 - **Codex input box detection**: empty prompt and status-line layout correctly recognized (#440)
-- **Activity-monitor health checks**: now run daily instead of being skipped (#459)
-- **Activity-monitor statusline format**: handles five_hour/seven_day format variants correctly
 - **Recent conversations order**: C4 recent conversations now print chronologically (#457)
 - **Early memory sync guard**: prevents memory sync from triggering before sufficient unsummarized content exists (#455)
 - **Self-upgrade step11 service restart**: repaired service restart step in self-upgrade flow (#456)
@@ -178,7 +159,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Heartbeat phase tagging**: heartbeat content now includes `[phase=primary|stuck|recovery|down-check]` markers, enabling phase-aware dispatch decisions (#431)
-- **Atomic status file writes**: `atomicWriteJson()` in activity-monitor prevents torn writes to the agent status file; `readJsonFileWithRetry()` in c4-dispatcher adds retry-on-parse-failure for robustness (#431)
 
 ## [0.4.8] - 2026-03-26
 
@@ -186,9 +166,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Base URL support (#418)
 
 ## [0.4.7] - 2026-03-26
-
-### Fixed
-- **Periodic probe interval corrected to 30 minutes**: activity-monitor periodic liveness checks were unintentionally reduced from 5 minutes to 3 minutes in v0.4.1. They now run every 30 minutes as intended, avoiding unnecessary idle probe traffic while preserving message-triggered and heartbeat-based recovery paths (#426)
 
 ## [0.4.6] - 2026-03-26 _(superseded by 0.4.7 — restores the intended periodic probe interval after the previous over-aggressive reduction)_ ⚠️ UPGRADE STRONGLY RECOMMENDED
 
@@ -220,7 +197,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OpenClaw ecosystem compatibility**: documentation for skill installation, capability mapping, and natural-language skill messaging (#372)
 
 ### Fixed
-- **Codex heartbeat kill-restart loop**: replaced tmux stdin injection with C4 control queue delivery, matching Claude's architecture. Eliminates false timeouts from `rollout_path` null after restart and user conversation disruption (#379)
 - **checkAuth over-engineered**: removed Stage 1 (`claude auth status`) and Stage 2 (HTTP `/v1/models`) — neither validates setup tokens or API keys reliably. Now uses only `claude -p ping --max-turns 1` for end-to-end auth verification (#378)
 - **Hardcoded Chinese in context rotation message**: replaced with English — zylos-core is open source, the agent translates at runtime (#377)
 - **Codex heartbeat ack instruction too vague**: updated `codex-addon.md` to explicitly instruct Codex to execute the ack command, matching Claude's template (#379)
@@ -243,7 +219,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **`auth_failed` health state**: authentication failures now set a dedicated health state instead of silently staying `ok`. Users see "authentication issues — please check credentials" instead of a generic error. User messages trigger immediate auth retry with no 3-minute wait (#359)
-- **Proactive API error scan**: detects API errors (HTTP 400/401/403/500) within ~15 seconds via tmux pane scanning, triggering fast heartbeat recovery instead of waiting for the next periodic probe (#355)
 - **/proc context-switch sampling**: frozen-process detection via `/proc/<pid>/status` context-switch counters — catches stuck Claude processes that appear alive but aren't processing (#351)
 - **API error fast-detection for heartbeat recovery**: `detectApiError` callback in HeartbeatEngine — on heartbeat failure, scans for API errors before triggering kill+restart, enabling targeted recovery (#352)
 
@@ -271,19 +246,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **OpenAI Codex runtime support**: run Zylos on Codex CLI instead of Claude Code. Switch anytime with `zylos runtime codex` — memory, skills, and channels are fully preserved across the switch (#311)
-- **`zylos runtime <name>` command**: switch AI runtime at any time without reinstalling. Handles install, auth, and tmux session management automatically
 - **`--runtime` and `--codex-api-key` install flags**: non-interactive Codex install support — `curl | bash -s -- --runtime codex --codex-api-key sk-xxx`. `ZYLOS_RUNTIME` and `OPENAI_API_KEY` env vars also supported (key is stored in `~/.codex/auth.json`, not `.env`)
 - **RuntimeAdapter abstraction**: `ClaudeAdapter` and `CodexAdapter` implement a shared interface — all core systems (heartbeat, context monitoring, guardian) are now runtime-agnostic
 - **Per-runtime instruction files**: `ZYLOS.md` (shared core) + `claude-addon.md` / `codex-addon.md` runtime addons, assembled into `CLAUDE.md` (Claude) or `AGENTS.md` (Codex) at setup time
 - **Codex skill discovery**: `.agents/skills/` symlink created at Codex launch so Codex discovers all installed skills natively via the Agent Skills spec
-- **Context rotation notifications**: when context is near full, the activity monitor sends a user notification before rotating to a new session — works across all communication channels
 - **Per-runtime heartbeat probes**: `ClaudeProbe` and `CodexProbe` handle liveness detection for each runtime's specific behavior
 
 ### Changed
 - **Layered instruction files**: `CLAUDE.md` is now assembled from `ZYLOS.md` + `claude-addon.md` on each install/upgrade. Existing `CLAUDE.md` is migrated to `ZYLOS.md` on first upgrade to v0.4.0
 
 ### Fixed
-- **activity-monitor crash after upgrade from 0.3.x**: when upgrading from a pre-v0.4.0 version, the old upgrade code restarted PM2 services before deploying the new ecosystem config, leaving `ZYLOS_PACKAGE_ROOT` unset. activity-monitor now falls back to `npm root -g` to locate the runtime package, preventing the crash
 - **self-upgrade rollback on slow services**: step 11 (verify services) used a one-shot 2-second check, causing false rollbacks when component services (Lark, Telegram, BotsHub) took longer than 2 seconds to restart. Now polls every 2 seconds for up to 30 seconds
 
 ## [0.3.7] - 2026-03-11
@@ -324,14 +296,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **User message triggers recovery in all unavailable states**: user messages now trigger recovery attempts in `recovering` and `down` states (not just `rate_limited`). Recovery cooldown reduced from 5 minutes to 1 minute. Error messages are honest about the bot's actual state instead of always claiming "rate limited" (#254)
 
 ### Fixed
-- **False positive rate limit detection**: replaced aggressive tick-level tmux text scanning with dual-signal detection — rate limit is now only detected when both heartbeat failure AND specific rate-limit text are present in the tmux pane. Prevents conversation content containing "rate limit" keywords from triggering false positives. Includes 71 tests (#257, closes #256)
 - **Rate-limited recovery deadlock**: `triggerRecovery` was blocked by a `rate_limited` guard that prevented recovery even when cooldown expired. Recovery now correctly proceeds after cooldown (#253)
 
 ## [0.3.4] - 2026-03-05
-
-### Added
-- **Exponential backoff for activity monitor**: replaces fixed 30-second retry with exponential backoff (30s → 60s → 120s → 240s, max 5 min) when Claude crashes or exits unexpectedly. Backoff resets after 60 seconds of stable runtime. Process signals (SIGTERM → SIGKILL escalation) ensure clean restarts. Includes 50 tests (#241, closes #177)
-- **RATE_LIMITED health state**: activity monitor now detects Anthropic rate-limit responses (429/529), enters a dedicated `RATE_LIMITED` state with parsed reset time, and automatically recovers — either when the reset time expires or when a user message arrives (whichever comes first). Channel bots show human-readable wait times. Includes 67 tests (#242, closes #233)
 
 ### Fixed
 - **Install script defaults to latest release tag**: `install.sh` without `--branch` now installs the latest GitHub release tag instead of `main`, preventing accidental installation of unreleased code (#239)
@@ -342,29 +309,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.3] - 2026-03-04
 
-### Added
-- **Plan usage monitoring**: activity monitor periodically checks `/usage` via tmux capture during idle periods, parses session/weekly usage percentages, and sends owner notifications when thresholds are exceeded (80% warning, 90% high, 95% critical). Only checks during active hours when Claude is idle with no pending work. Configurable via `zylos config` (#225, closes #206)
-
 ### Fixed
 - **Startup prompt blocking**: `ensureOnboardingComplete()` now also sets `effortCalloutDismissed` in `~/.claude.json` and `skipDangerousModePermissionPrompt` in `~/.claude/settings.json` — prevents new Claude Code interactive prompts from blocking automated startup on VMs (#227, closes #226)
 - **Usage monitor fires immediately on fresh install**: `lastUsageCheckAt` defaulted to 0, causing `/usage` to trigger 30 seconds after first startup instead of waiting the full check interval. Now defaults to current time when no persisted state exists (#229)
 
 ## [0.3.2] - 2026-03-04
 
-### Fixed
-- **Auth conflict with `claude login` + `.env` API key**: Guardian now detects native `claude login` auth (credentials.json on Linux, system Keychain on macOS) and skips `.env` token injection when present — prevents "Auth conflict: Both a token and an API key are set" error. Stale tokens are also stripped from existing tmux sessions (#219, closes #218)
-- **Onboarding prompts block native auth startup**: onboarding and workspace trust pre-acceptance was embedded inside `approveApiKey()`, so native auth users without `.env` tokens saw interactive prompts in tmux. Extracted `ensureOnboardingComplete()` as a standalone function called for all auth methods (#219, supersedes #217)
-
 ## [0.3.1] - 2026-03-04 _(superseded by 0.3.2 — auth conflict fix was incomplete)_
 
-### Fixed
-- **Guardian token override causes 401**: `startClaude()` always injected the static `CLAUDE_CODE_OAUTH_TOKEN` from `.env` into tmux, overriding `~/.claude/.credentials.json` which supports automatic token refresh. Once the static token expired, Claude got stuck on 401 errors despite having valid auto-refreshable credentials. Guardian now checks for `credentials.json` first and skips `.env` token injection when present. All three auth methods (claude login, setup token, API key) remain fully supported (#215, closes #211)
-
 ## [0.3.0] - 2026-03-04
-
-### Added
-- **`zylos doctor` command**: two-layer diagnostic and auto-repair system — Layer 1 runs health checks (tmux, PM2, network, Claude CLI, services, versions), Layer 2 delegates fixes to Claude when available, otherwise shows manual hints. Supports `--check` flag for diagnosis-only mode (#205, closes #202)
-- **`zylos uninstall --self`**: cleanly remove zylos from the system — stops all services (tmux + PM2), uninstalls the npm package, removes `~/zylos/` and shell PATH entries, with optional interactive cleanup of PM2 and Claude CLI. PM2 service detection uses runtime path matching instead of hardcoded names. `--force` flag for non-interactive mode (#213, closes #212)
 
 ### Fixed
 - `zylos init` no longer asks "Start services now?" — services always start unconditionally after init, removing an unnecessary prompt (#210)
@@ -420,9 +373,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.4] - 2026-02-22
 
-### Fixed
-- **Activity monitor Intl.DateTimeFormat memory leak**: `getLocalHour()` and `getLocalDate()` created new `Intl.DateTimeFormat` instances on every call (~3/sec from DailySchedule). V8/ICU allocates native memory per instance that GC never reclaims, causing unbounded RSS growth (~18 MB per 1 000 instantiations). Hoisted formatters to module-level constants. Activity monitor bumped to v15.
-
 ## [0.2.3] - 2026-02-22
 
 ### Added
@@ -434,8 +384,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `new-session` skill: graceful context handoff via `/clear` — preserves background tasks and hands off state to new session
 - Session cost tracking: logs per-session cost to `cost-log.jsonl` on session change
 - Unit tests for smart merge pipeline (43 tests via Jest)
-- Activity monitor exit code logging: each Claude exit logged to `claude-exit.log` with timestamp and exit code
-- Activity monitor critical events now output to stdout (visible in `pm2 logs`)
 
 ### Fixed
 - `zylos upgrade --self --check --branch`: version check now reads from specified branch instead of always main
@@ -449,23 +397,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Context monitor: fix cost carry-over bug on session change, track `used_percentage` every turn
 - Self-upgrade: step 8 shells out to newly installed `sync-settings-hooks.js` to avoid bootstrap problem
 - **Postinstall bootstrap fix**: settings sync now runs even during self-upgrade, ensuring new config fields (e.g. statusLine) are synced when upgrading from any old version
-- **Activity monitor PATH fix**: pass PATH to tmux session via `-e` flag — tmux server may not inherit activity-monitor's PATH, causing "command not found"
-- **Activity monitor CLAUDECODE env fix**: strip `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` env vars before starting Claude in tmux — fixes infinite restart loop when PM2 inherits Claude's runtime environment
-- **Activity monitor startupGrace bypass**: grace period now checked in offline branch (tmux not found), preventing 5s retry loop when Claude crashes immediately
-- **Activity monitor exponential backoff**: restart delay escalates 5s → 10s → 20s → 40s → 60s cap; requires 60s stable running before reset
 
 ### Changed
 - Upgrade pipeline uses smart merge instead of brute-force overwrite for both components and core skills
 - C4 upgrade reply includes auto-merged files and conflict details
 - `check-context` skill simplified: reads `statusline.json` directly (always current)
-- Activity monitor bumped to v14: env cleanup, exponential backoff, exit logging, stdout output
 - statusLine config added to settings template with auto-sync on upgrade
 - `postinstall.js` restructured: skill sync and settings sync separated; settings sync always runs when zylos is initialized
 
-### Removed
-- Polling-based context check (check-context script + activity monitor hourly poll)
-
-## [0.2.2] - 2026-02-22 _(superseded by 0.2.3 — activity monitor env pollution bug caused infinite restart loop on affected instances)_
+## [0.2.2] - 2026-02-22 _(superseded by 0.2.3)_
 
 ## [0.2.1] - 2026-02-22 _(superseded by 0.2.2 — postinstall did not sync settings during self-upgrade from older versions)_
 
@@ -477,7 +417,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Recovery backoff: failed recovery attempts wait progressively longer (1 min, 2 min, ... up to 5 min cap)
 - DOWN state periodic retry: after exhausting recovery budget, check back every 30 min
 - Daily upgrade check: queries GitHub at 6 AM for newer versions of core and all installed components, notifies via C4
-- Diagnostic logging: hook timing, delivery failures, and tmux captures logged to activity-monitor directory
 - Recovery notices: notify pending channels when Claude comes back online after downtime
 - Auto-sync settings.json hooks on upgrade: template is now the single source of truth for all hook configurations
 - `applyMigrationHints()` in self-upgrade pipeline (step 8): automatically adds missing hooks, updates modified hooks, removes obsolete core hooks
@@ -491,7 +430,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Deduplicate recovery notices for same chat with different message IDs
 - Preserve failed notifications in pending-channels file instead of discarding
 - postinstall.js: use execFileSync instead of execSync to prevent shell injection
-- Tmux capture truncation: keep last 8KB (most recent content) instead of first 8KB
 - Upgrade check: normalize v-prefix on both sides of version comparison
 - Upgrade check: return false on C4 enqueue failure to allow DailySchedule retry
 - DOWN state retry: only advance lastDownCheckAt after successful enqueue
@@ -499,10 +437,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `postinstall.js` uses template-based hook sync instead of `setup-hooks.js`
-- `templates/.claude/settings.json` now includes all hooks (SessionStart + activity-monitor)
 - Upgrade check runs as detached child process to avoid blocking monitor loop
 - Safety-net heartbeat interval relaxed to 2 hours (stuck detection is primary mechanism)
-- Activity monitor bumped to v12
 
 ### Removed
 - `setup-hooks.js`: replaced by `sync-settings-hooks.js` which handles all hooks from the template
@@ -528,18 +464,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Remove endpoint format restriction from C4 validation — endpoint format is now channel-specific (#113)
-- restart-claude: use c4-control enqueue instead of nohup script to prevent race condition (#113)
-- upgrade-claude: use c4-control enqueue instead of script-level idle detection (#113)
 - upgrade-claude: cancel queued /exit on timeout abort to prevent orphaned restarts (#113)
 - upgrade-claude: add ack-deadline to /exit enqueue to prevent stale running records (#113)
-- check-context: use c4-control enqueue with `--with-restart-check` flag (#113)
 - Dispatcher: require `idle_seconds >= 3` (sustained idle) before delivering require_idle messages (#113)
 
 ### Changed
 - Increase file attachment threshold from 1KB to 2KB (#113)
-- Simplify activity-monitor `enqueueContextCheck()` to delegate to check-context.js (#113)
 - Delete legacy `restart.js` script (no remaining callers) (#113)
-- Session-start-prompt: enqueue via c4-control instead of direct c4-receive (#113)
 
 ## [0.1.6] - 2026-02-17
 
@@ -547,7 +478,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `zylos upgrade --branch <name>` flag for testing PR branches before merge (#111)
 - Session startup hook (`session-start-prompt.js`) for injecting context at session start (#111)
 - Upgrade migration hints: detect new, modified, and removed hooks by script path matching (#111)
-- `hasStartupHook()` with fallback to C4 control enqueue when hook is not configured (#111)
 
 ### Changed
 - Context check split into two-step flow with deadline spacing (600s/630s) (#111)
@@ -589,7 +519,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.2] - 2026-02-13
 
 ### Added
-- Activity monitor: enqueue startup control after launching Claude (#94)
 - Web console: read password from .env file directly (#97)
 
 ### Fixed
