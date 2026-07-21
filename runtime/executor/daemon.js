@@ -46,17 +46,25 @@ export function createConfiguredProviderAdapter({ provider, zylosDir, environmen
 }
 
 function hasResumableRuntimeUpgrade({ database, zylosDir }) {
-  let hasActiveRun = false;
+  let resumableRun = null;
+  let hasUpgradeTable = false;
   if (typeof database?.prepare === 'function') {
     const table = database.prepare(`
       SELECT 1 FROM sqlite_master
       WHERE type = 'table' AND name = 'runtime_upgrade_runs'
     `).get();
-    if (table !== undefined) {
-      hasActiveRun = database.prepare(`
-        SELECT 1 FROM runtime_upgrade_runs
-        WHERE state NOT IN ('committed', 'rolled_back') LIMIT 1
-      `).get() !== undefined;
+    hasUpgradeTable = table !== undefined;
+    if (hasUpgradeTable) {
+      resumableRun = database.prepare(`
+        SELECT run.upgrade_id FROM runtime_upgrade_runs AS run
+        WHERE run.state NOT IN ('committed', 'rolled_back')
+           OR (run.state = 'committed' AND NOT EXISTS (
+             SELECT 1 FROM runtime_upgrade_events AS event
+             WHERE event.upgrade_id = run.upgrade_id
+               AND event.step_key = 'postcommit-cleanup'
+           ))
+        ORDER BY run.created_at ASC LIMIT 1
+      `).get() ?? null;
     }
   }
   const planDirectory = path.join(zylosDir, 'runtime', 'upgrade-plans');
@@ -66,7 +74,16 @@ function hasResumableRuntimeUpgrade({ database, zylosDir }) {
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
   }
-  return hasActiveRun || plans.length > 0;
+  if (resumableRun !== null) return true;
+  if (plans.length === 0) return false;
+  if (!hasUpgradeTable) return true;
+  for (const entry of plans) {
+    const run = database.prepare(`
+      SELECT state FROM runtime_upgrade_runs WHERE upgrade_id = ?
+    `).get(entry.slice(0, -'.json'.length));
+    if (run === undefined || !['committed', 'rolled_back'].includes(run.state)) return true;
+  }
+  return false;
 }
 
 async function loadInstalledExecutorUpgradeHandler() {
