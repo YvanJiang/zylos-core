@@ -259,14 +259,26 @@ function syncCoreInbound() {
 }
 
 function getMailboxMessages({
-  channel = 'web-console', sinceId = 0, limit = 100, latest = false,
+  channel = 'web-console', sinceId = 0, limit = 100, latest = false, cursorScope = null,
 } = {}) {
   if (channel !== 'web-console') return [];
-  return deliveryMailbox.list({ sinceId, limit, latest });
+  return deliveryMailbox.list({ sinceId, limit, latest, cursorScope });
 }
 
-function getNewMessages(sinceId) {
-  return getMailboxMessages({ sinceId, limit: 100 });
+function getNewMessages(sinceId, cursorScope = deliveryMailbox.cursorScope) {
+  return getMailboxMessages({ sinceId, limit: 100, cursorScope });
+}
+
+function setMailboxCursorScope(res) {
+  res.setHeader('X-Zylos-Mailbox-Cursor-Scope', deliveryMailbox.cursorScope);
+}
+
+function mailboxCursorError(res, error) {
+  setMailboxCursorScope(res);
+  return res.status(error.status || 500).json({
+    error: error.code || 'mailbox_cursor_error',
+    cursor_scope: error.cursorScope || deliveryMailbox.cursorScope,
+  });
 }
 
 function parseProjectionCursor(value) {
@@ -291,10 +303,16 @@ function broadcast(type, data) {
       try {
         client.send(message);
         if (type === 'messages' && Array.isArray(data) && data.length > 0) {
-          clientCursors.set(client, Math.max(
-            clientCursors.get(client) ?? 0,
+          const current = clientCursors.get(client) ?? {
+            cursorScope: deliveryMailbox.cursorScope, id: 0,
+          };
+          clientCursors.set(client, {
+            cursorScope: deliveryMailbox.cursorScope,
+            id: Math.max(
+            current.id,
             ...data.map(({ id }) => id),
-          ));
+            ),
+          });
         }
         delivered += 1;
       } catch {
@@ -462,12 +480,16 @@ async function checkUpdates() {
   }
 
   function flushClient(client) {
-    const cursor = clientCursors.get(client) ?? 0;
-    const newMessages = getNewMessages(cursor);
+    const cursor = clientCursors.get(client);
+    if (!cursor || cursor.cursorScope !== deliveryMailbox.cursorScope) return;
+    const newMessages = getNewMessages(cursor.id, cursor.cursorScope);
     if (newMessages.length === 0 || client.readyState !== 1) return;
     try {
       client.send(JSON.stringify({ type: 'messages', data: newMessages }));
-      clientCursors.set(client, Math.max(cursor, ...newMessages.map(({ id }) => id)));
+      clientCursors.set(client, {
+        cursorScope: cursor.cursorScope,
+        id: Math.max(cursor.id, ...newMessages.map(({ id }) => id)),
+      });
     } catch {
       clients.delete(client);
     }
@@ -520,8 +542,24 @@ wss.on('connection', (ws, req) => {
           ws.close(1008, 'Invalid durable projection cursor');
           return;
         }
-        clientCursors.set(ws, sinceId);
+        const cursorScope = typeof msg.cursor_scope === 'string' ? msg.cursor_scope : null;
+        try {
+          deliveryMailbox.list({ sinceId, limit: 1, cursorScope });
+        } catch (error) {
+          if (error.code === 'mailbox_cursor_scope_mismatch'
+            || error.code === 'mailbox_cursor_scope_required') {
+            ws.send(JSON.stringify({
+              type: 'cursor_reset', cursor_scope: deliveryMailbox.cursorScope,
+            }));
+            return;
+          }
+          throw error;
+        }
+        clientCursors.set(ws, { cursorScope: deliveryMailbox.cursorScope, id: sinceId });
         clients.add(ws);
+        ws.send(JSON.stringify({
+          type: 'subscribed', cursor_scope: deliveryMailbox.cursorScope,
+        }));
         checkUpdates().catch(() => {});
       } else if (msg.type === 'send') {
         const tempId = msg.tempId; // Track client's temp ID
@@ -576,6 +614,7 @@ app.get('/api/conversations', (req, res) => {
     const limit = parseInt(req.query.limit) || 50;
     const channel = req.query.channel || 'web-console';
     syncCoreInbound();
+    setMailboxCursorScope(res);
     res.json(getMailboxMessages({ channel, limit, latest: true }));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -589,6 +628,7 @@ app.get('/api/conversations/recent', (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 100;
     syncCoreInbound();
+    setMailboxCursorScope(res);
     res.json(getMailboxMessages({ limit, latest: true }));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -701,10 +741,20 @@ app.get('/api/inbound-media/:filename', (req, res) => {
 app.get('/api/poll', async (req, res) => {
   try {
     const sinceId = parseProjectionCursor(req.query.since_id);
+    const cursorScope = typeof req.query.cursor_scope === 'string'
+      ? req.query.cursor_scope : null;
+    // Fence the client's namespace before any projection or delivery work.
+    deliveryMailbox.list({ sinceId, limit: 1, cursorScope });
     syncCoreInbound();
     await drainWebOutbox();
-    res.json(getNewMessages(sinceId));
+    setMailboxCursorScope(res);
+    res.json(getNewMessages(sinceId, cursorScope));
   } catch (err) {
+    if (err.code === 'mailbox_cursor_scope_mismatch'
+      || err.code === 'mailbox_cursor_scope_required') {
+      mailboxCursorError(res, err);
+      return;
+    }
     res.status(err.status || 500).json({ error: err.message });
   }
 });

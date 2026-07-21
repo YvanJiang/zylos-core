@@ -209,6 +209,28 @@ describe('DeliveryMailbox', () => {
     ]);
   });
 
+  test('rejects a nonzero visibility cursor from another mailbox scope', () => {
+    const scopeA = { region: 'global', tenantId: 'tenant-a', botId: 'bot-a' };
+    const scopeB = { region: 'global', tenantId: 'tenant-b', botId: 'bot-b' };
+    const mailboxB = new DeliveryMailbox(db, scopeB);
+    mailboxB.projectInbound({
+      inboundEventId: 'b-old-inbound', endpointId: 'console', content: 'B inbound',
+      timestamp: '2026-07-21T00:00:00.000Z',
+    });
+    const mailboxA = new DeliveryMailbox(db, scopeA);
+    const newestA = mailboxA.deliver({
+      deliveryId: 'a-new-outbound', endpointId: 'console', content: 'A outbound',
+      timestamp: '2026-07-21T00:00:01.000Z',
+    });
+
+    expect(() => mailboxB.list({
+      sinceId: newestA.id,
+      cursorScope: mailboxA.cursorScope,
+    })).toThrow(/cursor scope/i);
+    expect(mailboxB.list({ sinceId: 0, cursorScope: mailboxB.cursorScope }))
+      .toEqual([expect.objectContaining({ content: 'B inbound' })]);
+  });
+
   test('persists canonical attachment metadata across reopen and fences conflicting replay', () => {
     const dbPath = path.join(tempDir, 'test.db');
     const mailbox = new DeliveryMailbox(db, TEST_MAILBOX_SCOPE);
@@ -254,7 +276,9 @@ describe('DeliveryMailbox', () => {
     });
 
     expect([firstInbound.id, secondInbound.id, delayedFirstReply.id]).toEqual([1, 2, 3]);
-    expect(mailbox.list({ sinceId: secondInbound.id })).toEqual([
+    expect(mailbox.list({
+      sinceId: secondInbound.id, cursorScope: mailbox.cursorScope,
+    })).toEqual([
       expect.objectContaining({ id: delayedFirstReply.id, content: 'first reply' }),
     ]);
   });
@@ -286,7 +310,9 @@ describe('DeliveryMailbox', () => {
       timestamp: '2026-07-21T00:10:00.000Z',
     });
     const firstPage = mailbox.list({ sinceId: 0, limit: 100 });
-    const secondPage = mailbox.list({ sinceId: firstPage.at(-1).id, limit: 100 });
+    const secondPage = mailbox.list({
+      sinceId: firstPage.at(-1).id, limit: 100, cursorScope: mailbox.cursorScope,
+    });
 
     expect(firstPage).toHaveLength(100);
     expect(secondPage).toHaveLength(51);

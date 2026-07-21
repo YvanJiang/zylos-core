@@ -93,12 +93,15 @@ async function startServer({
   region = 'global',
   tenantId = 'default',
   botId = 'zylos',
+  root: existingRoot = null,
 } = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wc-routes-'));
+  const root = existingRoot || fs.mkdtempSync(path.join(os.tmpdir(), 'wc-routes-'));
   const dbPath = path.join(root, 'comm-bridge', 'c4.db');
   const skillsDir = path.join(root, 'skills');
-  fs.writeFileSync(path.join(root, '.env'), '');
-  createDb(dbPath);
+  if (!existingRoot) {
+    fs.writeFileSync(path.join(root, '.env'), '');
+    createDb(dbPath);
+  }
   if (actualC4Receive) {
     fs.mkdirSync(skillsDir, { recursive: true });
   } else {
@@ -143,7 +146,7 @@ async function startServer({
   throw new Error(`server did not start: ${output}`);
 }
 
-async function stopServer(active) {
+async function stopServer(active, { preserveRoot = false } = {}) {
   if (!active) return;
   if (active.child.exitCode === null) {
     let forced = false;
@@ -162,7 +165,7 @@ async function stopServer(active) {
     });
     if (forced) throw new Error('Web Console did not complete its drain shutdown barrier');
   }
-  fs.rmSync(active.root, { recursive: true, force: true });
+  if (!preserveRoot) fs.rmSync(active.root, { recursive: true, force: true });
 }
 
 function rows(dbPath) {
@@ -741,9 +744,12 @@ describe('web-console attachment routes', () => {
     })();
     mailboxDb.close();
 
-    const first = await (await fetch(`${ctx.baseUrl}/api/poll?since_id=0`)).json();
+    const firstResponse = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    const cursorScope = firstResponse.headers.get('x-zylos-mailbox-cursor-scope');
+    const first = await firstResponse.json();
     const second = await (await fetch(
-      `${ctx.baseUrl}/api/poll?since_id=${first.at(-1).id}`,
+      `${ctx.baseUrl}/api/poll?since_id=${first.at(-1).id}`
+        + `&cursor_scope=${encodeURIComponent(cursorScope)}`,
     )).json();
     const all = [...first, ...second];
     expect(first).toHaveLength(100);
@@ -854,7 +860,9 @@ describe('web-console attachment routes', () => {
     }, { now: () => '2020-01-01T00:00:00.000Z' });
     seedDb.close();
     await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
-    const history = await (await fetch(`${ctx.baseUrl}/api/conversations/recent?limit=100`)).json();
+    const historyResponse = await fetch(`${ctx.baseUrl}/api/conversations/recent?limit=100`);
+    const cursorScope = historyResponse.headers.get('x-zylos-mailbox-cursor-scope');
+    const history = await historyResponse.json();
     const historyCursor = Math.max(...history.map(({ id }) => id));
 
     async function subscribedClient(sinceId) {
@@ -868,7 +876,9 @@ describe('web-console attachment routes', () => {
         const event = JSON.parse(raw.toString());
         if (event.type === 'messages') received.push(...event.data);
       });
-      ws.send(JSON.stringify({ type: 'subscribe', since_id: sinceId }));
+      ws.send(JSON.stringify({
+        type: 'subscribe', since_id: sinceId, cursor_scope: cursorScope,
+      }));
       return { ws, received };
     }
 
@@ -903,6 +913,89 @@ describe('web-console attachment routes', () => {
     expect(fromCurrent.received.some(({ content }) => content === 'cursor history only')).toBe(false);
     expect(fromBeginning.received.some(({ content }) => content === 'cursor visible to both')).toBe(true);
     expect(fromCurrent.received.some(({ content }) => content === 'cursor visible to both')).toBe(true);
+  });
+
+  test('scope-bound HTTP and WebSocket cursors reset across same-database B to A to B restart', async () => {
+    function acceptFor(active, tenantId, suffix) {
+      const coreDb = new Database(active.dbPath);
+      acceptCompatibilityInbound(coreDb, {
+        inbound_event_id: `scope-restart-${suffix}`, trace_id: `scope-restart-${suffix}-trace`,
+        occurred_at: '2026-07-21T00:00:00.000Z', received_at: '2026-07-21T00:00:00.000Z',
+        region: 'global', tenant_id: tenantId, channel: 'web-console', bot_id: 'zylos',
+        chat_type: 'dm', chat_id: 'console', native_thread_or_topic_id: null,
+        message_id: `scope-restart-${suffix}-message`,
+        actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
+        content: { kind: 'text', text: `${suffix} inbound`, attachments: [] },
+        reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+        source_ref: `scope-restart-${suffix}-source`,
+      }, { now: () => '2026-07-21T00:00:00.000Z' });
+      coreDb.close();
+    }
+
+    ctx = await startServer({ tenantId: 'tenant-b' });
+    const sharedRoot = ctx.root;
+    acceptFor(ctx, 'tenant-b', 'B');
+    const initialB = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    const bScope = initialB.headers.get('x-zylos-mailbox-cursor-scope');
+    const bMessages = await initialB.json();
+    expect(bScope).toMatch(/^web-console-mailbox-v1:[a-f0-9]{64}$/);
+    expect(bMessages.map(({ direction }) => direction)).toEqual(['in', 'out']);
+    await stopServer(ctx, { preserveRoot: true });
+
+    ctx = await startServer({ root: sharedRoot, tenantId: 'tenant-a' });
+    acceptFor(ctx, 'tenant-a', 'A');
+    const initialA = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    const aScope = initialA.headers.get('x-zylos-mailbox-cursor-scope');
+    const aMessages = await initialA.json();
+    const aCursor = aMessages.at(-1).id;
+    expect(aScope).not.toBe(bScope);
+    expect(aCursor).toBeGreaterThan(bMessages.at(-1).id);
+    await stopServer(ctx, { preserveRoot: true });
+
+    ctx = await startServer({ root: sharedRoot, tenantId: 'tenant-b' });
+    const staleHttp = await fetch(
+      `${ctx.baseUrl}/api/poll?since_id=${aCursor}&cursor_scope=${encodeURIComponent(aScope)}`,
+    );
+    expect(staleHttp.status).toBe(409);
+    const reset = await staleHttp.json();
+    expect(reset).toEqual({
+      error: 'mailbox_cursor_scope_mismatch', cursor_scope: bScope,
+    });
+    const reloadedB = await fetch(
+      `${ctx.baseUrl}/api/poll?since_id=0&cursor_scope=${encodeURIComponent(reset.cursor_scope)}`,
+    );
+    expect((await reloadedB.json()).map(({ direction, content }) => ({ direction, content })))
+      .toEqual(bMessages.map(({ direction, content }) => ({ direction, content })));
+
+    const wsEvents = [];
+    const ws = new WebSocket(`ws://127.0.0.1:${ctx.port}/`);
+    await new Promise((resolve, reject) => {
+      ws.once('open', resolve);
+      ws.once('error', reject);
+    });
+    ws.on('message', (raw) => {
+      const event = JSON.parse(raw.toString());
+      wsEvents.push(event);
+      if (event.type === 'cursor_reset') {
+        ws.send(JSON.stringify({
+          type: 'subscribe', since_id: 0, cursor_scope: event.cursor_scope,
+        }));
+      }
+    });
+    ws.send(JSON.stringify({
+      type: 'subscribe', since_id: aCursor, cursor_scope: aScope,
+    }));
+    const deadline = Date.now() + 5000;
+    while (!wsEvents.some((event) => event.type === 'messages') && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    ws.close();
+    expect(wsEvents.some((event) => event.type === 'cursor_reset'
+      && event.cursor_scope === bScope)).toBe(true);
+    const wsMessages = wsEvents.filter(({ type }) => type === 'messages')
+      .flatMap(({ data }) => data);
+    expect(wsMessages.map(({ direction, content }) => ({ direction, content })))
+      .toEqual(bMessages.map(({ direction, content }) => ({ direction, content })));
   });
 
   test('GET /api/conversations/recent does not project retired inbound rows', async () => {

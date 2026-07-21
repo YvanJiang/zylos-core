@@ -15,6 +15,7 @@ class ZylosConsole {
     this.statusText = document.querySelector('.status-text');
 
     this.lastMessageId = 0;
+    this.cursorScope = null;
     this.ws = null;
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 10;
@@ -78,7 +79,11 @@ class ZylosConsole {
         this.reconnectAttempts = 0;
         if (this.pollInterval) clearInterval(this.pollInterval);
         if (this.statusInterval) clearInterval(this.statusInterval);
-        this.ws.send(JSON.stringify({ type: 'subscribe', since_id: this.lastMessageId }));
+        this.ws.send(JSON.stringify({
+          type: 'subscribe',
+          since_id: this.lastMessageId,
+          cursor_scope: this.cursorScope,
+        }));
         this.updateConnectionStatus(true);
       };
 
@@ -141,6 +146,19 @@ class ZylosConsole {
         }
         break;
 
+      case 'subscribed':
+        this.applyMailboxScope(msg.cursor_scope);
+        break;
+
+      case 'cursor_reset':
+        this.applyMailboxScope(msg.cursor_scope);
+        if (this.ws?.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({
+            type: 'subscribe', since_id: 0, cursor_scope: this.cursorScope,
+          }));
+        }
+        break;
+
       case 'sent':
         // Message send confirmation
         if (msg.success) {
@@ -154,6 +172,26 @@ class ZylosConsole {
         }
         break;
     }
+  }
+
+  applyMailboxScope(nextScope) {
+    const accepted = globalThis.ZylosMailboxCursor.acceptScope({
+      cursorScope: this.cursorScope,
+      lastMessageId: this.lastMessageId,
+    }, nextScope, () => {
+      this.messagesContainer.replaceChildren();
+      this.pendingMessages.clear();
+      this.showEmptyState();
+    });
+    this.cursorScope = accepted.cursorScope;
+    this.lastMessageId = accepted.lastMessageId;
+    return accepted.reset;
+  }
+
+  mailboxPollUrl() {
+    const params = new URLSearchParams({ since_id: String(this.lastMessageId) });
+    if (this.cursorScope !== null) params.set('cursor_scope', this.cursorScope);
+    return `${this.basePath}/api/poll?${params}`;
   }
 
   updateConnectionStatus(connected) {
@@ -193,10 +231,15 @@ class ZylosConsole {
     try {
       let loaded = false;
       while (true) {
-        const response = await fetch(
-          `${this.basePath}/api/poll?since_id=${this.lastMessageId}`,
-        );
+        const response = await fetch(this.mailboxPollUrl());
+        if (response.status === 409) {
+          const reset = await response.json();
+          this.applyMailboxScope(reset.cursor_scope);
+          loaded = false;
+          continue;
+        }
         if (!response.ok) throw new Error(`Conversation load failed (${response.status})`);
+        this.applyMailboxScope(response.headers.get('x-zylos-mailbox-cursor-scope'));
         const conversations = await response.json();
         if (conversations.length === 0) break;
 
@@ -224,7 +267,14 @@ class ZylosConsole {
   // HTTP fallback methods
   async pollMessages() {
     try {
-      const response = await fetch(`${this.basePath}/api/poll?since_id=${this.lastMessageId}`);
+      const response = await fetch(this.mailboxPollUrl());
+      if (response.status === 409) {
+        const reset = await response.json();
+        this.applyMailboxScope(reset.cursor_scope);
+        return this.pollMessages();
+      }
+      if (!response.ok) throw new Error(`Message poll failed (${response.status})`);
+      this.applyMailboxScope(response.headers.get('x-zylos-mailbox-cursor-scope'));
       const messages = await response.json();
 
       if (messages.length > 0) {

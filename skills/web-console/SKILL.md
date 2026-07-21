@@ -56,7 +56,7 @@ Browser ──► Core ingress ──► conversation executor ──► Core ou
 | `/api/upload` | POST | Upload one attachment for the next message |
 | `/api/send` | POST | Send message to Claude |
 | `/api/media/:messageId` | GET | Retired legacy endpoint; always fails closed |
-| `/api/poll?since_id=N` | GET | Poll for new messages |
+| `/api/poll?since_id=N&cursor_scope=S` | GET | Poll the durable mailbox; nonzero cursors require the opaque scope returned in `X-Zylos-Mailbox-Cursor-Scope` |
 | `/api/health` | GET | Server health check |
 
 ## Files
@@ -72,8 +72,14 @@ Browser ──► Core ingress ──► conversation executor ──► Core ou
 └── public/
     ├── index.html     # Chat UI
     ├── styles.css     # Styling
+    ├── mailbox-cursor.js # Scope-bound durable cursor state/reset
     └── app.js         # Frontend logic
 ```
+
+The mailbox cursor is the pair `(X-Zylos-Mailbox-Cursor-Scope, message id)`.
+After a Core scope reconfiguration, HTTP returns `409 mailbox_cursor_scope_mismatch`
+and WebSocket returns `cursor_reset`; clients must clear the prior view and reload
+from cursor zero in the returned opaque scope.
 
 ## Environment Variables
 

@@ -110,6 +110,7 @@ export class DeliveryMailbox {
     this.scopeKey = crypto.createHash('sha256').update(JSON.stringify([
       region, tenantId, botId, this.channel, this.endpointId,
     ])).digest('hex');
+    this.cursorScope = `web-console-mailbox-v1:${this.scopeKey}`;
     this._insert = db.prepare(`
       INSERT OR IGNORE INTO delivery_mailbox (
         source_key, delivery_id, direction, channel, endpoint_id,
@@ -185,12 +186,26 @@ export class DeliveryMailbox {
     });
   }
 
-  list({ sinceId = 0, limit = 100, latest = false } = {}) {
+  list({ sinceId = 0, limit = 100, latest = false, cursorScope = null } = {}) {
     if (!Number.isSafeInteger(sinceId) || sinceId < 0) {
       throw new TypeError('sinceId must be a non-negative safe integer');
     }
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
       throw new TypeError('limit must be an integer from 1 to 1000');
+    }
+    if (cursorScope !== null && cursorScope !== this.cursorScope) {
+      const error = new Error('The durable mailbox cursor scope does not match this owner.');
+      error.code = 'mailbox_cursor_scope_mismatch';
+      error.status = 409;
+      error.cursorScope = this.cursorScope;
+      throw error;
+    }
+    if (sinceId > 0 && cursorScope === null) {
+      const error = new Error('A nonzero durable mailbox cursor requires its cursor scope.');
+      error.code = 'mailbox_cursor_scope_required';
+      error.status = 409;
+      error.cursorScope = this.cursorScope;
+      throw error;
     }
     const rows = this.db.prepare(`
       SELECT id, direction, channel, endpoint_id, content, attachments_json, timestamp

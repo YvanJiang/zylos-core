@@ -14,6 +14,7 @@ const normalRuntimeFiles = [
   'skills/web-console/scripts/db.js',
   'skills/web-console/scripts/send.js',
   'skills/web-console/public/message-reconciliation.js',
+  'skills/web-console/public/mailbox-cursor.js',
   'skills/web-console/public/app.js',
   'skills/shell/SKILL.md',
   'skills/shell/scripts/send.js',
@@ -53,7 +54,7 @@ function repositoryFiles() {
 }
 
 function isScannableText(file) {
-  return /\.(?:js|cjs|mjs|md|json|ya?ml|sh|env|sql)$/.test(file)
+  return /\.(?:js|cjs|mjs|md|html|json|ya?ml|sh|env|sql)$/.test(file)
     || ['Dockerfile', '.npmignore'].includes(path.basename(file))
     || file.startsWith('test/integration/runtime/bin/');
 }
@@ -141,16 +142,26 @@ describe('normal product paths have no retired runtime authority', () => {
     const reconciliationSource = fs.readFileSync(
       path.resolve('skills/web-console/public/message-reconciliation.js'), 'utf8',
     );
+    const cursorSource = fs.readFileSync(
+      path.resolve('skills/web-console/public/mailbox-cursor.js'), 'utf8',
+    );
+    const indexSource = fs.readFileSync(
+      path.resolve('skills/web-console/public/index.html'), 'utf8',
+    );
     expect(source).toMatch(/DeliveryMailbox|deliveryMailbox\.list|syncCoreInbound/);
     expect(source).toMatch(/validateInboundEnvelope|projectCoreWebConsoleContent/);
     expect(source).toMatch(/CORE_REGION|CORE_TENANT_ID|CORE_BOT_ID/);
     expect(ownerSource).toMatch(/targetRegion|targetTenantId|targetBotId/);
     expect(mailboxSource).toMatch(/region = \? AND tenant_id = \? AND bot_id = \?/);
     expect(mailboxSource).toMatch(/delivery_mailbox_scope_cursor/);
+    expect(mailboxSource).toMatch(/mailbox_cursor_scope_required/);
+    expect(source).toMatch(/X-Zylos-Mailbox-Cursor-Scope|cursor_reset/);
     expect(source).not.toMatch(/getCoreMessages|event\.rowid|outbox_rowid|broadcast\('messages'/);
     expect(source).not.toMatch(/latest message|parent chat|c4-send/i);
-    expect(appSource).toMatch(/api\/poll\?since_id=/);
+    expect(appSource).toMatch(/mailboxPollUrl|cursor_scope|replaceChildren/);
     expect(appSource).not.toMatch(/conversations\/recent\?limit=100/);
+    expect(cursorSource).toMatch(/web-console-mailbox-v1|lastMessageId: reset \? 0/);
+    expect(indexSource.indexOf('mailbox-cursor.js')).toBeLessThan(indexSource.indexOf('app.js'));
     expect(reconciliationSource).toMatch(/safeAttachmentHref|attachmentKey/);
     expect(reconciliationSource).not.toMatch(/javascript:|https?:\/\/|latest|parent/i);
   });
