@@ -11,9 +11,10 @@ description: >-
 channel ingress -> Core queue -> executor -> Core outbox -> channel delivery owner
 ```
 
-`c4-receive.js` accepts authenticated compatibility-channel text into the same
-canonical Core ingress used by channel adapters. It requires a stable native
-message ID and actor ID. Core persists the turn and the initial
+`c4-receive.js` accepts authenticated compatibility-channel content into the
+same canonical Core ingress used by channel adapters, including validated
+public attachment facts when the channel owns their capabilities. It requires
+a stable native message ID and actor ID. Core persists the turn and the initial
 `zylos.delivery-command@1.1` `send_text` command atomically.
 
 Normal outbound replies must never invoke `c4-send.js`. Core owns their durable

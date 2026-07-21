@@ -23,12 +23,15 @@ function printUsage() {
   --channel <channel> --endpoint <chat_id> --message-id <native_message_id> \\
   --actor-id <authenticated_actor_id> [--chat-type dm|group|thread] \\
   [--thread-id <native_thread_id>] [--root-message-id <native_root_message_id>] \\
-  [--occurred-at <RFC3339>] [--json] --content <message>`);
+  [--occurred-at <RFC3339>] [--attachments-json <json_array>] [--json] \\
+  --content <message>`);
 }
 
 function parseArgs(args) {
   const parsed = {
     actorId: null,
+    attachments: [],
+    attachmentsJson: null,
     channel: null,
     chatType: 'dm',
     content: null,
@@ -41,6 +44,7 @@ function parseArgs(args) {
   };
   const valueOptions = new Map([
     ['--actor-id', 'actorId'],
+    ['--attachments-json', 'attachmentsJson'],
     ['--channel', 'channel'],
     ['--chat-type', 'chatType'],
     ['--content', 'content'],
@@ -64,6 +68,16 @@ function parseArgs(args) {
     }
     parsed[field] = value;
     index += 1;
+  }
+  if (parsed.attachmentsJson !== null) {
+    try {
+      parsed.attachments = JSON.parse(parsed.attachmentsJson);
+    } catch {
+      return { error: '--attachments-json must contain valid JSON', json: parsed.json };
+    }
+    if (!Array.isArray(parsed.attachments)) {
+      return { error: '--attachments-json must contain a JSON array', json: parsed.json };
+    }
   }
   return parsed;
 }
@@ -125,7 +139,11 @@ function compatibilityMessage(parsed, receivedAt) {
       authenticated: true,
       roles: [],
     },
-    content: { kind: 'text', text: parsed.content, attachments: [] },
+    content: {
+      kind: parsed.attachments.length > 0 ? 'mixed' : 'text',
+      text: parsed.content,
+      attachments: parsed.attachments,
+    },
     reply: {
       root_message_id: parsed.rootMessageId,
       parent_message_id: null,

@@ -266,6 +266,7 @@ class ZylosConsole {
     // Add temporary message
     const tempId = `temp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const tempAttachments = readyAttachments.map((item) => ({
+      attachment_id: item.id,
       kind: item.kind,
       name: item.name,
       size_label: this.formatBytes(item.size),
@@ -470,16 +471,7 @@ class ZylosConsole {
     // For incoming user messages, remove matching temp message
     if (msg.direction === 'in') {
       const tempMessages = this.messagesContainer.querySelectorAll('[data-temp-id]');
-      for (const temp of tempMessages) {
-        if (temp.dataset.rawContent === msg.content) {
-          temp.remove();
-          break;
-        }
-      }
-      if (Array.isArray(msg.attachments) && msg.attachments.length > 0) {
-        const temp = this.messagesContainer.querySelector('.message.user.sending[data-has-attachments="true"]');
-        if (temp) temp.remove();
-      }
+      window.ZylosMessageReconciliation.reconcileOptimisticElements(tempMessages, msg);
     }
 
     const div = document.createElement('div');
@@ -509,6 +501,7 @@ class ZylosConsole {
     div.dataset.tempId = tempId;
     div.dataset.rawContent = content;
     div.dataset.hasAttachments = attachments.length > 0 ? 'true' : 'false';
+    div.dataset.attachmentKey = window.ZylosMessageReconciliation.attachmentKey(attachments) || '';
 
     const contentDiv = this.renderMessageContent({
       direction: 'in',
@@ -583,8 +576,8 @@ class ZylosConsole {
   }
 
   resolveHref(href) {
-    if (!href || !href.startsWith('/')) return href;
-    return `${this.basePath}${href}`;
+    const safeHref = window.ZylosMessageReconciliation.safeAttachmentHref(href);
+    return safeHref === null ? null : `${this.basePath}${safeHref}`;
   }
 
   formatBytes(bytes) {

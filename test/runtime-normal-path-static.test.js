@@ -13,6 +13,7 @@ const normalRuntimeFiles = [
   'skills/web-console/scripts/core-outbox-owner.js',
   'skills/web-console/scripts/db.js',
   'skills/web-console/scripts/send.js',
+  'skills/web-console/public/message-reconciliation.js',
   'skills/web-console/public/app.js',
   'skills/shell/SKILL.md',
   'skills/shell/scripts/send.js',
@@ -131,10 +132,17 @@ describe('normal product paths have no retired runtime authority', () => {
   test('Web Console routes consume only the monotonic channel mailbox projection', () => {
     const source = fs.readFileSync(path.resolve('skills/web-console/scripts/server.js'), 'utf8');
     const appSource = fs.readFileSync(path.resolve('skills/web-console/public/app.js'), 'utf8');
+    const reconciliationSource = fs.readFileSync(
+      path.resolve('skills/web-console/public/message-reconciliation.js'), 'utf8',
+    );
     expect(source).toMatch(/DeliveryMailbox|deliveryMailbox\.list|syncCoreInbound/);
+    expect(source).toMatch(/validateInboundEnvelope|projectCoreWebConsoleContent/);
     expect(source).not.toMatch(/getCoreMessages|event\.rowid|outbox_rowid|broadcast\('messages'/);
+    expect(source).not.toMatch(/latest message|parent chat|c4-send/i);
     expect(appSource).toMatch(/api\/poll\?since_id=/);
     expect(appSource).not.toMatch(/conversations\/recent\?limit=100/);
+    expect(reconciliationSource).toMatch(/safeAttachmentHref|attachmentKey/);
+    expect(reconciliationSource).not.toMatch(/javascript:|https?:\/\/|latest|parent/i);
   });
 
   test('the exact Node suite cannot execute retired provider-interface tests', () => {

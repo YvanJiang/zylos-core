@@ -134,6 +134,35 @@ describe('PersistentUploadRegistry', () => {
 });
 
 describe('DeliveryMailbox', () => {
+  test('persists canonical attachment metadata across reopen and fences conflicting replay', () => {
+    const dbPath = path.join(tempDir, 'test.db');
+    const mailbox = new DeliveryMailbox(db);
+    const attachment = {
+      attachment_id: 'upload-attachment-1',
+      kind: 'file',
+      name: 'report.txt',
+      media_type: 'text/plain',
+      size_bytes: 12,
+      size_label: '12B',
+      href: '/api/inbound-media/wc-2026-07-21-abcdef12.txt',
+    };
+    mailbox.projectInbound({
+      inboundEventId: 'inbound-attachment', endpointId: 'console', content: 'report',
+      attachments: [attachment], timestamp: '2026-07-21T00:00:00.000Z',
+    });
+    db.close();
+    db = openDb(dbPath);
+    const reopened = new DeliveryMailbox(db);
+    expect(reopened.list()).toEqual([
+      expect.objectContaining({ content: 'report', attachments: [attachment] }),
+    ]);
+    expect(() => reopened.projectInbound({
+      inboundEventId: 'inbound-attachment', endpointId: 'console', content: 'report',
+      attachments: [{ ...attachment, href: '/api/inbound-media/wc-other-abcdef12.txt' }],
+      timestamp: '2026-07-21T00:00:00.000Z',
+    })).toThrow(/conflicts with its durable projection/);
+  });
+
   test('assigns durable monotonic visibility cursors in actual mailbox order', () => {
     const mailbox = new DeliveryMailbox(db);
     const firstInbound = mailbox.projectInbound({

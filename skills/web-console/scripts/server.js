@@ -22,7 +22,9 @@ import {
   MAX_ATTACHMENTS,
   buildAnnotatedContent,
   contentDisposition,
+  createCoreWebConsoleAttachment,
   generateStoredFileName,
+  projectCoreWebConsoleContent,
   resolveAllowedPathSync,
   sanitizeDisplayName,
   sniffImage,
@@ -37,6 +39,7 @@ import {
 import { readExecutorObservability } from '../../../runtime/observability/executor-snapshot-client.js';
 import { projectRuntimeHealth } from '../../../runtime/observability/health-projection.js';
 import { createDrainBarrier, createWebConsoleOutboxOwner } from './core-outbox-owner.js';
+import { validateInboundEnvelope } from '../../../contracts/public/index.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -202,9 +205,8 @@ async function readStatus() {
  */
 function syncCoreInbound() {
   const rows = db.prepare(`
-    SELECT inbound.inbound_event_id,
+    SELECT inbound.inbound_event_id, inbound.envelope_json,
       conversation.chat_id AS endpoint_id,
-      json_extract(inbound.envelope_json, '$.content.text') AS content,
       inbound.committed_at AS timestamp
     FROM runtime_inbound_events AS inbound
     JOIN runtime_turns AS turn ON turn.inbound_event_id = inbound.inbound_event_id
@@ -215,12 +217,25 @@ function syncCoreInbound() {
     ORDER BY conversation.conversation_id ASC, turn.queue_sequence ASC
   `).all();
   for (const row of rows) {
-    deliveryMailbox.projectInbound({
-      inboundEventId: row.inbound_event_id,
-      endpointId: row.endpoint_id,
-      content: row.content ?? '',
-      timestamp: row.timestamp,
-    });
+    try {
+      const envelope = JSON.parse(row.envelope_json);
+      validateInboundEnvelope(envelope);
+      const projected = projectCoreWebConsoleContent(envelope.content, {
+        lookupUpload: (attachmentId) => uploadRegistry.getForProjection(attachmentId),
+        mediaDir: MEDIA_DIR,
+        maxBytes: MAX_UPLOAD_BYTES,
+      });
+      deliveryMailbox.projectInbound({
+        inboundEventId: row.inbound_event_id,
+        endpointId: row.endpoint_id,
+        content: projected.content,
+        attachments: projected.attachments,
+        timestamp: row.timestamp,
+      });
+    } catch {
+      // Channel-private attachment capabilities fail closed. Core retains the
+      // authoritative event for reconciliation without exposing local paths.
+    }
   }
 }
 
@@ -328,7 +343,7 @@ function webMessageId(value) {
   return `web-console-${crypto.createHash('sha256').update(value).digest('hex')}`;
 }
 
-function sendToC4(content, messageId) {
+function sendToC4(content, attachments, messageId) {
   const c4Receive = path.join(C4_SCRIPT_DIR, 'c4-receive.js');
 
   return new Promise((resolve, reject) => {
@@ -338,6 +353,7 @@ function sendToC4(content, messageId) {
       '--endpoint', 'console',
       '--message-id', messageId,
       '--actor-id', 'web-console-user',
+      '--attachments-json', JSON.stringify(attachments),
       '--content', content
     ], { stdio: 'pipe' });
 
@@ -377,6 +393,10 @@ async function sendConsoleMessage({ content, attachmentIds, sessionId, messageId
   }
 
   const combined = buildSendContent(content, attachmentEntries);
+  const coreAttachments = attachmentEntries.map((entry) => createCoreWebConsoleAttachment(entry, {
+    mediaDir: MEDIA_DIR,
+    maxBytes: MAX_UPLOAD_BYTES,
+  }));
   if (ids.length > 0) {
     attachmentEntries = uploadRegistry.consumeMany(ids, sessionId);
     if (!attachmentEntries) {
@@ -387,18 +407,14 @@ async function sendConsoleMessage({ content, attachmentIds, sessionId, messageId
     }
   }
   try {
-    await sendToC4(combined, webMessageId(messageId));
+    await sendToC4(combined, coreAttachments, webMessageId(messageId));
   } catch (err) {
     uploadRegistry.restoreMany(attachmentEntries);
     throw err;
   }
   return {
     content: combined,
-    attachments: attachmentEntries.map((entry) => ({
-      kind: entry.kind,
-      name: entry.name,
-      size_label: entry.sizeLabel || null
-    }))
+    attachments: coreAttachments
   };
 }
 

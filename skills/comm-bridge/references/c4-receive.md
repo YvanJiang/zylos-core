@@ -10,8 +10,16 @@ node ~/zylos/.claude/skills/comm-bridge/scripts/c4-receive.js \
   --actor-id <authenticated_actor_id> \
   [--chat-type dm|group|thread] \
   [--thread-id <native_thread_id> --root-message-id <native_root_message_id>] \
-  [--occurred-at <RFC3339>] --content <text> [--json]
+  [--occurred-at <RFC3339>] \
+  [--attachments-json <validated_public_attachment_array>] \
+  --content <text> [--json]
 ```
+
+Channel owners may supply canonical public attachment facts with
+`--attachments-json`; their `attachment_id` and `content_ref` must be stable
+channel-owned capabilities. Display names, local paths, and URLs are never
+routing or download authority. A channel renderer must validate its capability
+again and construct any user-visible download href at its own boundary.
 
 Retries must preserve the stable message ID and original occurrence timestamp.
 For a native thread, both its conversation/thread identity and durable root

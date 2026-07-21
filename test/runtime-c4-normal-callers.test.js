@@ -106,6 +106,41 @@ describe('normal C4 callers use durable Core contracts', () => {
     database.close();
   });
 
+  test('compatibility ingress preserves validated public attachment facts', () => {
+    const { zylosDir, env } = fixture();
+    const attachments = [{
+      attachment_id: 'channel-upload-1',
+      media_type: 'text/plain',
+      name: 'report.txt',
+      content_ref: 'channel-owned-ref-1',
+      size_bytes: 12,
+    }];
+    const accepted = run(receiveCli, [
+      '--channel', 'web-console', '--endpoint', 'console',
+      '--message-id', 'web-attachment-1', '--actor-id', 'local-console-user',
+      '--occurred-at', '2026-07-21T00:00:00.000Z',
+      '--attachments-json', JSON.stringify(attachments),
+      '--content', 'structured attachment', '--json',
+    ], env);
+    assert.equal(accepted.status, 0, accepted.stderr);
+
+    const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
+    const envelope = JSON.parse(database.prepare(`
+      SELECT envelope_json FROM runtime_inbound_events WHERE inbound_event_id = ?
+    `).get('web-attachment-1').envelope_json);
+    database.close();
+    assert.equal(envelope.content.kind, 'mixed');
+    assert.deepEqual(envelope.content.attachments, attachments);
+
+    const invalid = run(receiveCli, [
+      '--channel', 'web-console', '--endpoint', 'console',
+      '--message-id', 'web-attachment-invalid', '--actor-id', 'local-console-user',
+      '--attachments-json', '{not-json}', '--content', 'invalid', '--json',
+    ], env);
+    assert.equal(invalid.status, 1);
+    assert.equal(JSON.parse(invalid.stdout).error.code, 'INVALID_ARGS');
+  });
+
   test('compatibility ingress does not consult activity files or add terminal reply instructions', () => {
     const source = fs.readFileSync(receiveCli, 'utf8');
     assert.match(source, /acceptCompatibilityInbound/);

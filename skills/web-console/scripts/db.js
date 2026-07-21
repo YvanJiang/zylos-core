@@ -41,10 +41,43 @@ function openDb(dbPath = DB_PATH) {
       channel TEXT NOT NULL,
       endpoint_id TEXT NOT NULL,
       content TEXT NOT NULL,
+      attachments_json TEXT NOT NULL DEFAULT '[]',
       timestamp TEXT NOT NULL
     );
   `);
+  const mailboxColumns = new Set(
+    db.prepare('PRAGMA table_info(delivery_mailbox)').all().map(({ name }) => name),
+  );
+  if (!mailboxColumns.has('attachments_json')) {
+    db.exec("ALTER TABLE delivery_mailbox ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'");
+  }
   return db;
+}
+
+const MAILBOX_ATTACHMENT_FIELDS = Object.freeze([
+  'attachment_id', 'kind', 'name', 'media_type', 'size_bytes', 'size_label', 'href',
+]);
+
+function serializeMailboxAttachments(attachments) {
+  if (!Array.isArray(attachments)) throw new TypeError('attachments must be an array');
+  const normalized = attachments.map((attachment) => {
+    if (!attachment || typeof attachment !== 'object' || Array.isArray(attachment)
+      || Object.keys(attachment).some((field) => !MAILBOX_ATTACHMENT_FIELDS.includes(field))
+      || MAILBOX_ATTACHMENT_FIELDS.some((field) => !Object.hasOwn(attachment, field))) {
+      throw new TypeError('mailbox attachment has invalid fields');
+    }
+    if (typeof attachment.attachment_id !== 'string' || attachment.attachment_id.length === 0
+      || !['image', 'file'].includes(attachment.kind)
+      || typeof attachment.name !== 'string' || attachment.name.length === 0
+      || typeof attachment.media_type !== 'string' || attachment.media_type.length === 0
+      || !Number.isSafeInteger(attachment.size_bytes) || attachment.size_bytes < 0
+      || typeof attachment.size_label !== 'string'
+      || !/^\/api\/inbound-media\/wc-[A-Za-z0-9._-]+$/.test(attachment.href)) {
+      throw new TypeError('mailbox attachment metadata is invalid');
+    }
+    return Object.fromEntries(MAILBOX_ATTACHMENT_FIELDS.map((field) => [field, attachment[field]]));
+  });
+  return JSON.stringify(normalized);
 }
 
 export class DeliveryMailbox {
@@ -52,13 +85,15 @@ export class DeliveryMailbox {
     this.db = db;
     this._insert = db.prepare(`
       INSERT OR IGNORE INTO delivery_mailbox (
-        source_key, delivery_id, direction, channel, endpoint_id, content, timestamp
-      ) VALUES (?, ?, ?, 'web-console', ?, ?, ?)
+        source_key, delivery_id, direction, channel, endpoint_id, content, attachments_json, timestamp
+      ) VALUES (?, ?, ?, 'web-console', ?, ?, ?, ?)
     `);
     this._bySource = db.prepare('SELECT * FROM delivery_mailbox WHERE source_key = ?');
   }
 
-  _store({ sourceKey, deliveryId = null, direction, endpointId, content, timestamp }) {
+  _store({
+    sourceKey, deliveryId = null, direction, endpointId, content, attachments = [], timestamp,
+  }) {
     if (typeof sourceKey !== 'string' || sourceKey.length === 0) {
       throw new TypeError('sourceKey must be a non-empty string');
     }
@@ -70,10 +105,14 @@ export class DeliveryMailbox {
     if (typeof timestamp !== 'string' || Number.isNaN(Date.parse(timestamp))) {
       throw new TypeError('timestamp must be an ISO timestamp');
     }
-    this._insert.run(sourceKey, deliveryId, direction, endpointId, content, timestamp);
+    const attachmentsJson = serializeMailboxAttachments(attachments);
+    this._insert.run(
+      sourceKey, deliveryId, direction, endpointId, content, attachmentsJson, timestamp,
+    );
     const row = this._bySource.get(sourceKey);
     if (!row || row.delivery_id !== deliveryId || row.direction !== direction
-      || row.endpoint_id !== endpointId || row.content !== content) {
+      || row.endpoint_id !== endpointId || row.content !== content
+      || row.attachments_json !== attachmentsJson) {
       throw new Error('A Web Console mailbox source conflicts with its durable projection.');
     }
     return Object.freeze({
@@ -82,15 +121,16 @@ export class DeliveryMailbox {
       channel: row.channel,
       endpoint_id: row.endpoint_id,
       content: row.content,
+      attachments: JSON.parse(row.attachments_json),
       timestamp: row.timestamp,
       platform_message_id: `web-console-mailbox:${row.id}`,
     });
   }
 
-  projectInbound({ inboundEventId, endpointId, content, timestamp }) {
+  projectInbound({ inboundEventId, endpointId, content, attachments = [], timestamp }) {
     return this._store({
       sourceKey: `inbound:${inboundEventId}`,
-      direction: 'in', endpointId, content, timestamp,
+      direction: 'in', endpointId, content, attachments, timestamp,
     });
   }
 
@@ -112,13 +152,17 @@ export class DeliveryMailbox {
       throw new TypeError('limit must be an integer from 1 to 1000');
     }
     const rows = this.db.prepare(`
-      SELECT id, direction, channel, endpoint_id, content, timestamp
+      SELECT id, direction, channel, endpoint_id, content, attachments_json, timestamp
       FROM delivery_mailbox
       WHERE id > ?
       ORDER BY id ${latest ? 'DESC' : 'ASC'}
       LIMIT ?
     `).all(sinceId, limit);
-    return latest ? rows.reverse() : rows;
+    const projected = rows.map(({ attachments_json: attachmentsJson, ...row }) => ({
+      ...row,
+      attachments: JSON.parse(attachmentsJson),
+    }));
+    return latest ? projected.reverse() : projected;
   }
 }
 
@@ -180,6 +224,7 @@ export class PersistentUploadRegistry {
       add: db.prepare(`INSERT INTO uploads (id, session_token, path, name, size, size_label, mime, kind, created_at, consumed)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`),
       get: db.prepare('SELECT * FROM uploads WHERE id = ? AND consumed = 0'),
+      getStored: db.prepare('SELECT * FROM uploads WHERE id = ?'),
       consume: db.prepare('UPDATE uploads SET consumed = 1 WHERE id = ? AND consumed = 0'),
       restore: db.prepare('UPDATE uploads SET consumed = 0 WHERE id = ?'),
       cleanup: db.prepare('DELETE FROM uploads WHERE consumed = 0 AND created_at < ?'),
@@ -236,6 +281,21 @@ export class PersistentUploadRegistry {
     for (const entry of entries || []) {
       if (entry?.id) this._stmts.restore.run(entry.id);
     }
+  }
+
+  getForProjection(id) {
+    const row = this._stmts.getStored.get(id);
+    if (!row) return null;
+    return {
+      id: row.id,
+      path: row.path,
+      name: row.name,
+      size: row.size,
+      sizeLabel: row.size_label,
+      mime: row.mime,
+      kind: row.kind,
+      consumed: row.consumed === 1,
+    };
   }
 }
 

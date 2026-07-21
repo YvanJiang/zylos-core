@@ -1,8 +1,10 @@
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import vm from 'node:vm';
 import { afterEach, beforeEach, describe, expect, test } from '@jest/globals';
 import Database from '../skills/web-console/node_modules/better-sqlite3/lib/index.js';
 import WebSocket from '../skills/web-console/node_modules/ws/wrapper.mjs';
@@ -12,6 +14,9 @@ import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.j
 
 const SERVER_PATH = path.resolve('skills/web-console/scripts/server.js');
 const SQLITE_MODULE = path.resolve('skills/web-console/node_modules/better-sqlite3/lib/index.js');
+const RECONCILIATION_PATH = path.resolve(
+  'skills/web-console/public/message-reconciliation.js',
+);
 
 let ctx;
 
@@ -82,13 +87,17 @@ db.close();
   fs.writeFileSync(path.join(scriptDir, 'c4-send.js'), '');
 }
 
-async function startServer({ maxUploadMb = 20 } = {}) {
+async function startServer({ maxUploadMb = 20, actualC4Receive = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wc-routes-'));
   const dbPath = path.join(root, 'comm-bridge', 'c4.db');
   const skillsDir = path.join(root, 'skills');
   fs.writeFileSync(path.join(root, '.env'), '');
   createDb(dbPath);
-  createFakeC4Receive(skillsDir, dbPath);
+  if (actualC4Receive) {
+    fs.mkdirSync(skillsDir, { recursive: true });
+  } else {
+    createFakeC4Receive(skillsDir, dbPath);
+  }
   const port = await freePort();
 
   const child = spawn(process.execPath, [SERVER_PATH], {
@@ -96,7 +105,7 @@ async function startServer({ maxUploadMb = 20 } = {}) {
     env: {
       ...process.env,
       ZYLOS_DIR: root,
-      WEB_CONSOLE_SKILLS_DIR: skillsDir,
+      WEB_CONSOLE_SKILLS_DIR: actualC4Receive ? path.resolve('skills') : skillsDir,
       WEB_CONSOLE_PORT: String(port),
       WEB_CONSOLE_BIND: '127.0.0.1',
       WEB_CONSOLE_MAX_UPLOAD_MB: String(maxUploadMb)
@@ -179,6 +188,199 @@ afterEach(async () => {
 });
 
 describe('web-console attachment routes', () => {
+  test('actual Core ingress projects safe attachment metadata through the durable mailbox', async () => {
+    ctx = await startServer({ actualC4Receive: true });
+    const upload = await uploadFile(ctx, {
+      name: 'quarterly report.txt',
+      type: 'text/plain',
+      content: 'durable attachment bytes',
+    });
+    const sent = await sendHttp(ctx, {
+      message: 'Review this report',
+      attachments: [upload.body.id],
+      message_id: 'actual-http-attachment',
+    });
+
+    expect(sent.res.status).toBe(200);
+    const response = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    expect(response.status).toBe(200);
+    const mailbox = await response.json();
+    const inbound = mailbox.find(({ direction }) => direction === 'in');
+    expect(inbound).toMatchObject({
+      channel: 'web-console',
+      endpoint_id: 'console',
+      content: 'Review this report',
+      attachments: [{
+        attachment_id: upload.body.id,
+        kind: 'file',
+        name: 'quarterly report.txt',
+        media_type: 'text/plain',
+        size_bytes: 24,
+        size_label: '24B',
+      }],
+    });
+    expect(inbound.attachments[0].href).toMatch(
+      /^\/api\/inbound-media\/wc-.*-[0-9a-f]{8}\.txt$/,
+    );
+    expect(inbound.content).not.toContain('[attachment:');
+    const downloaded = await fetch(`${ctx.baseUrl}${inbound.attachments[0].href}`);
+    expect(downloaded.status).toBe(200);
+    expect(await downloaded.text()).toBe('durable attachment bytes');
+    expect(mailbox.filter(({ direction }) => direction === 'out')).toEqual([
+      expect.objectContaining({ attachments: [] }),
+    ]);
+
+    const coreDb = new Database(ctx.dbPath);
+    const envelope = JSON.parse(coreDb.prepare(`
+      SELECT envelope_json FROM runtime_inbound_events
+      WHERE inbound_event_id = ?
+    `).get(`web-console-${crypto.createHash('sha256')
+      .update('actual-http-attachment').digest('hex')}`).envelope_json);
+    coreDb.close();
+    expect(envelope.content.attachments).toEqual([expect.objectContaining({
+      attachment_id: upload.body.id,
+      name: 'quarterly report.txt',
+      media_type: 'text/plain',
+    })]);
+    expect(envelope.reply).toEqual({
+      root_message_id: null,
+      parent_message_id: null,
+      reply_to_message_id: null,
+    });
+  });
+
+  test('actual WebSocket ingress reconciles one matching optimistic attachment message', async () => {
+    ctx = await startServer({ actualC4Receive: true });
+    const upload = await uploadFile(ctx, {
+      name: 'diagram.png',
+      type: 'image/png',
+      content: 'image payload',
+    });
+    const received = [];
+    const acknowledgements = [];
+    const ws = new WebSocket(`ws://127.0.0.1:${ctx.port}/`);
+    await new Promise((resolve, reject) => {
+      ws.once('open', resolve);
+      ws.once('error', reject);
+    });
+    ws.on('message', (raw) => {
+      const event = JSON.parse(raw.toString());
+      if (event.type === 'messages') received.push(...event.data);
+      if (event.type === 'sent') acknowledgements.push(event);
+    });
+    ws.send(JSON.stringify({ type: 'subscribe', since_id: 0 }));
+    ws.send(JSON.stringify({
+      type: 'send',
+      content: '',
+      attachments: [upload.body.id],
+      tempId: 'actual-ws-attachment',
+    }));
+
+    const deadline = Date.now() + 5000;
+    while ((!acknowledgements.some(({ success }) => success)
+      || !received.some((message) => message.direction === 'in'
+        && message.attachments?.[0]?.attachment_id === upload.body.id))
+      && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    ws.close();
+    const canonical = received.find((message) => message.direction === 'in'
+      && message.attachments?.[0]?.attachment_id === upload.body.id);
+    expect(canonical).toMatchObject({
+      content: '',
+      attachments: [{ attachment_id: upload.body.id, kind: 'image', name: 'diagram.png' }],
+    });
+
+    const browser = {};
+    vm.runInNewContext(fs.readFileSync(RECONCILIATION_PATH, 'utf8'), browser);
+    const optimistic = [
+      { tempId: 'unrelated', content: '', attachments: [{ attachment_id: crypto.randomUUID() }] },
+      { tempId: 'actual-ws-attachment', content: '', attachments: [{ attachment_id: upload.body.id }] },
+    ];
+    const reconcile = browser.ZylosMessageReconciliation.reconcileOptimisticMessages;
+    const reconcileElements = browser.ZylosMessageReconciliation.reconcileOptimisticElements;
+    const safeHref = browser.ZylosMessageReconciliation.safeAttachmentHref;
+    expect(safeHref(canonical.attachments[0].href)).toBe(canonical.attachments[0].href);
+    expect(safeHref('javascript:alert(1)')).toBeNull();
+    expect(safeHref('https://attacker.invalid/file')).toBeNull();
+    expect(safeHref('/api/inbound-media/../../secret')).toBeNull();
+    expect(reconcile(optimistic, canonical)).toBe(true);
+    expect(optimistic.map(({ tempId }) => tempId)).toEqual(['unrelated']);
+    expect(reconcile(optimistic, canonical)).toBe(false);
+    expect(optimistic.map(({ tempId }) => tempId)).toEqual(['unrelated']);
+
+    const rows = [
+      { dataset: { rawContent: '', attachmentKey: JSON.stringify([crypto.randomUUID()]) } },
+      { dataset: { rawContent: '', attachmentKey: JSON.stringify([upload.body.id]) } },
+    ];
+    for (const row of rows) {
+      row.remove = () => rows.splice(rows.indexOf(row), 1);
+    }
+    expect(reconcileElements(rows, canonical)).toBe(true);
+    expect(rows).toHaveLength(1);
+    expect(reconcileElements(rows, canonical)).toBe(false);
+    expect(rows).toHaveLength(1);
+  });
+
+  test('Core mailbox projection rejects unowned attachment paths and URLs without blocking safe ingress', async () => {
+    ctx = await startServer({ actualC4Receive: true });
+    const upload = await uploadFile(ctx, {
+      name: 'safe.txt', type: 'text/plain', content: 'safe bytes',
+    });
+    const coreDb = new Database(ctx.dbPath);
+    acceptCompatibilityInbound(coreDb, {
+      inbound_event_id: 'unsafe-web-attachment', trace_id: 'unsafe-web-attachment-trace',
+      occurred_at: '2026-07-21T00:00:00.000Z', received_at: '2026-07-21T00:00:00.000Z',
+      region: 'global', tenant_id: 'unsafe-web-tenant', channel: 'web-console',
+      bot_id: 'zylos', chat_type: 'dm', chat_id: 'console',
+      native_thread_or_topic_id: null, message_id: 'unsafe-web-message',
+      actor: { type: 'user', actor_id: 'web-user', authenticated: true, roles: [] },
+      content: {
+        kind: 'mixed',
+        text: 'never display\n[attachment:file /private/etc/passwd name="safe.txt" 10B]',
+        attachments: [{
+          attachment_id: upload.body.id,
+          media_type: 'text/plain',
+          name: 'safe.txt',
+          content_ref: 'https://attacker.invalid/secret',
+          size_bytes: 10,
+          href: 'javascript:alert(1)',
+        }],
+      },
+      reply: { root_message_id: null, parent_message_id: null, reply_to_message_id: null },
+      source_ref: 'unsafe-web-source',
+    }, { now: () => '2026-07-21T00:00:00.000Z' });
+    coreDb.close();
+
+    const firstPoll = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    expect(firstPoll.status).toBe(200);
+    expect((await firstPoll.json()).some(({ content }) => content.includes('never display'))).toBe(false);
+
+    const sent = await sendHttp(ctx, {
+      message: 'safe display',
+      attachments: [upload.body.id],
+      message_id: 'safe-after-unsafe-attachment',
+    });
+    expect(sent.res.status).toBe(200);
+    const safePoll = await fetch(`${ctx.baseUrl}/api/poll?since_id=0`);
+    expect(safePoll.status).toBe(200);
+    const messages = await safePoll.json();
+    expect(messages.some(({ content }) => content.includes('never display'))).toBe(false);
+    expect(messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        direction: 'in',
+        content: 'safe display',
+        attachments: [expect.objectContaining({
+          attachment_id: upload.body.id,
+          href: expect.stringMatching(/^\/api\/inbound-media\/wc-/),
+        })],
+      }),
+    ]));
+    expect(JSON.stringify(messages)).not.toContain('javascript:');
+    expect(JSON.stringify(messages)).not.toContain('/private/etc/passwd');
+    expect(JSON.stringify(messages)).not.toContain('attacker.invalid');
+  });
+
   test('POST /api/upload stores a UUID-named file and returns metadata', async () => {
     ctx = await startServer();
     const { res, body } = await uploadFile(ctx, { name: '../bad name.txt', content: 'abc' });
