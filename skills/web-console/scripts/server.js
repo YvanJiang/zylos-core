@@ -299,14 +299,33 @@ function requireMailboxMutationScope(cursorScope) {
   deliveryMailbox.assertCursorScope(cursorScope);
 }
 
-function projectInboundForDelivery(delivery) {
+function projectInboundForDelivery(command) {
   const source = db.prepare(`
-    SELECT outbox.turn_id, turn.inbound_event_id
+    SELECT outbox.turn_id, turn.inbound_event_id,
+      outbox.aggregate_type, outbox.aggregate_id, outbox.aggregate_version,
+      json_extract(outbox.command_json, '$.outbox_id') AS command_outbox_id,
+      json_extract(outbox.command_json, '$.delivery_id') AS command_delivery_id,
+      json_extract(outbox.command_json, '$.mapping.turn_id') AS command_turn_id,
+      json_extract(outbox.command_json, '$.aggregate_type') AS command_aggregate_type,
+      json_extract(outbox.command_json, '$.aggregate_id') AS command_aggregate_id,
+      json_extract(outbox.command_json, '$.aggregate_version') AS command_aggregate_version
     FROM runtime_outbox AS outbox
     LEFT JOIN runtime_turns AS turn ON turn.turn_id = outbox.turn_id
-    WHERE outbox.delivery_id = ?
-  `).get(delivery.delivery_id);
+    WHERE outbox.outbox_id = ? AND outbox.delivery_id = ?
+  `).get(command.outbox_id, command.delivery_id);
   if (!source) throw new Error('The Core outbox delivery source is missing.');
+  if (source.command_outbox_id !== command.outbox_id
+    || source.command_delivery_id !== command.delivery_id
+    || source.turn_id !== command.mapping.turn_id
+    || source.command_turn_id !== command.mapping.turn_id
+    || source.aggregate_type !== command.aggregate_type
+    || source.command_aggregate_type !== command.aggregate_type
+    || source.aggregate_id !== command.aggregate_id
+    || source.command_aggregate_id !== command.aggregate_id
+    || source.aggregate_version !== command.aggregate_version
+    || source.command_aggregate_version !== command.aggregate_version) {
+    throw new Error('The Core outbox delivery identity is inconsistent.');
+  }
   if (source.turn_id === null) {
     syncCoreInbound();
     return;
@@ -366,8 +385,8 @@ const deliveryOwner = createWebConsoleOutboxOwner({
   tenantId: CORE_TENANT_ID,
   botId: CORE_BOT_ID,
   serviceInstanceId: `web-console-${SERVICE_BIRTH_ID}`,
-  projectInbound(_message, delivery) {
-    projectInboundForDelivery(delivery);
+  projectInbound(command) {
+    projectInboundForDelivery(command);
   },
   deliverMessage(message, delivery) {
     return deliveryMailbox.deliver({

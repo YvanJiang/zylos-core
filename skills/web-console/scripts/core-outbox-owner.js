@@ -23,6 +23,25 @@ export function createWebConsoleOutboxOwner({
     }
   }
 
+  const textRenderer = createChannelNeutralTextRenderer({
+    now,
+    async sendText(delivery) {
+      const message = Object.freeze({
+        delivery_id: delivery.delivery_id,
+        direction: 'out',
+        channel: 'web-console',
+        endpoint_id: delivery.target.chat_id,
+        content: delivery.text,
+        timestamp: now(),
+      });
+      const effect = await deliverMessage(message, delivery);
+      if (!effect || typeof effect.platform_message_id !== 'string'
+        || effect.platform_message_id.length === 0) {
+        throw new Error('Web Console mailbox did not confirm its durable delivery effect.');
+      }
+      return { platform_message_id: effect.platform_message_id };
+    },
+  });
   const owner = createOutboxService({
     database,
     channel: 'web-console',
@@ -32,26 +51,12 @@ export function createWebConsoleOutboxOwner({
     targetBotId: botId,
     serviceInstanceId,
     now,
-    renderer: createChannelNeutralTextRenderer({
-      now,
-      async sendText(delivery) {
-        const message = Object.freeze({
-          delivery_id: delivery.delivery_id,
-          direction: 'out',
-          channel: 'web-console',
-          endpoint_id: delivery.target.chat_id,
-          content: delivery.text,
-          timestamp: now(),
-        });
-        await projectInbound(message, delivery);
-        const effect = await deliverMessage(message, delivery);
-        if (!effect || typeof effect.platform_message_id !== 'string'
-          || effect.platform_message_id.length === 0) {
-          throw new Error('Web Console mailbox did not confirm its durable delivery effect.');
-        }
-        return { platform_message_id: effect.platform_message_id };
+    renderer: {
+      async deliver(command) {
+        await projectInbound(command);
+        return textRenderer.deliver(command);
       },
-    }),
+    },
   });
 
   async function drain({ limit = 20 } = {}) {

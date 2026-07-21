@@ -153,7 +153,12 @@ describe('normal product paths have no retired runtime authority', () => {
     expect(source).toMatch(/projectInbound\([^)]*\)[\s\S]*projectInboundForDelivery/);
     expect(source).toMatch(/source\.turn_id === null/);
     expect(source).toMatch(/deliveryMailbox\.hasInboundEvent/);
-    expect(ownerSource).toMatch(/await projectInbound[\s\S]*await deliverMessage/);
+    expect(ownerSource).toMatch(
+      /await projectInbound\(command\)[\s\S]*return textRenderer\.deliver\(command\)/,
+    );
+    expect(source).toMatch(/command_outbox_id[\s\S]*command_turn_id/);
+    expect(source).toMatch(/source\.turn_id !== command\.mapping\.turn_id/);
+    expect(source).toMatch(/command_aggregate_version !== command\.aggregate_version/);
     expect(source).toMatch(/CORE_REGION|CORE_TENANT_ID|CORE_BOT_ID/);
     expect(ownerSource).toMatch(/targetRegion|targetTenantId|targetBotId/);
     expect(mailboxSource).toMatch(/region = \? AND tenant_id = \? AND bot_id = \?/);

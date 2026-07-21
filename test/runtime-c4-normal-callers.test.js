@@ -325,7 +325,9 @@ describe('normal C4 callers use durable Core contracts', () => {
       botId: 'bot-c4',
       serviceInstanceId: 'web-console-owner-round-trip',
       now: () => claimTime,
-      projectInbound() {
+      projectInbound(command) {
+        assert.equal(command.outbox_id.length > 0, true);
+        assert.equal(command.mapping.turn_id, accepted.turn_id);
         projectionOrder.push('inbound');
       },
       deliverMessage(message, delivery) {
