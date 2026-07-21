@@ -164,6 +164,9 @@ describe('normal product paths have no retired runtime authority', () => {
     expect(source).toMatch(/requestUpdate/);
     expect(source).toMatch(/requireMailboxMutationScope/);
     expect(source).toMatch(/getForMediaPath/);
+    expect(source).toMatch(/upload\?\.consumed/);
+    expect(source).toMatch(/deliveryMailbox\.hasInboundAttachment/);
+    expect(mailboxSource).toMatch(/hasInboundAttachment/);
     expect(source).toMatch(/new PersistentUploadRegistry[\s\S]*CORE_REGION[\s\S]*CORE_TENANT_ID/);
     expect(source).not.toMatch(/getCoreMessages|event\.rowid|outbox_rowid|broadcast\('messages'/);
     expect(source).not.toMatch(/latest message|parent chat|c4-send/i);

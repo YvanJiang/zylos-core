@@ -183,6 +183,17 @@ export class DeliveryMailbox {
       WHERE source_key = ? AND channel = 'web-console' AND endpoint_id = 'console'
         AND region = ? AND tenant_id = ? AND bot_id = ?
     `);
+    this._hasInboundAttachment = db.prepare(`
+      SELECT 1
+      FROM delivery_mailbox AS mailbox
+      JOIN json_each(mailbox.attachments_json) AS attachment
+      WHERE mailbox.direction = 'in'
+        AND mailbox.channel = 'web-console' AND mailbox.endpoint_id = 'console'
+        AND mailbox.region = ? AND mailbox.tenant_id = ? AND mailbox.bot_id = ?
+        AND json_extract(attachment.value, '$.attachment_id') = ?
+        AND json_extract(attachment.value, '$.href') = ?
+      LIMIT 1
+    `);
   }
 
   _store({
@@ -245,6 +256,14 @@ export class DeliveryMailbox {
       sourceKey: `delivery:${deliveryId}`,
       deliveryId, direction: 'out', endpointId, content, timestamp,
     });
+  }
+
+  hasInboundAttachment({ attachmentId, href }) {
+    if (typeof attachmentId !== 'string' || attachmentId.length === 0
+      || typeof href !== 'string' || href.length === 0) return false;
+    return Boolean(this._hasInboundAttachment.get(
+      this.region, this.tenantId, this.botId, attachmentId, href,
+    ));
   }
 
   assertCursorScope(cursorScope) {

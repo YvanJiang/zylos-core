@@ -11,6 +11,7 @@ import WebSocket from '../skills/web-console/node_modules/ws/wrapper.mjs';
 import { createIdempotencyKey } from '../contracts/public/index.js';
 import { acceptCompatibilityInbound } from '../runtime/compatibility/c4-channel-fallback.js';
 import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { DeliveryMailbox } from '../skills/web-console/scripts/db.js';
 
 const SERVER_PATH = path.resolve('skills/web-console/scripts/server.js');
 const SQLITE_MODULE = path.resolve('skills/web-console/node_modules/better-sqlite3/lib/index.js');
@@ -700,6 +701,44 @@ describe('web-console attachment routes', () => {
     expect(await restored.text()).toBe('secret-a');
   });
 
+  test('an uploaded attachment is not downloadable before Core admission consumes it', async () => {
+    ctx = await startServer();
+    const upload = await uploadFile(ctx, {
+      name: 'not-admitted.txt', content: 'not admitted',
+    });
+    expect(upload.res.status).toBe(200);
+    const filenames = fs.readdirSync(path.join(ctx.root, 'web-console', 'media'));
+    expect(filenames).toHaveLength(1);
+
+    const response = await fetch(
+      `${ctx.baseUrl}/api/inbound-media/${encodeURIComponent(filenames[0])}`,
+    );
+    expect(response.status).toBe(404);
+  });
+
+  test('a consumed attachment becomes downloadable only after its scoped mailbox projection', async () => {
+    ctx = await startServer({ actualC4Receive: true });
+    const upload = await uploadFile(ctx, {
+      name: 'projection-gated.txt', content: 'projection gated',
+    });
+    expect(upload.res.status).toBe(200);
+    const sent = await sendHttp(ctx, {
+      message: 'project this attachment', attachments: [upload.body.id],
+      message_id: 'projection-gated-message',
+    });
+    expect(sent.res.status).toBe(200);
+    const [filename] = fs.readdirSync(path.join(ctx.root, 'web-console', 'media'));
+    const href = `/api/inbound-media/${encodeURIComponent(filename)}`;
+
+    expect((await fetch(`${ctx.baseUrl}${href}`)).status).toBe(404);
+    const mailbox = await (await fetch(`${ctx.baseUrl}/api/poll?since_id=0`)).json();
+    expect(mailbox.find(({ direction }) => direction === 'in').attachments)
+      .toEqual([expect.objectContaining({ attachment_id: upload.body.id })]);
+    const projected = await fetch(`${ctx.baseUrl}${href}`);
+    expect(projected.status).toBe(200);
+    expect(await projected.text()).toBe('projection gated');
+  });
+
   test('GET /api/media/:messageId fails closed for retired legacy media rows', async () => {
     ctx = await startServer();
     const imagePath = path.join(ctx.root, 'out.png');
@@ -728,7 +767,7 @@ describe('web-console attachment routes', () => {
     }
   });
 
-  test('GET /api/inbound-media/:filename serves uploaded files from media dir', async () => {
+  test('GET /api/inbound-media/:filename serves consumed uploads projected by its scoped mailbox', async () => {
     ctx = await startServer();
     const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
     const mediaDir = path.join(ctx.root, 'web-console', 'media');
@@ -752,6 +791,28 @@ describe('web-console attachment routes', () => {
       'owned-test-file', txtFile, 'wc-test-doc.txt', 5, '5B',
       'text/plain', 'file', Date.now(),
     );
+    const mailbox = new DeliveryMailbox(mailboxDb, {
+      region: 'global', tenantId: 'default', botId: 'zylos',
+    });
+    const timestamp = new Date().toISOString();
+    mailbox.projectInbound({
+      inboundEventId: 'owned-test-image-event', endpointId: 'console', timestamp,
+      content: '',
+      attachments: [{
+        attachment_id: 'owned-test-image', kind: 'image', name: 'wc-test-image.png',
+        media_type: 'image/png', size_bytes: pngBytes.length,
+        size_label: `${pngBytes.length}B`, href: '/api/inbound-media/wc-test-image.png',
+      }],
+    });
+    mailbox.projectInbound({
+      inboundEventId: 'owned-test-file-event', endpointId: 'console', timestamp,
+      content: '',
+      attachments: [{
+        attachment_id: 'owned-test-file', kind: 'file', name: 'wc-test-doc.txt',
+        media_type: 'text/plain', size_bytes: 5,
+        size_label: '5B', href: '/api/inbound-media/wc-test-doc.txt',
+      }],
+    });
     mailboxDb.close();
 
     const imgRes = await fetch(`${ctx.baseUrl}/api/inbound-media/wc-test-image.png`);

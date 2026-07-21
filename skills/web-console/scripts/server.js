@@ -743,8 +743,13 @@ app.get('/api/inbound-media/:filename', (req, res) => {
 
     const allowedPath = resolveAllowedPathSync(target, [MEDIA_DIR]);
     if (!allowedPath) return res.sendStatus(404);
-    if (!uploadRegistry.getForMediaPath(target)
-      && !uploadRegistry.getForMediaPath(allowedPath)) return res.sendStatus(404);
+    const upload = uploadRegistry.getForMediaPath(target)
+      || uploadRegistry.getForMediaPath(allowedPath);
+    if (!upload?.consumed) return res.sendStatus(404);
+    if (!deliveryMailbox.hasInboundAttachment({
+      attachmentId: upload.id,
+      href: `/api/inbound-media/${filename}`,
+    })) return res.sendStatus(404);
 
     let stat;
     try {
