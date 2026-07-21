@@ -65,8 +65,28 @@
     });
   }
 
+  function acceptMutationResponse(state, status, payload, requestGeneration, onReset = null) {
+    if (status !== 409) {
+      return Object.freeze({
+        handled: false,
+        accepted: false,
+        reset: false,
+        cursorScope: state.cursorScope,
+        lastMessageId: state.lastMessageId,
+        scopeGeneration: state.scopeGeneration,
+      });
+    }
+    return Object.freeze({
+      handled: true,
+      ...acceptScopedResponse(
+        state, payload?.cursor_scope, requestGeneration, onReset,
+      ),
+    });
+  }
+
   root.ZylosMailboxCursor = Object.freeze({
     acceptScope,
+    acceptMutationResponse,
     acceptScopedResponse,
     isCurrentGeneration,
     resetScopedClientState,

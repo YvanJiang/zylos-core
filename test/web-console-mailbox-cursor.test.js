@@ -83,4 +83,27 @@ describe('Web Console mailbox cursor state', () => {
     expect(api.isCurrentGeneration(7, 7)).toBe(true);
     expect(api.isCurrentGeneration(7, 8)).toBe(false);
   });
+
+  test('applies a mutation 409 reset once and ignores a delayed old rejection', () => {
+    const api = loadCursorApi();
+    const scopeA = `web-console-mailbox-v1:${'a'.repeat(64)}`;
+    const scopeB = `web-console-mailbox-v1:${'b'.repeat(64)}`;
+    let resets = 0;
+    const reset = api.acceptMutationResponse(
+      { cursorScope: scopeA, lastMessageId: 31, scopeGeneration: 6 },
+      409, { cursor_scope: scopeB }, 6, () => { resets += 1; },
+    );
+    expect(reset).toEqual({
+      handled: true, accepted: true, reset: true, cursorScope: scopeB,
+      lastMessageId: 0, scopeGeneration: 7,
+    });
+    expect(resets).toBe(1);
+    expect(api.acceptMutationResponse(
+      reset, 409, { cursor_scope: scopeA }, 6, () => { resets += 1; },
+    )).toEqual({
+      handled: true, accepted: false, reset: false, cursorScope: scopeB,
+      lastMessageId: 0, scopeGeneration: 7,
+    });
+    expect(resets).toBe(1);
+  });
 });

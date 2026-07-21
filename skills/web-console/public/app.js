@@ -190,6 +190,9 @@ class ZylosConsole {
         break;
 
       case 'sent':
+        if (this.applyMutationScopeResponse(
+          msg.status, msg, this.scopeGeneration,
+        ).handled) break;
         // Message send confirmation
         if (msg.success) {
           // Message was sent successfully, it will appear via 'messages' event
@@ -211,11 +214,26 @@ class ZylosConsole {
       scopeGeneration: this.scopeGeneration,
     }, nextScope, requestGeneration,
     () => globalThis.ZylosMailboxCursor.resetScopedClientState(this));
-    if (!accepted.accepted) return accepted;
+    this.commitMailboxScope(accepted);
+    return accepted;
+  }
+
+  applyMutationScopeResponse(status, payload, requestGeneration) {
+    const accepted = globalThis.ZylosMailboxCursor.acceptMutationResponse({
+      cursorScope: this.cursorScope,
+      lastMessageId: this.lastMessageId,
+      scopeGeneration: this.scopeGeneration,
+    }, status, payload, requestGeneration,
+    () => globalThis.ZylosMailboxCursor.resetScopedClientState(this));
+    this.commitMailboxScope(accepted);
+    return accepted;
+  }
+
+  commitMailboxScope(accepted) {
+    if (!accepted.accepted) return;
     this.cursorScope = accepted.cursorScope;
     this.lastMessageId = accepted.lastMessageId;
     this.scopeGeneration = accepted.scopeGeneration;
-    return accepted;
   }
 
   mailboxPollUrl() {
@@ -403,6 +421,9 @@ class ZylosConsole {
         if (!globalThis.ZylosMailboxCursor.isCurrentGeneration(
           sendGeneration, this.scopeGeneration,
         )) return;
+        if (this.applyMutationScopeResponse(
+          response.status, result, sendGeneration,
+        ).handled) return;
 
         if (result.success) {
           this.markMessageSent(tempId);
@@ -491,6 +512,9 @@ class ZylosConsole {
       } catch {
         // Keep generic error below.
       }
+      if (this.applyMutationScopeResponse(
+        xhr.status, result, uploadGeneration,
+      ).handled) return;
       if (xhr.status >= 200 && xhr.status < 300 && result.id) {
         item.status = 'ready';
         item.progress = 100;

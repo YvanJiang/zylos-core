@@ -596,6 +596,8 @@ wss.on('connection', (ws, req) => {
             success: false,
             error: err.code || err.message,
             message: err.message,
+            status: err.status || 500,
+            cursor_scope: err.cursorScope || deliveryMailbox.cursorScope,
             tempId
           }));
         }

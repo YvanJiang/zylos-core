@@ -81,19 +81,20 @@ function openDb(dbPath = DB_PATH) {
   const uploadColumns = new Set(
     db.prepare('PRAGMA table_info(uploads)').all().map(({ name }) => name),
   );
-  if (uploadColumns.has('region')) {
+  const candidateScopeColumns = ['region', 'tenant_id', 'bot_id'];
+  if (candidateScopeColumns.some((column) => uploadColumns.has(column))) {
     db.transaction(() => {
-      db.exec(`
-        INSERT OR IGNORE INTO scoped_uploads (
+      if (candidateScopeColumns.every((column) => uploadColumns.has(column))) {
+        db.exec(`INSERT OR IGNORE INTO scoped_uploads (
           id, session_token, path, name, size, size_label, mime, kind,
           region, tenant_id, bot_id, created_at, consumed
         )
         SELECT id, session_token, path, name, size, size_label, mime, kind,
           region, tenant_id, bot_id, created_at, consumed
         FROM uploads
-        WHERE region IS NOT NULL AND tenant_id IS NOT NULL AND bot_id IS NOT NULL;
-
-        CREATE TABLE uploads_rollback_compatible (
+        WHERE region IS NOT NULL AND tenant_id IS NOT NULL AND bot_id IS NOT NULL`);
+      }
+      db.exec(`CREATE TABLE uploads_rollback_compatible (
           id TEXT PRIMARY KEY,
           session_token TEXT,
           path TEXT NOT NULL,
@@ -104,16 +105,17 @@ function openDb(dbPath = DB_PATH) {
           kind TEXT NOT NULL,
           created_at INTEGER NOT NULL,
           consumed INTEGER NOT NULL DEFAULT 0
-        );
-        INSERT OR IGNORE INTO uploads_rollback_compatible (
+        )`);
+      const legacyPredicate = candidateScopeColumns.every((column) => uploadColumns.has(column))
+        ? 'WHERE region IS NULL OR tenant_id IS NULL OR bot_id IS NULL' : '';
+      db.exec(`INSERT OR IGNORE INTO uploads_rollback_compatible (
           id, session_token, path, name, size, size_label, mime, kind, created_at, consumed
         )
         SELECT id, session_token, path, name, size, size_label, mime, kind, created_at, consumed
         FROM uploads
-        WHERE region IS NULL OR tenant_id IS NULL OR bot_id IS NULL;
+        ${legacyPredicate};
         DROP TABLE uploads;
-        ALTER TABLE uploads_rollback_compatible RENAME TO uploads;
-      `);
+        ALTER TABLE uploads_rollback_compatible RENAME TO uploads`);
     })();
   }
   db.exec(`

@@ -646,13 +646,15 @@ describe('web-console attachment routes', () => {
       cursor_scope: scopeA,
     });
     expect(wsAck).toMatchObject({
-      success: false, error: 'mailbox_cursor_scope_mismatch', tempId: 'stale-a-ws',
+      success: false, error: 'mailbox_cursor_scope_mismatch', status: 409,
+      cursor_scope: scopeB, tempId: 'stale-a-ws',
     });
     const missingWsAck = await wsMutation({
       type: 'send', content: 'missing scope WS mutation', tempId: 'missing-scope-ws',
     });
     expect(missingWsAck).toMatchObject({
-      success: false, error: 'mailbox_cursor_scope_required', tempId: 'missing-scope-ws',
+      success: false, error: 'mailbox_cursor_scope_required', status: 409,
+      cursor_scope: scopeB, tempId: 'missing-scope-ws',
     });
 
     const currentHttp = await fetch(`${ctx.baseUrl}/api/send`, {

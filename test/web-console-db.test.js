@@ -162,6 +162,45 @@ describe('PersistentUploadRegistry', () => {
     migrated.close();
   });
 
+  test.each([
+    ['region'],
+    ['tenant_id'],
+    ['bot_id'],
+    ['region', 'tenant_id'],
+    ['region', 'bot_id'],
+    ['tenant_id', 'bot_id'],
+  ])('recovers and reopens an interrupted candidate migration with columns %j', (...scopeColumns) => {
+    const partialPath = path.join(tempDir, `partial-${scopeColumns.join('-')}.db`);
+    const partial = new Database(partialPath);
+    partial.exec(`
+      CREATE TABLE uploads (
+        id TEXT PRIMARY KEY, session_token TEXT, path TEXT NOT NULL, name TEXT NOT NULL,
+        size INTEGER NOT NULL, size_label TEXT, mime TEXT, kind TEXT NOT NULL,
+        created_at INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO uploads VALUES (
+        'partial-upload', 'partial-session', '/tmp/partial.txt', 'partial.txt',
+        7, '7B', 'text/plain', 'file', 0, 0
+      );
+    `);
+    for (const column of scopeColumns) partial.exec(`ALTER TABLE uploads ADD COLUMN ${column} TEXT`);
+    partial.close();
+
+    const recovered = openDb(partialPath);
+    expect(new Set(recovered.prepare('PRAGMA table_info(uploads)').all()
+      .map(({ name }) => name))).not.toContain('region');
+    expect(recovered.prepare("SELECT id FROM uploads WHERE id = 'partial-upload'").get())
+      .toEqual({ id: 'partial-upload' });
+    expect(new PersistentUploadRegistry(recovered, TEST_MAILBOX_SCOPE)
+      .getMany(['partial-upload'], 'partial-session')).toEqual([]);
+    recovered.close();
+
+    const reopened = openDb(partialPath);
+    expect(reopened.prepare("SELECT id FROM uploads WHERE id = 'partial-upload'").get())
+      .toEqual({ id: 'partial-upload' });
+    reopened.close();
+  });
+
   test('add, getMany, consumeMany work like in-memory registry', () => {
     const registry = new PersistentUploadRegistry(db, { ttlMs: 30000, ...TEST_MAILBOX_SCOPE });
     const entry = registry.add({
