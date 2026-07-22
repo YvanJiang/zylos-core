@@ -820,7 +820,10 @@ export function createClaudeConversationAdapter({
   }
   const safeQueryOptions = {
     ...queryOptions,
-    env: selectEnvironment(resolvedEnvironment, environmentAllowlist),
+    env: {
+      ...selectEnvironment(resolvedEnvironment, environmentAllowlist),
+      CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
+    },
   };
   const executors = new Map();
   let lifecycle = 'open';

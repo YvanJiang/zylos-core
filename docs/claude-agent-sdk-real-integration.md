@@ -14,6 +14,13 @@ declared `interrupt_receipt_v1` capability are probed before live execution.
 An SDK, bundled-CLI, capability, or control-surface drift fails closed and needs
 a new requirements review.
 
+Since Claude Agent SDK `0.2.83`, the authoritative
+`session_state_changed:idle` event is opt-in. For the pinned target, Core always
+sets `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1` after selecting the provider
+subprocess environment. Caller omission, `0`, or any other value cannot disable
+it, and unrelated environment variables remain fenced. Operators do not need to
+configure this Core-required lifecycle signal.
+
 ## Command and evidence
 
 Run from the `zylos-core` repository root:
@@ -48,6 +55,14 @@ config/transcript directory, and SQLite database. On timeout it aborts, forces
 every observed SDK query closed, and waits up to 15 seconds each for close and
 scenario cleanup before any later scenario can begin.
 
+The bounded Global42 post-live repair is qualified against the DeepSeek
+Anthropic-compatible endpoint with `ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`
+and both `ANTHROPIC_MODEL` and `ZYLOS_CLAUDE_SDK_LIVE_MODEL` set to
+`deepseek-v4-flash`. Supply `ANTHROPIC_AUTH_TOKEN` from a protected source; do
+not place it in repository files, logs, documentation, or command arguments.
+Do not set `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS` around the gate: the test
+must exercise the production adapter's injection.
+
 ## Evidence lanes
 
 Real-provider evidence uses the official SDK through the production Core seam:
@@ -63,6 +78,10 @@ adapter, SQLite state, and outbox. It proves:
 - stop reaches the real SDK interrupt path while the permission is pending, and
   the cancelled interaction cannot execute its tool.
 
+The lifecycle scenario observes and waits through the authoritative idle event
+before attempting eviction. A completed result is not used as an idle proxy,
+even when both messages arrive in the same millisecond.
+
 Deterministic fault evidence remains separate because provider auth, context,
 transient classification, stale-attempt fencing, mapping recovery, and deliberate
 commit/ack failure points cannot be safely or repeatably forced in a hosted model.
@@ -71,6 +90,12 @@ callback suppression, recovery notice delivery before provider work, answer
 send-before-ack fencing, `delivery_unknown`, and no blind replay of an unknown
 side effect. The acceptance matrix and exact test names live in
 `scripts/lib/claude-sdk-real-integration.js`.
+
+Evidence is intentionally non-substitutable: the minimized live A/B probe
+diagnoses the missing opt-in, the focused deterministic regression proves Core
+injects and fences the environment while preserving the idle-only input
+boundary, and the required live gate proves all six hosted-provider scenarios
+with `release_ready=true`. None of those lanes makes another optional.
 
 ## SDK-specific residual risk
 
@@ -83,3 +108,10 @@ Hosted-model behavior can still vary by model, account policy, rate limit, and
 service state. A credential-free run is useful deterministic and native-target
 evidence only; all six real-provider cases remain explicitly unrun until the
 machine-readable record reports `release_ready=true`.
+
+The DeepSeek qualification does not independently prove Anthropic first-party
+service behavior, and it remains specific to `deepseek-v4-flash`, the compatible
+endpoint behavior observed during this run, SDK `0.3.215`, and bundled Claude
+Code `2.1.215`. Any target or SDK change requires fresh real-provider evidence;
+it is not authorization to accept `result` or `command_lifecycle:completed` as
+the turn-over signal.

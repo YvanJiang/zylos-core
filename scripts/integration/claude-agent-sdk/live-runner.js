@@ -159,6 +159,7 @@ function createObservedQuery() {
   const interrupts = [];
   const providerQueries = new Set();
   const sessionStates = [];
+  const idleWaiters = new Set();
 
   function closeProviderQuery(providerQuery) {
     const existing = closePromises.get(providerQuery);
@@ -168,6 +169,29 @@ function createObservedQuery() {
       .finally(() => providerQueries.delete(providerQuery));
     closePromises.set(providerQuery, closing);
     return closing;
+  }
+
+  function waitForIdleCount(minimumCount, { signal }) {
+    return new Promise((resolve, reject) => {
+      const onAbort = () => {
+        idleWaiters.delete(notify);
+        reject(signal.reason ?? new Error('Claude idle wait was aborted.'));
+      };
+      const notify = () => {
+        const idleCount = sessionStates.filter(({ state }) => state === 'idle').length;
+        if (idleCount < minimumCount) return;
+        idleWaiters.delete(notify);
+        signal.removeEventListener('abort', onAbort);
+        setImmediate(resolve);
+      };
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      idleWaiters.add(notify);
+      signal.addEventListener('abort', onAbort, { once: true });
+      notify();
+    });
   }
 
   function query(arguments_) {
@@ -195,6 +219,7 @@ function createObservedQuery() {
               state: message.state,
               session_id: message.session_id,
             }));
+            for (const notify of idleWaiters) notify();
           }
         }
         return result;
@@ -248,6 +273,7 @@ function createObservedQuery() {
     interrupts,
     query,
     sessionStates,
+    waitForIdleCount,
   });
 }
 
@@ -401,6 +427,7 @@ async function runLifecycleScenario({
       });
       const firstResult = await service.runNext();
       const secondResult = await service.runNext();
+      await observed.waitForIdleCount(2, { signal: abortController.signal });
       assert(firstResult.status === 'completed', 'The first real Claude turn did not complete.');
       assert(secondResult.status === 'completed', 'The second real Claude turn did not complete.');
       assert(observed.calls.length === 1, 'Two turns did not share one long-lived SDK query.');
