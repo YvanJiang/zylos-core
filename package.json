@@ -13,6 +13,7 @@
     "test": "npm run test:jest && npm run test:node",
     "test:jest": "node --experimental-vm-modules node_modules/.bin/jest",
     "test:node": "node scripts/run-node-tests.js",
+    "test:integration:claude-sdk": "node scripts/install-skill-deps.js && node scripts/verify-claude-sdk-real-integration.js --require-live",
     "pretest:integration:codex-app-server:real": "node scripts/install-skill-deps.js",
     "test:integration:codex-app-server:real": "node scripts/e2e/codex-app-server-real-integration.js",
     "test:integration:codex-app-server:native-smoke": "node scripts/e2e/codex-app-server-native-smoke.js",

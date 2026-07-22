@@ -538,6 +538,70 @@ function createDelayedIdleQuery({ sessionId }) {
   return { idleConsumed, query, releaseIdle };
 }
 
+function createAuthoritativeIdleBoundaryQuery({ sessionId }) {
+  const commandCompleted = deferred();
+  const releaseResult = deferred();
+  const resultConsumed = deferred();
+  const releaseIdle = deferred();
+  const secondInputConsumed = deferred();
+  const inputs = [];
+
+  function query({ prompt }) {
+    let turnNo = 0;
+    const stream = (async function* generateSdkMessages() {
+      for await (const input of prompt) {
+        turnNo += 1;
+        inputs.push(input.message.content);
+        if (turnNo === 1) {
+          yield { type: 'system', subtype: 'init', session_id: sessionId };
+          yield {
+            type: 'system',
+            subtype: 'command_lifecycle',
+            state: 'completed',
+            session_id: sessionId,
+          };
+          commandCompleted.resolve();
+          await releaseResult.promise;
+          yield {
+            type: 'result',
+            subtype: 'success',
+            session_id: sessionId,
+            result: input.message.content,
+          };
+          resultConsumed.resolve();
+          await releaseIdle.promise;
+          yield idleSession(sessionId);
+          continue;
+        }
+        secondInputConsumed.resolve();
+        yield {
+          type: 'result',
+          subtype: 'success',
+          session_id: sessionId,
+          result: input.message.content,
+        };
+        yield idleSession(sessionId);
+      }
+    }());
+    stream.interrupt = async () => ({ still_queued: [] });
+    stream.close = () => {
+      releaseResult.resolve();
+      releaseIdle.resolve();
+    };
+    return stream;
+  }
+
+  return {
+    commandCompleted,
+    inputs,
+    query,
+    releaseIdle,
+    releaseResult,
+    resultConsumed,
+    secondInputConsumed,
+  };
+}
+
 function createThrowingQuery({ sessionId }) {
   function query({ prompt }) {
     const stream = (async function* generateSdkMessages() {
@@ -1132,6 +1196,43 @@ describe('Claude conversation executor', () => {
     });
   });
 
+  test('forces SDK session-state events after fencing caller environment', async () => {
+    for (const [index, callerValue] of [undefined, '0', 'caller-value'].entries()) {
+      const database = openTestDatabase();
+      const accepted = acceptQueuedTurn(database, `session-state-env-${index}`);
+      const fake = createFakeQuery({
+        sessionId: `claude-session-state-env-${index}`,
+      });
+      const environment = {
+        PATH: '/test/bin',
+        DATABASE_PASSWORD: 'must-not-reach-provider-process',
+      };
+      if (callerValue !== undefined) {
+        environment.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS = callerValue;
+      }
+      const service = createExecutorService({
+        database,
+        adapter: createClaudeConversationAdapter({
+          query: fake.query,
+          queryOptions: { env: environment },
+        }),
+        provider: 'claude',
+        serviceInstanceId: `executor-service-session-state-env-${index}`,
+        now: () => '2026-07-22T09:00:00Z',
+        generateId: deterministicIds(`session-state-env-${index}`),
+      });
+
+      await expect(service.runNext()).resolves.toMatchObject({ turn_id: accepted.turn_id });
+      expect(fake.calls[0].options.env).toEqual({
+        CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
+        PATH: '/test/bin',
+      });
+
+      await service.close();
+      database.close();
+    }
+  });
+
   test('removes static tokens when native credentials are detected', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'native-auth-env');
@@ -1164,7 +1265,11 @@ describe('Claude conversation executor', () => {
     });
 
     await expect(service.runNext()).resolves.toMatchObject({ turn_id: accepted.turn_id });
-    expect(fake.calls[0].options.env).toEqual({ HOME: nativeHome, PATH: '/test/bin' });
+    expect(fake.calls[0].options.env).toEqual({
+      CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
+      HOME: nativeHome,
+      PATH: '/test/bin',
+    });
     expect(detectedExecutable).toBe('/sdk/bundled/claude');
     await service.close();
     database.close();
@@ -1203,6 +1308,7 @@ describe('Claude conversation executor', () => {
 
     await expect(service.runNext()).resolves.toMatchObject({ turn_id: accepted.turn_id });
     expect(fake.calls[0].options.env).toEqual({
+      CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
       HOME: '/Users/keychain-user',
       PATH: '/test/bin',
     });
@@ -1261,6 +1367,7 @@ describe('Claude conversation executor', () => {
     expect(fake.calls[0].options.resume).toBeUndefined();
     expect(fake.calls[0].options.env).toEqual({
       ANTHROPIC_API_KEY: 'test-key',
+      CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
       PATH: '/test/bin',
     });
     expect(fake.inputs).toEqual(['turn first', 'turn second']);
@@ -1294,6 +1401,58 @@ describe('Claude conversation executor', () => {
         end_offset: 22,
       },
     });
+
+    await service.close();
+    database.close();
+  });
+
+  test('requires matching SDK idle after command completion and result before queued input', async () => {
+    const database = openTestDatabase();
+    const first = acceptQueuedTurn(database, 'authoritative-idle-first');
+    const second = acceptQueuedTurn(database, 'authoritative-idle-second');
+    const fake = createAuthoritativeIdleBoundaryQuery({
+      sessionId: 'claude-session-authoritative-idle',
+    });
+    const service = createExecutorService({
+      database,
+      adapter: createClaudeConversationAdapter({ query: fake.query }),
+      provider: 'claude',
+      serviceInstanceId: 'executor-service-authoritative-idle',
+      now: () => '2026-07-22T09:01:00Z',
+      generateId: deterministicIds('authoritative-idle'),
+    });
+
+    let firstRunSettled = false;
+    const firstRun = service.runNext();
+    void firstRun.then(
+      () => { firstRunSettled = true; },
+      () => { firstRunSettled = true; },
+    );
+    await fake.commandCompleted.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(firstRunSettled).toBe(false);
+
+    fake.releaseResult.resolve();
+    await expect(firstRun).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: first.turn_id,
+    });
+    await fake.resultConsumed.promise;
+
+    const secondRun = service.runNext();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(fake.inputs).toEqual(['turn authoritative-idle-first']);
+
+    fake.releaseIdle.resolve();
+    await fake.secondInputConsumed.promise;
+    await expect(secondRun).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: second.turn_id,
+    });
+    expect(fake.inputs).toEqual([
+      'turn authoritative-idle-first',
+      'turn authoritative-idle-second',
+    ]);
 
     await service.close();
     database.close();
