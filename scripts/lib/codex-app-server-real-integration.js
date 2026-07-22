@@ -1003,7 +1003,7 @@ export async function runCodexAppServerRealIntegration({
         }),
         Object.freeze({
           case: 'mcp_elicitation',
-          reason: 'Production lockdown disables MCP because the target protocol does not provide the synchronous Core pre-action fence required by Global14.',
+          reason: 'Production lockdown disables MCP because 0.144.5 exposes only a conditional model-initiated prompt seam; this candidate does not enable or prove every configuration, reviewer, bypass-exclusion, durable-lease, restart, and acknowledgement condition required by Global14.',
         }),
         Object.freeze({
           case: 'stale_server_traffic',

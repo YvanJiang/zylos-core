@@ -151,9 +151,12 @@ as real attempted-but-not-triggered, not positive passes:
   server request.
 - User input: `triggered=false`, `provider_neutral_tool_name=null`; the normal default-mode target
   returned text rather than a `requestUserInput` server request. Collaboration mode remains disabled.
-- MCP elicitation: production configuration deliberately disables and declines MCP. The fixed
-  protocol does not provide Core's required synchronous pre-action lease fence before an MCP tool's
-  external side effect, so a positive real MCP run would conflict with the Global14 baseline.
+- MCP elicitation: production configuration deliberately disables and declines MCP. Official
+  0.144.5 source has a conditional model-initiated prompt seam before the MCP call, but this
+  candidate does not enable or prove its configuration, reviewer, hook/Guardian/cache, direct-RPC,
+  durable-lease, restart, and acknowledgement conditions. It therefore remains fail-closed under
+  the Global14 baseline; see
+  [`codex-app-server-0.144.5-fence-research.md`](./codex-app-server-0.144.5-fence-research.md).
 - Stale server traffic: the official server has no acceptance API for forging stale protocol
   traffic; deterministic fail-closed protocol tests remain the evidence for this negative matrix.
 
@@ -162,5 +165,6 @@ fixture for the positive server-request cases above. Their durable request/answe
 and stale-traffic matrices remain deterministic protocol-injection evidence, not real positive
 server-request evidence. A CLI upgrade must regenerate the
 experimental schemas, update the fixed identity, and rerun this suite. MCP cannot become a positive
-normal-path acceptance without a requirements decision that supplies the missing synchronous Core
-fence; substituting another transport is prohibited.
+normal-path acceptance until the conditional prompt seam and all bypass exclusions are implemented
+and proved, or upstream supplies an explicit fail-closed fixture/capability. Substituting another
+transport is prohibited.

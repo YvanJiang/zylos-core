@@ -76,9 +76,9 @@ entries are `thread/inject_items`, `mock/experimentalMethod`, `thread/increment_
 
 The official
 [`app-server-test-client`](https://github.com/openai/codex/blob/rust-v0.144.5/codex-rs/app-server-test-client/src/lib.rs#L962-L1011)
-implements `trigger_cmd_approval` by sending the prompt
-`Run touch /tmp/should-trigger-approval...`, and implements `trigger_patch_approval` by sending a
-prompt asking the model to use `apply_patch`. Both set approval and sandbox policy, but neither
+implements `trigger_cmd_approval` by sending a natural-language request that asks the model to run
+a bounded command, and implements `trigger_patch_approval` with another natural-language tool-use
+request. Both set approval and sandbox policy, but neither
 injects a tool call or server request. Their result still depends on model behavior, matching the
 already observed `triggered=false` runs.
 
