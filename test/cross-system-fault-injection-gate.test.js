@@ -85,6 +85,18 @@ describe('Global47 cross-system fault-injection gate', () => {
         REQUIRED_ACCEPTANCE_DIMENSIONS.every((dimension) => assertions.includes(dimension))
       ))).toBe(true);
     }
+    expect(CROSS_SYSTEM_FAULT_CASES.find(({ case_id: caseId }) => (
+      caseId === 'outbox_replay'
+    ))).toMatchObject({
+      expected: {
+        classification: 'delivery_transient_then_dead_letter',
+        user_notification: 'accumulated_terminal_fallback_visible',
+        recovery_or_fallback: 'bounded_2_4_8_retry_then_new_delivery',
+        audit_or_metrics: 'attempt_and_lease_epochs_recorded',
+        backlog_drain: 'fallback_delivered_without_duplicate',
+      },
+      probes: [{ probe_id: 'core-outbox-safe-replay' }],
+    });
   });
 
   test('builds machine evidence only from successful public-seam probes and raw contract proof', () => {

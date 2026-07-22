@@ -322,11 +322,17 @@ export const CROSS_SYSTEM_FAULT_CASES = Object.freeze([
       'keeps an expired post-action result unconfirmed and blocks automatic replay',
     ),
   ]),
-  acceptanceCase('outbox_replay', 'channel', OBSERVABLE.channelUnknown, [
+  acceptanceCase('outbox_replay', 'channel', {
+    classification: 'delivery_transient_then_dead_letter',
+    userNotification: 'accumulated_terminal_fallback_visible',
+    recoveryOrFallback: 'bounded_2_4_8_retry_then_new_delivery',
+    auditOrMetrics: 'attempt_and_lease_epochs_recorded',
+    backlogDrain: 'fallback_delivered_without_duplicate',
+  }, [
     coreJest(
-      'core-outbox-replay',
+      'core-outbox-safe-replay',
       'test/runtime-outbox-service.test.js',
-      'quarantines an expired exact-base delivering claim without replay or new authority',
+      'retries a final update after 2/4/8 seconds then uses a new delivery and mapping',
     ),
   ]),
 ]);
