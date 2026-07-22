@@ -141,6 +141,11 @@ describe('Global47 cross-system fault-injection gate', () => {
     expect(evidence.cases).toHaveLength(CROSS_SYSTEM_FAULT_CASES.length);
     expect(evidence.contract_evidence).toHaveLength(4);
     expect(() => validateCrossSystemFaultInjectionEvidence(evidence)).not.toThrow();
+
+    const substitutedProbe = structuredClone(evidence);
+    substitutedProbe.cases[0].probes[0] = structuredClone(evidence.cases[1].probes[0]);
+    expect(() => validateCrossSystemFaultInjectionEvidence(substitutedProbe))
+      .toThrow('probe identity mismatch');
   });
 
   test('builds one deduplicated executable plan and retains only hashes from child output', () => {

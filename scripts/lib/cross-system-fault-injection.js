@@ -424,12 +424,15 @@ function validateProbeResult(result) {
 export function executeCrossSystemFaultInjectionPlan(plan, { runProbe }) {
   if (!Array.isArray(plan) || plan.length === 0) throw new TypeError('plan must be non-empty');
   if (typeof runProbe !== 'function') throw new TypeError('runProbe must be a function');
-  const results = plan.map((item) => validateProbeResult(runProbe(item)));
   const expectedIds = new Set(plan.map(({ probe_id: probeId }) => probeId));
   if (expectedIds.size !== plan.length) throw new TypeError('plan probe IDs must be unique');
-  for (const result of results) {
-    if (!expectedIds.has(result.probe_id)) throw new TypeError('probe result does not match the plan');
-  }
+  const results = plan.map((item) => {
+    const result = validateProbeResult(runProbe(item));
+    if (result.probe_id !== item.probe_id || result.repository !== item.repository) {
+      throw new TypeError('probe result identity does not match the plan');
+    }
+    return result;
+  });
   return Object.freeze({
     passed: results.every(({ exit_code: exitCode }) => exitCode === 0),
     results: Object.freeze(results.map((result) => Object.freeze({ ...result }))),
@@ -509,8 +512,15 @@ export function validateCrossSystemFaultInjectionEvidence(evidence) {
     if (!Array.isArray(observed.probes) || observed.probes.length !== declared.probes.length) {
       throw new TypeError(`${observed.case_id} probe evidence is incomplete`);
     }
-    for (const result of observed.probes) {
+    for (const [index, result] of observed.probes.entries()) {
       validateProbeResult(result);
+      const expectedProbe = declared.probes[index];
+      if (
+        result.probe_id !== expectedProbe.probe_id
+        || result.repository !== expectedProbe.repository
+      ) {
+        throw new TypeError(`${observed.case_id} probe identity mismatch`);
+      }
       if (result.exit_code !== 0) throw new TypeError(`${observed.case_id} probe failed`);
     }
   }
