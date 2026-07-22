@@ -20,6 +20,8 @@
     "test:integration:codex-app-server:interaction:command": "node scripts/e2e/codex-app-server-interaction-probe.js command_approval",
     "test:integration:codex-app-server:interaction:file": "node scripts/e2e/codex-app-server-interaction-probe.js file_approval",
     "test:integration:codex-app-server:interaction:input": "node scripts/e2e/codex-app-server-interaction-probe.js request_user_input",
+    "pretest:acceptance:cross-system-fault-injection": "node scripts/install-skill-deps.js",
+    "test:acceptance:cross-system-fault-injection": "node scripts/verify-cross-system-fault-injection.js",
     "test:contracts:five-repo": "node scripts/verify-five-repo-contracts.js",
     "test:release:retired-runtime": "node --experimental-vm-modules node_modules/.bin/jest --runInBand test/five-repo-retired-runtime-gate.test.js test/runtime-normal-path-static.test.js && node scripts/verify-five-repo-retired-runtime.js"
   },

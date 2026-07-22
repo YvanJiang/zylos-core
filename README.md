@@ -402,6 +402,23 @@ deterministic regression, and six-case live acceptance evidence separate.
 
 See [the evidence lanes, prerequisites, and residual risks](docs/claude-agent-sdk-real-integration.md).
 
+## Cross-system fault-injection gate
+
+Run the deterministic Global47 matrix against the exact Core, Feishu, Lark, Dashboard, and Luna
+integration baselines:
+
+```bash
+npm run test:acceptance:cross-system-fault-injection
+```
+
+The gate injects restart, stale-fence, orphan-runtime, SQLite, scheduler, workspace, provider,
+channel-delivery, and outbox-replay faults. It emits identifier-free machine evidence for the
+classification, user-visible notice, recovery/fallback, audit/metrics, and backlog outcome of
+every case, plus consumer-owned raw JCS/idempotency/payload-hash proof. Deterministic success does
+not substitute for unavailable real-provider or real-platform evidence.
+
+See [the exact matrix, safety boundaries, and evidence lanes](docs/cross-system-fault-injection.md).
+
 ## Uninstall
 
 ```bash
