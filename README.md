@@ -383,6 +383,25 @@ The gate scans every tracked text file and every file reported by each
 repository's `npm pack --dry-run`. Its allowlist is exact, purpose-bearing, and
 limited to isolated one-time migration records or negative proofs.
 
+## Claude Agent SDK real-integration gate
+
+The credential-dependent Claude target gate validates the pinned SDK and
+bundled executable, runs focused deterministic fault injection, and then uses
+the official SDK through the production Core seam. It fails closed when the
+real-provider lane is unavailable or incomplete.
+
+```bash
+npm run test:integration:claude-sdk
+```
+
+For the pinned SDK `0.3.215` and bundled Claude Code `2.1.215`, Core injects the
+opt-in `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1` lifecycle prerequisite after
+fencing the SDK subprocess environment. Global42's bounded live target is
+DeepSeek `deepseek-v4-flash`; the integration guide keeps diagnostic A/B,
+deterministic regression, and six-case live acceptance evidence separate.
+
+See [the evidence lanes, prerequisites, and residual risks](docs/claude-agent-sdk-real-integration.md).
+
 ## Uninstall
 
 ```bash
