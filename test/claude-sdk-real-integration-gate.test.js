@@ -1,4 +1,6 @@
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import { describe, expect, test } from '@jest/globals';
 
@@ -10,6 +12,7 @@ import {
   validateClaudeSdkTarget,
 } from '../scripts/lib/claude-sdk-real-integration.js';
 import {
+  removeSdkTemporaryDirectoryAfterShutdown,
   runWithTimeout,
 } from '../scripts/integration/claude-agent-sdk/live-runner.js';
 
@@ -215,6 +218,25 @@ describe('Claude Agent SDK real-integration acceptance gate', () => {
       forceClose: async () => {},
       timeoutMs: 1,
     })).rejects.toMatchObject({ code: 'live_cleanup_unconfirmed' });
+  });
+
+  test('removes SDK temporary config recreated after shutdown begins', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-global42-cleanup-test-'));
+    try {
+      let waitCalls = 0;
+      await removeSdkTemporaryDirectoryAfterShutdown(directory, {
+        settleMs: 1,
+        wait: async () => {
+          waitCalls += 1;
+          fs.mkdirSync(directory, { recursive: true });
+          fs.writeFileSync(path.join(directory, '.late-sdk-state'), 'late');
+        },
+      });
+      expect(waitCalls).toBe(1);
+      expect(fs.existsSync(directory)).toBe(false);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   test('exposes one fail-closed command and an operator record for the real target', () => {

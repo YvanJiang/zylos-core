@@ -31,6 +31,7 @@ const inboundFixture = JSON.parse(fs.readFileSync(
 ));
 const DEFAULT_TIMEOUT_MS = 180_000;
 const CLEANUP_TIMEOUT_MS = 15_000;
+const SDK_SHUTDOWN_SETTLE_MS = 2_500;
 const ACCEPTANCE_MCP_SERVER = 'zylos_global42_acceptance';
 const ACCEPTANCE_MCP_TOOL = `mcp__${ACCEPTANCE_MCP_SERVER}__approval_probe`;
 const REQUIRED_REAL_CASE_IDS = Object.freeze([
@@ -121,6 +122,27 @@ function safeError(error) {
       ? error.providerError.category
       : null,
   });
+}
+
+export async function removeSdkTemporaryDirectoryAfterShutdown(directory, {
+  settleMs = SDK_SHUTDOWN_SETTLE_MS,
+  wait = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+} = {}) {
+  if (typeof directory !== 'string' || directory.length === 0) {
+    throw new TypeError('directory must be a non-empty string');
+  }
+  if (!Number.isFinite(settleMs) || settleMs < 0) {
+    throw new TypeError('settleMs must be a non-negative finite number');
+  }
+  if (typeof wait !== 'function') throw new TypeError('wait must be a function');
+  fs.rmSync(directory, { recursive: true, force: true });
+  await wait(settleMs);
+  fs.rmSync(directory, { recursive: true, force: true });
+  if (fs.existsSync(directory)) {
+    const error = new Error('Claude SDK temporary directory cleanup was not confirmed.');
+    error.code = 'live_cleanup_unconfirmed';
+    throw error;
+  }
 }
 
 function queryOptions({

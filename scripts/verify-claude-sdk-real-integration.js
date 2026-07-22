@@ -14,6 +14,7 @@ import {
   validateClaudeSdkTarget,
 } from './lib/claude-sdk-real-integration.js';
 import {
+  removeSdkTemporaryDirectoryAfterShutdown,
   runLiveClaudeSdkAcceptance,
 } from './integration/claude-agent-sdk/live-runner.js';
 
@@ -185,7 +186,7 @@ async function probeQuerySurface(cliPath) {
       if (!closed) throw new Error('The SDK native-surface query did not close cleanly.');
     } finally {
       clearTimeout(closeTimeout);
-      fs.rmSync(configDirectory, { recursive: true, force: true });
+      await removeSdkTemporaryDirectoryAfterShutdown(configDirectory);
     }
   }
 }
