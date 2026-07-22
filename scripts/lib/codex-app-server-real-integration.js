@@ -1,4 +1,5 @@
 import { execFile, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -474,10 +475,19 @@ async function runInterruptProbe({ codexExecutable, workspaceDirectory, reason }
   }
 }
 
-async function initializeProtocolProbe({ codexExecutable, workspaceDirectory }) {
+async function initializeProtocolProbe({
+  codexExecutable,
+  workspaceDirectory,
+  environment = process.env,
+  clientInfo = Object.freeze({
+    name: 'zylos-global43-real-integration',
+    title: 'Zylos Global43 Real Integration',
+    version: '1.0.0',
+  }),
+}) {
   const child = spawn(codexExecutable, ['app-server', '--stdio'], {
     cwd: workspaceDirectory,
-    env: process.env,
+    env: environment,
     shell: false,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -490,7 +500,10 @@ async function initializeProtocolProbe({ codexExecutable, workspaceDirectory }) 
         const message = JSON.parse(line);
         if (message.id === 'global43-initialize') {
           if (message.error) reject(new Error('Target app-server rejected initialize.'));
-          else resolve(message.result);
+          else {
+            child.stdin.write(`${JSON.stringify({ method: 'initialized', params: {} })}\n`);
+            resolve(message.result);
+          }
         }
       } catch (error) {
         reject(error);
@@ -507,11 +520,7 @@ async function initializeProtocolProbe({ codexExecutable, workspaceDirectory }) 
     id: 'global43-initialize',
     method: 'initialize',
     params: {
-      clientInfo: {
-        name: 'zylos-global43-real-integration',
-        title: 'Zylos Global43 Real Integration',
-        version: '1.0.0',
-      },
+      clientInfo,
       capabilities: {
         experimentalApi: true,
         requestAttestation: false,
@@ -529,6 +538,396 @@ async function initializeProtocolProbe({ codexExecutable, workspaceDirectory }) 
     } catch {
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
       await withTimeout(closed, 5_000, 'initialize process forced shutdown');
+    }
+  }
+}
+
+function isolatedSmokeEnvironment(baseEnvironment, codexHome) {
+  const environment = {};
+  for (const key of ['PATH', 'SystemRoot', 'WINDIR', 'ComSpec', 'PATHEXT', 'LANG', 'LC_ALL']) {
+    if (typeof baseEnvironment[key] === 'string') environment[key] = baseEnvironment[key];
+  }
+  environment.HOME = codexHome;
+  environment.CODEX_HOME = codexHome;
+  environment.TERM = 'dumb';
+  return environment;
+}
+
+export async function runCodexAppServerInitializeSmoke({
+  codexExecutable = process.env.CODEX_BIN || 'codex',
+  baseEnvironment = process.env,
+  execFile = execFileAsync,
+  initialize = initializeProtocolProbe,
+} = {}) {
+  const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-global43-smoke-'));
+  const codexHome = path.join(temporaryDirectory, 'codex-home');
+  const workspaceDirectory = path.join(temporaryDirectory, 'workspace');
+  fs.mkdirSync(codexHome, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(workspaceDirectory, { recursive: true, mode: 0o700 });
+  const environment = isolatedSmokeEnvironment(baseEnvironment, codexHome);
+  try {
+    const [{ stdout }, initialized] = await Promise.all([
+      execFile(codexExecutable, ['--version'], { encoding: 'utf8', env: environment }),
+      initialize({
+        codexExecutable,
+        workspaceDirectory,
+        environment,
+        clientInfo: {
+          name: 'zylos-global43-native-smoke',
+          title: 'Zylos Global43 Native Smoke',
+          version: '1.0.0',
+        },
+      }),
+    ]);
+    const cliVersion = stdout.trim();
+    if (cliVersion !== 'codex-cli 0.144.5') {
+      throw new Error(`Global43 requires codex-cli 0.144.5, received ${cliVersion}.`);
+    }
+    if (fs.realpathSync(initialized.codexHome) !== fs.realpathSync(codexHome)) {
+      throw new Error('Initialize did not use the dedicated smoke CODEX_HOME.');
+    }
+    return Object.freeze({
+      evidence_schema_version: 1,
+      provider_transport: 'official_app_server',
+      protocol: Object.freeze({
+        cli_version: cliVersion,
+        initialize_user_agent: initialized.userAgent,
+        transport: 'stdio',
+        initialized_notification: true,
+        platform_family: initialized.platformFamily,
+        platform_os: initialized.platformOs,
+      }),
+      isolation: Object.freeze({
+        dedicated_codex_home: true,
+        host_codex_home_reused: false,
+        credentials_inherited: false,
+      }),
+    });
+  } finally {
+    fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+}
+
+export function writeCodexAppServerRealEvidenceFile({ evidence, evidenceFile, codexHome }) {
+  if (
+    evidence?.evidence_schema_version !== 1
+    || evidence?.provider_transport !== 'official_app_server'
+  ) {
+    throw new TypeError('Only Global43 official app-server evidence schema 1 may be persisted.');
+  }
+  if (typeof evidenceFile !== 'string' || typeof codexHome !== 'string') {
+    throw new TypeError('evidenceFile and codexHome must be strings.');
+  }
+  const lexicalHome = path.resolve(codexHome);
+  const resolvedHome = fs.realpathSync(codexHome);
+  const resolvedFile = path.resolve(evidenceFile);
+  const relativeFile = path.relative(lexicalHome, resolvedFile);
+  if (relativeFile.startsWith('..') || path.isAbsolute(relativeFile)) {
+    throw new Error('Global43 evidence file must remain inside CODEX_HOME.');
+  }
+  const evidenceDirectory = path.dirname(resolvedFile);
+  fs.mkdirSync(evidenceDirectory, { recursive: true, mode: 0o700 });
+  const resolvedDirectory = fs.realpathSync(evidenceDirectory);
+  const relativeDirectory = path.relative(resolvedHome, resolvedDirectory);
+  if (relativeDirectory.startsWith('..') || path.isAbsolute(relativeDirectory)) {
+    throw new Error('Global43 evidence file must remain inside CODEX_HOME.');
+  }
+  const temporaryFile = path.join(
+    resolvedDirectory,
+    `.global43-evidence-${randomUUID()}.tmp`,
+  );
+  try {
+    fs.writeFileSync(temporaryFile, `${JSON.stringify(evidence)}\n`, {
+      encoding: 'utf8',
+      flag: 'wx',
+      mode: 0o600,
+    });
+    fs.renameSync(temporaryFile, resolvedFile);
+  } finally {
+    fs.rmSync(temporaryFile, { force: true });
+  }
+}
+
+export function selectRestartResumeThreadId(evidence) {
+  const threadIds = evidence?.lifecycle?.thread_ids;
+  if (
+    evidence?.evidence_schema_version !== 1
+    || evidence?.provider_transport !== 'official_app_server'
+    || !Array.isArray(threadIds)
+    || threadIds.length !== 3
+    || typeof threadIds[0] !== 'string'
+    || threadIds[0].length === 0
+    || !threadIds.every((threadId) => threadId === threadIds[0])
+  ) {
+    throw new Error('Restart resume requires one durable thread ID across all lifecycle turns.');
+  }
+  return threadIds[0];
+}
+
+export async function runCodexAppServerRestartResume({
+  providerNativeId,
+  codexExecutable = process.env.CODEX_BIN || 'codex',
+  createAdapter = createCodexAppServerAdapter,
+} = {}) {
+  if (typeof providerNativeId !== 'string' || providerNativeId.length === 0) {
+    throw new TypeError('providerNativeId must be a non-empty string.');
+  }
+  const expectedText = 'ZYLOS-GLOBAL43-CONTAINER-RESTART-OK';
+  const context = executionContext({
+    providerNativeId,
+    suffix: 'container-restart-resume',
+  });
+  context.input = {
+    kind: 'text',
+    text: `Reply with exactly ${expectedText} and do not use tools.`,
+    attachments: [],
+  };
+  const adapter = createAdapter({
+    codexExecutable,
+    sandbox: 'read-only',
+  });
+  try {
+    const events = await withTimeout(
+      collect(adapter.execute(context)),
+      60_000,
+      'container restart resume turn',
+    );
+    const finalText = events.filter(({ kind }) => kind === 'text_snapshot').at(-1)?.payload?.text;
+    if (finalText !== expectedText) {
+      throw new Error('Container restart resume returned unexpected text.');
+    }
+    return Object.freeze({
+      evidence_schema_version: 1,
+      provider_transport: 'official_app_server',
+      protocol: Object.freeze({
+        cli_version: 'codex-cli 0.144.5',
+        transport: 'stdio',
+      }),
+      container_restart: Object.freeze({
+        fresh_container: true,
+        thread_id: providerNativeId,
+        thread_id_reused: true,
+        subsequent_turn: true,
+        normalized_event_kinds: [...new Set(events.map(({ kind }) => kind))],
+      }),
+    });
+  } finally {
+    await adapter.close();
+  }
+}
+
+const realInteractionScenarios = Object.freeze({
+  command_approval: Object.freeze({
+    expectedKind: 'tool_approval',
+    expectedToolName: 'command',
+    prompt: 'Use the shell command `touch global43-command-approved.txt` exactly once. Explicitly request user approval for escalated execution outside the read-only sandbox before running it. Do not attempt the command without approval and do not use any other tool.',
+    artifact: 'global43-command-approved.txt',
+  }),
+  file_approval: Object.freeze({
+    expectedKind: 'tool_approval',
+    expectedToolName: 'file_change',
+    prompt: 'Use the file patch tool exactly once to propose `global43-file-approved.txt` containing `GLOBAL43 FILE APPROVED`. Explicitly request file-change approval before applying it. Do not write without approval and do not use the shell.',
+    artifact: 'global43-file-approved.txt',
+  }),
+  request_user_input: Object.freeze({
+    expectedKind: 'question',
+    expectedToolName: null,
+    prompt: 'Call the request_user_input tool exactly once to ask one non-secret free-form question with no timeout; do not ask in ordinary assistant text. After the tool answer, reply with a short confirmation. Do not use any other tool.',
+    artifact: null,
+  }),
+});
+
+function realInteractionAnswer(request, scenario) {
+  const sourceEventId = `global43-${scenario}-answer-action`;
+  const value = request.kind === 'question'
+    ? { kind: 'text', text: 'GLOBAL43 USER INPUT ANSWER' }
+    : request.kind === 'choice'
+      ? { kind: 'choice', choice_id: request.choices[0]?.choice_id }
+      : { kind: 'decision', decision: 'approve' };
+  const answer = {
+    contract: 'zylos.interaction-answer',
+    contract_version: '1.0',
+    trace_id: `global43-${scenario}-answer-trace`,
+    interaction_id: request.interaction_id,
+    interaction_version: request.version,
+    answer_id: `global43-${scenario}-answer`,
+    source_event_or_action_id: sourceEventId,
+    actor: {
+      type: 'user',
+      actor_id: 'user-A',
+      authenticated: true,
+      roles: ['member'],
+    },
+    source_context: {
+      region: 'cn',
+      tenant_id: 'tenant-A',
+      channel: 'feishu',
+      bot_id: 'bot-A',
+      chat_id: 'chat-dm-A',
+      native_thread_or_topic_id: null,
+      platform_message_or_action_id: sourceEventId,
+    },
+    source: request.allowed_sources.includes('card_action')
+      ? 'card_action'
+      : request.allowed_sources[0],
+    value,
+    answered_at: new Date().toISOString(),
+  };
+  answer.idempotency_key = createIdempotencyKey('interaction', {
+    interaction_id: answer.interaction_id,
+    source_event_or_action_id: answer.source_event_or_action_id,
+  });
+  return answer;
+}
+
+function readRealInteractionEvidence(database, accepted) {
+  const interaction = database.prepare(`
+    SELECT state, handoff_state, request_json
+    FROM runtime_interactions
+    WHERE turn_id = ?
+    ORDER BY ordinal ASC
+    LIMIT 1
+  `).get(accepted.turn_id);
+  const handoff = database.prepare(`
+    SELECT state
+    FROM runtime_interaction_handoffs
+    WHERE interaction_id IN (
+      SELECT interaction_id FROM runtime_interactions WHERE turn_id = ?
+    )
+    ORDER BY handoff_id ASC
+    LIMIT 1
+  `).get(accepted.turn_id);
+  const audit = database.prepare(`
+    SELECT outcome
+    FROM runtime_interaction_audit
+    WHERE interaction_id IN (
+      SELECT interaction_id FROM runtime_interactions WHERE turn_id = ?
+    )
+    ORDER BY audit_id ASC
+    LIMIT 1
+  `).get(accepted.turn_id);
+  const answerCount = database.prepare(`
+    SELECT COUNT(*) AS count
+    FROM runtime_interaction_answers
+    WHERE interaction_id IN (
+      SELECT interaction_id FROM runtime_interactions WHERE turn_id = ?
+    )
+  `).get(accepted.turn_id).count;
+  const turn = database.prepare(`
+    SELECT state FROM runtime_turns WHERE turn_id = ?
+  `).get(accepted.turn_id);
+  const events = database.prepare(`
+    SELECT event_json FROM runtime_normalized_events
+    WHERE turn_id = ? ORDER BY event_sequence ASC
+  `).all(accepted.turn_id).map(({ event_json: eventJson }) => JSON.parse(eventJson));
+  const toolName = events.find(({ kind }) => kind === 'tool_started')?.payload?.tool_name ?? null;
+  const finalTextPresent = events.some(({ kind, payload }) => (
+    kind === 'text_snapshot' && typeof payload?.text === 'string' && payload.text.length > 0
+  ));
+  return {
+    interaction,
+    handoff,
+    audit,
+    answerCount,
+    turn,
+    eventKinds: [...new Set(events.map(({ kind }) => kind))],
+    toolName,
+    finalTextPresent,
+  };
+}
+
+export async function runCodexAppServerRealInteractionProbe({
+  scenario,
+  codexExecutable = process.env.CODEX_BIN || 'codex',
+  createAdapter = createCodexAppServerAdapter,
+} = {}) {
+  const specification = realInteractionScenarios[scenario];
+  if (specification === undefined) {
+    throw new TypeError('scenario must be command_approval, file_approval, or request_user_input.');
+  }
+  const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), `zylos-global43-${scenario}-`));
+  const workspaceDirectory = path.join(temporaryDirectory, 'workspace');
+  fs.mkdirSync(workspaceDirectory, { recursive: true, mode: 0o700 });
+  const database = new Database(path.join(temporaryDirectory, 'c4.db'));
+  let service = null;
+  try {
+    const adapter = createAdapter({
+      codexExecutable,
+      cwd: workspaceDirectory,
+      approvalPolicy: 'on-request',
+      sandbox: 'workspace-write',
+    });
+    service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: `global43-real-interaction-${scenario}`,
+      workspaceRoot: workspaceDirectory,
+      generateId: deterministicIds(`global43-real-interaction-${scenario}`),
+    });
+    const envelope = normalEnvelope(`interaction-${scenario}`, specification.prompt);
+    const accepted = acceptNormalInbound(database, envelope, {
+      now: () => new Date().toISOString(),
+      generateId: deterministicIds(`global43-real-interaction-inbound-${scenario}`),
+    });
+    const waiting = await withTimeout(service.runNext(), 60_000, `${scenario} request`);
+    if (waiting?.status !== 'waiting_user') {
+      const durable = readRealInteractionEvidence(database, accepted);
+      return Object.freeze({
+        evidence_schema_version: 1,
+        provider_transport: 'official_app_server',
+        scenario,
+        triggered: false,
+        provider_result_status: waiting?.status ?? null,
+        provider_neutral_tool_name: durable.toolName,
+        bounded_artifact_created: specification.artifact === null
+          ? null
+          : fs.existsSync(path.join(workspaceDirectory, specification.artifact)),
+        final_text_present: durable.finalTextPresent,
+        normalized_event_kinds: durable.eventKinds,
+      });
+    }
+    if (waiting.request.kind !== specification.expectedKind) {
+      throw new Error(`${scenario} emitted ${waiting.request.kind} instead of the expected interaction kind.`);
+    }
+    const committed = service.submitInteractionAnswer(
+      realInteractionAnswer(waiting.request, scenario),
+    );
+    const delivered = await withTimeout(
+      service.deliverInteractionAnswer(committed.handoff_id),
+      60_000,
+      `${scenario} answer delivery`,
+    );
+    const durable = readRealInteractionEvidence(database, accepted);
+    if (specification.expectedToolName !== null && durable.toolName !== specification.expectedToolName) {
+      throw new Error(`${scenario} emitted ${durable.toolName ?? 'no tool'} instead of ${specification.expectedToolName}.`);
+    }
+    return Object.freeze({
+      evidence_schema_version: 1,
+      provider_transport: 'official_app_server',
+      scenario,
+      triggered: true,
+      pre_action_lease_fenced: specification.expectedToolName !== null,
+      provider_neutral_tool_name: durable.toolName,
+      provider_acknowledged: delivered?.acknowledgement?.status === 'accepted',
+      bounded_artifact_created: specification.artifact === null
+        ? null
+        : fs.existsSync(path.join(workspaceDirectory, specification.artifact)),
+      durable: Object.freeze({
+        interaction_state: durable.interaction?.state ?? null,
+        handoff_state: durable.handoff?.state ?? null,
+        answer_count: durable.answerCount,
+        audit_outcome: durable.audit?.outcome ?? null,
+        turn_state: durable.turn?.state ?? null,
+        normalized_event_kinds: durable.eventKinds,
+      }),
+    });
+  } finally {
+    try {
+      await service?.close();
+    } finally {
+      database.close();
+      fs.rmSync(temporaryDirectory, { recursive: true, force: true });
     }
   }
 }
@@ -592,15 +991,15 @@ export async function runCodexAppServerRealIntegration({
       unrun_cases: Object.freeze([
         Object.freeze({
           case: 'command_approval',
-          reason: 'Requires a controlled target-model/tool fixture that deterministically emits the server request without relying on an external side effect.',
+          reason: 'Two bounded official-target prompts in the dedicated Apple Container completed with no tool_started event or server request; the fixed target exposes no controlled fixture that forces command approval.',
         }),
         Object.freeze({
           case: 'file_approval',
-          reason: 'Requires a controlled target-model/tool fixture and an isolated one-shot write approval exercise.',
+          reason: 'Two bounded official-target prompts in the dedicated Apple Container completed with no tool_started event, file artifact, or server request; the fixed target exposes no controlled fixture that forces file approval.',
         }),
         Object.freeze({
           case: 'request_user_input',
-          reason: 'The target default-mode model does not deterministically expose requestUserInput to this client.',
+          reason: 'Two explicit default-mode official-target prompts completed with text only and no requestUserInput server request; collaboration mode remains disabled on the normal path.',
         }),
         Object.freeze({
           case: 'mcp_elicitation',

@@ -18,6 +18,17 @@ CLI process, or another provider transport as a substitute.
   `codex login status` must report a logged-in installation.
 - Authenticated lifecycle and interrupt probes require provider network access. The harness never
   prints or copies a credential.
+- Apple Container acceptance uses `container CLI version 1.1.0 (build release, commit 5973b9c)`,
+  Linux arm64, and
+  the credential-free [`Containerfile.codex-app-server-acceptance`](../Containerfile.codex-app-server-acceptance).
+  The image installs official `@openai/codex@0.144.5` with npm integrity
+  `sha512-jjB+K+OMv572mKhS+2QuLxWXDJNdpwbPenf+V+8bdq7wg4Scqt3cn6WEekD8wPqDVZqck0HSX17K9rD9kbDJQA==`,
+  asserts its exact CLI version while building, and defaults directly to
+  `codex app-server --stdio`.
+- Container credentials and rollout state live only in the dedicated named volume
+  `zylos-global43-codex-home-0-144-5` mounted at `/acceptance/codex-home`. The host `~/.codex` is
+  neither mounted nor copied. Authentication is performed after image build and is never written
+  into an image layer, repository file, command transcript, or emitted evidence.
 - All prompts use a fresh temporary read-only workspace. Negative auth, context, and transient
   probes use isolated temporary `CODEX_HOME` directories. The transient fixture points at the
   closed local endpoint `127.0.0.1:9` and uses a non-credential placeholder key.
@@ -26,6 +37,7 @@ Run the opt-in acceptance with:
 
 ```bash
 npm run test:integration:codex-app-server:real
+npm run test:integration:codex-app-server:native-smoke
 ```
 
 The named command first installs the existing `comm-bridge` native dependency and then invokes
@@ -36,9 +48,61 @@ and emit one machine-readable line prefixed with
 `ZYLOS_CODEX_APP_SERVER_REAL_EVIDENCE=`. Emitted credential state is the fixed enum
 `authenticated`; raw login-status output is used only for the local prerequisite check.
 
+For Linux arm64, build the candidate and run the same real runner with a PID-1 reaper:
+
+```bash
+container build --progress plain --platform linux/arm64 \
+  --build-arg CODEX_VERSION=0.144.5 \
+  --build-arg CANDIDATE_SHA="$CANDIDATE_SHA" \
+  --tag "zylos-global43-codex-app-server:0.144.5-$CANDIDATE_SHA" \
+  --file Containerfile.codex-app-server-acceptance .
+
+container run --remove --interactive --init \
+  --name zylos-global43-codex-acceptance \
+  --platform linux/arm64 \
+  --mount type=volume,source=zylos-global43-codex-home-0-144-5,target=/acceptance/codex-home \
+  --env CODEX_HOME=/acceptance/codex-home \
+  --env HOME=/acceptance/home \
+  --env ZYLOS_CODEX_APP_SERVER_EVIDENCE_FILE=/acceptance/codex-home/global43/real-evidence.json \
+  --workdir /opt/zylos \
+  "zylos-global43-codex-app-server:0.144.5-$CANDIDATE_SHA" \
+  node scripts/e2e/codex-app-server-real-integration.js
+
+container run --remove --interactive --init \
+  --name zylos-global43-codex-restart-resume \
+  --platform linux/arm64 \
+  --mount type=volume,source=zylos-global43-codex-home-0-144-5,target=/acceptance/codex-home \
+  --env CODEX_HOME=/acceptance/codex-home \
+  --env HOME=/acceptance/home \
+  --env ZYLOS_CODEX_APP_SERVER_EVIDENCE_FILE=/acceptance/codex-home/global43/real-evidence.json \
+  --workdir /opt/zylos \
+  "zylos-global43-codex-app-server:0.144.5-$CANDIDATE_SHA" \
+  node scripts/e2e/codex-app-server-restart-resume.js
+```
+
+Run each bounded positive-interaction attempt in its own fresh `--init` container by replacing
+`SCENARIO` below with `command_approval`, `file_approval`, or `request_user_input`:
+
+```bash
+container run --remove --interactive --init \
+  --name "zylos-global43-codex-${SCENARIO//_/-}" \
+  --platform linux/arm64 \
+  --mount type=volume,source=zylos-global43-codex-home-0-144-5,target=/acceptance/codex-home \
+  --env CODEX_HOME=/acceptance/codex-home \
+  --env HOME=/acceptance/home \
+  --workdir /opt/zylos \
+  "zylos-global43-codex-app-server:0.144.5-$CANDIDATE_SHA" \
+  node scripts/e2e/codex-app-server-interaction-probe.js "$SCENARIO"
+```
+
+`--init` is required because the deliberate side-effect-unknown fault kills the app-server process
+group. Without a container init reaper, Linux orphan zombies remain observable by the adapter's
+process-group barrier and the run correctly fails closed. With `--init`, the same probe proved the
+group disappeared without weakening Core's shutdown semantics.
+
 ## Real target evidence
 
-The 2026-07-21 acceptance run passed the following through the installed official target:
+The 2026-07-22 acceptance run passed the following through the installed official target:
 
 | Scenario | Evidence |
 |---|---|
@@ -52,6 +116,13 @@ The 2026-07-21 acceptance run passed the following through the installed officia
 | authentication | an isolated unauthenticated target exhausted its retry notifications; Core persisted `provider_auth_failed` and ended `failed` |
 | transient provider failure | an isolated target connection refusal persisted retryable `delivery_transient`; Core scheduled the safe retry |
 | side-effect unknown | the harness killed only its own executing app-server process group; Core persisted `side_effect_unknown` and entered `recovering` |
+| container restart | after the first acceptance container exited, a second fresh container mounted the same state volume, loaded the one thread ID shared by all three durable lifecycle turns, resumed it, and completed a subsequent turn |
+
+The separate macOS arm64 smoke uses
+[`scripts/e2e/codex-app-server-native-smoke.js`](../scripts/e2e/codex-app-server-native-smoke.js).
+It creates a fresh empty temporary `CODEX_HOME`, strips credential environment variables, starts a
+new native app-server process, performs `initialize`/`initialized`, checks `codex-cli 0.144.5`, and
+then deletes the temporary state. It does not connect to or reuse a running host Codex process.
 
 The real test asserts all three successful turns have exactly one native thread ID. The emitted
 evidence intentionally records the ID for that invocation rather than committing a machine-local
@@ -67,22 +138,29 @@ covered by the injected-protocol tests in
 interaction persistence tests. Those tests also cover stale notifications, requests, responses,
 answers, attempts, leases, connection IDs, and server request tombstones.
 
-These cases were not claimed as positive real-target passes:
+The dedicated Linux arm64 container ran two bounded prompts for each positive interaction case.
+Each attempt completed normally with `turn_state_changed`, `text_delta`, and `text_snapshot`, but no
+`tool_started`, no server request, and no command/file artifact. These cases are therefore recorded
+as real attempted-but-not-triggered, not positive passes:
 
-- Command approval: no controlled target-model/tool fixture was available to emit the request
-  deterministically without relying on an external side effect.
-- File approval: no isolated deterministic model/tool fixture was available for a one-shot write
-  request.
-- User input: the target default-mode model did not deterministically expose `requestUserInput` to
-  this client.
+- Command approval: `triggered=false`, `provider_neutral_tool_name=null`,
+  `bounded_artifact_created=false`; the target exposes no controlled fixture that forces the
+  server request.
+- File approval: `triggered=false`, `provider_neutral_tool_name=null`,
+  `bounded_artifact_created=false`; the target exposes no controlled fixture that forces the
+  server request.
+- User input: `triggered=false`, `provider_neutral_tool_name=null`; the normal default-mode target
+  returned text rather than a `requestUserInput` server request. Collaboration mode remains disabled.
 - MCP elicitation: production configuration deliberately disables and declines MCP. The fixed
   protocol does not provide Core's required synchronous pre-action lease fence before an MCP tool's
   external side effect, so a positive real MCP run would conflict with the Global14 baseline.
 - Stale server traffic: the official server has no acceptance API for forging stale protocol
   traffic; deterministic fail-closed protocol tests remain the evidence for this negative matrix.
 
-Residual risk is therefore limited to target-version drift and the lack of a controlled official
-target fixture for the positive server-request cases above. A CLI upgrade must regenerate the
+Residual risk is therefore target-version drift plus the lack of a controlled official target
+fixture for the positive server-request cases above. Their durable request/answer/acknowledgement
+and stale-traffic matrices remain deterministic protocol-injection evidence, not real positive
+server-request evidence. A CLI upgrade must regenerate the
 experimental schemas, update the fixed identity, and rerun this suite. MCP cannot become a positive
 normal-path acceptance without a requirements decision that supplies the missing synchronous Core
 fence; substituting another transport is prohibited.
