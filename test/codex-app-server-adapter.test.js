@@ -16,6 +16,7 @@ function createFakeAppServer({
   respondToInterrupt = true,
   respondToTurnStart = true,
   resumeTurns = [],
+  threadResumeError = null,
   turnStartResponsePatch = {},
 } = {}) {
   const child = new EventEmitter();
@@ -49,6 +50,10 @@ function createFakeAppServer({
         send({ id: message.id, result: { thread: { id: 'codex-thread-1' } } });
       } else if (message.method === 'thread/resume') {
         const threadId = message.params.threadId;
+        if (threadResumeError !== null) {
+          send({ id: message.id, error: threadResumeError });
+          continue;
+        }
         send({
           id: message.id,
           result: { thread: { id: threadId, turns: resumeTurns } },
@@ -241,6 +246,240 @@ function sendStartedCommand({ send, threadId, turnId }, itemId, {
 }
 
 describe('Codex app-server provider adapter', () => {
+  test('classifies the target app-server missing-rollout response as context invalid', async () => {
+    const server = createFakeAppServer({
+      threadResumeError: {
+        code: -32600,
+        message: 'no rollout found for thread id codex-thread-missing',
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(executeAdapter(adapter, executionContext({
+      lineage: { provider_native_id: 'codex-thread-missing' },
+    })))).rejects.toMatchObject({
+      code: 'provider_context_invalid',
+      providerError: {
+        code: 'provider_context_invalid',
+        category: 'provider',
+        retryable: false,
+        side_effect_status: 'none',
+      },
+    });
+  });
+
+  test('keeps a transient resume rejection retryable instead of treating it as lost context', async () => {
+    const server = createFakeAppServer({
+      threadResumeError: {
+        code: -32603,
+        message: 'provider unavailable with HTTP status 503',
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(executeAdapter(adapter, executionContext({
+      lineage: { provider_native_id: 'codex-thread-existing' },
+    })))).rejects.toMatchObject({
+      code: 'delivery_transient',
+      providerError: {
+        code: 'delivery_transient',
+        category: 'provider',
+        retryable: true,
+        side_effect_status: 'none',
+      },
+    });
+  });
+
+  test('waits through retry progress and classifies the target app-server final 401 as auth', async () => {
+    let completeTurn;
+    let finalErrorSent = false;
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'error',
+          params: {
+            error: {
+              message: 'Reconnecting... 2/5',
+              codexErrorInfo: {
+                responseStreamDisconnected: { httpStatusCode: 401 },
+              },
+              additionalDetails: 'redacted target app-server authentication failure',
+            },
+            willRetry: true,
+            threadId,
+            turnId,
+          },
+        });
+        send({
+          method: 'error',
+          params: {
+            error: {
+              message: 'unexpected status 401 Unauthorized',
+              codexErrorInfo: 'other',
+              additionalDetails: null,
+            },
+            willRetry: false,
+            threadId,
+            turnId,
+          },
+        });
+        finalErrorSent = true;
+        completeTurn = () => {
+          send({
+            method: 'turn/completed',
+            params: {
+              threadId,
+              turn: {
+                id: turnId,
+                status: 'failed',
+                items: [],
+                error: {
+                  message: 'unexpected status 401 Unauthorized',
+                  codexErrorInfo: 'other',
+                  additionalDetails: null,
+                },
+              },
+            },
+          });
+        };
+      },
+    });
+    const reportProviderFailure = jest.fn();
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const running = collect(executeAdapter(adapter, executionContext({ reportProviderFailure })));
+    running.catch(() => {});
+    let settled = false;
+    running.finally(() => { settled = true; }).catch(() => {});
+    await waitFor(() => finalErrorSent);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(settled).toBe(false);
+    expect(reportProviderFailure).not.toHaveBeenCalled();
+    completeTurn();
+    await expect(running).rejects.toMatchObject({
+        code: 'provider_auth_failed',
+        providerError: {
+          code: 'provider_auth_failed',
+          category: 'authentication',
+          retryable: false,
+          side_effect_status: 'none',
+        },
+      });
+    expect(reportProviderFailure).not.toHaveBeenCalled();
+    expect(server.child.kill).not.toHaveBeenCalled();
+  });
+
+  test('does not treat an error notification without turn/completed as timeout stop proof', async () => {
+    let finalErrorSent = false;
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'error',
+          params: {
+            error: { message: 'service unavailable HTTP status 503' },
+            willRetry: false,
+            threadId,
+            turnId,
+          },
+        });
+        finalErrorSent = true;
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      interruptConfirmationTimeoutMs: 5,
+    });
+    const context = executionContext();
+    const running = collect(executeAdapter(adapter, context));
+    running.catch(() => {});
+    await waitFor(() => finalErrorSent);
+
+    await expect(adapter.interrupt({
+      turn_id: context.turn_id,
+      attempt: context.attempt,
+      reason: 'timeout',
+    })).resolves.toEqual({ status: 'uncertain', reason: 'timeout' });
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+    await expect(running).rejects.toMatchObject({
+      providerError: { code: 'side_effect_unknown' },
+    });
+  });
+
+  test('uses the canonical terminal error after an earlier retry-progress classification', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'error',
+          params: {
+            error: { message: 'provider unavailable with HTTP status 503' },
+            willRetry: true,
+            threadId,
+            turnId,
+          },
+        });
+        send({
+          method: 'turn/completed',
+          params: {
+            threadId,
+            turn: {
+              id: turnId,
+              status: 'failed',
+              items: [],
+              error: { message: 'unexpected status 401 Unauthorized' },
+            },
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(executeAdapter(adapter, executionContext())))
+      .rejects.toMatchObject({
+        code: 'provider_auth_failed',
+        providerError: {
+          code: 'provider_auth_failed',
+          category: 'authentication',
+          retryable: false,
+          side_effect_status: 'none',
+        },
+      });
+  });
+
+  test('does not treat an error notification without turn/completed as abort proof', async () => {
+    let finalErrorSent = false;
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'error',
+          params: {
+            error: { message: 'service unavailable HTTP status 503' },
+            willRetry: false,
+            threadId,
+            turnId,
+          },
+        });
+        finalErrorSent = true;
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      interruptConfirmationTimeoutMs: 5,
+    });
+    const context = executionContext();
+    const running = collect(executeAdapter(adapter, context));
+    running.catch(() => {});
+    await waitFor(() => finalErrorSent);
+
+    await expect(adapter.abort(context)).resolves.toEqual({
+      status: 'provider_stopped',
+      provider_status: 'process_exited',
+    });
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
+    await expect(running).rejects.toMatchObject({
+      providerError: { code: 'side_effect_unknown' },
+    });
+  });
+
   test('advertises the workspace access enforced by its configured sandbox', () => {
     const spawnProcess = jest.fn();
 
@@ -2558,12 +2797,18 @@ describe('Codex app-server provider adapter', () => {
   });
 
   test.each([
-    ['error', {
+    ['error followed by failed terminal', {
       method: 'error',
       params: {
         threadId: 'codex-thread-1',
         turnId: 'codex-turn-1',
         error: { message: 'private provider error' },
+      },
+    }, {
+      method: 'turn/completed',
+      params: {
+        threadId: 'codex-thread-1',
+        turn: { id: 'codex-turn-1', status: 'failed', items: [] },
       },
     }],
     ['failed terminal', {
@@ -2587,7 +2832,8 @@ describe('Codex app-server provider adapter', () => {
         turn: { id: 'codex-turn-1', status: 'completed', items: [] },
       },
     }],
-  ])('reports a fenced provider failure for a waiting interaction on %s', async (_label, terminal) => {
+  ])('reports a fenced provider failure for a waiting interaction on %s', async (...testCase) => {
+    const [, terminal, followupTerminal = null] = testCase;
     const reportProviderFailure = jest.fn();
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
@@ -2607,6 +2853,11 @@ describe('Codex app-server provider adapter', () => {
     });
 
     server.send(terminal);
+    if (followupTerminal) {
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(reportProviderFailure).not.toHaveBeenCalled();
+      server.send(followupTerminal);
+    }
     await waitFor(() => reportProviderFailure.mock.calls.length === 1);
     expect(reportProviderFailure).toHaveBeenCalledWith(expect.objectContaining({
       providerError: expect.objectContaining({

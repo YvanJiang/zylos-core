@@ -104,6 +104,62 @@ function malformedTurnStartAppServer() {
   return child;
 }
 
+function classifiedFailureAppServer(error) {
+  const child = new EventEmitter();
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = (signal) => {
+    if (signal === 'SIGTERM') queueMicrotask(() => child.emit('close', 0, signal));
+    return true;
+  };
+  let buffer = '';
+  const send = (message) => child.stdout.write(`${JSON.stringify(message)}\n`);
+  child.stdin.on('data', (chunk) => {
+    buffer += chunk.toString('utf8');
+    while (buffer.includes('\n')) {
+      const newline = buffer.indexOf('\n');
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      if (line.length === 0) continue;
+      const message = JSON.parse(line);
+      if (message.method === 'initialize') {
+        send({ id: message.id, result: { userAgent: 'codex-test' } });
+      } else if (message.method === 'thread/start') {
+        send({ id: message.id, result: { thread: { id: 'codex-thread-classified' } } });
+      } else if (message.method === 'turn/start') {
+        const threadId = message.params.threadId;
+        const turnId = 'codex-turn-classified';
+        send({
+          id: message.id,
+          result: { turn: { id: turnId, status: 'inProgress', items: [] } },
+        });
+        queueMicrotask(() => {
+          send({
+            method: 'turn/started',
+            params: {
+              threadId,
+              turn: { id: turnId, status: 'inProgress', items: [] },
+            },
+          });
+          send({
+            method: 'error',
+            params: { error, willRetry: false, threadId, turnId },
+          });
+          send({
+            method: 'turn/completed',
+            params: {
+              threadId,
+              turn: { id: turnId, status: 'failed', items: [], error },
+            },
+          });
+        });
+      }
+    }
+  });
+  return child;
+}
+
 function readEvents(database, turnId) {
   return database.prepare(`
     SELECT event_json
@@ -1325,6 +1381,89 @@ describe('runtime executor service', () => {
     });
 
     database.close();
+  });
+
+  test('persists a terminal app-server 401 as failed instead of uncertain recovery', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'codex-auth-terminal');
+    const child = classifiedFailureAppServer({
+      message: 'unexpected status 401 Unauthorized',
+      codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 401 } },
+      additionalDetails: null,
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => child });
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-codex-auth-terminal',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('codex-auth-terminal'),
+    });
+
+    try {
+      await expect(service.runNext()).resolves.toMatchObject({
+        status: 'failed',
+        turn_id: accepted.turn_id,
+      });
+      expect(database.prepare(`
+        SELECT state FROM runtime_turns WHERE turn_id = ?
+      `).get(accepted.turn_id)).toEqual({ state: 'failed' });
+      const attempt = database.prepare(`
+        SELECT error_json FROM runtime_provider_attempts
+        WHERE turn_id = ? AND attempt_no = 1
+      `).get(accepted.turn_id);
+      expect(JSON.parse(attempt.error_json)).toMatchObject({
+        code: 'provider_auth_failed',
+        category: 'authentication',
+        retryable: false,
+        side_effect_status: 'none',
+      });
+    } finally {
+      await service.close();
+      database.close();
+    }
+  });
+
+  test('schedules a safe retry for a terminal app-server 503 instead of uncertain recovery', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'codex-transient-terminal');
+    const child = classifiedFailureAppServer({
+      message: 'provider unavailable with HTTP status 503',
+      additionalDetails: null,
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => child });
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-codex-transient-terminal',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('codex-transient-terminal'),
+      providerRetryJitterRatio: 0,
+    });
+
+    try {
+      await expect(service.runNext()).resolves.toMatchObject({
+        status: 'retry_scheduled',
+        turn_id: accepted.turn_id,
+        retry: { backoff_ms: 1_000 },
+      });
+      const attempt = database.prepare(`
+        SELECT state, side_effect_status, error_json
+        FROM runtime_provider_attempts WHERE turn_id = ? AND attempt_no = 1
+      `).get(accepted.turn_id);
+      expect(attempt).toMatchObject({ state: 'retry_wait', side_effect_status: 'none' });
+      expect(JSON.parse(attempt.error_json)).toMatchObject({
+        code: 'delivery_transient',
+        category: 'provider',
+        retryable: true,
+        side_effect_status: 'none',
+      });
+    } finally {
+      await service.close();
+      database.close();
+    }
   });
 
   test('maps a confirmed Codex cancellation terminal to stopped and preserves lineage', async () => {

@@ -23,8 +23,8 @@ The implementation was audited against:
 - locally generated experimental TypeScript and JSON Schema from
   `codex app-server generate-ts --experimental` and
   `codex app-server generate-json-schema --experimental`;
-- the official Codex app-server README and protocol source at commit
-  `0fb559f0f6e231a88ac02ea002d3ecd248e2b515`.
+- the official Codex app-server README and protocol source at tag `rust-v0.144.5`, commit
+  `87db9bc18ba5bc82c1cb4e4381b44f693ee35623`.
 
 The stdio connection performs `initialize`, waits for its response, and then sends `initialized`.
 It enables `experimentalApi`, disables request attestation, and advertises
@@ -42,14 +42,14 @@ Private app-server method and item names remain inside the adapter:
 | fenced `turn/started` | provider-neutral started signal; Core atomically authors `starting -> running` with `provider_started` |
 | `item/agentMessage/delta` and completed agent message | `text_delta` and `text_snapshot` |
 | command and file lifecycle | `tool_started`, `tool_progress`, `tool_finished`; item IDs, progress methods, and fixed-version statuses are fenced by type |
-| MCP, dynamic, collaboration, web, image, or provider-hook lifecycle | capability failure; these paths are disabled because their fixed execution surface lacks the required synchronous Core fence |
+| MCP, dynamic, collaboration, web, image, or provider-hook lifecycle | capability failure; these paths are disabled because the current locked configuration has not established every required synchronous Core fence and bypass exclusion |
 | completed turn | adapter iterator completion; Core authors the canonical completed state |
 | failed/interrupted turn, error notification, or lost connection | typed provider failure; Core authors the canonical failure or recovery state |
 | fenced token-usage and moderation telemetry | intentionally omitted because the public normalized-event contract has no usage/score event and private provider scores must not escape the adapter |
 | command/file approval | one-shot `accept` only after the current durable permission and workspace fences; otherwise a durable `tool_approval` interaction, with the same workspace fence repeated before an approved handoff is sent |
 | permissions approval | empty turn-scoped denial followed by capability failure; the adapter never creates a turn/session filesystem or network grant |
 | single-question `requestUserInput` | durable `question` or fixed `choice` interaction with answer constraints preserved |
-| MCP elicitation or tool execution | disabled and declined because the fixed protocol has no Core-controlled synchronous gate before an MCP tool's external side effects |
+| MCP elicitation or tool execution | disabled and declined; 0.144.5 has a conditional model-initiated prompt seam, but this candidate neither enables nor proves all configuration, reviewer, hook/Guardian/cache, direct-RPC, and durable-lease conditions required to use it safely |
 
 User-supplied answers are accepted only through Core's durable interaction-answer and handoff
 records. The
@@ -103,6 +103,15 @@ unexpected hook, MCP/dynamic/collaboration/web/image item, dynamic tool
 server request, permission-profile request, or MCP elicitation is refused and retires the
 connection; its item-start notification is only contradiction evidence, never claimed as the
 pre-action fence.
+
+Official 0.144.5 source does contain a conditional blocking seam for a model-initiated MCP tool
+when every server/tool uses prompt approval, review reaches app-server, no hook, Guardian, or cache
+auto-allows the call, and the elicitation feature remains enabled. That seam precedes the external
+`manager.call_tool` operation, so it may support a future Global14 implementation. It is not enabled
+or claimed by this candidate: the configuration and every bypass remain fail-closed, and the
+client-initiated `mcpServer/tool/call` RPC bypasses that seam entirely. The version-specific source
+and fixture audit is recorded in
+[`codex-app-server-0.144.5-fence-research.md`](./codex-app-server-0.144.5-fence-research.md).
 
 The remaining app-server RPCs with independent side effects (`thread/shellCommand`, `command/exec`,
 `process/spawn`, `fs/writeFile`, configuration/plugin mutation, direct MCP calls, and their control
@@ -168,4 +177,6 @@ are rejected instead of fabricating an acknowledgement or collapsing distinct qu
 Real local verification requires an authenticated Codex
 installation and exercises only safe read-only prompts and explicit negative/interrupt protocol
 paths; approval, user-input, and MCP elicitation require a controlled provider/tool fixture before
-they can be asserted end to end without creating external side effects.
+they can be asserted end to end without creating external side effects. The fixed target,
+prerequisites, machine-readable runner, completed matrix, unrun cases, and residual risks are
+recorded in [`codex-app-server-real-integration.md`](./codex-app-server-real-integration.md).
