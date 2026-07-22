@@ -104,13 +104,15 @@ describe('Global47 cross-system fault-injection gate', () => {
     const evidence = buildCrossSystemFaultInjectionEvidence({
       repositoryEvidence,
       probeResults: outcome.results,
-      contractEvidence: Object.keys(EXPECTED_BASELINES).map((repository) => ({
-        repository,
-        fixture_sha256: 'c'.repeat(64),
-        raw_jcs_count: 11,
-        idempotency_key_count: 6,
-        payload_hash_count: 6,
-      })),
+      contractEvidence: Object.keys(EXPECTED_BASELINES)
+        .filter((repository) => repository !== 'zylos-core')
+        .map((repository) => ({
+          repository,
+          fixture_sha256: 'c'.repeat(64),
+          raw_jcs_count: 11,
+          idempotency_key_count: 6,
+          payload_hash_count: 6,
+        })),
       realEvidence: {
         claude: { status: 'unavailable', reason: 'credential_unavailable' },
         codex: { status: 'unavailable', reason: 'controlled_fixture_unavailable' },
@@ -125,6 +127,7 @@ describe('Global47 cross-system fault-injection gate', () => {
     expect(evidence.real_status).toBe('unavailable');
     expect(evidence.release_ready).toBe(false);
     expect(evidence.cases).toHaveLength(CROSS_SYSTEM_FAULT_CASES.length);
+    expect(evidence.contract_evidence).toHaveLength(4);
     expect(() => validateCrossSystemFaultInjectionEvidence(evidence)).not.toThrow();
   });
 

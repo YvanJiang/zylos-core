@@ -63,7 +63,7 @@ ZYLOS_GLOBAL47_FAULT_INJECTION_EVIDENCE=
 ```
 
 The JSON record contains repository heads/merge-bases/clean state, all 25 case records, hashed
-probe outputs, safe channel observations, exact tool versions, and five consumer-owned contract
+probe outputs, safe channel observations, exact tool versions, and four consumer-owned contract
 records. Contract records are accepted only when each consumer emits the current Core fixture
 SHA and positive independent raw-JCS, idempotency-key, and payload-hash counts.
 

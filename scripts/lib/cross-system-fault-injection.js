@@ -18,6 +18,10 @@ export const CROSS_SYSTEM_BASELINES = Object.freeze({
   'luna-pet': '59ce7e9b43539c63423c1f09c43eeaac06e5c6f5',
 });
 
+const CONTRACT_CONSUMERS = Object.freeze(
+  Object.keys(CROSS_SYSTEM_BASELINES).filter((repository) => repository !== 'zylos-core'),
+);
+
 export const REQUIRED_ACCEPTANCE_DIMENSIONS = Object.freeze([
   'classification',
   'user_notification',
@@ -441,15 +445,15 @@ export function validateCrossSystemRepositoryEvidence(repositories) {
 }
 
 function validateContractEvidence(entries) {
-  if (!Array.isArray(entries) || entries.length !== Object.keys(CROSS_SYSTEM_BASELINES).length) {
-    throw new TypeError('one contract evidence record per repository is required');
+  if (!Array.isArray(entries) || entries.length !== CONTRACT_CONSUMERS.length) {
+    throw new TypeError('one raw contract evidence record per consumer is required');
   }
   const repositories = new Set();
   let fixtureSha = null;
   for (const entry of entries) {
     const value = requireRecord('contract evidence entry', entry);
-    if (!Object.hasOwn(CROSS_SYSTEM_BASELINES, value.repository)) {
-      throw new TypeError('unknown contract evidence repository');
+    if (!CONTRACT_CONSUMERS.includes(value.repository)) {
+      throw new TypeError('unknown contract evidence consumer');
     }
     if (repositories.has(value.repository)) throw new TypeError('duplicate contract evidence');
     repositories.add(value.repository);

@@ -38,13 +38,15 @@ function contractEnvironment(directories) {
 }
 
 function normalizeContractEvidence(outcome) {
-  return outcome.results.map(({ repository, evidence }) => ({
-    repository,
-    fixture_sha256: evidence.core_fixture_sha256,
-    raw_jcs_count: evidence.computations.jcs_bytes_from_raw_payload,
-    idempotency_key_count: evidence.computations.idempotency_key_from_raw_payload,
-    payload_hash_count: evidence.computations.payload_hash_from_raw_payload,
-  }));
+  return outcome.results
+    .filter(({ evidence }) => evidence !== null)
+    .map(({ repository, evidence }) => ({
+      repository,
+      fixture_sha256: evidence.core_fixture_sha256,
+      raw_jcs_count: evidence.computations.jcs_bytes_from_raw_payload,
+      idempotency_key_count: evidence.computations.idempotency_key_from_raw_payload,
+      payload_hash_count: evidence.computations.payload_hash_from_raw_payload,
+    }));
 }
 
 try {
