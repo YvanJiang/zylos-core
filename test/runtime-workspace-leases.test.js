@@ -632,6 +632,12 @@ describe('durable workspace lease coordinator', () => {
       SELECT state FROM runtime_workspace_leases WHERE holder_turn_id = ?
     `).get(turn.turn_id)).toEqual({ state: 'released' });
     expect(restartedDatabase.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(turn.turn_id)).toEqual({ state: 'stopped' });
+    expect(restartedDatabase.prepare(`
+      SELECT status FROM runtime_turn_queue WHERE turn_id = ?
+    `).get(turn.turn_id)).toEqual({ status: 'stopped' });
+    expect(restartedDatabase.prepare(`
       SELECT owner_service_instance_id FROM runtime_executor_residents
       WHERE conversation_id = ?
     `).get(turn.conversation_id)).toEqual({ owner_service_instance_id: null });
@@ -842,13 +848,98 @@ describe('durable workspace lease coordinator', () => {
     expect(store.releaseRecoveringExecutorOwnership(turnContext)).toEqual({
       lease_released: true,
       resident_released: false,
+      terminal_state: 'stopped',
       workspace_released: true,
     });
     expect(database.prepare(`
       SELECT state FROM runtime_workspace_leases WHERE holder_turn_id = ?
     `).get(turn.turn_id)).toEqual({ state: 'released' });
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(turn.turn_id)).toEqual({ state: 'stopped' });
 
     database.close();
+  });
+
+  test('startup reconciliation terminalizes a released orphan recovery that still owns the queue', () => {
+    const fixture = createFixture();
+    const turn = acceptQueuedTurn(fixture.database, 'released-orphan', 'chat-released-orphan');
+    const store = createExecutorStore({
+      database: fixture.database,
+      provider: 'codex',
+      serviceInstanceId: 'workspace-released-orphan-old',
+      now: () => '2026-07-19T13:08:10.000Z',
+      generateId: deterministicIds('workspace-released-orphan-old'),
+      leaseDurationMs: 1_000,
+      workspaceLeaseDurationMs: 1_000,
+      interactionTimeoutMs: 1_000,
+    });
+    const workspaceAccess = { workspace_root: fixture.workspace, mode: 'writable' };
+    const reservation = store.reserveNextExecutor({
+      maxResidentExecutorsPerBot: 1,
+      workspaceAccessByConversation: new Map([[turn.conversation_id, workspaceAccess]]),
+    });
+    const turnContext = store.claimNextQueuedTurn({
+      conversationId: turn.conversation_id,
+      workspaceAccess,
+      workspaceLease: reservation.workspace,
+    });
+    store.transitionTurn(turnContext, 'starting', 'running');
+    store.transitionTurn(turnContext, 'running', 'recovering', {
+      reasonCode: 'workspace_lease_expired',
+      recovery: {
+        waitForDecision: true,
+        error: {
+          code: 'workspace_lease_expired',
+          category: 'conflict',
+          retryable: false,
+          side_effect_status: 'unknown',
+          user_message: 'Workspace ownership expired while work was active.',
+        },
+      },
+    });
+    fixture.database.prepare(`
+      UPDATE runtime_executor_leases
+      SET lease_owner = NULL, turn_id = NULL, attempt_id = NULL,
+        attempt_no = NULL, lease_expires_at = NULL, updated_at = ?
+      WHERE conversation_id = ?
+    `).run('2026-07-19T13:08:11.000Z', turn.conversation_id);
+    fixture.database.prepare(`
+      UPDATE runtime_workspace_leases
+      SET state = 'released', released_at = ?, updated_at = ?
+      WHERE workspace_lease_id = ?
+    `).run(
+      '2026-07-19T13:08:11.000Z',
+      '2026-07-19T13:08:11.000Z',
+      turnContext.workspace.workspace_lease_id,
+    );
+
+    const restartedStore = createExecutorStore({
+      database: fixture.database,
+      provider: 'codex',
+      serviceInstanceId: 'workspace-released-orphan-new',
+      now: () => '2026-07-19T13:08:12.000Z',
+      generateId: deterministicIds('workspace-released-orphan-new'),
+    });
+    const reconciliation = restartedStore.reconcileNonterminalTurns(
+      [],
+      'startup_reconciliation',
+    );
+
+    expect(reconciliation.results).toEqual([
+      {
+        turn_id: turn.turn_id,
+        status: 'terminalized_released_recovery',
+      },
+    ]);
+    expect(fixture.database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(turn.turn_id)).toEqual({ state: 'stopped' });
+    expect(fixture.database.prepare(`
+      SELECT status FROM runtime_turn_queue WHERE turn_id = ?
+    `).get(turn.turn_id)).toEqual({ status: 'stopped' });
+
+    fixture.database.close();
   });
 
   test('serializes overlapping writes and trusts read-only mode only from provider sandbox', () => {
@@ -1264,7 +1355,10 @@ describe('durable workspace lease coordinator', () => {
     expect(database.prepare(`
       SELECT event_json FROM runtime_normalized_events
       WHERE turn_id = ? ORDER BY event_sequence DESC LIMIT 1
-    `).get(turn.turn_id).event_json).toContain('workspace_lease_expired');
+    `).get(turn.turn_id).event_json).toContain('provider_isolated_manual_recovery_required');
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(turn.turn_id)).toEqual({ state: 'stopped' });
 
     await service.close();
     database.close();

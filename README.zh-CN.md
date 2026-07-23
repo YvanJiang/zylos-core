@@ -83,6 +83,10 @@ curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/in
 | `OPENAI_API_KEY` | `--codex-api-key` |
 | `OPENAI_BASE_URL` | `--codex-base-url` |
 
+Codex 场景下，`--codex-base-url` / `OPENAI_BASE_URL` 会被写成
+`config.toml` 里的 provider 路由（`[model_providers.<provider>] base_url = ...`），
+而不是依赖进程级的 base URL。
+
 **退出码：** `0` = 成功，`1` = 致命错误（如无效 token），`2` = 部分成功（如 Caddy 下载失败但其他步骤正常）。
 
 </details>

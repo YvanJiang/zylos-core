@@ -17,6 +17,7 @@ import {
 } from '../cli/lib/executor-service-lifecycle.js';
 
 import { resolveCliEntry } from '../cli/launcher.js';
+import { resolveActiveRelease } from '../runtime/executor/launcher.js';
 import { runtimeCommand } from '../cli/commands/runtime.js';
 import { classifyExecutorUpgradeControlFailure } from '../cli/commands/component.js';
 
@@ -488,6 +489,39 @@ describe('installed CLI release dispatcher', () => {
 
     expect(resolveCliEntry({ zylosDir, packageRoot: current }))
       .toBe(path.join(target, 'cli', 'zylos.js'));
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+});
+
+describe('installed executor release dispatcher', () => {
+  test('can ignore active release for Docker sidecar manifests', () => {
+    const directory = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-executor-release-'));
+    const current = path.join(directory, 'current');
+    const target = path.join(directory, 'target');
+    const zylosDir = path.join(directory, 'installation');
+    for (const release of [current, target]) {
+      fs.mkdirSync(path.join(release, 'runtime', 'executor'), { recursive: true });
+      fs.writeFileSync(path.join(release, 'runtime', 'executor', 'daemon.js'), '#!/usr/bin/env node\n');
+    }
+    fs.mkdirSync(path.join(zylosDir, 'runtime'), { recursive: true });
+    fs.writeFileSync(path.join(zylosDir, 'runtime', 'active-release.json'), JSON.stringify({
+      release_ref: 'release-B',
+      release_path: target,
+      upgrade_id: 'upgrade-B',
+    }));
+
+    expect(resolveActiveRelease({ zylosDir, packageRoot: current, useActiveRelease: false }))
+      .toMatchObject({
+        entry: path.join(current, 'runtime', 'executor', 'daemon.js'),
+        releaseRef: null,
+        upgradeId: null,
+      });
+    expect(resolveActiveRelease({ zylosDir, packageRoot: current }))
+      .toMatchObject({
+        entry: path.join(target, 'runtime', 'executor', 'daemon.js'),
+        releaseRef: 'release-B',
+        upgradeId: 'upgrade-B',
+      });
     fs.rmSync(directory, { recursive: true, force: true });
   });
 });

@@ -360,6 +360,56 @@ describe('acceptNormalInbound', () => {
     database.close();
   });
 
+  test('starts a new default lineage when the previous default provider thread is invalid', () => {
+    const database = openTestDatabase();
+    const dependencies = deterministicOptions();
+    const first = acceptNormalInbound(database, normalEnvelope(), dependencies);
+
+    database.prepare(`
+      UPDATE runtime_lineages
+      SET provider = 'codex',
+          provider_native_id = 'codex-thread-lost',
+          provider_native_id_bound_at = ?,
+          provider_native_state = 'invalid'
+      WHERE lineage_id = ?
+    `).run('2026-07-19T06:01:00Z', first.lineage_id);
+
+    const second = acceptNormalInbound(
+      database,
+      nextEnvelope(normalEnvelope(), 'after-invalid-default'),
+      dependencies,
+    );
+
+    expect(second.status).toBe('accepted');
+    expect(second.conversation_id).toBe(first.conversation_id);
+    expect(second.lineage_id).not.toBe(first.lineage_id);
+    expect(second.lineage_resolution_state).toBe('bound');
+    expect(database.prepare(`
+      SELECT lineage_id, is_default, provider_native_state
+      FROM runtime_lineages
+      WHERE conversation_id = ?
+      ORDER BY created_at ASC, lineage_id ASC
+    `).all(first.conversation_id)).toEqual([
+      {
+        lineage_id: first.lineage_id,
+        is_default: 0,
+        provider_native_state: 'invalid',
+      },
+      {
+        lineage_id: second.lineage_id,
+        is_default: 1,
+        provider_native_state: 'unknown',
+      },
+    ]);
+    expect(database.prepare(`
+      SELECT lineage_id
+      FROM runtime_turns
+      WHERE turn_id = ?
+    `).get(second.turn_id)).toEqual({ lineage_id: second.lineage_id });
+
+    database.close();
+  });
+
   test('replays the first result after restart and rejects a changed payload without side effects', () => {
     const database = openTestDatabase();
     const databasePath = database.name;

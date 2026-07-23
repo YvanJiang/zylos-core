@@ -5,6 +5,8 @@ import { createInterface } from 'node:readline';
 const DEFAULT_ENV_ALLOWLIST = Object.freeze([
   'CODEX_API_KEY',
   'CODEX_HOME',
+  'CODEX_NETWORK_ACCESS',
+  'CODEX_PROVIDER_TURN_TIMEOUT_MS',
   'COLORTERM',
   'HOME',
   'HTTPS_PROXY',
@@ -25,10 +27,12 @@ const DEFAULT_ENV_ALLOWLIST = Object.freeze([
   'TERM',
   'TMPDIR',
   'USER',
+  'ZYLOS_PROVIDER_TURN_TIMEOUT_MS',
   'https_proxy',
   'http_proxy',
   'no_proxy',
 ]);
+const DEFAULT_TURN_EXECUTION_TIMEOUT_MS = 600_000;
 
 const APP_SERVER_FEATURE_DISABLES = Object.freeze([
   'hooks',
@@ -79,6 +83,15 @@ function providerErrorFor(code) {
       retryable: false,
       side_effect_status: 'unknown',
       user_message: 'The provider requested an unsupported interaction.',
+    };
+  }
+  if (code === 'provider_execution_timed_out') {
+    return {
+      code: 'provider_execution_timed_out',
+      category: 'provider',
+      retryable: false,
+      side_effect_status: 'none',
+      user_message: 'Codex provider execution timed out.',
     };
   }
   return {
@@ -173,6 +186,19 @@ function supervisedProcessGroupIsAlive(processGroupId) {
   }
 }
 
+function runtimeProcessGroupEvidence(recovery) {
+  const processEvidence = recovery?.runtime_evidence?.process;
+  if (!processEvidence || typeof processEvidence !== 'object' || Array.isArray(processEvidence)) {
+    return null;
+  }
+  if (!Number.isSafeInteger(processEvidence.pgid) || processEvidence.pgid <= 0) {
+    return null;
+  }
+  return Object.freeze({
+    process_group_id: processEvidence.pgid,
+  });
+}
+
 function serverRequestTombstone({ thread_id: threadId, turn_id: turnId, method, params }) {
   return Object.freeze({
     thread_id: threadId,
@@ -190,6 +216,21 @@ function selectEnvironment(source, allowlist) {
     }
   }
   return selected;
+}
+
+function resolveNetworkAccess(env) {
+  const value = env.CODEX_NETWORK_ACCESS;
+  if (typeof value !== 'string') return false;
+  return ['1', 'true', 'yes', 'on', 'enabled'].includes(value.trim().toLowerCase());
+}
+
+function resolveTurnExecutionTimeoutMs(env) {
+  const raw = env.CODEX_PROVIDER_TURN_TIMEOUT_MS ?? env.ZYLOS_PROVIDER_TURN_TIMEOUT_MS;
+  if (raw === undefined || raw === null || raw === '') return DEFAULT_TURN_EXECUTION_TIMEOUT_MS;
+  const normalized = String(raw).trim().toLowerCase();
+  if (['0', 'false', 'off', 'disabled', 'none'].includes(normalized)) return null;
+  const parsed = Number(normalized);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : Number.NaN;
 }
 
 function requireExecutionContext(context) {
@@ -592,6 +633,8 @@ export function createCodexAppServerAdapter({
   spawnProcess = spawn,
   cwd,
   env = process.env,
+  networkAccess = resolveNetworkAccess(env),
+  turnExecutionTimeoutMs = resolveTurnExecutionTimeoutMs(env),
   envAllowlist = DEFAULT_ENV_ALLOWLIST,
   clientInfo = Object.freeze({ name: 'zylos-core', title: 'Zylos Core', version: '0.6.0' }),
   approvalPolicy = 'on-request',
@@ -646,6 +689,15 @@ export function createCodexAppServerAdapter({
     throw new TypeError('timeout functions must be callable');
   }
   if (typeof now !== 'function') throw new TypeError('now must be a function');
+  if (typeof networkAccess !== 'boolean') {
+    throw new TypeError('networkAccess must be a boolean');
+  }
+  if (
+    turnExecutionTimeoutMs !== null
+    && (!Number.isSafeInteger(turnExecutionTimeoutMs) || turnExecutionTimeoutMs <= 0)
+  ) {
+    throw new TypeError('turnExecutionTimeoutMs must be a positive safe integer or null');
+  }
 
   const childEnvironment = selectEnvironment(env, envAllowlist);
   const effectiveCwd = cwd ?? process.cwd();
@@ -2265,6 +2317,27 @@ export function createCodexAppServerAdapter({
       side_effect_observed: false,
     };
     inFlightTurnStarts.add(run);
+    let executionTimeout = null;
+    const clearExecutionTimeout = () => {
+      if (executionTimeout === null) return;
+      clearTimeoutFn(executionTimeout);
+      executionTimeout = null;
+    };
+    if (turnExecutionTimeoutMs !== null) {
+      executionTimeout = setTimeoutFn(() => {
+        executionTimeout = null;
+        const runKey = run.turn_id === null ? null : activeRunKey(run.thread_id, run.turn_id);
+        const runIsCurrent = inFlightTurnStarts.has(run)
+          || (runKey !== null
+            && (startingRuns.get(runKey) === run || activeRuns.get(runKey) === run));
+        if (!runIsCurrent || target.failed) return;
+        failConnection(target, new CodexAppServerAdapterError(
+          'provider_execution_timed_out',
+          `Codex app-server turn exceeded ${turnExecutionTimeoutMs}ms without completing.`,
+        ));
+      }, turnExecutionTimeoutMs);
+      executionTimeout?.unref?.();
+    }
     try {
       const threadId = await loadThread(target, context, controls, run);
       run.thread_id = threadId;
@@ -2277,7 +2350,7 @@ export function createCodexAppServerAdapter({
         cwd: effectiveCwd,
         approvalPolicy: providerApprovalPolicy,
         approvalsReviewer: 'user',
-        sandboxPolicy: { type: 'readOnly', networkAccess: false },
+        sandboxPolicy: { type: 'readOnly', networkAccess },
         environments: [],
       }, {
         onResult: (response) => {
@@ -2294,6 +2367,7 @@ export function createCodexAppServerAdapter({
     try {
       yield* run.queue;
     } finally {
+      clearExecutionTimeout();
       inFlightTurnStarts.delete(run);
       if (run.turn_id !== null) {
         const runKey = activeRunKey(run.thread_id, run.turn_id);
@@ -2664,6 +2738,33 @@ export function createCodexAppServerAdapter({
     );
   }
 
+  async function isolateOrphanedWorkspace(recovery) {
+    const evidence = runtimeProcessGroupEvidence(recovery);
+    if (evidence === null) {
+      return Object.freeze({
+        isolated: false,
+        provider_status: 'missing_process_group_evidence',
+      });
+    }
+    try {
+      if (isProcessGroupAlive(evidence.process_group_id)) {
+        return Object.freeze({
+          isolated: false,
+          provider_status: 'process_group_alive',
+        });
+      }
+    } catch {
+      return Object.freeze({
+        isolated: false,
+        provider_status: 'process_group_unknown',
+      });
+    }
+    return Object.freeze({
+      isolated: true,
+      provider_status: 'process_group_exited',
+    });
+  }
+
   async function close() {
     const target = connection;
     if (!target) return [];
@@ -2697,6 +2798,7 @@ export function createCodexAppServerAdapter({
     execute,
     getWorkspaceAccess,
     interrupt,
+    isolateOrphanedWorkspace,
     prepareInteractionAnswer,
     queryInteractionHandoffAcceptance,
     recoverLineage,

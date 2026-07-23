@@ -10,8 +10,17 @@
 # ────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
+if [ "$(id -u)" = "0" ]; then
+  mkdir -p /home/zylos/.codex /home/zylos/.claude /home/zylos/zylos
+  chown -R zylos:zylos /home/zylos/.codex /home/zylos/.claude /home/zylos/zylos
+  export HOME=/home/zylos
+  exec /usr/sbin/runuser --preserve-environment -u zylos -- "$0" "$@"
+fi
+
 ZYLOS_DIR="${HOME}/zylos"
 ENV_FILE="${ZYLOS_DIR}/.env"
+export ZYLOS_PACKAGE_ROOT="${ZYLOS_PACKAGE_ROOT:-${HOME}/.npm-global/lib/node_modules/zylos}"
+export ZYLOS_EXECUTOR_IGNORE_ACTIVE_RELEASE="${ZYLOS_EXECUTOR_IGNORE_ACTIVE_RELEASE:-1}"
 
 # ── Colour helpers ────────────────────────────────────────────────────────────
 info()  { echo -e "\033[0;36m[zylos]\033[0m $*"; }
@@ -41,6 +50,17 @@ if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && \
   fi
 fi
 ok "Authentication configured"
+
+if [ -z "${OPENAI_API_KEY:-}" ] && [ -n "${CODEX_API_KEY:-}" ]; then
+  export OPENAI_API_KEY="${CODEX_API_KEY}"
+fi
+if [ -z "${OPENAI_BASE_URL:-}" ] && [ -n "${CODEX_PROVIDER_BASE_URL:-}" ]; then
+  export OPENAI_BASE_URL="${CODEX_PROVIDER_BASE_URL}"
+fi
+if [ -n "${OPENAI_API_KEY:-}" ]; then
+  node -e "const fs=require('node:fs'); const os=require('node:os'); const path=require('node:path'); const key=process.env.OPENAI_API_KEY; if (!key) process.exit(0); const dir=path.join(os.homedir(), '.codex'); const file=path.join(dir, 'auth.json'); fs.mkdirSync(dir, {recursive:true}); let auth={}; try { auth=JSON.parse(fs.readFileSync(file, 'utf8')); } catch {} auth.auth_mode='apikey'; auth.OPENAI_API_KEY=key; fs.writeFileSync(file, JSON.stringify(auth, null, 2) + '\n', {mode:0o600});"
+  ok "Codex auth store prepared"
+fi
 
 # ── Step 2: Workspace initialisation via zylos init ───────────────────────────
 # zylos init handles: directory structure, .env creation from template,
@@ -107,12 +127,39 @@ upsert_env "LARK_APP_SECRET" "${LARK_APP_SECRET:-}"
 # on subsequent restarts without relying on Docker's environment re-injection.
 upsert_env "OPENAI_API_KEY" "${OPENAI_API_KEY:-}"
 upsert_env "CODEX_API_KEY" "${CODEX_API_KEY:-}"
+upsert_env "OPENAI_BASE_URL" "${OPENAI_BASE_URL:-}"
+upsert_env "CODEX_PROVIDER_BASE_URL" "${CODEX_PROVIDER_BASE_URL:-}"
+upsert_env "CODEX_NETWORK_ACCESS" "${CODEX_NETWORK_ACCESS:-}"
+upsert_env "CODEX_PROVIDER_TURN_TIMEOUT_MS" "${CODEX_PROVIDER_TURN_TIMEOUT_MS:-}"
+upsert_env "ZYLOS_PROVIDER_TURN_TIMEOUT_MS" "${ZYLOS_PROVIDER_TURN_TIMEOUT_MS:-}"
 
 # Save current PATH so PM2 services can find claude and node
 upsert_env "SYSTEM_PATH" "${PATH}"
 
 # ── Step 3: Start PM2 services ────────────────────────────────────────────────
 step 3 "Starting executor service..."
+
+RELEASE_SCRIPT="${ZYLOS_PACKAGE_ROOT}/docker/publish-active-release.js"
+if [ ! -f "${RELEASE_SCRIPT}" ]; then
+  error "Docker release publisher script is missing: ${RELEASE_SCRIPT}"
+  exit 1
+fi
+node "${RELEASE_SCRIPT}" "${ZYLOS_DIR}" "${ZYLOS_PACKAGE_ROOT}"
+
+PM2_TEMPLATE="${ZYLOS_PACKAGE_ROOT}/templates/pm2/ecosystem.config.cjs"
+if [ ! -f "${PM2_TEMPLATE}" ]; then
+  error "PM2 ecosystem template is missing: ${PM2_TEMPLATE}"
+  exit 1
+fi
+mkdir -p "${ZYLOS_DIR}/pm2"
+cp "${PM2_TEMPLATE}" "${ZYLOS_DIR}/pm2/ecosystem.config.cjs"
+
+FENCE_SCRIPT="${ZYLOS_PACKAGE_ROOT}/docker/prepare-executor-start.js"
+if [ ! -f "${FENCE_SCRIPT}" ]; then
+  error "Executor start preparation script is missing: ${FENCE_SCRIPT}"
+  exit 1
+fi
+node "${FENCE_SCRIPT}" "${ZYLOS_DIR}"
 
 # ── All done ──────────────────────────────────────────────────────────────────
 echo ""

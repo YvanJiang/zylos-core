@@ -126,6 +126,7 @@ describe('runtime base URL support', () => {
     assert.equal(claudeSettings.env.ANTHROPIC_BASE_URL, 'https://claude-proxy.example.com');
 
     const codexConfig = fs.readFileSync(path.join(tmpRoot, '.codex', 'config.toml'), 'utf8');
-    assert.match(codexConfig, /openai_base_url = "https:\/\/codex-proxy\.example\.com\/v1"/);
+    assert.match(codexConfig, /^model_provider = "OpenAI"$/m);
+    assert.match(codexConfig, /\[model_providers\.OpenAI\][\s\S]*base_url = "https:\/\/codex-proxy\.example\.com\/v1"/);
   });
 });

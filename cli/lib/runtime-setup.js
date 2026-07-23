@@ -315,7 +315,7 @@ const CODEX_PROJECT_HEADER = [
 
 const CODEX_GLOBAL_HEADER = [
   '# Codex global config.',
-  '# Zylos manages its project trust entry and optional base URL; other settings are preserved.',
+  '# Zylos manages its project trust entry and optional provider routing; other settings are preserved.',
 ].join('\n');
 
 const CODEX_NOTICE = {
@@ -347,6 +347,90 @@ function isTomlSectionValue(value) {
   return value && typeof value === 'object' && !Array.isArray(value);
 }
 
+function firstString(...values) {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+function firstDefined(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null && value !== '') return value;
+  }
+  return undefined;
+}
+
+function optionalBoolean(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  }
+  return undefined;
+}
+
+function resolveCodexConfigOptions(opts = {}, env = {}) {
+  const providerBaseUrl = firstString(
+    opts.providerBaseUrl,
+    opts.openaiBaseUrl,
+    env.CODEX_PROVIDER_BASE_URL,
+    env.OPENAI_BASE_URL,
+  );
+  const modelProvider = firstString(
+    opts.modelProvider,
+    env.CODEX_MODEL_PROVIDER,
+    providerBaseUrl ? 'OpenAI' : undefined,
+  );
+
+  return {
+    modelProvider,
+    model: firstString(opts.model, env.CODEX_MODEL),
+    reviewModel: firstString(opts.reviewModel, env.CODEX_REVIEW_MODEL),
+    modelReasoningEffort: firstString(opts.modelReasoningEffort, env.CODEX_MODEL_REASONING_EFFORT),
+    disableResponseStorage: optionalBoolean(firstDefined(opts.disableResponseStorage, env.CODEX_DISABLE_RESPONSE_STORAGE)),
+    networkAccess: firstString(opts.networkAccess, env.CODEX_NETWORK_ACCESS),
+    windowsWslSetupAcknowledged: optionalBoolean(firstDefined(opts.windowsWslSetupAcknowledged, env.CODEX_WINDOWS_WSL_SETUP_ACKNOWLEDGED)),
+    featureGoals: optionalBoolean(firstDefined(opts.featureGoals, opts.goals, env.CODEX_FEATURE_GOALS)),
+    providerBaseUrl,
+    providerName: firstString(opts.providerName, env.CODEX_PROVIDER_NAME, modelProvider),
+    providerWireApi: firstString(opts.providerWireApi, env.CODEX_PROVIDER_WIRE_API, providerBaseUrl ? 'responses' : undefined),
+    providerRequiresOpenaiAuth: optionalBoolean(firstDefined(opts.providerRequiresOpenaiAuth, env.CODEX_PROVIDER_REQUIRES_OPENAI_AUTH, providerBaseUrl ? true : undefined)),
+  };
+}
+
+function applyCodexModelSettings(obj, options) {
+  if (options.modelProvider) obj.model_provider = options.modelProvider;
+  if (options.model) obj.model = options.model;
+  else if (obj.model === undefined) obj.model = 'gpt-5.5';
+  if (options.reviewModel) obj.review_model = options.reviewModel;
+  if (options.modelReasoningEffort) obj.model_reasoning_effort = options.modelReasoningEffort;
+  else if (obj.model_reasoning_effort === undefined) obj.model_reasoning_effort = 'medium';
+  if (options.disableResponseStorage !== undefined) obj.disable_response_storage = options.disableResponseStorage;
+  if (options.networkAccess) obj.network_access = options.networkAccess;
+  if (options.windowsWslSetupAcknowledged !== undefined) {
+    obj.windows_wsl_setup_acknowledged = options.windowsWslSetupAcknowledged;
+  }
+}
+
+function applyCodexProviderRouting(obj, options) {
+  if (options.modelProvider) obj.model_provider = options.modelProvider;
+  if (!options.modelProvider || !options.providerBaseUrl) return;
+
+  obj.model_providers = isTomlSectionValue(obj.model_providers) ? obj.model_providers : {};
+  const existingProvider = isTomlSectionValue(obj.model_providers[options.modelProvider])
+    ? obj.model_providers[options.modelProvider]
+    : {};
+  obj.model_providers[options.modelProvider] = {
+    ...existingProvider,
+    name: options.providerName || existingProvider.name || options.modelProvider,
+    base_url: options.providerBaseUrl,
+    wire_api: options.providerWireApi || existingProvider.wire_api || 'responses',
+    requires_openai_auth: options.providerRequiresOpenaiAuth ?? existingProvider.requires_openai_auth ?? true,
+  };
+}
+
 /**
  * Render project-level .codex/config.toml with headless configuration.
  *
@@ -357,23 +441,25 @@ function isTomlSectionValue(value) {
  * Written to <projectDir>/.codex/config.toml (Codex project-level config).
  *
  * @param {string} existingContent - Existing project config.toml contents (optional)
+ * @param {object} opts - Optional Codex config overrides
  * @returns {string}
  */
-export function renderCodexProjectConfig(existingContent = '') {
+export function renderCodexProjectConfig(existingContent = '', opts = {}) {
   const obj = parseCodexToml(existingContent);
+  const options = resolveCodexConfigOptions(opts);
 
   // Always overwrite: these values are required for unattended Zylos runtime behavior.
   obj.check_for_update_on_startup = false;
   obj.model_availability_nux = 'gpt-5.4';
 
-  // Backfill: default only when the user has not configured a value.
-  if (obj.model === undefined) obj.model = 'gpt-5.5';
-  if (obj.model_reasoning_effort === undefined) obj.model_reasoning_effort = 'medium';
+  applyCodexModelSettings(obj, options);
+  applyCodexProviderRouting(obj, options);
 
   obj.features = isTomlSectionValue(obj.features) ? obj.features : {};
   obj.features.multi_agent = true;
   obj.features.fast_mode = false;
   obj.features.hooks = true;
+  if (options.featureGoals !== undefined) obj.features.goals = options.featureGoals;
 
   const existingNotice = isTomlSectionValue(obj.notice) ? obj.notice : {};
   const notice = { ...CODEX_NOTICE };
@@ -391,7 +477,7 @@ export function renderCodexProjectConfig(existingContent = '') {
 /**
  * Render global ~/.codex/config.toml with user/environment-level settings.
  *
- * Contains only trust declarations and optional base URL override.
+ * Contains trust declarations and optional provider routing.
  * Existing [projects.*] trust entries are preserved; the zylos project trust
  * entry is always regenerated.
  *
@@ -402,13 +488,12 @@ export function renderCodexProjectConfig(existingContent = '') {
  */
 export function renderCodexGlobalConfig(projectDir, existingContent = '', opts = {}) {
   const absProject = path.resolve(projectDir);
-  const openaiBaseUrl = opts.openaiBaseUrl || process.env.OPENAI_BASE_URL || '';
+  const options = resolveCodexConfigOptions(opts);
   const obj = parseCodexToml(existingContent);
-  if (openaiBaseUrl) {
-    obj.openai_base_url = openaiBaseUrl;
-  }
+  applyCodexProviderRouting(obj, options);
   obj.features = isTomlSectionValue(obj.features) ? obj.features : {};
   obj.features.hooks = true;
+  if (options.featureGoals !== undefined) obj.features.goals = options.featureGoals;
   obj.projects = isTomlSectionValue(obj.projects) ? obj.projects : {};
   obj.projects[absProject] = { trust_level: 'trusted' };
   return tomlWithHeader(CODEX_GLOBAL_HEADER, obj);
@@ -430,6 +515,8 @@ export function renderCodexGlobalConfig(projectDir, existingContent = '', opts =
  */
 export function writeCodexConfig(projectDir, opts = {}) {
   try {
+    const configOptions = resolveCodexConfigOptions(opts, process.env);
+
     // Write project-level config
     const projectCodexDir = path.join(path.resolve(projectDir), '.codex');
     fs.mkdirSync(projectCodexDir, { recursive: true });
@@ -440,7 +527,7 @@ export function writeCodexConfig(projectDir, opts = {}) {
     } catch { /* new file — nothing to preserve */ }
     fs.writeFileSync(
       projectConfigPath,
-      renderCodexProjectConfig(existingProject),
+      renderCodexProjectConfig(existingProject, configOptions),
       'utf8'
     );
 
@@ -454,7 +541,7 @@ export function writeCodexConfig(projectDir, opts = {}) {
     fs.mkdirSync(globalCodexDir, { recursive: true });
     fs.writeFileSync(
       globalConfigPath,
-      renderCodexGlobalConfig(projectDir, existing, opts),
+      renderCodexGlobalConfig(projectDir, existing, configOptions),
       'utf8'
     );
 

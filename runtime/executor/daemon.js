@@ -196,6 +196,9 @@ export async function runExecutorDaemon({
       workspaceRoot: zylosDir,
       releaseRef: process.env.ZYLOS_RELEASE_REF || null,
       upgradeId: process.env.ZYLOS_UPGRADE_ID || null,
+      isolateOrphanedWorkspace: typeof adapter.isolateOrphanedWorkspace === 'function'
+        ? adapter.isolateOrphanedWorkspace
+        : null,
       onUpgrade,
       healthCheck: prerequisiteOwner.health,
       onClose: async () => {

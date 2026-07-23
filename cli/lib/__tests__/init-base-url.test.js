@@ -46,9 +46,11 @@ describe('base URL support', () => {
     const initModule = await import('../../commands/init.js');
     const originalAnthropicBaseUrl = process.env.ANTHROPIC_BASE_URL;
     const originalOpenAiBaseUrl = process.env.OPENAI_BASE_URL;
+    const originalProviderBaseUrl = process.env.CODEX_PROVIDER_BASE_URL;
 
     process.env.ANTHROPIC_BASE_URL = 'https://claude-env.example.com';
     process.env.OPENAI_BASE_URL = 'https://codex-env.example.com/v1';
+    delete process.env.CODEX_PROVIDER_BASE_URL;
 
     try {
       const envOnly = initModule.parseInitFlags([]);
@@ -69,10 +71,51 @@ describe('base URL support', () => {
 
       if (originalOpenAiBaseUrl === undefined) delete process.env.OPENAI_BASE_URL;
       else process.env.OPENAI_BASE_URL = originalOpenAiBaseUrl;
+
+      if (originalProviderBaseUrl === undefined) delete process.env.CODEX_PROVIDER_BASE_URL;
+      else process.env.CODEX_PROVIDER_BASE_URL = originalProviderBaseUrl;
     }
   });
 
-  test('writeCodexConfig writes openai_base_url when OPENAI_BASE_URL is set', async () => {
+  test('resolveFromEnv prefers CODEX_PROVIDER_BASE_URL for Codex routing', async () => {
+    const initModule = await import('../../commands/init.js');
+    const originalOpenAiBaseUrl = process.env.OPENAI_BASE_URL;
+    const originalProviderBaseUrl = process.env.CODEX_PROVIDER_BASE_URL;
+
+    process.env.OPENAI_BASE_URL = 'https://generic-openai.example.com/v1';
+    process.env.CODEX_PROVIDER_BASE_URL = 'https://codex-provider.example.com';
+
+    try {
+      const envOnly = initModule.parseInitFlags([]);
+      initModule.resolveFromEnv(envOnly);
+      assert.equal(envOnly.codexBaseUrl, 'https://codex-provider.example.com');
+    } finally {
+      if (originalOpenAiBaseUrl === undefined) delete process.env.OPENAI_BASE_URL;
+      else process.env.OPENAI_BASE_URL = originalOpenAiBaseUrl;
+
+      if (originalProviderBaseUrl === undefined) delete process.env.CODEX_PROVIDER_BASE_URL;
+      else process.env.CODEX_PROVIDER_BASE_URL = originalProviderBaseUrl;
+    }
+  });
+
+  test('Codex API key verification URL is built from the configured provider base URL', async () => {
+    const initModule = await import('../../commands/init.js');
+
+    assert.equal(
+      String(initModule.codexModelsVerificationUrl('https://proxy.example.com')),
+      'https://proxy.example.com/v1/models',
+    );
+    assert.equal(
+      String(initModule.codexModelsVerificationUrl('https://proxy.example.com/openai/v1')),
+      'https://proxy.example.com/openai/v1/models',
+    );
+    assert.equal(
+      String(initModule.codexModelsVerificationUrl()),
+      'https://api.openai.com/v1/models',
+    );
+  });
+
+  test('writeCodexConfig writes provider routing when OPENAI_BASE_URL is set', async () => {
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-base-url-'));
     const originalHome = process.env.HOME;
     const originalOpenAiBaseUrl = process.env.OPENAI_BASE_URL;
@@ -87,7 +130,9 @@ describe('base URL support', () => {
 
       const configPath = path.join(tmpRoot, '.codex', 'config.toml');
       const config = fs.readFileSync(configPath, 'utf8');
-      assert.match(config, /openai_base_url = "https:\/\/openai-proxy\.example\.com\/v1"/);
+      assert.match(config, /^model_provider = "OpenAI"$/m);
+      assert.match(config, /\[model_providers\.OpenAI\][\s\S]*base_url = "https:\/\/openai-proxy\.example\.com\/v1"/);
+      assert.match(config, /\[model_providers\.OpenAI\][\s\S]*wire_api = "responses"/);
     } finally {
       if (originalHome === undefined) delete process.env.HOME;
       else process.env.HOME = originalHome;
@@ -99,7 +144,7 @@ describe('base URL support', () => {
     }
   });
 
-  test('writeCodexConfig writes openai_base_url when explicit opts.openaiBaseUrl is provided', async () => {
+  test('writeCodexConfig writes provider routing when explicit opts.openaiBaseUrl is provided', async () => {
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-base-url-opt-'));
     const originalHome = process.env.HOME;
     const originalOpenAiBaseUrl = process.env.OPENAI_BASE_URL;
@@ -117,7 +162,8 @@ describe('base URL support', () => {
 
       const configPath = path.join(tmpRoot, '.codex', 'config.toml');
       const config = fs.readFileSync(configPath, 'utf8');
-      assert.match(config, /openai_base_url = "https:\/\/explicit-proxy\.example\.com\/v1"/);
+      assert.match(config, /^model_provider = "OpenAI"$/m);
+      assert.match(config, /\[model_providers\.OpenAI\][\s\S]*base_url = "https:\/\/explicit-proxy\.example\.com\/v1"/);
     } finally {
       if (originalHome === undefined) delete process.env.HOME;
       else process.env.HOME = originalHome;

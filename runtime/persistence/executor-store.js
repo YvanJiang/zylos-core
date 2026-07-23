@@ -5051,6 +5051,19 @@ export function createExecutorStore({
           attempt_no: turn.attempt_no,
           lease_epoch: turn.lease_epoch,
         });
+        const providerAttempt = database.prepare(`
+          SELECT runtime_evidence_json
+          FROM runtime_provider_attempts
+          WHERE attempt_id = ?
+        `).get(turn.attempt_id);
+        let runtimeEvidence = null;
+        if (typeof providerAttempt?.runtime_evidence_json === 'string') {
+          try {
+            runtimeEvidence = JSON.parse(providerAttempt.runtime_evidence_json);
+          } catch {
+            runtimeEvidence = null;
+          }
+        }
         const envelope = JSON.parse(turn.envelope_json);
         const recoveryContext = Object.freeze({
           conversation_id: turn.conversation_id,
@@ -5067,6 +5080,9 @@ export function createExecutorStore({
           }),
           workspace,
           attempt,
+          runtime_evidence: runtimeEvidence === null
+            ? null
+            : Object.freeze(structuredClone(runtimeEvidence)),
         });
         if (turn.state === 'timed_out') {
           return recoveryContext;
@@ -6940,6 +6956,57 @@ export function createExecutorStore({
           reason: 'provider_isolation_confirmed',
         })
         : null;
+      let terminalState = null;
+      if (turn.state === 'recovering') {
+        const hasExecutionRecovery = database.prepare(`
+          SELECT 1 FROM runtime_execution_recoveries
+          WHERE turn_id = ?
+          LIMIT 1
+        `).get(turn.turn_id) !== undefined;
+        const hasBlockingInteraction = database.prepare(`
+          SELECT 1 FROM runtime_interactions
+          WHERE turn_id = ?
+            AND state IN (${BLOCKING_INTERACTION_STATES_SQL})
+          LIMIT 1
+        `).get(turn.turn_id) !== undefined;
+        if (!hasExecutionRecovery && !hasBlockingInteraction) {
+          const terminalError = createContractError({
+            code: 'side_effect_unknown',
+            category: 'provider',
+            retryable: false,
+            sideEffectStatus: 'unknown',
+            userMessage: 'Provider isolation was confirmed after recovery; this turn was stopped to unblock subsequent work.',
+            occurredAt: releasedAt,
+          });
+          transitionInTransaction(database, {
+            turnId: turn.turn_id,
+            fromState: 'recovering',
+            toState: 'stopped',
+            fence: turnContext.attempt,
+            provider,
+            serviceInstanceId,
+            occurredAt: releasedAt,
+            generateId,
+            reasonCode: 'provider_isolated_manual_recovery_required',
+            retainLease: true,
+          });
+          database.prepare(`
+            UPDATE runtime_provider_attempts
+            SET state = 'stopped', side_effect_status = 'unknown',
+              error_json = ?, updated_at = ?
+            WHERE turn_id = ? AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+              AND state IN ('starting', 'running', 'recovering')
+          `).run(
+            JSON.stringify(terminalError),
+            releasedAt,
+            turn.turn_id,
+            turnContext.attempt.attempt_id,
+            turnContext.attempt.attempt_no,
+            turnContext.attempt.lease_epoch,
+          );
+          terminalState = 'stopped';
+        }
+      }
       const releasedLease = database.prepare(`
         UPDATE runtime_executor_leases
         SET lease_owner = NULL, turn_id = NULL, attempt_id = NULL,
@@ -7024,6 +7091,7 @@ export function createExecutorStore({
         lease_released: true,
         resident_released: residentReleased,
         workspace_released: workspaceReleased !== null,
+        terminal_state: terminalState,
       };
     });
     return release.immediate();
@@ -9017,6 +9085,7 @@ export function createExecutorStore({
           attempt.service_instance_id, attempt.executor_instance_id,
           attempt.runtime_instance_id, attempt.runtime_evidence_json,
           attempt.last_provider_event_at, attempt.started_at,
+          queue.status AS queue_status,
           lease.lease_owner, lease.turn_id AS lease_turn_id,
           lease.attempt_id AS lease_attempt_id, lease.attempt_no AS lease_attempt_no,
           lease.lease_epoch AS lease_epoch_current, lease.lease_expires_at,
@@ -9032,6 +9101,8 @@ export function createExecutorStore({
          AND attempt.attempt_id = turn.attempt_id
          AND attempt.attempt_no = turn.attempt_no
          AND attempt.lease_epoch = turn.lease_epoch
+        LEFT JOIN runtime_turn_queue AS queue
+          ON queue.turn_id = turn.turn_id
         LEFT JOIN runtime_executor_leases AS lease
           ON lease.conversation_id = turn.conversation_id
         WHERE attempt.provider = ?
@@ -9046,7 +9117,65 @@ export function createExecutorStore({
       const results = [];
       const reconciledAtMs = Date.parse(reconciledAt);
       for (const candidate of candidates) {
-        if (['redirecting', 'recovering'].includes(candidate.state)) {
+        if (candidate.state === 'recovering') {
+          if (
+            candidate.queue_status === 'claimed'
+            && candidate.lease_owner === null
+            && candidate.has_blocking_interaction !== 1
+          ) {
+            const terminalError = createContractError({
+              code: 'side_effect_unknown',
+              category: 'provider',
+              retryable: false,
+              sideEffectStatus: 'unknown',
+              userMessage: 'Provider isolation was confirmed after recovery; this turn was stopped to unblock subsequent work.',
+              occurredAt: reconciledAt,
+            });
+            const fence = {
+              attempt_id: candidate.attempt_id,
+              attempt_no: candidate.attempt_no,
+              lease_epoch: candidate.lease_epoch,
+            };
+            transitionInTransaction(database, {
+              turnId: candidate.turn_id,
+              fromState: 'recovering',
+              toState: 'stopped',
+              fence,
+              provider,
+              serviceInstanceId,
+              occurredAt: reconciledAt,
+              generateId,
+              reasonCode: 'provider_isolated_manual_recovery_required',
+              requireActiveLease: false,
+              retainLease: true,
+            });
+            database.prepare(`
+              UPDATE runtime_provider_attempts
+              SET state = 'stopped', side_effect_status = 'unknown',
+                error_json = ?, updated_at = ?
+              WHERE turn_id = ? AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+                AND state IN ('starting', 'running', 'recovering')
+            `).run(
+              JSON.stringify(terminalError),
+              reconciledAt,
+              candidate.turn_id,
+              candidate.attempt_id,
+              candidate.attempt_no,
+              candidate.lease_epoch,
+            );
+            results.push({
+              turn_id: candidate.turn_id,
+              status: 'terminalized_released_recovery',
+            });
+            continue;
+          }
+          results.push({
+            turn_id: candidate.turn_id,
+            status: 'specialized_recovery_retained',
+          });
+          continue;
+        }
+        if (candidate.state === 'redirecting') {
           results.push({
             turn_id: candidate.turn_id,
             status: 'specialized_recovery_retained',

@@ -199,10 +199,18 @@ export function buildInitialDeliveryCommand({
 
 function resolveOrCreateDefaultLineage(database, envelope, conversationId, committedAt, generateId) {
   let lineage = database.prepare(`
-    SELECT lineage_id
+    SELECT lineage_id, provider_native_state
     FROM runtime_lineages
     WHERE conversation_id = ? AND is_default = 1
   `).get(conversationId);
+  if (lineage?.provider_native_state === 'invalid') {
+    database.prepare(`
+      UPDATE runtime_lineages
+      SET is_default = 0
+      WHERE conversation_id = ? AND is_default = 1
+    `).run(conversationId);
+    lineage = null;
+  }
   if (!lineage) {
     lineage = { lineage_id: generateId('lineage') };
     database.prepare(`
