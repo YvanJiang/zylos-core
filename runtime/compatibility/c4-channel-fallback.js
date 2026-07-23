@@ -6,6 +6,8 @@ import {
 } from '../../contracts/public/index.js';
 import { acceptNormalInbound } from '../persistence/inbound-acceptance.js';
 
+const MAIN_CARD_CHANNELS = new Set(['feishu', 'lark']);
+
 export function createCompatibilityEnvelope(message, {
   receivedAt = message?.received_at,
   traceId = message?.trace_id,
@@ -54,7 +56,9 @@ export function acceptCompatibilityInbound(database, message, options = {}) {
   });
   return acceptNormalInbound(database, envelope, {
     ...options,
-    initialDeliveryOperation: 'send_text',
+    initialDeliveryOperation: MAIN_CARD_CHANNELS.has(envelope.channel)
+      ? 'create_main'
+      : 'send_text',
   });
 }
 

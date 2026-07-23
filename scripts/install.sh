@@ -341,6 +341,13 @@ install_zylos() {
       cp -R "$installed_root/." "$bootstrap_backup/base-release/"
       base_name="$(cd "$bootstrap_backup/base-release" && npm pack --ignore-scripts --pack-destination "$bootstrap_backup" --silent)"
       mv "$bootstrap_backup/$base_name" "$bootstrap_backup/exact-base-package.tgz"
+      if [ ! -f "$bootstrap_backup/target-source/package-lock.json" ]; then
+        warn "Target source has no root package-lock.json; refusing a non-reproducible executor release."
+        return 1
+      fi
+      # npm pack excludes package-lock.json. Publish the identical lock data as
+      # npm-shrinkwrap.json so the extracted release can run deterministic npm ci.
+      cp "$bootstrap_backup/target-source/package-lock.json" "$bootstrap_backup/target-source/npm-shrinkwrap.json"
       target_name="$(cd "$bootstrap_backup/target-source" && npm pack --ignore-scripts --pack-destination "$bootstrap_backup" --silent)"
       mv "$bootstrap_backup/$target_name" "$bootstrap_backup/executor-package.tgz"
       tar -xzf "$bootstrap_backup/executor-package.tgz" -C "$bootstrap_backup/target-release" --strip-components=1

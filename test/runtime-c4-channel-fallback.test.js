@@ -18,6 +18,7 @@ import {
 } from '../runtime/compatibility/c4-channel-fallback.js';
 import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { createExecutorService } from '../runtime/executor/service.js';
+import { deliveredResult } from './helpers/delivered-result.js';
 
 const temporaryDirectories = [];
 
@@ -67,6 +68,17 @@ function compatibilityMessage(suffix = 'initial') {
       reply_to_message_id: null,
     },
     source_ref: null,
+  };
+}
+
+function cardCompatibilityMessage(channel, suffix = 'card') {
+  const message = compatibilityMessage(suffix);
+  return {
+    ...message,
+    inbound_event_id: `${channel}-event-${suffix}`,
+    region: channel === 'feishu' ? 'cn' : 'global',
+    channel,
+    message_id: `${channel}-message-${suffix}`,
   };
 }
 
@@ -178,6 +190,73 @@ describe('C4 channel-neutral fallback', () => {
 
     database.close();
   });
+
+  test.each(['feishu', 'lark'])(
+    'keeps %s status and result updates in one main card',
+    async (channel) => {
+      const database = openTestDatabase();
+      const accepted = acceptCompatibilityInbound(
+        database,
+        cardCompatibilityMessage(channel),
+        {
+          now: () => '2026-07-19T08:05:00Z',
+          generateId: deterministicIds(`${channel}-card-inbound`),
+        },
+      );
+      const executor = createExecutorService({
+        database,
+        adapter: {
+          async *execute() {
+            yield {
+              kind: 'text_snapshot',
+              payload: { text: 'card result', end_offset: 11 },
+              provider_native_id: null,
+            };
+          },
+        },
+        provider: 'claude',
+        serviceInstanceId: `executor-service-${channel}-card`,
+        now: () => '2026-07-19T08:05:01Z',
+        generateId: deterministicIds(`${channel}-card-executor`),
+      });
+      await expect(executor.runNext()).resolves.toMatchObject({
+        status: 'completed',
+        turn_id: accepted.turn_id,
+      });
+
+      const deliveredCommands = [];
+      const outbox = createOutboxService({
+        database,
+        renderer: {
+          async deliver(command) {
+            deliveredCommands.push(command);
+            return deliveredResult(command, '2026-07-19T08:05:02Z');
+          },
+        },
+        serviceInstanceId: `outbox-service-${channel}-card`,
+        now: () => '2026-07-19T08:05:02Z',
+        generateId: deterministicIds(`${channel}-card-outbox`),
+        throttleMs: 0,
+      });
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        const outcome = await outbox.dispatchNext();
+        if (outcome.status === 'idle') break;
+      }
+
+      expect(deliveredCommands.map(({ operation }) => operation)).toEqual([
+        'create_main',
+        'update_main',
+      ]);
+      expect(new Set(deliveredCommands.map(({ mapping }) => mapping.mapping_id)).size).toBe(1);
+      expect(deliveredCommands[1].target_platform_message_id).toBe(
+        deliveredCommands[0].operation === 'create_main'
+          ? `platform-${deliveredCommands[0].delivery_attempt_id}`
+          : null,
+      );
+
+      database.close();
+    },
+  );
 
   test('renders received, completed, failed and action-required delivery commands as text', async () => {
     const database = openTestDatabase();

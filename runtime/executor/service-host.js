@@ -7,6 +7,10 @@ import { createExecutorService } from './service.js';
 
 const MAX_REQUEST_BYTES = 64 * 1024;
 
+function reportPollError(error) {
+  console.error('[zylos-executor] Background poll failed.', error);
+}
+
 function matchesSocketIdentity(stat, identity) {
   return stat.dev === identity.dev
     && stat.ino === identity.ino
@@ -160,6 +164,7 @@ export function createExecutorServiceHost({
   socketPath,
   workspaceRoot,
   pollIntervalMs = 250,
+  onPollError = reportPollError,
   onUpgrade = null,
   onClose = null,
   healthCheck = null,
@@ -172,6 +177,7 @@ export function createExecutorServiceHost({
     throw new TypeError('pollIntervalMs must be a positive safe integer');
   }
   if (typeof createService !== 'function') throw new TypeError('createService must be a function');
+  if (typeof onPollError !== 'function') throw new TypeError('onPollError must be a function');
   if (onUpgrade !== null && typeof onUpgrade !== 'function') {
     throw new TypeError('onUpgrade must be a function or null');
   }
@@ -310,7 +316,7 @@ export function createExecutorServiceHost({
       throw error;
     }
     lifecycle = 'open';
-    pollTimer = setInterval(() => poll().catch(() => {}), pollIntervalMs);
+    pollTimer = setInterval(() => poll().catch(onPollError), pollIntervalMs);
     pollTimer.unref?.();
     await poll();
     return service.publishObservabilitySnapshot();

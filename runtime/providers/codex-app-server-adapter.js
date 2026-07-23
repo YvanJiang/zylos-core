@@ -30,6 +30,20 @@ const DEFAULT_ENV_ALLOWLIST = Object.freeze([
   'no_proxy',
 ]);
 
+const APP_SERVER_FEATURE_DISABLES = Object.freeze([
+  'hooks',
+  'code_mode_host',
+  'image_generation',
+  'multi_agent',
+]);
+
+function appServerArguments() {
+  const args = ['app-server'];
+  for (const feature of APP_SERVER_FEATURE_DISABLES) args.push('--disable', feature);
+  args.push('--stdio');
+  return args;
+}
+
 function providerErrorFor(code) {
   if (code === 'provider_auth_failed') {
     return {
@@ -333,41 +347,30 @@ const ONE_SHOT_WRITE_APPROVAL_METHODS = Object.freeze(new Set([
   'item/fileChange/requestApproval',
 ]));
 const DISABLED_SIDE_EFFECT_TOOL_TYPES = Object.freeze(new Set([
-  'mcpToolCall',
   'dynamicToolCall',
   'collabAgentToolCall',
   'webSearch',
   'imageGeneration',
 ]));
 const APP_SERVER_LOCKDOWN_CONFIG = Object.freeze({
-  mcp_servers: Object.freeze({}),
   web_search: 'disabled',
   features: Object.freeze({
-    apps: false,
     browser_use: false,
     code_mode: false,
     collaboration_modes: false,
     computer_use: false,
     enable_fanout: false,
-    enable_mcp_apps: false,
     exec_permission_approvals: false,
     hooks: false,
     image_generation: false,
     in_app_browser: false,
-    js_repl: false,
-    js_repl_tools_only: false,
     multi_agent: false,
     multi_agent_mode: false,
     multi_agent_v2: false,
     plugin_hooks: false,
-    plugin_sharing: false,
-    plugins: false,
     remote_control: false,
-    remote_plugin: false,
     request_permissions: false,
     request_permissions_tool: false,
-    tool_call_mcp_elicitation: false,
-    tool_search: false,
   }),
 });
 
@@ -1796,7 +1799,17 @@ export function createCodexAppServerAdapter({
       ));
       return;
     }
-    const components = serverRequestComponents(message.method, message.params, run);
+    const autoAcceptMcpTool = message.method === 'mcpServer/elicitation/request'
+      && typeof message.params?.serverName === 'string'
+      && message.params.serverName.length > 0
+      && ['form', 'openai/form'].includes(message.params?.mode)
+      && typeof message.params?.message === 'string'
+      && message.params.message.trim().length > 0
+      && isRecord(message.params?._meta)
+      && message.params._meta.codex_approval_kind === 'mcp_tool_call';
+    const components = autoAcceptMcpTool
+      ? []
+      : serverRequestComponents(message.method, message.params, run);
     if (!components) {
       sendServerError(target, message.id, 'Unsupported or stale app-server request.');
       failConnection(target, new CodexAppServerAdapterError(
@@ -1843,13 +1856,13 @@ export function createCodexAppServerAdapter({
       ));
       return;
     }
-    if (message.method === 'mcpServer/elicitation/request') {
+    if (autoAcceptMcpTool) {
       group.response_sent = true;
-      sendServerResponse(target, message.id, { action: 'decline', content: null, _meta: null });
-      failConnection(target, new CodexAppServerAdapterError(
-        'unsupported_capability',
-        'Codex MCP execution is disabled because its tool calls lack a synchronous Core fence.',
-      ));
+      group.auto_approved = true;
+      sendServerResponse(target, message.id, { action: 'accept', content: {}, _meta: null });
+      group.resolved.then(() => {
+        providerRequests.delete(group.request_key);
+      }).catch((error) => failConnection(target, error));
       return;
     }
     if (
@@ -2006,13 +2019,17 @@ export function createCodexAppServerAdapter({
       resolveClosed = resolve;
     });
     const detachedProcessGroup = process.platform !== 'win32';
-    const child = spawnProcess(codexExecutable, ['app-server', '--stdio'], {
-      cwd,
-      detached: detachedProcessGroup,
-      env: childEnvironment,
-      shell: false,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    const child = spawnProcess(
+      codexExecutable,
+      appServerArguments(),
+      {
+        cwd,
+        detached: detachedProcessGroup,
+        env: childEnvironment,
+        shell: false,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      },
+    );
     const target = {
       connection_id: `codex-app-server-${nextConnectionNo}`,
       child,

@@ -5,7 +5,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterEach, describe, expect, test } from '@jest/globals';
+import { afterEach, describe, expect, jest, test } from '@jest/globals';
 
 const require = createRequire(new URL('../skills/comm-bridge/package.json', import.meta.url));
 const Database = require('better-sqlite3');
@@ -21,6 +21,7 @@ import {
   legacyLifecycleArtifactPaths,
   obsoleteHookBaseKeys,
 } from '../runtime/migration/legacy-lifecycle-artifacts.js';
+import { findResumableRuntimeUpgrade } from '../runtime/migration/upgrade-state.js';
 
 const directories = [];
 const hosts = [];
@@ -76,6 +77,40 @@ function inertAdapter(provider = 'claude') {
 }
 
 describe('executor service lifecycle host', () => {
+  test('reports background poll failures instead of discarding the provider error', async () => {
+    const state = fixture();
+    const pollFailure = new Error('provider hook rejected');
+    let reportPollError;
+    const pollErrorReported = new Promise((resolve) => { reportPollError = resolve; });
+    const onPollError = jest.fn(reportPollError);
+    let polls = 0;
+    const service = {
+      start: jest.fn(),
+      runNext: jest.fn(async () => {
+        polls += 1;
+        if (polls > 1) throw pollFailure;
+      }),
+      publishObservabilitySnapshot: jest.fn(() => ({ contract: 'fixture' })),
+      close: jest.fn(async () => {}),
+    };
+    const host = createExecutorServiceHost({
+      database: state.database,
+      adapter: inertAdapter(),
+      provider: 'codex',
+      serviceInstanceId: 'service-fixture-poll-error',
+      socketPath: state.socketPath,
+      workspaceRoot: state.directory,
+      pollIntervalMs: 5,
+      onPollError,
+      createService: () => service,
+    });
+    hosts.push(host);
+    await host.start();
+
+    await expect(settleWithin(pollErrorReported, 200, 'timeout')).resolves.toBe(pollFailure);
+    expect(onPollError).toHaveBeenCalledTimes(1);
+  });
+
   test('reports canonical Core identity and health and acknowledges graceful shutdown', async () => {
     const state = fixture();
     const host = createExecutorServiceHost({
@@ -571,9 +606,12 @@ describe('executor daemon resource ownership', () => {
     const events = [];
     state.database.exec(`
       CREATE TABLE runtime_upgrade_runs (upgrade_id TEXT, scope_kind TEXT, bot_id TEXT, state TEXT, state_version INTEGER, created_at TEXT);
-      CREATE TABLE runtime_upgrade_events (upgrade_id TEXT, step_key TEXT);
+      CREATE TABLE runtime_upgrade_effects (upgrade_id TEXT, step_key TEXT, state TEXT);
       INSERT INTO runtime_upgrade_runs VALUES ('upgrade-pending', 'installation', NULL, 'committed', 1, '2026-07-21T00:00:00.000Z');
     `);
+    expect(findResumableRuntimeUpgrade(state.database)).toMatchObject({
+      upgrade_id: 'upgrade-pending', state: 'committed',
+    });
     const database = state.database;
     const close = database.close.bind(database);
     database.close = () => { events.push('database-close'); close(); };
@@ -595,10 +633,11 @@ describe('executor daemon resource ownership', () => {
     const events = [];
     state.database.exec(`
       CREATE TABLE runtime_upgrade_runs (upgrade_id TEXT, scope_kind TEXT, bot_id TEXT, state TEXT, state_version INTEGER, created_at TEXT);
-      CREATE TABLE runtime_upgrade_events (upgrade_id TEXT, step_key TEXT);
+      CREATE TABLE runtime_upgrade_effects (upgrade_id TEXT, step_key TEXT, state TEXT);
       INSERT INTO runtime_upgrade_runs VALUES ('finished', 'installation', NULL, 'committed', 1, '2026-07-21T00:00:00.000Z');
-      INSERT INTO runtime_upgrade_events VALUES ('finished', 'postcommit-cleanup');
+      INSERT INTO runtime_upgrade_effects VALUES ('finished', 'postcommit-cleanup', 'completed');
     `);
+    expect(findResumableRuntimeUpgrade(state.database)).toBeNull();
     const database = state.database;
     const host = { closed: Promise.resolve(), async start() { events.push('host-start'); }, async close() {} };
     const daemon = await runExecutorDaemon({
@@ -651,8 +690,9 @@ describe('executor daemon resource ownership', () => {
 describe('executor prerequisite ownership', () => {
   test('owns scheduler and web-console children without starting retired runtime daemons', async () => {
     const state = fixture();
-    const scheduler = path.join(state.directory, '.claude', 'skills', 'scheduler', 'scripts', 'daemon.js');
-    const webConsole = path.join(state.directory, '.claude', 'skills', 'web-console', 'scripts', 'server.js');
+    const releasePath = path.join(state.directory, 'runtime', 'releases', 'executor-fixture');
+    const scheduler = path.join(releasePath, 'skills', 'scheduler', 'scripts', 'daemon.js');
+    const webConsole = path.join(releasePath, 'skills', 'web-console', 'scripts', 'server.js');
     fs.mkdirSync(path.dirname(scheduler), { recursive: true });
     fs.mkdirSync(path.dirname(webConsole), { recursive: true });
     fs.writeFileSync(scheduler, '');
@@ -670,6 +710,7 @@ describe('executor prerequisite ownership', () => {
     }
     const owner = createExecutorPrerequisiteOwner({
       zylosDir: state.directory,
+      releasePath,
       spawnFn: (command, args, options) => {
         spawned.push({ command, args, options });
         const child = new ChildFixture();

@@ -933,6 +933,9 @@ describe('runtime /stop linearization', () => {
       provider_stop_status: 'isolated',
       lease_released: true,
     });
+    expect(database.prepare(`
+      SELECT state FROM runtime_execution_recoveries WHERE turn_id = ?
+    `).get(active.turn_id)).toEqual({ state: 'stopped' });
     expect(cancellationContexts).toEqual([
       expect.objectContaining({
         conversation_id: active.conversation_id,

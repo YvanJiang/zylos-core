@@ -344,11 +344,14 @@ describe('exact-base executor lifecycle bootstrap', () => {
 
   test('the installer stages exact packages and enters durable bootstrap before global activation or init', () => {
     const installer = fs.readFileSync(new URL('../scripts/install.sh', import.meta.url), 'utf8');
-    const stage = installer.indexOf('npm pack --ignore-scripts');
+    const shrinkwrap = installer.indexOf('npm-shrinkwrap.json');
+    const stage = installer.indexOf('npm pack --ignore-scripts', shrinkwrap);
     const bootstrap = installer.lastIndexOf('bootstrap-executor-lifecycle.js');
     const globalInstall = installer.indexOf('ZYLOS_PACKAGE_PREPARE=1 npm install');
     const init = installer.indexOf('info "Running zylos init..."');
-    expect(stage).toBeGreaterThan(0);
+    expect(shrinkwrap).toBeGreaterThan(0);
+    expect(stage).toBeGreaterThan(shrinkwrap);
+    expect(installer).toContain('cp "$bootstrap_backup/target-source/package-lock.json" "$bootstrap_backup/target-source/npm-shrinkwrap.json"');
     expect(bootstrap).toBeGreaterThan(stage);
     expect(globalInstall).toBeGreaterThan(bootstrap);
     expect(init).toBeGreaterThan(bootstrap);

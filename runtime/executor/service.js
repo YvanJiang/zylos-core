@@ -511,6 +511,7 @@ export function createExecutorService({
           store.reconcileNonterminalTurns(
             [...activeRuns.values()].map(({ turnContext }) => turnContext),
             'sweep_reconciliation',
+            { controlledStartingGraceMs: nonterminalSweepIntervalMs },
           );
           observabilityPublisher.recordReconciliation();
           refresh();
@@ -2570,6 +2571,23 @@ export function createExecutorService({
             shutdownFailures,
             'Executor shutdown did not release all durable ownership.',
           );
+        }
+        const registration = database.prepare(`
+          SELECT revoked_at FROM runtime_executor_service_instances
+          WHERE service_instance_id = ?
+        `).get(serviceInstanceId);
+        if (!registration) {
+          throw new Error('Executor service instance registration is unavailable.');
+        }
+        if (registration.revoked_at === null) {
+          const revoked = database.prepare(`
+            UPDATE runtime_executor_service_instances
+            SET revoked_at = ?
+            WHERE service_instance_id = ? AND revoked_at IS NULL
+          `).run(now(), serviceInstanceId);
+          if (revoked.changes !== 1) {
+            throw new Error('Executor service instance could not be durably revoked.');
+          }
         }
         lifecycle = 'closed';
       } catch (error) {

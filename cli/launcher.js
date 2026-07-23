@@ -37,7 +37,14 @@ function main() {
   });
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+let invokedEntry = null;
+try {
+  invokedEntry = process.argv[1] ? fs.realpathSync(process.argv[1]) : null;
+} catch {
+  invokedEntry = null;
+}
+
+if (invokedEntry && import.meta.url === pathToFileURL(invokedEntry).href) {
   try {
     main();
   } catch (error) {

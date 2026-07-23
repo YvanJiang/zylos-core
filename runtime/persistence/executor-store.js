@@ -4577,6 +4577,13 @@ export function createExecutorStore({
           };
         } else {
           turn = settleBlockingInteractionsForStop(turnContext, turn, stoppedAt);
+          if (previousState === 'recovering') {
+            database.prepare(`
+              UPDATE runtime_execution_recoveries
+              SET state = 'stopped', recovery_version = recovery_version + 1, updated_at = ?
+              WHERE turn_id = ? AND state IN ('waiting_decision', 'authorized')
+            `).run(stoppedAt, turn.turn_id);
+          }
           const terminalEvent = transitionInTransaction(database, {
             turnId: turn.turn_id,
             fromState: previousState,
@@ -8873,12 +8880,16 @@ export function createExecutorStore({
   function reconcileNonterminalTurns(
     controlledTurnContexts = [],
     recoveryKind = 'sweep_reconciliation',
+    { controlledStartingGraceMs = 0 } = {},
   ) {
     if (!Array.isArray(controlledTurnContexts)) {
       throw new TypeError('controlledTurnContexts must be an array');
     }
     if (!['startup_reconciliation', 'sweep_reconciliation'].includes(recoveryKind)) {
       throw new TypeError('recoveryKind must identify startup or sweep reconciliation');
+    }
+    if (!Number.isFinite(controlledStartingGraceMs) || controlledStartingGraceMs < 0) {
+      throw new TypeError('controlledStartingGraceMs must be a non-negative finite number');
     }
     const controlled = new Map(controlledTurnContexts.map((context) => [context.turn_id, context]));
     const reconcile = database.transaction(() => {
@@ -8888,7 +8899,7 @@ export function createExecutorStore({
           turn.attempt_no, turn.lease_epoch,
           attempt.service_instance_id, attempt.executor_instance_id,
           attempt.runtime_instance_id, attempt.runtime_evidence_json,
-          attempt.last_provider_event_at,
+          attempt.last_provider_event_at, attempt.started_at,
           lease.lease_owner, lease.turn_id AS lease_turn_id,
           lease.attempt_id AS lease_attempt_id, lease.attempt_no AS lease_attempt_no,
           lease.lease_epoch AS lease_epoch_current, lease.lease_expires_at,
@@ -8960,11 +8971,22 @@ export function createExecutorStore({
         const validProviderEventActivity = typeof candidate.last_provider_event_at === 'string'
           && Number.isFinite(providerEventAtMs)
           && providerEventAtMs <= reconciledAtMs;
-        if (
-          exactLocalIdentity
+        const attemptStartedAtMs = Date.parse(candidate.started_at);
+        const controlledStartingWithinGrace = recoveryKind === 'sweep_reconciliation'
+          && candidate.state === 'starting'
+          && exactLocalIdentity
           && exactLeaseFence
-          && durableRuntimeEvidence
-          && validProviderEventActivity
+          && Number.isFinite(attemptStartedAtMs)
+          && reconciledAtMs >= attemptStartedAtMs
+          && reconciledAtMs - attemptStartedAtMs < controlledStartingGraceMs;
+        if (
+          controlledStartingWithinGrace
+          || (
+            exactLocalIdentity
+            && exactLeaseFence
+            && durableRuntimeEvidence
+            && validProviderEventActivity
+          )
         ) {
           results.push({ turn_id: candidate.turn_id, status: 'healthy' });
           continue;

@@ -61,9 +61,10 @@ export function findResumableRuntimeUpgrade(database) {
        OR (
          run.state = 'committed'
          AND NOT EXISTS (
-           SELECT 1 FROM runtime_upgrade_events AS event
-           WHERE event.upgrade_id = run.upgrade_id
-             AND event.step_key = 'postcommit-cleanup'
+           SELECT 1 FROM runtime_upgrade_effects AS effect
+           WHERE effect.upgrade_id = run.upgrade_id
+             AND effect.step_key = 'postcommit-cleanup'
+             AND effect.state = 'completed'
          )
        )
     ORDER BY run.created_at ASC

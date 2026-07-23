@@ -1,5 +1,8 @@
 import { EventEmitter } from 'node:events';
 import { spawn as spawnSubprocess } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PassThrough } from 'node:stream';
 
@@ -658,7 +661,14 @@ describe('Codex app-server provider adapter', () => {
     expect(spawnProcess).toHaveBeenCalledTimes(1);
     expect(spawnProcess).toHaveBeenCalledWith(
       'codex',
-      ['app-server', '--stdio'],
+      expect.arrayContaining([
+        'app-server',
+        '--disable', 'hooks',
+        '--disable', 'code_mode_host',
+        '--disable', 'image_generation',
+        '--disable', 'multi_agent',
+        '--stdio',
+      ]),
       expect.objectContaining({
         detached: process.platform !== 'win32',
         shell: false,
@@ -687,10 +697,8 @@ describe('Codex app-server provider adapter', () => {
         environments: [],
         dynamicTools: [],
         config: expect.objectContaining({
-          mcp_servers: {},
           web_search: 'disabled',
           features: expect.objectContaining({
-            apps: false,
             hooks: false,
             multi_agent: false,
             multi_agent_v2: false,
@@ -704,6 +712,7 @@ describe('Codex app-server provider adapter', () => {
         }),
       }),
     }));
+    expect(server.received[2].params.config).not.toHaveProperty('mcp_servers');
     expect(context.bindProviderNativeId).toHaveBeenCalledWith('codex-thread-1');
     expect(context.reportProviderState).toHaveBeenCalledWith({
       state: 'started',
@@ -729,6 +738,55 @@ describe('Codex app-server provider adapter', () => {
         environments: [],
       }),
     }));
+  });
+
+  test('preserves enabled MCP servers and plugin-provided MCP discovery at app-server start', async () => {
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-mcp-isolation-'));
+    fs.writeFileSync(path.join(codexHome, 'config.toml'), `
+[mcp_servers.node_repl]
+command = "node"
+
+[mcp_servers.gitnexus]
+command = "gitnexus"
+enabled = false
+`);
+    const server = createFakeAppServer();
+    const spawnProcess = jest.fn(() => server.child);
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess,
+      cwd: '/workspace',
+      env: {
+        CODEX_HOME: codexHome,
+        PATH: process.env.PATH,
+      },
+    });
+
+    try {
+      await expect(collect(executeAdapter(adapter, executionContext()))).resolves.toEqual([]);
+
+      expect(spawnProcess).toHaveBeenCalledWith(
+        'codex',
+        [
+          'app-server',
+          '--disable', 'hooks',
+          '--disable', 'code_mode_host',
+          '--disable', 'image_generation',
+          '--disable', 'multi_agent',
+          '--stdio',
+        ],
+        expect.any(Object),
+      );
+      const threadStart = server.received.find(({ method }) => method === 'thread/start');
+      expect(threadStart.params.config).not.toHaveProperty('mcp_servers');
+      expect(threadStart.params.config.features).not.toHaveProperty('apps');
+      expect(threadStart.params.config.features).not.toHaveProperty('enable_mcp_apps');
+      expect(threadStart.params.config.features).not.toHaveProperty('plugins');
+      expect(threadStart.params.config.features).not.toHaveProperty('tool_call_mcp_elicitation');
+      expect(threadStart.params.config.features).not.toHaveProperty('tool_search');
+    } finally {
+      await adapter.close();
+      fs.rmSync(codexHome, { recursive: true, force: true });
+    }
   });
 
   test('resumes and multiplexes persisted lineages over the same supervised process', async () => {
@@ -768,10 +826,10 @@ describe('Codex app-server provider adapter', () => {
         approvalsReviewer: 'user',
         sandbox: 'read-only',
         config: expect.objectContaining({
-          mcp_servers: {},
           web_search: 'disabled',
         }),
       }));
+      expect(resume.params.config).not.toHaveProperty('mcp_servers');
     }
     expect(server.received.filter(({ method }) => method === 'turn/start')).toHaveLength(2);
   });
@@ -1125,6 +1183,119 @@ describe('Codex app-server provider adapter', () => {
     expect(JSON.stringify(server.received)).not.toContain('exec --json');
   });
 
+  test('automatically executes an enabled MCP tool and normalizes its lifecycle', async () => {
+    let activeTurn = null;
+    const server = createFakeAppServer({
+      afterTurnStart(details) {
+        activeTurn = details;
+        details.send({
+          method: 'item/started',
+          params: {
+            threadId: details.threadId,
+            turnId: details.turnId,
+            startedAtMs: 1,
+            item: {
+              type: 'mcpToolCall',
+              id: 'mcp-call-1',
+              server: 'node_repl',
+              tool: 'js',
+              status: 'inProgress',
+            },
+          },
+        });
+        details.send({
+          id: 'mcp-tool-approval-1',
+          method: 'mcpServer/elicitation/request',
+          params: {
+            threadId: details.threadId,
+            turnId: details.turnId,
+            serverName: 'node_repl',
+            mode: 'form',
+            message: 'Allow this MCP tool call?',
+            requestedSchema: { type: 'object', properties: {}, required: [] },
+            _meta: { codex_approval_kind: 'mcp_tool_call' },
+          },
+        });
+      },
+      onClientResponse({ message, send }) {
+        if (message.id !== 'mcp-tool-approval-1') return;
+        send({
+          method: 'serverRequest/resolved',
+          params: { threadId: activeTurn.threadId, requestId: message.id },
+        });
+        send({
+          method: 'item/mcpToolCall/progress',
+          params: {
+            threadId: activeTurn.threadId,
+            turnId: activeTurn.turnId,
+            itemId: 'mcp-call-1',
+            message: 'MCP tool is running.',
+          },
+        });
+        send({
+          method: 'item/completed',
+          params: {
+            threadId: activeTurn.threadId,
+            turnId: activeTurn.turnId,
+            completedAtMs: 2,
+            item: {
+              type: 'mcpToolCall',
+              id: 'mcp-call-1',
+              server: 'node_repl',
+              tool: 'js',
+              status: 'completed',
+            },
+          },
+        });
+        send({
+          method: 'turn/completed',
+          params: {
+            threadId: activeTurn.threadId,
+            turn: { id: activeTurn.turnId, status: 'completed', items: [] },
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(executeAdapter(adapter, executionContext()))).resolves.toEqual([
+      {
+        kind: 'tool_started',
+        provider_native_id: 'codex-thread-1',
+        payload: {
+          tool_use_id: 'mcp-call-1',
+          tool_name: 'external_tool',
+          summary: 'External tool started.',
+          side_effect_status: 'unknown',
+        },
+      },
+      {
+        kind: 'tool_progress',
+        provider_native_id: 'codex-thread-1',
+        payload: {
+          tool_use_id: 'mcp-call-1',
+          tool_name: 'external_tool',
+          summary: 'External tool running.',
+          side_effect_status: 'unknown',
+        },
+      },
+      {
+        kind: 'tool_finished',
+        provider_native_id: 'codex-thread-1',
+        payload: {
+          tool_use_id: 'mcp-call-1',
+          tool_name: 'external_tool',
+          summary: 'External tool completed.',
+          side_effect_status: 'unknown',
+        },
+      },
+    ]);
+    expect(server.received).toContainEqual({
+      id: 'mcp-tool-approval-1',
+      result: { action: 'accept', content: {}, _meta: null },
+    });
+  });
+
   test('ignores fenced private telemetry that has no provider-neutral event shape', async () => {
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
@@ -1390,7 +1561,6 @@ describe('Codex app-server provider adapter', () => {
   });
 
   test.each([
-    'mcpToolCall',
     'dynamicToolCall',
     'collabAgentToolCall',
     'webSearch',
@@ -2043,7 +2213,7 @@ describe('Codex app-server provider adapter', () => {
     );
   });
 
-  test('declines a well-formed MCP elicitation instead of exposing an external side-effect path', async () => {
+  test('publishes a non-approval MCP elicitation as a durable interaction', async () => {
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
         send({
@@ -2066,14 +2236,27 @@ describe('Codex app-server provider adapter', () => {
       },
     });
     const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+    const iterator = executeAdapter(adapter, executionContext())[Symbol.asyncIterator]();
 
-    await expect(collect(executeAdapter(adapter, executionContext()))).rejects.toMatchObject({
-      providerError: { code: 'unsupported_capability' },
-    });
-    expect(server.received).toContainEqual({
-      id: 'disabled-mcp-elicitation',
-      result: { action: 'decline', content: null, _meta: null },
-    });
+    try {
+      await expect(nextInteraction(iterator)).resolves.toMatchObject({
+        done: false,
+        value: {
+          kind: 'interaction_requested',
+          payload: {
+            kind: 'question',
+            prompt: 'Choose an environment.',
+          },
+        },
+      });
+      expect(server.received).not.toContainEqual(expect.objectContaining({
+        id: 'disabled-mcp-elicitation',
+        result: expect.objectContaining({ action: 'accept' }),
+      }));
+    } finally {
+      await iterator.return();
+      await adapter.close();
+    }
   });
 
   test('rejects an app-server initiated dynamic tool call before it can execute', async () => {

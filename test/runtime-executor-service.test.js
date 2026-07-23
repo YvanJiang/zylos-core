@@ -229,6 +229,57 @@ afterEach(() => {
 });
 
 describe('runtime executor service', () => {
+  test('revokes its durable service registration only after a clean close', async () => {
+    const database = openTestDatabase();
+    const service = createExecutorService({
+      database,
+      adapter: { async *execute() {}, async close() { return []; } },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-clean-close',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('clean-close'),
+    });
+
+    service.start();
+    expect(database.prepare(`
+      SELECT revoked_at FROM runtime_executor_service_instances
+      WHERE service_instance_id = ?
+    `).get('executor-service-clean-close')).toEqual({ revoked_at: null });
+
+    await service.close();
+
+    expect(database.prepare(`
+      SELECT revoked_at FROM runtime_executor_service_instances
+      WHERE service_instance_id = ?
+    `).get('executor-service-clean-close')).toEqual({
+      revoked_at: '2026-07-19T07:02:00Z',
+    });
+    database.close();
+  });
+
+  test('keeps its durable service registration active when close cannot prove isolation', async () => {
+    const database = openTestDatabase();
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute() {},
+        async close() { throw new Error('provider isolation remains unproven'); },
+      },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-failed-close',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('failed-close'),
+    });
+
+    service.start();
+    await expect(service.close()).rejects.toThrow('provider isolation remains unproven');
+    expect(database.prepare(`
+      SELECT revoked_at FROM runtime_executor_service_instances
+      WHERE service_instance_id = ?
+    `).get('executor-service-failed-close')).toEqual({ revoked_at: null });
+    database.close();
+  });
+
   test('renews the current executor turn lease every ten seconds under its exact fence', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'turn-lease-renewal');
@@ -520,6 +571,88 @@ describe('runtime executor service', () => {
     });
 
     await service.close();
+    database.close();
+  });
+
+  test('gives a locally controlled starting turn one sweep interval to report provider activity', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'nonterminal-sweep-starting-grace');
+    let sweep;
+    let releaseProviderStartup;
+    const providerStartup = new Promise((resolve) => { releaseProviderStartup = resolve; });
+    const clock = { now: '2026-07-19T07:01:00Z' };
+    const service = createExecutorService({
+      database,
+      adapter: {
+        async *execute(context) {
+          await providerStartup;
+          context.reportRuntimeEvidence({
+            runtime_instance_id: 'codex-app-server-starting-grace',
+            handle_kind: 'codex_app_server_connection',
+            controllable: true,
+          });
+          context.reportProviderState({ state: 'started', provider_native_id: null });
+        },
+      },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-nonterminal-sweep-starting-grace',
+      now: () => clock.now,
+      generateId: deterministicIds('nonterminal-sweep-starting-grace'),
+      scheduleNonterminalSweep(callback, intervalMs) {
+        expect(intervalMs).toBe(30_000);
+        sweep = callback;
+        return { unref() {} };
+      },
+      cancelNonterminalSweep() {},
+    });
+
+    service.start();
+    const running = service.runNext();
+    await new Promise((resolve) => setImmediate(resolve));
+    clock.now = '2026-07-19T07:01:01Z';
+    sweep();
+
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'starting' });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_execution_recoveries WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ count: 0 });
+
+    releaseProviderStartup();
+    await expect(running).resolves.toMatchObject({ status: 'completed' });
+    await service.close();
+    database.close();
+  });
+
+  test('fails closed when a locally controlled starting turn exhausts its sweep grace', () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'nonterminal-sweep-starting-grace-expired');
+    const clock = { now: '2026-07-19T07:01:00Z' };
+    const store = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-nonterminal-sweep-starting-grace-expired',
+      now: () => clock.now,
+      generateId: deterministicIds('nonterminal-sweep-starting-grace-expired'),
+      leaseDurationMs: 60_000,
+    });
+    const context = store.claimNextQueuedTurn();
+    clock.now = '2026-07-19T07:01:30Z';
+
+    expect(store.reconcileNonterminalTurns(
+      [context],
+      'sweep_reconciliation',
+      { controlledStartingGraceMs: 30_000 },
+    )).toMatchObject({
+      inspected: 1,
+      healthy: 0,
+      waiting_decision: 1,
+      results: [{ turn_id: accepted.turn_id, status: 'waiting_decision' }],
+    });
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'recovering' });
     database.close();
   });
 

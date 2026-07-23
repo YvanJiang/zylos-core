@@ -29,6 +29,7 @@ module.exports = {
   apps: [{
     name: 'zylos-executor',
     script: EXECUTOR_ENTRY,
+    interpreter: 'none',
     cwd: ZYLOS_DIR,
     env: {
       NODE_ENV: 'production',

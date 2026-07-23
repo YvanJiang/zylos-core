@@ -24,6 +24,7 @@ function closeChild(child, graceMs) {
 
 export function createExecutorPrerequisiteOwner({
   zylosDir,
+  releasePath,
   spawnFn = spawn,
   existsSync = fs.existsSync,
   closeGraceMs = 5_000,
@@ -32,13 +33,18 @@ export function createExecutorPrerequisiteOwner({
     || path.parse(zylosDir).root === zylosDir) {
     throw new TypeError('zylosDir must be an explicit absolute non-root path');
   }
+  if (typeof releasePath !== 'string' || !path.isAbsolute(releasePath)
+    || path.parse(releasePath).root === releasePath) {
+    throw new TypeError('releasePath must be an explicit absolute non-root path');
+  }
+  const releaseRoot = path.resolve(releasePath);
   const children = new Map();
   let started = false;
   let closing = false;
   let failure = null;
 
   function descriptors() {
-    const skills = path.join(zylosDir, '.claude', 'skills');
+    const skills = path.join(releaseRoot, 'skills');
     const values = [
       {
         name: 'scheduler',

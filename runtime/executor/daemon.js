@@ -59,9 +59,10 @@ function hasResumableRuntimeUpgrade({ database, zylosDir }) {
         SELECT run.upgrade_id FROM runtime_upgrade_runs AS run
         WHERE run.state NOT IN ('committed', 'rolled_back')
            OR (run.state = 'committed' AND NOT EXISTS (
-             SELECT 1 FROM runtime_upgrade_events AS event
-             WHERE event.upgrade_id = run.upgrade_id
-               AND event.step_key = 'postcommit-cleanup'
+             SELECT 1 FROM runtime_upgrade_effects AS effect
+             WHERE effect.upgrade_id = run.upgrade_id
+               AND effect.step_key = 'postcommit-cleanup'
+               AND effect.state = 'completed'
            ))
         ORDER BY run.created_at ASC LIMIT 1
       `).get() ?? null;
@@ -182,7 +183,7 @@ export async function runExecutorDaemon({
   let prerequisiteOwner = null;
   try {
     assertExecutorStartFence({ zylosDir });
-    prerequisiteOwner = createPrerequisiteOwner({ zylosDir });
+    prerequisiteOwner = createPrerequisiteOwner({ zylosDir, releasePath: currentReleasePath });
     await prerequisiteOwner.start();
     const adapter = createAdapter({ provider, zylosDir, environment: process.env });
     host = createHost({

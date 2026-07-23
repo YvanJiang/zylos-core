@@ -424,7 +424,9 @@ describe('installed service template', () => {
     const template = path.resolve('templates/pm2/ecosystem.config.cjs');
     const child = spawnSync(process.execPath, ['-e', `
       const config = require(${JSON.stringify(template)});
-      process.stdout.write(JSON.stringify(config.apps.map((app) => ({ name: app.name, script: app.script }))));
+      process.stdout.write(JSON.stringify(config.apps.map((app) => ({
+        name: app.name, script: app.script, interpreter: app.interpreter,
+      }))));
     `], {
       encoding: 'utf8',
       env: { ...process.env, HOME: home, ZYLOS_DIR: zylosDir, ZYLOS_PACKAGE_ROOT: process.cwd() },
@@ -435,11 +437,41 @@ describe('installed service template', () => {
     expect(JSON.parse(child.stdout)).toEqual([{
       name: EXECUTOR_SERVICE_NAME,
       script: path.resolve('runtime/executor/launcher.js'),
+      interpreter: 'none',
     }]);
   });
 });
 
 describe('installed CLI release dispatcher', () => {
+  test('runs when invoked through the installed npm bin symlink', () => {
+    const directory = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-cli-bin-link-'));
+    const target = path.join(directory, 'target');
+    const zylosDir = path.join(directory, 'installation');
+    const binDir = path.join(directory, 'bin');
+    fs.mkdirSync(path.join(target, 'cli'), { recursive: true });
+    fs.mkdirSync(path.join(zylosDir, 'runtime'), { recursive: true });
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(target, 'cli', 'zylos.js'),
+      '#!/usr/bin/env node\nconsole.log(`forwarded:${process.argv[2]}`);\n',
+      { mode: 0o755 },
+    );
+    fs.writeFileSync(path.join(zylosDir, 'runtime', 'active-release.json'), JSON.stringify({
+      release_ref: 'release-B', release_path: target,
+    }));
+    const command = path.join(binDir, 'zylos');
+    fs.symlinkSync(path.resolve('cli/launcher.js'), command);
+    try {
+      const child = spawnSync(command, ['probe'], {
+        encoding: 'utf8', env: { ...process.env, ZYLOS_DIR: zylosDir },
+      });
+      expect(child.status).toBe(0);
+      expect(child.stdout.trim()).toBe('forwarded:probe');
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test('uses the same durable active release as the executor launcher', () => {
     const directory = fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'zylos-cli-release-'));
     const current = path.join(directory, 'current');

@@ -6,8 +6,12 @@ It does not change the provider-neutral Core contracts or the migration consensu
 
 ## Transport boundary
 
-Each executor-service adapter instance supervises one `codex app-server --stdio` process group and
-multiplexes logical conversation executors over its newline-delimited bidirectional protocol.
+Each executor-service adapter instance supervises one locked-down `codex app-server` process group
+and multiplexes logical conversation executors over its newline-delimited bidirectional protocol.
+Before app-server starts, the adapter disables hooks, code-mode hosting, image generation, and
+multi-agent execution at the process layer. It deliberately preserves the effective Codex MCP,
+plugin, and app configuration, so every server that was already `enabled=true` remains available;
+servers disabled by the user's configuration stay disabled.
 The child, connection, in-memory thread, request IDs, and active turn handles are not durable
 authority. Core's persisted lineage, turn, attempt, lease, interaction, and handoff records remain
 authoritative.
@@ -42,14 +46,16 @@ Private app-server method and item names remain inside the adapter:
 | fenced `turn/started` | provider-neutral started signal; Core atomically authors `starting -> running` with `provider_started` |
 | `item/agentMessage/delta` and completed agent message | `text_delta` and `text_snapshot` |
 | command and file lifecycle | `tool_started`, `tool_progress`, `tool_finished`; item IDs, progress methods, and fixed-version statuses are fenced by type |
-| MCP, dynamic, collaboration, web, image, or provider-hook lifecycle | capability failure; these paths are disabled because the current locked configuration has not established every required synchronous Core fence and bypass exclusion |
+| MCP tool lifecycle | `tool_started`, optional `tool_progress`, and `tool_finished`; normal MCP items do not cause an unsupported-capability recovery |
+| dynamic, collaboration, web, image, or provider-hook lifecycle | capability failure; these paths remain disabled because they are outside the authorized MCP exception |
 | completed turn | adapter iterator completion; Core authors the canonical completed state |
 | failed/interrupted turn, error notification, or lost connection | typed provider failure; Core authors the canonical failure or recovery state |
 | fenced token-usage and moderation telemetry | intentionally omitted because the public normalized-event contract has no usage/score event and private provider scores must not escape the adapter |
 | command/file approval | one-shot `accept` only after the current durable permission and workspace fences; otherwise a durable `tool_approval` interaction, with the same workspace fence repeated before an approved handoff is sent |
 | permissions approval | empty turn-scoped denial followed by capability failure; the adapter never creates a turn/session filesystem or network grant |
 | single-question `requestUserInput` | durable `question` or fixed `choice` interaction with answer constraints preserved |
-| MCP elicitation or tool execution | disabled and declined; 0.144.5 has a conditional model-initiated prompt seam, but this candidate neither enables nor proves all configuration, reviewer, hook/Guardian/cache, direct-RPC, and durable-lease conditions required to use it safely |
+| MCP tool-approval elicitation | automatically answered with one-shot `accept` and no Core interaction; this is the explicit 2026-07-23 fluidity-over-isolation decision |
+| other supported MCP form elicitation | durable `question` or fixed `choice` interaction; malformed or unsupported forms fail closed |
 
 User-supplied answers are accepted only through Core's durable interaction-answer and handoff
 records. The
@@ -94,23 +100,26 @@ receive the normal provider-loss recovery signal.
 
 App-server provides a blocking pre-action boundary for built-in command and file-change approvals.
 The read-only OS sandbox is the enforcement layer that prevents the built-in shell and apply-patch
-paths from writing before that response. The adapter also locks each new/resumed thread with empty
-MCP and dynamic-tool configuration and disables apps/connectors, plugins, hooks, code mode, browser,
-computer use, image generation, web search, collaboration/subagents, JS REPL, tool search, and the
-permission-request tools. Both legacy and v2/fanout/collaboration-mode multi-agent feature keys are
-disabled so an inherited local configuration cannot reopen a background execution surface. An
-unexpected hook, MCP/dynamic/collaboration/web/image item, dynamic tool
-server request, permission-profile request, or MCP elicitation is refused and retires the
+paths from writing before that response. An empty thread-level `mcp_servers` object is deliberately
+not sent: Codex 0.144.5 merges that object with inherited configuration instead of replacing it.
+The adapter now relies on that inheritance so effective enabled MCP and plugin-provided servers are
+loaded normally. Hooks, code mode, browser, computer use, image generation, web search,
+collaboration/subagents, and permission-request tools remain disabled outside MCP. Both legacy and
+v2/fanout/collaboration-mode multi-agent feature keys are disabled so an inherited local
+configuration cannot reopen those unrelated execution surfaces. An unexpected hook,
+dynamic/collaboration/web/image item, dynamic tool server request, permission-profile request, or
+malformed MCP elicitation is refused and retires the
 connection; its item-start notification is only contradiction evidence, never claimed as the
 pre-action fence.
 
 Official 0.144.5 source does contain a conditional blocking seam for a model-initiated MCP tool
 when every server/tool uses prompt approval, review reaches app-server, no hook, Guardian, or cache
-auto-allows the call, and the elicitation feature remains enabled. That seam precedes the external
-`manager.call_tool` operation, so it may support a future Global14 implementation. It is not enabled
-or claimed by this candidate: the configuration and every bypass remain fail-closed, and the
-client-initiated `mcpServer/tool/call` RPC bypasses that seam entirely. The version-specific source
-and fixture audit is recorded in
+auto-allows the call, and the elicitation feature remains enabled. The 2026-07-23 decision does not
+claim this as a security fence: Zylos automatically accepts tool-approval elicitation, and servers
+configured for automatic approval can execute without any server request. The resulting MCP access
+may bypass Core workspace leases, the provider sandbox, and protected-action approval. The
+client-initiated `mcpServer/tool/call` RPC remains unreachable through Zylos's private sender. The
+version-specific source and fixture audit is recorded in
 [`codex-app-server-0.144.5-fence-research.md`](./codex-app-server-0.144.5-fence-research.md).
 
 The remaining app-server RPCs with independent side effects (`thread/shellCommand`, `command/exec`,
@@ -120,7 +129,7 @@ and its private sender has an explicit call-site allowlist limited to initialize
 start/resume, turn start/interrupt, and the exact server-request responses above.
 
 Multi-question, secret, provider-auto-resolving, and fixed-choice-plus-Other `requestUserInput`
-requests, MCP execution and elicitation, unknown server requests, duplicate request IDs,
+requests, malformed or unsupported non-approval MCP elicitation, unknown server requests, duplicate request IDs,
 unsupported item or notification types, incomplete fixed-version request shapes, duplicate or
 unfinished tool lifecycles, cross-tool progress, unrenderable approval details, and stale or
 mismatched traffic fail closed.
