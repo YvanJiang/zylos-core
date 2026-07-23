@@ -156,6 +156,45 @@ describe('executor lifecycle CLI boundary', () => {
     expect(result).toMatchObject({ ok: true, previousServiceInstanceId: 'executor-old', serviceInstanceId: 'executor-new' });
   });
 
+  test('loads the executor ecosystem with the selected installation and package roots', async () => {
+    const invocations = [];
+    const replies = [
+      health('executor-old'), shutdown('executor-old'),
+      health('executor-new'),
+    ];
+    const result = await restartExecutorService({
+      zylosDir: '/tmp/zylos-cli-fixture',
+      execFileSyncFn(file, args, options) {
+        invocations.push({ file, args, options });
+        if (file === 'pm2' && args[0] === 'jlist') {
+          return JSON.stringify([{
+            name: EXECUTOR_SERVICE_NAME,
+            pm2_env: {
+              status: 'online',
+              pm_exec_path: path.resolve('runtime/executor/launcher.js'),
+              pm_cwd: '/tmp/zylos-cli-fixture',
+              ZYLOS_DIR: '/tmp/zylos-cli-fixture',
+            },
+          }]);
+        }
+        return '';
+      },
+      requestFn: async () => replies.shift(),
+      retryDelaysMs: [0],
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      previousServiceInstanceId: 'executor-old',
+      serviceInstanceId: 'executor-new',
+    });
+    const restart = invocations.find(({ args }) => args[0] === 'restart');
+    expect(restart.options.env).toMatchObject({
+      ZYLOS_DIR: '/tmp/zylos-cli-fixture',
+      ZYLOS_PACKAGE_ROOT: path.resolve('.'),
+    });
+  });
+
   test('restart rejects a new healthy identity for the wrong provider', async () => {
     const replies = [
       health('executor-old', 'healthy', 'claude'),

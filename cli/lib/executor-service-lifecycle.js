@@ -6,11 +6,14 @@ import { assertExecutorStartFence } from '../../runtime/executor/start-fence.js'
 
 export const EXECUTOR_SERVICE_NAME = 'zylos-executor';
 
-function expectedExecutorEntry() {
-  const packageRoot = process.env.ZYLOS_PACKAGE_ROOT
+function executorPackageRoot() {
+  return process.env.ZYLOS_PACKAGE_ROOT
     ? path.resolve(process.env.ZYLOS_PACKAGE_ROOT)
     : path.resolve(import.meta.dirname, '..', '..');
-  return path.join(packageRoot, 'runtime', 'executor', 'launcher.js');
+}
+
+function expectedExecutorEntry() {
+  return path.join(executorPackageRoot(), 'runtime', 'executor', 'launcher.js');
 }
 
 function requireZylosDir(zylosDir) {
@@ -101,8 +104,16 @@ async function waitForHealthy({
   return last;
 }
 
-function runPm2(execFileSyncFn, args) {
-  execFileSyncFn('pm2', args, { stdio: 'pipe', timeout: 30_000 });
+function runPm2(execFileSyncFn, args, { zylosDir = null } = {}) {
+  const options = { stdio: 'pipe', timeout: 30_000 };
+  if (zylosDir !== null) {
+    options.env = {
+      ...process.env,
+      ZYLOS_DIR: requireZylosDir(zylosDir),
+      ZYLOS_PACKAGE_ROOT: executorPackageRoot(),
+    };
+  }
+  execFileSyncFn('pm2', args, options);
 }
 
 function inspectExecutorRegistration({ zylosDir, execFileSyncFn, required }) {
@@ -149,7 +160,7 @@ export async function startExecutorService({
     inspectExecutorRegistration({ zylosDir, execFileSyncFn, required: false });
     runPm2(execFileSyncFn, [
       'start', ecosystemPath(zylosDir), '--only', EXECUTOR_SERVICE_NAME,
-    ]);
+    ], { zylosDir });
     runPm2(execFileSyncFn, ['save']);
   } catch (error) {
     return pm2Failure(error);
@@ -227,7 +238,7 @@ export async function restartExecutorService({
         await restoreConfiguration();
         runPm2(execFileSyncFn, [
           'restart', ecosystemPath(zylosDir), '--only', EXECUTOR_SERVICE_NAME,
-        ]);
+        ], { zylosDir });
         runPm2(execFileSyncFn, ['save']);
         rollback = await waitForHealthy({
           zylosDir, requestFn, retryDelaysMs,
@@ -251,7 +262,7 @@ export async function restartExecutorService({
   try {
     runPm2(execFileSyncFn, [
       'restart', ecosystemPath(zylosDir), '--only', EXECUTOR_SERVICE_NAME,
-    ]);
+    ], { zylosDir });
     runPm2(execFileSyncFn, ['save']);
   } catch (error) {
     restartFailure = pm2Failure(error);
@@ -268,7 +279,7 @@ export async function restartExecutorService({
     await restoreConfiguration();
     runPm2(execFileSyncFn, [
       'restart', ecosystemPath(zylosDir), '--only', EXECUTOR_SERVICE_NAME,
-    ]);
+    ], { zylosDir });
     runPm2(execFileSyncFn, ['save']);
     rollback = await waitForHealthy({
       zylosDir, requestFn, retryDelaysMs,
