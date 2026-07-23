@@ -19,7 +19,11 @@ export function requireSafeReleasePath(releasePath) {
   return { entry, releasePath: resolved };
 }
 
-export function resolveActiveRelease({ zylosDir, packageRoot }) {
+export function resolveActiveRelease({ zylosDir, packageRoot, useActiveRelease = true }) {
+  if (useActiveRelease === false) {
+    const release = requireSafeReleasePath(packageRoot);
+    return { ...release, releaseRef: null, upgradeId: null };
+  }
   const activeFile = path.join(zylosDir, 'runtime', 'active-release.json');
   try {
     const active = JSON.parse(fs.readFileSync(activeFile, 'utf8'));
@@ -42,7 +46,11 @@ function main() {
     || path.parse(zylosDir).root === zylosDir) {
     throw new Error('ZYLOS_DIR must be an explicit absolute non-root path.');
   }
-  const active = resolveActiveRelease({ zylosDir, packageRoot });
+  const active = resolveActiveRelease({
+    zylosDir,
+    packageRoot,
+    useActiveRelease: process.env.ZYLOS_EXECUTOR_IGNORE_ACTIVE_RELEASE !== '1',
+  });
   runForwardedNode(active.entry, [], {
     cwd: zylosDir,
     env: {

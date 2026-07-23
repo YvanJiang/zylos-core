@@ -84,6 +84,10 @@ Flags can also be set via environment variables during `zylos init`. Resolution 
 | `OPENAI_API_KEY` | `--codex-api-key` |
 | `OPENAI_BASE_URL` | `--codex-base-url` |
 
+For Codex, `--codex-base-url` / `OPENAI_BASE_URL` are converted into Codex
+provider routing in `config.toml` (`[model_providers.<provider>] base_url = ...`)
+instead of relying on a process-level base URL.
+
 CI, Kubernetes, and shared E2E environments should also provide `GITHUB_TOKEN`
 so `zylos add` and `zylos upgrade` use GitHub's authenticated API quota instead
 of the shared unauthenticated quota. See the

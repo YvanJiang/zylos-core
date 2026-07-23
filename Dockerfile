@@ -35,6 +35,7 @@ USER zylos
 ENV HOME=/home/zylos
 ENV NPM_CONFIG_PREFIX=/home/zylos/.npm-global
 ENV PATH="/home/zylos/.npm-global/bin:/home/zylos/.local/bin:/usr/local/bin:${PATH}"
+ENV ZYLOS_PACKAGE_ROOT=/home/zylos/.npm-global/lib/node_modules/zylos
 
 # ── Install zylos-core from local source ─────────────────────────────────────
 # COPY the repo (filtered by .dockerignore) and install from it, so the image
@@ -42,6 +43,7 @@ ENV PATH="/home/zylos/.npm-global/bin:/home/zylos/.local/bin:/usr/local/bin:${PA
 WORKDIR /home/zylos
 COPY --chown=zylos:zylos . /tmp/zylos-core
 RUN npm install -g --install-links /tmp/zylos-core \
+    && node /home/zylos/.npm-global/lib/node_modules/zylos/scripts/install-skill-deps.js \
     && rm -rf /tmp/zylos-core \
     && zylos --version
 
@@ -62,4 +64,5 @@ RUN chmod +x /entrypoint.sh
 # Healthcheck is defined in docker-compose.yml (start_period=600s for slow init).
 # No HEALTHCHECK here to avoid a conflicting override.
 
+USER root
 ENTRYPOINT ["/entrypoint.sh"]

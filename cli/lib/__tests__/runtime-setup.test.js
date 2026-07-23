@@ -53,6 +53,7 @@ describe('renderCodexProjectConfig', () => {
     assert.doesNotMatch(content, /\[projects\./);
     assert.doesNotMatch(content, /trust_level/);
     assert.doesNotMatch(content, /openai_base_url/);
+    assert.doesNotMatch(content, /\[model_providers\./);
   });
 
   it('preserves unknown top-level keys, sections, and feature flags while updating zylos keys', () => {
@@ -141,9 +142,12 @@ describe('renderCodexGlobalConfig', () => {
     assert.doesNotMatch(content, /check_for_update_on_startup/);
   });
 
-  it('includes openai_base_url when provided', () => {
+  it('includes provider routing when provided', () => {
     const content = renderCodexGlobalConfig('/home/user/zylos', '', { openaiBaseUrl: 'https://proxy.example.com/v1' });
-    assert.match(content, /openai_base_url = "https:\/\/proxy\.example\.com\/v1"/);
+    assert.match(content, /^model_provider = "OpenAI"$/m);
+    assert.match(content, /\[model_providers\.OpenAI\][\s\S]*base_url = "https:\/\/proxy\.example\.com\/v1"/);
+    assert.match(content, /\[model_providers\.OpenAI\][\s\S]*wire_api = "responses"/);
+    assert.match(content, /\[model_providers\.OpenAI\][\s\S]*requires_openai_auth = true/);
   });
 
   it('preserves unknown global top-level keys, sections, and unrelated projects', () => {
@@ -168,19 +172,44 @@ describe('renderCodexGlobalConfig', () => {
     assert.match(content, /\[projects\."\/home\/user\/zylos"\]\ntrust_level = "trusted"/);
   });
 
-  it('preserves existing openai_base_url when zylos has no value', () => {
+  it('preserves existing openai_base_url when zylos has no provider value', () => {
     const existing = 'openai_base_url = "https://user-proxy.example.com/v1"\n';
     const content = renderCodexGlobalConfig('/home/user/zylos', existing);
     assert.match(content, /openai_base_url = "https:\/\/user-proxy\.example\.com\/v1"/);
   });
 
-  it('overwrites existing openai_base_url when zylos has a value', () => {
+  it('preserves existing openai_base_url and writes provider routing when zylos has a value', () => {
     const existing = 'openai_base_url = "https://old-proxy.example.com/v1"\n';
     const content = renderCodexGlobalConfig('/home/user/zylos', existing, {
       openaiBaseUrl: 'https://new-proxy.example.com/v1',
     });
-    assert.match(content, /openai_base_url = "https:\/\/new-proxy\.example\.com\/v1"/);
-    assert.doesNotMatch(content, /old-proxy/);
+    assert.match(content, /openai_base_url = "https:\/\/old-proxy\.example\.com\/v1"/);
+    assert.match(content, /\[model_providers\.OpenAI\][\s\S]*base_url = "https:\/\/new-proxy\.example\.com\/v1"/);
+  });
+
+  it('renders dev Codex model settings and provider routing for project config', () => {
+    const content = renderCodexProjectConfig('', {
+      modelProvider: 'OpenAI',
+      model: 'gpt-5.5',
+      reviewModel: 'gpt-5.5',
+      modelReasoningEffort: 'xhigh',
+      disableResponseStorage: true,
+      networkAccess: 'enabled',
+      windowsWslSetupAcknowledged: true,
+      providerBaseUrl: 'https://proxy.beemaxai.com',
+      providerWireApi: 'responses',
+      providerRequiresOpenaiAuth: true,
+      featureGoals: true,
+    });
+    assert.match(content, /^model_provider = "OpenAI"$/m);
+    assert.match(content, /^model = "gpt-5\.5"$/m);
+    assert.match(content, /^review_model = "gpt-5\.5"$/m);
+    assert.match(content, /^model_reasoning_effort = "xhigh"$/m);
+    assert.match(content, /^disable_response_storage = true$/m);
+    assert.match(content, /^network_access = "enabled"$/m);
+    assert.match(content, /^windows_wsl_setup_acknowledged = true$/m);
+    assert.match(content, /\[features\][\s\S]*goals = true/);
+    assert.match(content, /\[model_providers\.OpenAI\][\s\S]*base_url = "https:\/\/proxy\.beemaxai\.com"/);
   });
 });
 

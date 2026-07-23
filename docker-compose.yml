@@ -27,6 +27,9 @@ services:
       TZ: ${TZ:-UTC}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       CODEX_API_KEY: ${CODEX_API_KEY:-}
+      CODEX_NETWORK_ACCESS: ${CODEX_NETWORK_ACCESS:-enabled}
+      CODEX_PROVIDER_TURN_TIMEOUT_MS: ${CODEX_PROVIDER_TURN_TIMEOUT_MS:-600000}
+      CODEX_PROVIDER_BASE_URL: ${CODEX_PROVIDER_BASE_URL:-https://proxy.beemaxai.com}
 
       # ── Channel tokens (optional) ─────────────────────────────────────────
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
@@ -40,6 +43,9 @@ services:
 
       # Claude Code settings and auth tokens
       - claude-config:/home/zylos/.claude
+
+      # Codex settings, auth, and provider-native thread store
+      - codex-config:/home/zylos/.codex
 
       # Optional: mount your own .env instead of relying on environment block
       # - ./zylos.env:/home/zylos/zylos/.env:ro
@@ -65,4 +71,6 @@ volumes:
   zylos-data:
     driver: local
   claude-config:
+    driver: local
+  codex-config:
     driver: local

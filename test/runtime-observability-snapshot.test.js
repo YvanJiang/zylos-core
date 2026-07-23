@@ -566,6 +566,63 @@ describe('Core runtime observability snapshot publisher', () => {
     database.close();
   });
 
+  test('ignores dead-lettered outbox rows after their turn is terminal', () => {
+    const { database } = openDatabase();
+    const accepted = acceptNormalInbound(database, normalEnvelope('terminal-outbox-dead-letter'), {
+      now: () => '2026-07-20T07:59:50Z',
+      generateId: deterministicIds('terminal-outbox-dead-letter'),
+    });
+    const failedDelivery = JSON.stringify({
+      code: 'delivery_projection_rejected',
+      category: 'provider',
+      retryable: false,
+      side_effect_status: 'none',
+      user_message: 'A stale delivery update failed after the turn stopped.',
+      occurred_at: '2026-07-20T08:00:01Z',
+    });
+
+    database.prepare(`
+      UPDATE runtime_turns
+      SET state = 'stopped',
+        turn_version = turn_version + 1,
+        committed_at = ?,
+        terminal_at = ?
+      WHERE turn_id = ?
+    `).run('2026-07-20T08:00:01Z', '2026-07-20T08:00:01Z', accepted.turn_id);
+    database.prepare(`
+      UPDATE runtime_turn_queue
+      SET status = 'stopped',
+        wait_reason = NULL,
+        wait_detail_json = NULL
+      WHERE turn_id = ?
+    `).run(accepted.turn_id);
+    database.prepare(`
+      UPDATE runtime_outbox
+      SET status = 'dead_letter',
+        attempt_count = 5,
+        last_error_json = ?,
+        updated_at = ?
+      WHERE turn_id = ?
+    `).run(failedDelivery, '2026-07-20T08:00:02Z', accepted.turn_id);
+
+    const snapshot = createPublisher(database, {
+      now: () => '2026-07-20T08:00:07Z',
+    }).publish();
+    expect(snapshot.service.health).toBe('healthy');
+    expect(snapshot.outbox).toMatchObject({
+      complete: true,
+      items: [],
+      retry_count: 0,
+      dead_letter_count: 0,
+    });
+    expect(snapshot.turns.items).toContainEqual(expect.objectContaining({
+      turn_id: accepted.turn_id,
+      state: 'stopped',
+      side_effect_status: 'none',
+    }));
+    database.close();
+  });
+
   test('publishes complete full replacements with durable monotonic versions across reopen', () => {
     const { database, databasePath } = openDatabase();
     const firstPublisher = createPublisher(database);

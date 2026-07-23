@@ -483,6 +483,36 @@ describe('Codex app-server provider adapter', () => {
     });
   });
 
+  test('isolates orphaned workspace recovery only after the runtime process group is gone', async () => {
+    const processGroupStates = new Map([
+      [1234, false],
+      [5678, true],
+    ]);
+    const adapter = createCodexAppServerAdapter({
+      cwd: '/workspace',
+      isProcessGroupAlive: (processGroupId) => processGroupStates.get(processGroupId) ?? false,
+    });
+
+    await expect(adapter.isolateOrphanedWorkspace({
+      runtime_evidence: { process: { pgid: 1234 } },
+    })).resolves.toEqual({
+      isolated: true,
+      provider_status: 'process_group_exited',
+    });
+    await expect(adapter.isolateOrphanedWorkspace({
+      runtime_evidence: { process: { pgid: 5678 } },
+    })).resolves.toEqual({
+      isolated: false,
+      provider_status: 'process_group_alive',
+    });
+    await expect(adapter.isolateOrphanedWorkspace({
+      runtime_evidence: null,
+    })).resolves.toEqual({
+      isolated: false,
+      provider_status: 'missing_process_group_evidence',
+    });
+  });
+
   test('advertises the workspace access enforced by its configured sandbox', () => {
     const spawnProcess = jest.fn();
 
@@ -738,6 +768,22 @@ describe('Codex app-server provider adapter', () => {
         environments: [],
       }),
     }));
+  });
+
+  test('passes enabled network access to Codex turn/start', async () => {
+    const server = createFakeAppServer();
+    const adapter = createCodexAppServerAdapter({
+      env: { CODEX_NETWORK_ACCESS: 'enabled' },
+      spawnProcess: () => server.child,
+    });
+
+    await collect(executeAdapter(adapter, executionContext()));
+
+    const turnStart = server.received.find(({ method }) => method === 'turn/start');
+    expect(turnStart.params.sandboxPolicy).toEqual({
+      type: 'readOnly',
+      networkAccess: true,
+    });
   });
 
   test('preserves enabled MCP servers and plugin-provided MCP discovery at app-server start', async () => {
@@ -1000,6 +1046,45 @@ enabled = false
       providerError: { code: 'side_effect_unknown', side_effect_status: 'unknown' },
     });
     expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+  });
+
+  test('times out a silent running Codex turn and terminates the app-server', async () => {
+    let timeoutCallback;
+    let timeoutDelay;
+    const reportProviderFailure = jest.fn(() => ({ status: 'failed' }));
+    const server = createFakeAppServer({
+      afterTurnStart() {},
+    });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      turnExecutionTimeoutMs: 1_000,
+      setTimeoutFn: (callback, delay) => {
+        timeoutCallback = callback;
+        timeoutDelay = delay;
+        return { unref() {} };
+      },
+      clearTimeoutFn: jest.fn(),
+    });
+    const waiting = executeAdapter(adapter, executionContext({
+      reportProviderFailure,
+    }))[Symbol.asyncIterator]().next();
+    await waitFor(() => server.received.some(({ method }) => method === 'turn/start'));
+
+    expect(timeoutDelay).toBe(1_000);
+    timeoutCallback();
+
+    await expect(waiting).rejects.toMatchObject({
+      code: 'provider_execution_timed_out',
+      providerError: {
+        code: 'provider_execution_timed_out',
+        side_effect_status: 'none',
+        retryable: false,
+      },
+    });
+    expect(reportProviderFailure).toHaveBeenCalledWith(expect.objectContaining({
+      code: 'provider_execution_timed_out',
+    }));
+    expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
   });
 
   test('retires the connection when a successful turn/start response has no usable turn fence', async () => {
@@ -3291,6 +3376,7 @@ enabled = false
       spawnProcess: () => server.child,
       interruptConfirmationTimeoutMs: 250,
       processTerminationGraceMs: 250,
+      turnExecutionTimeoutMs: null,
       setTimeoutFn(callback, delay) {
         expect(delay).toBe(250);
         confirmTimeout = callback;

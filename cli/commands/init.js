@@ -7,6 +7,7 @@
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import https from 'node:https';
 import os from 'node:os';
 import path from 'node:path';
@@ -444,16 +445,44 @@ function verifyApiKey(apiKey) {
   });
 }
 
+export function codexModelsVerificationUrl(baseUrl = null) {
+  if (!baseUrl) return new URL('https://api.openai.com/v1/models');
+  const url = new URL(baseUrl);
+  const normalizedPath = url.pathname.replace(/\/+$/, '');
+  if (normalizedPath.endsWith('/models')) {
+    url.pathname = normalizedPath;
+  } else if (normalizedPath.endsWith('/v1')) {
+    url.pathname = `${normalizedPath}/models`;
+  } else {
+    url.pathname = `${normalizedPath}/v1/models`;
+  }
+  url.search = '';
+  url.hash = '';
+  return url;
+}
+
 /**
- * Verify an OpenAI API key by making a lightweight GET request to /v1/models.
- * @param {string} apiKey - The OpenAI API key (sk-...)
+ * Verify an OpenAI-compatible API key by making a lightweight GET request to
+ * /v1/models on the configured Codex provider route.
+ * @param {string} apiKey - The OpenAI-compatible API key (sk-...)
+ * @param {string|null} baseUrl - Optional OpenAI-compatible provider base URL
  * @returns {Promise<true|false|null>} true=valid (200), false=invalid (401), null=network error
  */
-function verifyCodexApiKey(apiKey) {
+export function verifyCodexApiKey(apiKey, baseUrl = process.env.CODEX_PROVIDER_BASE_URL || process.env.OPENAI_BASE_URL || null) {
   return new Promise((resolve) => {
-    const req = https.request({
-      hostname: 'api.openai.com',
-      path: '/v1/models',
+    let url;
+    try {
+      url = codexModelsVerificationUrl(baseUrl);
+    } catch {
+      resolve(null);
+      return;
+    }
+    const transport = url.protocol === 'http:' ? http : https;
+    const req = transport.request({
+      protocol: url.protocol,
+      hostname: url.hostname,
+      port: url.port,
+      path: `${url.pathname}${url.search}`,
       method: 'GET',
       headers: { 'Authorization': `Bearer ${apiKey}` },
       timeout: 10000,
@@ -1577,6 +1606,9 @@ export function resolveFromEnv(opts) {
   if (opts.baseUrl === null && process.env.ANTHROPIC_BASE_URL) {
     opts.baseUrl = process.env.ANTHROPIC_BASE_URL;
   }
+  if (opts.codexBaseUrl === null && process.env.CODEX_PROVIDER_BASE_URL) {
+    opts.codexBaseUrl = process.env.CODEX_PROVIDER_BASE_URL;
+  }
   if (opts.codexBaseUrl === null && process.env.OPENAI_BASE_URL) {
     opts.codexBaseUrl = process.env.OPENAI_BASE_URL;
   }
@@ -1856,7 +1888,7 @@ export async function initCommand(args) {
         // Do NOT save before verifying: a bad key in process.env causes isCodexAuthenticated()
         // to report "authenticated" even when the key is invalid (path 1 check is existence-only).
         if (!quiet) console.log(`  ${dim('Verifying Codex API key...')}`);
-        const verifyResult = await verifyCodexApiKey(opts.codexApiKey);
+        const verifyResult = await verifyCodexApiKey(opts.codexApiKey, pendingCodexBaseUrl);
         if (verifyResult === true) {
           if (saveCodexApiKey(opts.codexApiKey)) {
             codexAuthenticated = true;
@@ -1867,7 +1899,7 @@ export async function initCommand(args) {
           }
         } else if (verifyResult === false) {
           console.error(`  ${error('Codex API key is invalid or could not be verified.')}`);
-          console.error(`    ${dim('Check your key at platform.openai.com')}`);
+          console.error(`    ${dim(pendingCodexBaseUrl ? `Check your key and provider route at ${pendingCodexBaseUrl}` : 'Check your key at platform.openai.com')}`);
           if (skipConfirm) exitCode = 1;
         } else {
           // null = network unreachable — save and proceed, let Codex fail at runtime if key is bad

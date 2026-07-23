@@ -832,6 +832,10 @@ export function createExecutorService({
           turn_id: turnContext.turn_id,
           workspace: Object.freeze({ ...turnContext.workspace }),
           attempt: Object.freeze({ ...turnContext.attempt }),
+          runtime_evidence: turnContext.runtime_evidence === null
+            || turnContext.runtime_evidence === undefined
+            ? null
+            : deepFreeze(structuredClone(turnContext.runtime_evidence)),
         }));
         if (isolation !== true && isolation?.isolated !== true) {
           result.isolation_pending.push(turnId);

@@ -472,13 +472,19 @@ function collectWorkspaceLeases(database) {
 
 function collectOutbox(database, generatedAt) {
   const rows = database.prepare(`
-    SELECT status, command_json, created_at, lease_expires_at,
+    SELECT outbox.status, outbox.command_json, outbox.created_at,
+      outbox.lease_expires_at,
       lease_expires_epoch_ms, pre_action_fenced_at
-    FROM runtime_outbox
-    WHERE status IN (
+    FROM runtime_outbox AS outbox
+    LEFT JOIN runtime_turns AS turn ON turn.turn_id = outbox.turn_id
+    WHERE outbox.status IN (
       'pending', 'delivering', 'retry_wait', 'dead_letter', 'delivery_unknown'
     )
-    ORDER BY created_at, outbox_id
+      AND NOT (
+        outbox.status = 'dead_letter'
+        AND turn.state IN (${TERMINAL_TURN_STATES.map((state) => `'${state}'`).join(', ')})
+      )
+    ORDER BY outbox.created_at, outbox.outbox_id
   `).all();
   const grouped = new Map();
   for (const row of rows) {

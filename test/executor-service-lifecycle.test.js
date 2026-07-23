@@ -876,6 +876,40 @@ describe('executor daemon resource ownership', () => {
       'prerequisites-close', 'database-close',
     ]);
   });
+
+  test('passes provider orphaned workspace isolation into the service host', async () => {
+    const state = fixture();
+    const database = state.database;
+    const isolateOrphanedWorkspace = jest.fn();
+    let hostOptions;
+    const host = {
+      closed: Promise.resolve(),
+      async start() {},
+      async close() {},
+    };
+
+    const daemon = await runExecutorDaemon({
+      zylosDir: state.directory,
+      Database: function DatabaseFixture() { return database; },
+      createAdapter: () => ({
+        ...inertAdapter('codex'),
+        isolateOrphanedWorkspace,
+      }),
+      createUpgradeHandler: () => async () => ({ state: 'committed' }),
+      createPrerequisiteOwner: () => ({
+        async start() {},
+        health() { return { ok: true }; },
+        async close() {},
+      }),
+      createHost: (options) => {
+        hostOptions = options;
+        return host;
+      },
+    });
+
+    expect(hostOptions.isolateOrphanedWorkspace).toBe(isolateOrphanedWorkspace);
+    await daemon.close();
+  });
 });
 
 describe('executor prerequisite ownership', () => {
