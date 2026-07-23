@@ -152,6 +152,71 @@ describe('executor service lifecycle host', () => {
     expect(fs.existsSync(state.socketPath)).toBe(false);
   });
 
+  test('resolves and submits channel interactions through the running executor owner', async () => {
+    const state = fixture();
+    const resolution = {
+      platform_message_id: 'platform-main-card-A',
+      mapping: { mapping_id: 'mapping-A' },
+      request_scope: { channel: 'feishu' },
+      interactions: [{ interaction_id: 'interaction-A' }],
+    };
+    const answerResult = {
+      status: 'accepted',
+      handoff_state: 'pending',
+      handoff_id: 'handoff-A',
+    };
+    const service = {
+      start: jest.fn(),
+      runNext: jest.fn(async () => ({ status: 'idle' })),
+      publishObservabilitySnapshot: jest.fn(() => ({ contract: 'fixture' })),
+      resolveInteractionTarget: jest.fn(() => resolution),
+      submitInteractionAnswer: jest.fn(() => answerResult),
+      deliverInteractionAnswer: jest.fn(async () => ({ acknowledgement: { resumed: true } })),
+      close: jest.fn(async () => {}),
+    };
+    const onPollError = jest.fn();
+    const host = createExecutorServiceHost({
+      database: state.database,
+      adapter: inertAdapter(),
+      provider: 'codex',
+      serviceInstanceId: 'service-fixture-channel-interaction',
+      socketPath: state.socketPath,
+      workspaceRoot: state.directory,
+      pollIntervalMs: 10_000,
+      onPollError,
+      createService: () => service,
+    });
+    hosts.push(host);
+    await host.start();
+
+    const target = {
+      region: 'cn',
+      tenantId: 'tenant-A',
+      channel: 'feishu',
+      botId: 'bot-A',
+      platformMessageId: 'platform-main-card-A',
+      mappingId: 'mapping-A',
+      interactionId: 'interaction-A',
+    };
+    await expect(requestExecutorService(state.socketPath, {
+      action: 'resolve_interaction',
+      target,
+    })).resolves.toEqual({ ok: true, result: resolution });
+    expect(service.resolveInteractionTarget).toHaveBeenCalledWith(target);
+
+    const answer = { contract: 'zylos.interaction-answer', interaction_id: 'interaction-A' };
+    const sourceEvidence = { platformMessageId: 'platform-main-card-A' };
+    await expect(requestExecutorService(state.socketPath, {
+      action: 'submit_interaction_answer',
+      answer,
+      source_evidence: sourceEvidence,
+    })).resolves.toEqual({ ok: true, result: answerResult });
+    expect(service.submitInteractionAnswer).toHaveBeenCalledWith(answer, sourceEvidence);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(service.deliverInteractionAnswer).toHaveBeenCalledWith('handoff-A');
+    expect(onPollError).not.toHaveBeenCalled();
+  });
+
   test('refuses to replace a non-socket control path', async () => {
     const state = fixture();
     fs.mkdirSync(path.dirname(state.socketPath), { recursive: true });
@@ -263,6 +328,29 @@ describe('executor service lifecycle host', () => {
         )));
         fs.rmSync(state.socketPath, { force: true });
       }
+    }
+  });
+
+  test('does not classify a failed interaction resolution as an unknown mutation', async () => {
+    const state = fixture();
+    fs.mkdirSync(path.dirname(state.socketPath), { recursive: true });
+    const server = net.createServer((socket) => {
+      socket.once('data', () => socket.destroy());
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(state.socketPath, resolve);
+    });
+    try {
+      await expect(requestExecutorService(state.socketPath, {
+        action: 'resolve_interaction',
+        target: {},
+      })).rejects.not.toHaveProperty('outcome');
+    } finally {
+      await new Promise((resolve, reject) => server.close((error) => (
+        error ? reject(error) : resolve()
+      )));
+      fs.rmSync(state.socketPath, { force: true });
     }
   });
 

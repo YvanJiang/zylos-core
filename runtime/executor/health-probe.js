@@ -14,6 +14,30 @@ import { createExecutorService } from './service.js';
 
 const require = createRequire(new URL('../../skills/comm-bridge/package.json', import.meta.url));
 
+const HEALTH_PUBLISH_RETRY_MS = 100;
+const HEALTH_PUBLISH_TIMEOUT_MS = 10_000;
+
+function isTransientSqliteLock(error) {
+  return error?.code === 'SQLITE_BUSY' || error?.code === 'SQLITE_LOCKED';
+}
+
+export async function publishTargetHealthSnapshot(service, {
+  now = () => Date.now(),
+  sleep = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+  retryMs = HEALTH_PUBLISH_RETRY_MS,
+  timeoutMs = HEALTH_PUBLISH_TIMEOUT_MS,
+} = {}) {
+  const deadline = now() + timeoutMs;
+  for (;;) {
+    try {
+      return service.publishObservabilitySnapshot();
+    } catch (error) {
+      if (!isTransientSqliteLock(error) || now() >= deadline) throw error;
+      await sleep(retryMs);
+    }
+  }
+}
+
 function providerAdapter(provider, zylosDir) {
   if (provider === 'claude') {
     return createClaudeConversationAdapter({ queryOptions: { cwd: zylosDir, env: process.env } });
@@ -54,7 +78,7 @@ export async function runTargetHealthProbe({
     upgradeId,
   });
   service.start();
-  const snapshot = service.publishObservabilitySnapshot();
+  const snapshot = await publishTargetHealthSnapshot(service);
   let closePromise = null;
   const close = () => {
     if (closePromise === null) {

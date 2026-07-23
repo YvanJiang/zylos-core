@@ -201,6 +201,76 @@ describe('runtime interaction happy path', () => {
     database.close();
   });
 
+  test('resolves the exact delivered channel card to its current interaction scope', () => {
+    const database = openTestDatabase();
+    const { envelope, store, turnContext } = createRunningTurn(database, 'channel-resolution');
+    const request = store.requestInteraction(turnContext, {
+      provider_interaction_ref: 'provider-question-channel-resolution',
+      tool_use_id: 'tool-use-channel-resolution',
+      kind: 'tool_approval',
+      prompt: 'Allow the requested workspace write?',
+      choices: [],
+      authorized_subjects: [{ type: 'actor', actor_id: 'user-123' }],
+      allowed_sources: ['main_card_reply', 'card_action'],
+    });
+    const outbox = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-service-channel-resolution',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('delivery-channel-resolution'),
+      throttleMs: 0,
+    });
+    let platformMessageId = null;
+    for (let count = 0; count < 10; count += 1) {
+      const command = outbox.claimNext();
+      if (command === null) break;
+      const result = deliveredResult(command, '2026-07-19T07:02:00Z');
+      platformMessageId = result.platform_message_id;
+      outbox.recordResult(result);
+    }
+    const mapping = database.prepare(`
+      SELECT mapping_id FROM runtime_message_mappings
+      WHERE platform_message_id = ?
+    `).get(platformMessageId);
+
+    expect(store.resolveInteractionTarget({
+      region: envelope.region,
+      tenantId: envelope.tenant_id,
+      channel: envelope.channel,
+      botId: envelope.bot_id,
+      platformMessageId,
+      mappingId: mapping.mapping_id,
+      interactionId: request.interaction_id,
+    })).toEqual({
+      platform_message_id: platformMessageId,
+      mapping: expect.objectContaining({
+        mapping_id: mapping.mapping_id,
+        conversation_id: request.conversation_id,
+        turn_id: request.turn_id,
+        lineage_id: request.lineage_id,
+        binding_state: 'bound',
+      }),
+      request_scope: {
+        region: envelope.region,
+        tenant_id: envelope.tenant_id,
+        channel: envelope.channel,
+        bot_id: envelope.bot_id,
+        chat_id: envelope.chat_id,
+        native_thread_or_topic_id: envelope.native_thread_or_topic_id,
+      },
+      interactions: [request],
+    });
+    expect(() => store.resolveInteractionTarget({
+      region: envelope.region,
+      tenantId: envelope.tenant_id,
+      channel: envelope.channel,
+      botId: 'another-bot',
+      platformMessageId,
+    })).toThrow(expect.objectContaining({ code: 'mapping_missing' }));
+
+    database.close();
+  });
+
   test('durably commits a valid answer and pending handoff before returning to the provider', () => {
     const database = openTestDatabase();
     const { accepted, store, turnContext } = createRunningTurn(database, 'answer');

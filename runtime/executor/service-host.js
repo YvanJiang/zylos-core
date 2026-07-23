@@ -6,6 +6,7 @@ import path from 'node:path';
 import { createExecutorService } from './service.js';
 
 const MAX_REQUEST_BYTES = 64 * 1024;
+const READ_ONLY_ACTIONS = new Set(['health', 'resolve_interaction']);
 
 function reportPollError(error) {
   console.error('[zylos-executor] Background poll failed.', error);
@@ -115,7 +116,7 @@ export function requestExecutorService(socketPath, request, { timeoutMs = 5_000 
     let data = '';
     let dispatched = false;
     const classifyFailure = (error) => {
-      if (dispatched && request.action !== 'health') {
+      if (dispatched && !READ_ONLY_ACTIONS.has(request.action)) {
         error.outcome = 'unknown';
       }
       return error;
@@ -255,6 +256,26 @@ export function createExecutorServiceHost({
             },
             snapshot,
           };
+        }
+        if (request.action === 'resolve_interaction') {
+          return service.resolveInteractionTarget(request.target);
+        }
+        if (request.action === 'submit_interaction_answer') {
+          const result = service.submitInteractionAnswer(
+            request.answer,
+            request.source_evidence ?? {},
+          );
+          if (
+            ['accepted', 'duplicate'].includes(result?.status)
+            && result.handoff_state === 'pending'
+            && typeof result.handoff_id === 'string'
+            && result.handoff_id.length > 0
+          ) {
+            Promise.resolve()
+              .then(() => service.deliverInteractionAnswer(result.handoff_id))
+              .catch(onPollError);
+          }
+          return result;
         }
         if (request.action === 'shutdown') {
           if (lifecycleMutation !== null) {

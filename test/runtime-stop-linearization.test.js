@@ -919,6 +919,7 @@ describe('runtime /stop linearization', () => {
       now: () => '2026-07-20T01:08:00Z',
       generateId: deterministicIds('stop-recovering'),
     });
+    service.start();
 
     await expect(service.runNext()).resolves.toMatchObject({
       status: 'recovering',
@@ -945,6 +946,17 @@ describe('runtime /stop linearization', () => {
     ]);
     expect(isolationContexts).toEqual(cancellationContexts);
 
+    const snapshot = service.publishObservabilitySnapshot();
+    expect(snapshot.turns.items).toEqual([
+      expect.objectContaining({
+        turn_id: active.turn_id,
+        state: 'stopped',
+        side_effect_status: 'unknown',
+      }),
+    ]);
+    expect(snapshot.service.health).toBe('healthy');
+
+    await service.close();
     database.close();
   });
 

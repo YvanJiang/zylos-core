@@ -72,6 +72,15 @@ function preflight() {
   };
 }
 
+function writeActiveExecutorRelease(zylosDir, releasePath) {
+  fs.mkdirSync(path.join(zylosDir, 'runtime'), { recursive: true });
+  fs.writeFileSync(path.join(zylosDir, 'runtime', 'active-release.json'), JSON.stringify({
+    release_ref: 'release-A',
+    release_path: releasePath,
+    upgrade_id: 'upgrade-base-release',
+  }));
+}
+
 describe('installed executor upgrade driver', () => {
   test('drives the canonical durable host through commit and postcommit cleanup', async () => {
     const calls = [];
@@ -109,6 +118,36 @@ describe('installed executor upgrade driver', () => {
     expect(calls[0]).toEqual(['attach', preflight()]);
     expect(calls.slice(1).every((call) => call[1] === 'upgrade-fixture')).toBe(true);
     expect(calls.slice(1).every((call) => call[2]?.legacyBatch === legacyBatch)).toBe(true);
+  });
+
+  test('waits for a transient drain without spending the durable transition budget', async () => {
+    let remainingWaits = 65;
+    let rollbackRequests = 0;
+    const host = {
+      async attach() { return { state: 'preflight' }; },
+      async advance() {
+        if (remainingWaits > 0) {
+          remainingWaits -= 1;
+          return {
+            state: 'maintenance',
+            status: 'waiting',
+            active_turn_ids: ['turn-active'],
+            deadline_at: '2026-07-20T10:10:00.000Z',
+          };
+        }
+        return { state: 'committed', completed_step: 'postcommit-cleanup' };
+      },
+      requestRollback() { rollbackRequests += 1; },
+    };
+
+    await expect(driveInstalledRuntimeUpgrade({
+      host,
+      preflight: preflight(),
+      legacyBatch: { batch_id: 'empty-upgrade-fixture', records: [] },
+      waitForPoll: async () => {},
+    })).resolves.toMatchObject({ success: true, state: 'committed' });
+    expect(remainingWaits).toBe(0);
+    expect(rollbackRequests).toBe(0);
   });
 
   test('reports the durable rolled-back result instead of claiming upgrade success', async () => {
@@ -377,6 +416,12 @@ describe('installed executor production upgrade owner', () => {
       fs.writeFileSync(path.join(release, 'package.json'), JSON.stringify({
         name: 'zylos', version: release === currentRelease ? 'release-A' : 'release-B',
       }));
+      if (release === downloadedSource) {
+        fs.writeFileSync(path.join(release, 'package-lock.json'), JSON.stringify({
+          name: 'zylos', version: 'release-B', lockfileVersion: 3, requires: true,
+          packages: { '': { name: 'zylos', version: 'release-B' } },
+        }));
+      }
       fs.writeFileSync(path.join(release, 'runtime', 'executor', 'daemon.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'runtime', 'executor', 'health-probe.js'), 'export {};\n');
       fs.writeFileSync(path.join(release, 'runtime', 'executor', 'launcher.js'), 'export {};\n');
@@ -407,6 +452,7 @@ describe('installed executor production upgrade owner', () => {
         fs.writeFileSync(artifact, 'obsolete');
       }
     }
+    writeActiveExecutorRelease(zylosDir, currentRelease);
     const codexHooks = path.join(zylosDir, '.codex', 'hooks.json');
     fs.mkdirSync(path.dirname(codexHooks), { recursive: true });
     fs.writeFileSync(codexHooks, JSON.stringify({
@@ -569,6 +615,10 @@ describe('installed executor production upgrade owner', () => {
       .map(({ cwd }) => cwd);
     expect(precommitDependencyDirectories).toHaveLength(4);
     expect(precommitDependencyDirectories.some((cwd) => cwd.endsWith('/skills/comm-bridge'))).toBe(true);
+    const preparedReleaseRoot = precommitDependencyDirectories.find((cwd) => !cwd.includes('/skills/'));
+    expect(JSON.parse(fs.readFileSync(
+      path.join(preparedReleaseRoot, 'npm-shrinkwrap.json'), 'utf8',
+    ))).toMatchObject({ name: 'zylos', version: 'release-B', lockfileVersion: 3 });
     expect(commands.filter(([file, args]) => file === 'npm' && args[0] === 'ci')
       .every(([, args]) => !args.includes('--ignore-scripts'))).toBe(true);
     expect(commands.filter(([file, args]) => file === process.execPath && args[0] === '-e'))
@@ -648,6 +698,12 @@ describe('installed executor production upgrade owner', () => {
           : 'module.exports = { apps: [{ name: "zylos-executor" }] };\n',
       );
     }
+    fs.mkdirSync(path.join(zylosDir, 'runtime'), { recursive: true });
+    fs.writeFileSync(path.join(zylosDir, 'runtime', 'active-release.json'), JSON.stringify({
+      release_ref: 'release-A',
+      release_path: currentRelease,
+      upgrade_id: 'upgrade-base-release',
+    }));
     fs.mkdirSync(path.join(zylosDir, 'comm-bridge'), { recursive: true });
     fs.mkdirSync(path.join(zylosDir, 'pm2'), { recursive: true });
     fs.writeFileSync(
@@ -709,7 +765,7 @@ describe('installed executor production upgrade owner', () => {
     expect(commands).toContainEqual(['pm2', ['stop', 'c4-dispatcher']]);
     expect(JSON.parse(fs.readFileSync(
       path.join(zylosDir, 'runtime', 'active-release.json'), 'utf8',
-    ))).toMatchObject({ release_ref: 'release-A', upgrade_id: null });
+    ))).toMatchObject({ release_ref: 'release-A', upgrade_id: 'upgrade-base-release' });
     database.close();
   });
 
@@ -742,6 +798,7 @@ describe('installed executor production upgrade owner', () => {
           : `import fs from 'node:fs';\nfs.writeFileSync(process.env.ZYLOS_TEST_HEALTH_PID_FILE, String(process.pid));\nprocess.on('SIGTERM', () => {});\nprocess.stdout.write('not-json\\n');\nsetInterval(() => {}, 1_000);\n`,
       );
     }
+    writeActiveExecutorRelease(zylosDir, currentRelease);
     fs.mkdirSync(path.join(zylosDir, 'comm-bridge'), { recursive: true });
     const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
     const previousPidFile = process.env.ZYLOS_TEST_HEALTH_PID_FILE;
@@ -806,6 +863,7 @@ describe('installed executor production upgrade owner', () => {
           : `import fs from 'node:fs';\nfs.writeFileSync(process.env.ZYLOS_TEST_HEALTH_PID_FILE, String(process.pid));\nprocess.on('SIGTERM', () => {});\nsetInterval(() => {}, 1_000);\n`,
       );
     }
+    writeActiveExecutorRelease(zylosDir, currentRelease);
     fs.mkdirSync(path.join(zylosDir, 'comm-bridge'), { recursive: true });
     const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
     const previousPidFile = process.env.ZYLOS_TEST_HEALTH_PID_FILE;
@@ -909,6 +967,7 @@ describe('installed executor production upgrade owner', () => {
       legacy_batch: legacyBatch,
       legacy_queue_file: legacyQueueFile,
       from_release_path: currentRelease,
+      from_upgrade_id: 'upgrade-base-release',
       to_release_path: targetRelease,
       from_package_version: 'release-A',
       to_package_version: 'release-B',
@@ -920,7 +979,7 @@ describe('installed executor production upgrade owner', () => {
     })}\n`);
     fs.mkdirSync(path.join(zylosDir, 'runtime'), { recursive: true });
     fs.writeFileSync(path.join(zylosDir, 'runtime', 'active-release.json'), JSON.stringify({
-      release_ref: 'release-A', release_path: currentRelease, upgrade_id: null,
+      release_ref: 'release-A', release_path: currentRelease, upgrade_id: 'upgrade-base-release',
     }));
 
     const handler = createInstalledExecutorUpgradeHandler({

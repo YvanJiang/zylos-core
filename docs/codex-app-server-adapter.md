@@ -57,6 +57,12 @@ Private app-server method and item names remain inside the adapter:
 | MCP tool-approval elicitation | automatically answered with one-shot `accept` and no Core interaction; this is the explicit 2026-07-23 fluidity-over-isolation decision |
 | other supported MCP form elicitation | durable `question` or fixed `choice` interaction; malformed or unsupported forms fail closed |
 
+Whitespace-only agent-message deltas are retained per provider item but are not emitted as standalone
+normalized events, because public text events must be displayable. The adapter prefixes that buffered
+whitespace to the next displayable delta; a completed agent-message snapshot remains authoritative and
+replaces any still-buffered fragment. This preserves provider text and offsets without turning a legal
+streaming boundary into a persistence failure or recovery transition.
+
 User-supplied answers are accepted only through Core's durable interaction-answer and handoff
 records. The
 adapter verifies the current connection, provider request, thread, turn, Core turn, attempt, lease,

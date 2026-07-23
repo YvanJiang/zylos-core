@@ -1183,6 +1183,48 @@ enabled = false
     expect(JSON.stringify(server.received)).not.toContain('exec --json');
   });
 
+  test('buffers whitespace-only agent deltas until displayable text arrives', async () => {
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'item/agentMessage/delta',
+          params: { threadId, turnId, itemId: 'message-1', delta: ' \n' },
+        });
+        send({
+          method: 'item/agentMessage/delta',
+          params: { threadId, turnId, itemId: 'message-1', delta: 'Hello' },
+        });
+        send({
+          method: 'item/completed',
+          params: {
+            threadId,
+            turnId,
+            completedAtMs: 1,
+            item: { type: 'agentMessage', id: 'message-1', text: ' \nHello' },
+          },
+        });
+        send({
+          method: 'turn/completed',
+          params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({ spawnProcess: () => server.child });
+
+    await expect(collect(executeAdapter(adapter, executionContext()))).resolves.toEqual([
+      {
+        kind: 'text_delta',
+        provider_native_id: 'codex-thread-1',
+        payload: { text: ' \nHello', start_offset: 0, end_offset: 7 },
+      },
+      {
+        kind: 'text_snapshot',
+        provider_native_id: 'codex-thread-1',
+        payload: { text: ' \nHello', end_offset: 7 },
+      },
+    ]);
+  });
+
   test('automatically executes an enabled MCP tool and normalizes its lifecycle', async () => {
     let activeTurn = null;
     const server = createFakeAppServer({

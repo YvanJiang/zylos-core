@@ -1,4 +1,5 @@
 const MAX_TRANSITIONS = 64;
+const DRAIN_POLL_MS = 1_000;
 
 function waitingStatus(result) {
   return typeof result?.status === 'string' && result.status.startsWith('waiting_for_');
@@ -14,10 +15,27 @@ function upgradeResult(preflight, result, extra = {}) {
   });
 }
 
-async function advanceUntil({ host, preflight, legacyBatch, terminal, onAdvance = () => {} }) {
-  for (let transition = 0; transition < MAX_TRANSITIONS; transition += 1) {
+function defaultWaitForPoll(delayMs) {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function advanceUntil({
+  host,
+  preflight,
+  legacyBatch,
+  terminal,
+  onAdvance = () => {},
+  waitForPoll,
+}) {
+  let transitions = 0;
+  while (transitions < MAX_TRANSITIONS) {
     const result = await host.advance(preflight.upgrade_id, { legacyBatch });
     onAdvance(result);
+    if (result?.status === 'waiting') {
+      await waitForPoll(DRAIN_POLL_MS);
+      continue;
+    }
+    transitions += 1;
     if (waitingStatus(result)) {
       throw new Error(`Installed runtime upgrade cannot proceed: ${result.status}`);
     }
@@ -26,7 +44,12 @@ async function advanceUntil({ host, preflight, legacyBatch, terminal, onAdvance 
   throw new Error(`Installed runtime upgrade exceeded ${MAX_TRANSITIONS} durable transitions.`);
 }
 
-export async function driveInstalledRuntimeUpgrade({ host, preflight, legacyBatch }) {
+export async function driveInstalledRuntimeUpgrade({
+  host,
+  preflight,
+  legacyBatch,
+  waitForPoll = defaultWaitForPoll,
+}) {
   if (!host || typeof host.attach !== 'function' || typeof host.advance !== 'function'
     || typeof host.requestRollback !== 'function') {
     throw new TypeError('host must expose the installed runtime upgrade interface');
@@ -38,6 +61,7 @@ export async function driveInstalledRuntimeUpgrade({ host, preflight, legacyBatc
     || !Array.isArray(legacyBatch.records)) {
     throw new TypeError('legacyBatch must be a canonical migration batch');
   }
+  if (typeof waitForPoll !== 'function') throw new TypeError('waitForPoll must be a function');
   let latest = await host.attach(preflight);
   if (latest?.state === 'rolled_back') {
     return upgradeResult(preflight, latest, {
@@ -52,6 +76,7 @@ export async function driveInstalledRuntimeUpgrade({ host, preflight, legacyBatc
         host,
         preflight,
         legacyBatch,
+        waitForPoll,
         onAdvance: (result) => { latest = result; },
         terminal: (result) => result.state === 'rolled_back',
       });
@@ -69,17 +94,27 @@ export async function driveInstalledRuntimeUpgrade({ host, preflight, legacyBatc
     }
   }
   try {
-    const committed = await advanceUntil({
+    const settled = await advanceUntil({
       host,
       preflight,
       legacyBatch,
+      waitForPoll,
       onAdvance: (result) => { latest = result; },
-      terminal: (result) => result.state === 'committed'
-        && result.completed_step === 'postcommit-cleanup',
+      terminal: (result) => (
+        (result.state === 'committed' && result.completed_step === 'postcommit-cleanup')
+        || result.state === 'rolled_back'
+      ),
     });
-    return upgradeResult(preflight, committed, {
+    if (settled.state === 'rolled_back') {
+      return upgradeResult(preflight, settled, {
+        success: false,
+        error: settled.failure?.message ?? 'Runtime upgrade rolled back during drain.',
+        rollback: { performed: true, state: settled.state, steps: [] },
+      });
+    }
+    return upgradeResult(preflight, settled, {
       success: true,
-      completedStep: committed.completed_step,
+      completedStep: settled.completed_step,
     });
   } catch (error) {
     if (latest?.state === 'committed') {
@@ -101,6 +136,7 @@ export async function driveInstalledRuntimeUpgrade({ host, preflight, legacyBatc
         host,
         preflight,
         legacyBatch,
+        waitForPoll,
         onAdvance: (result) => { latest = result; },
         terminal: (result) => result.state === 'rolled_back',
       });

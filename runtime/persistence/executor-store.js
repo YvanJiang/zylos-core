@@ -6266,6 +6266,123 @@ export function createExecutorStore({
     }
   }
 
+  function resolveInteractionTarget({
+    region,
+    tenantId,
+    channel,
+    botId,
+    platformMessageId,
+    mappingId = null,
+    interactionId = null,
+  } = {}) {
+    for (const [name, value] of [
+      ['region', region],
+      ['tenantId', tenantId],
+      ['channel', channel],
+      ['botId', botId],
+      ['platformMessageId', platformMessageId],
+    ]) {
+      if (typeof value !== 'string' || value.length === 0) {
+        throw new TypeError(`${name} must be a non-empty string`);
+      }
+    }
+    if (mappingId !== null && (typeof mappingId !== 'string' || mappingId.length === 0)) {
+      throw new TypeError('mappingId must be null or a non-empty string');
+    }
+    if (
+      interactionId !== null
+      && (typeof interactionId !== 'string' || interactionId.length === 0)
+    ) {
+      throw new TypeError('interactionId must be null or a non-empty string');
+    }
+
+    const row = database.prepare(`
+      SELECT mapping.*, lane.target_json
+      FROM runtime_message_mappings AS mapping
+      LEFT JOIN runtime_delivery_lanes AS lane
+        ON lane.turn_id = mapping.turn_id
+      WHERE mapping.region = ?
+        AND mapping.tenant_id = ?
+        AND mapping.channel = ?
+        AND mapping.bot_id = ?
+        AND mapping.platform_message_id = ?
+    `).get(region, tenantId, channel, botId, platformMessageId);
+    if (!row || (mappingId !== null && row.mapping_id !== mappingId)) {
+      conflict('mapping_missing', 'The current channel card mapping was not found.');
+    }
+
+    let target;
+    if (row.target_json !== null) {
+      target = JSON.parse(row.target_json);
+    } else {
+      const commandRow = database.prepare(`
+        SELECT command_json
+        FROM runtime_outbox
+        WHERE json_extract(command_json, '$.mapping.mapping_id') = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+      `).get(row.mapping_id);
+      if (!commandRow) {
+        conflict('mapping_corrupt', 'The current channel card target was not found.');
+      }
+      target = JSON.parse(commandRow.command_json).target;
+    }
+    if (
+      !target
+      || target.region !== region
+      || target.tenant_id !== tenantId
+      || target.channel !== channel
+      || target.bot_id !== botId
+    ) {
+      conflict('mapping_corrupt', 'The current channel card target scope is inconsistent.');
+    }
+
+    const interactionRows = row.turn_id === null
+      ? database.prepare(`
+          SELECT request_json
+          FROM runtime_interactions
+          WHERE conversation_id = ? AND parent_type = 'security_control'
+          ORDER BY ordinal, created_at
+        `).all(row.conversation_id)
+      : database.prepare(`
+          SELECT request_json
+          FROM runtime_interactions
+          WHERE turn_id = ?
+          ORDER BY ordinal, created_at
+        `).all(row.turn_id);
+    const interactions = interactionRows.map(
+      ({ request_json: requestJson }) => JSON.parse(requestJson),
+    );
+    if (
+      interactionId !== null
+      && !interactions.some((interaction) => interaction.interaction_id === interactionId)
+    ) {
+      conflict('interaction_not_found', 'The card action is not correlated to this mapping.');
+    }
+
+    return {
+      platform_message_id: platformMessageId,
+      mapping: {
+        mapping_id: row.mapping_id,
+        conversation_id: row.conversation_id,
+        turn_id: row.turn_id,
+        lineage_id: row.lineage_id,
+        binding_state: row.binding_state,
+        reason: row.reason,
+        mapping_version: row.mapping_version,
+      },
+      request_scope: {
+        region: target.region,
+        tenant_id: target.tenant_id,
+        channel: target.channel,
+        bot_id: target.bot_id,
+        chat_id: target.chat_id,
+        native_thread_or_topic_id: target.native_thread_or_topic_id,
+      },
+      interactions,
+    };
+  }
+
   function expireInteraction(expiration) {
     const expire = database.transaction(() => {
       const expiredAt = now();
@@ -9356,6 +9473,7 @@ export function createExecutorStore({
     markInteractionHandoffDeliveryUnknown,
     markInteractionHandoffPreSendFailure,
     markInteractionHandoffSendStarted,
+    resolveInteractionTarget,
     releaseExecutorResident,
     releaseWorkspaceReservation: workspaceLeases.release,
     releaseRecoveringExecutorOwnership,

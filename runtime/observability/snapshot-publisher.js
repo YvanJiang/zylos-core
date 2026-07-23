@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 
 import {
+  TERMINAL_TURN_STATES,
   validateContractError,
   validateObservabilitySnapshot,
   validatePublicFixtureSafety,
@@ -243,9 +244,11 @@ function collectExecutors(database, serviceInstanceId, generatedAt) {
     const unknownRecovery = unknownRecoveryTurns.has(activeTurnId);
     const blocking = interactionState?.blocking === 1;
     const exactFence = exactActiveFence(row, attempt, serviceInstanceId, generatedAt);
-    const sideEffectUnknown = attempt.side_effect_status === 'unknown'
+    const sideEffectUnknown = activeTurnId !== null && (
+      attempt.side_effect_status === 'unknown'
       || unknownInteraction
-      || unknownRecovery;
+      || unknownRecovery
+    );
     let health;
     if (sideEffectUnknown || ['redirecting', 'recovering'].includes(row.active_state)) {
       health = 'degraded';
@@ -610,7 +613,10 @@ function deriveServiceHealth(sections, serviceDegraded, serviceOffline) {
     return 'degraded';
   }
   if (sections.turns.items.some(
-    ({ state, side_effect_status: status }) => state === 'recovering' || status === 'unknown',
+    ({ state, side_effect_status: status }) => (
+      state === 'recovering'
+      || (status === 'unknown' && !TERMINAL_TURN_STATES.includes(state))
+    ),
   )) {
     return 'degraded';
   }

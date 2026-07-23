@@ -2633,6 +2633,7 @@ export function createExecutorService({
     publishObservabilitySnapshot: observabilityPublisher.publish,
     reconcileWorkspaceRecoveries,
     reconcileInteractionHandoff,
+    resolveInteractionTarget: store.resolveInteractionTarget,
     resolveInteractionHandoff,
     runNext,
     snapshot,

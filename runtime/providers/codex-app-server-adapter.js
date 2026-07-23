@@ -982,15 +982,25 @@ export function createCodexAppServerAdapter({
         run.text_item_order.push(params.itemId);
         run.text_by_item.set(params.itemId, '');
       }
+      const pendingText = run.pending_text_by_item.get(params.itemId) ?? '';
+      if (params.delta.trim().length === 0) {
+        run.pending_text_by_item.set(params.itemId, `${pendingText}${params.delta}`);
+        return;
+      }
+      const displayableDelta = `${pendingText}${params.delta}`;
       const startOffset = textSnapshot(run).length;
-      run.text_by_item.set(params.itemId, `${run.text_by_item.get(params.itemId)}${params.delta}`);
+      run.pending_text_by_item.delete(params.itemId);
+      run.text_by_item.set(
+        params.itemId,
+        `${run.text_by_item.get(params.itemId)}${displayableDelta}`,
+      );
       run.queue.push({
         kind: 'text_delta',
         provider_native_id: run.thread_id,
         payload: {
-          text: params.delta,
+          text: displayableDelta,
           start_offset: startOffset,
-          end_offset: startOffset + params.delta.length,
+          end_offset: startOffset + displayableDelta.length,
         },
       });
       return;
@@ -1081,6 +1091,7 @@ export function createCodexAppServerAdapter({
           return;
         }
         if (!run.text_by_item.has(item.id)) run.text_item_order.push(item.id);
+        run.pending_text_by_item.delete(item.id);
         run.text_by_item.set(item.id, item.text);
         const text = textSnapshot(run);
         run.queue.push({
@@ -2244,6 +2255,7 @@ export function createCodexAppServerAdapter({
       resolveTerminal,
       rejectTerminal,
       thread_id: null,
+      pending_text_by_item: new Map(),
       text_by_item: new Map(),
       text_item_order: [],
       tool_items: new Map(),

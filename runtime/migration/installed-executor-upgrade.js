@@ -343,6 +343,29 @@ function deployManagedFile(source, destination) {
   return destination;
 }
 
+function readActiveReleaseUpgradeId(activeReleaseFile, {
+  releaseRef,
+  releasePath,
+  required,
+}) {
+  let active;
+  try {
+    active = JSON.parse(fs.readFileSync(activeReleaseFile, 'utf8'));
+  } catch (error) {
+    if (error?.code === 'ENOENT' && !required) return null;
+    throw error;
+  }
+  if (active?.release_ref !== releaseRef
+    || requireDirectory('active release path', active?.release_path) !== releasePath) {
+    throw new Error('Active executor release pointer conflicts with the upgrade source.');
+  }
+  if (active.upgrade_id === null && !required) return null;
+  if (typeof active.upgrade_id !== 'string' || active.upgrade_id.length === 0) {
+    throw new Error('Active executor release lacks its durable upgrade identity.');
+  }
+  return active.upgrade_id;
+}
+
 function readUpgradePlan(planFile, expectedUpgradeId, {
   installationRoot,
   releaseRoot,
@@ -564,6 +587,24 @@ function copyPackagePayload({ sourcePath, releasePath, packlistFn }) {
     fs.copyFileSync(resolvedSource, destination, fs.constants.COPYFILE_EXCL);
     fs.chmodSync(destination, stat.mode & 0o777);
   }
+
+  // npm deliberately omits package-lock.json from package payloads. The
+  // managed release runs `npm ci`, so preserve the exact source lock under
+  // npm's publishable lockfile name, matching the legacy bootstrap packager.
+  const releaseShrinkwrap = path.join(releasePath, 'npm-shrinkwrap.json');
+  if (!fs.existsSync(releaseShrinkwrap)) {
+    const sourceLock = path.join(sourcePath, 'package-lock.json');
+    if (fs.existsSync(sourceLock)) {
+      const resolvedLock = fs.realpathSync(sourceLock);
+      if (!resolvedLock.startsWith(`${sourcePath}${path.sep}`)) {
+        throw new Error('Candidate package lockfile escaped its source directory.');
+      }
+      const lockStat = fs.statSync(resolvedLock);
+      if (!lockStat.isFile()) throw new Error('Candidate package lockfile is not a file.');
+      fs.copyFileSync(resolvedLock, releaseShrinkwrap, fs.constants.COPYFILE_EXCL);
+      fs.chmodSync(releaseShrinkwrap, lockStat.mode & 0o777);
+    }
+  }
 }
 
 function prepareRelease({
@@ -591,6 +632,7 @@ function decorateReleaseAdapter(adapter, activeReleaseFile, execFileSyncFn, {
   zylosDir,
   targetReleasePath,
   packageLifecycle,
+  fromUpgradeId,
 }) {
   return Object.freeze({
     async activate(request) {
@@ -611,9 +653,9 @@ function decorateReleaseAdapter(adapter, activeReleaseFile, execFileSyncFn, {
       atomicJson(activeReleaseFile, {
         release_ref: result.release_ref,
         release_path: result.release_path,
-        upgrade_id: null,
+        upgrade_id: fromUpgradeId,
       });
-      return { ...result, upgrade_id: null, package_restoration: packageResult };
+      return { ...result, upgrade_id: fromUpgradeId, package_restoration: packageResult };
     },
     async cleanup(request) {
       assertLegacyServicesInactive({ zylosDir, execFileSyncFn });
@@ -892,6 +934,15 @@ export function createInstalledExecutorUpgradeHandler({
       [plan.preflight.from_release]: requireDirectory('from_release_path', plan.from_release_path),
       [plan.preflight.to_release]: requireDirectory('to_release_path', plan.to_release_path),
     };
+    const previousFence = database.prepare(`
+      SELECT upgrade_id FROM runtime_active_release_fences
+      WHERE scope_key = 'installation' AND release_ref = ?
+    `).get(plan.preflight.from_release);
+    const fromUpgradeId = plan.from_upgrade_id ?? previousFence?.upgrade_id ?? null;
+    if (plan.from_release_kind !== 'legacy_base'
+      && (typeof fromUpgradeId !== 'string' || fromUpgradeId.length === 0)) {
+      throw new Error('Runtime upgrade plan lacks the source release upgrade identity.');
+    }
     const physicalReleaseAdapter = createAtomicReleaseAdapter({
       activeReleaseFile,
       releases,
@@ -916,6 +967,7 @@ export function createInstalledExecutorUpgradeHandler({
         zylosDir: installationRoot,
         targetReleasePath: plan.to_release_path,
         packageLifecycle,
+        fromUpgradeId,
       },
     );
     const legacySourceAdapter = createLegacySourceQueueAdapter({
@@ -1072,6 +1124,11 @@ export function createInstalledExecutorUpgradeHandler({
     if (fromRelease === target.release) {
       throw new Error('Target executor release must differ from the active release.');
     }
+    const fromUpgradeId = readActiveReleaseUpgradeId(activeReleaseFile, {
+      releaseRef: fromRelease,
+      releasePath: packageRoot,
+      required: !allowLegacyFromRelease,
+    });
     const prepared = prepareRelease({
       source: target.downloaded_source,
       releaseRef: target.release,
@@ -1121,6 +1178,7 @@ export function createInstalledExecutorUpgradeHandler({
       legacy_batch: legacyBatch,
       legacy_queue_file: legacyQueueFile,
       from_release_path: packageRoot,
+      from_upgrade_id: fromUpgradeId,
       to_release_path: prepared.releasePath,
       from_package_version: readPackageRelease(packageRoot, {
         legacySource: allowLegacyFromRelease,
