@@ -521,6 +521,100 @@ describe('runtime executor service', () => {
     restartedDatabase.close();
   });
 
+  test('startup terminalizes a recovery interaction expired by an older executor', async () => {
+    const firstDatabase = openTestDatabase();
+    const accepted = acceptQueuedTurn(firstDatabase, 'startup-expired-recovery');
+    const oldStore = createExecutorStore({
+      database: firstDatabase,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-startup-expired-recovery-old',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('startup-expired-recovery-old'),
+      leaseDurationMs: 1_000,
+      workspaceLeaseDurationMs: 1_000,
+    });
+    const oldContext = oldStore.claimNextQueuedTurn({
+      workspaceAccess: { workspace_root: process.cwd(), mode: 'writable' },
+    });
+    oldStore.transitionTurn(oldContext, 'starting', 'running');
+    oldStore.markProviderFailure(oldContext, {
+      code: 'side_effect_unknown',
+      category: 'provider',
+      retryable: false,
+      side_effect_status: 'unknown',
+      user_message: 'The provider execution outcome is unknown.',
+      occurred_at: '2026-07-19T07:01:00Z',
+    });
+    const interactionRow = firstDatabase.prepare(`
+      SELECT interaction_id, version, request_json
+      FROM runtime_interactions
+      WHERE turn_id = ? AND parent_type = 'recovery_control'
+    `).get(accepted.turn_id);
+    const expiredRequest = {
+      ...JSON.parse(interactionRow.request_json),
+      state: 'expired',
+      version: interactionRow.version + 1,
+    };
+    firstDatabase.prepare(`
+      UPDATE runtime_interactions
+      SET state = 'expired', version = ?, request_json = ?, updated_at = ?
+      WHERE interaction_id = ?
+    `).run(
+      expiredRequest.version,
+      JSON.stringify(expiredRequest),
+      '2026-07-19T07:01:02Z',
+      interactionRow.interaction_id,
+    );
+    const databasePath = firstDatabase.name;
+    firstDatabase.close();
+
+    const restartedDatabase = new Database(databasePath);
+    const service = createExecutorService({
+      database: restartedDatabase,
+      adapter: { async *execute() {} },
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-startup-expired-recovery-new',
+      now: () => '2026-07-19T07:02:00Z',
+      generateId: deterministicIds('startup-expired-recovery-new'),
+      leaseDurationMs: 1_000,
+      workspaceLeaseDurationMs: 1_000,
+      isolateOrphanedWorkspace: async () => ({ isolated: true }),
+      scheduleWorkspaceHeartbeat() { return { unref() {} }; },
+      cancelWorkspaceHeartbeat() {},
+    });
+
+    service.start();
+    expect(restartedDatabase.prepare(`
+      SELECT state FROM runtime_execution_recoveries WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'stopped' });
+    expect(restartedDatabase.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'timed_out' });
+    expect(restartedDatabase.prepare(`
+      SELECT status, wait_reason FROM runtime_turn_queue WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ status: 'timed_out', wait_reason: null });
+
+    const deliveryService = createOutboxService({
+      database: restartedDatabase,
+      serviceInstanceId: 'delivery-service-startup-expired-recovery',
+      now: () => '2026-07-19T07:02:01Z',
+      generateId: deterministicIds('delivery-startup-expired-recovery'),
+      throttleMs: 0,
+    });
+    for (let command = deliveryService.claimNext(); command; command = deliveryService.claimNext()) {
+      deliveryService.recordResult(deliveredResult(command, '2026-07-19T07:02:01Z'));
+    }
+    await expect(service.reconcileWorkspaceRecoveries()).resolves.toMatchObject({
+      isolated: [accepted.turn_id],
+    });
+    expect(restartedDatabase.prepare(`
+      SELECT state FROM runtime_workspace_leases WHERE holder_turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'released' });
+
+    await service.close();
+    restartedDatabase.close();
+  });
+
   test('runs a thirty-second sweep and fences newly orphaned nonterminal work', async () => {
     const database = openTestDatabase();
     let sweep;
@@ -1896,6 +1990,101 @@ describe('runtime executor service', () => {
       turn_id: accepted.turn_id,
     });
 
+    database.close();
+  });
+
+  test('times out an unanswered execution recovery and releases its workspace after isolation', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'provider-failure-timeout');
+    let clock = '2026-07-19T07:05:00Z';
+    let abortCalls = 0;
+    const adapter = {
+      async *execute() {
+        const error = new Error('private provider failure');
+        error.providerError = {
+          code: 'side_effect_unknown',
+          category: 'provider',
+          retryable: false,
+          side_effect_status: 'unknown',
+          user_message: 'The provider execution failed after side effects may have occurred.',
+        };
+        throw error;
+      },
+      async abort() {
+        abortCalls += 1;
+        return { status: 'provider_stopped', provider_status: 'process_exited' };
+      },
+    };
+    const service = createExecutorService({
+      database,
+      adapter,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-provider-failure-timeout',
+      now: () => clock,
+      generateId: deterministicIds('provider-failure-timeout'),
+      interactionTimeoutMs: 1_000,
+      setTimeoutFn() { return { unref() {} }; },
+      clearTimeoutFn() {},
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'recovering',
+      turn_id: accepted.turn_id,
+    });
+    const recoveryRequest = JSON.parse(database.prepare(`
+      SELECT request_json FROM runtime_interactions
+      WHERE turn_id = ? AND parent_type = 'recovery_control'
+    `).get(accepted.turn_id).request_json);
+
+    clock = '2026-07-19T07:05:02Z';
+    await expect(service.expireInteraction({
+      interaction_id: recoveryRequest.interaction_id,
+      interaction_version: recoveryRequest.version,
+    })).resolves.toMatchObject({
+      status: 'expired',
+      newly_expired: true,
+      turn_state: 'timed_out',
+      lease_released: false,
+      provider_stop_status: 'notification_pending',
+    });
+    expect(abortCalls).toBe(0);
+    expect(database.prepare(`
+      SELECT state FROM runtime_execution_recoveries WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'stopped' });
+    expect(database.prepare(`
+      SELECT state FROM runtime_turns WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'timed_out' });
+    expect(database.prepare(`
+      SELECT status, wait_reason FROM runtime_turn_queue WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ status: 'timed_out', wait_reason: null });
+    expect(database.prepare(`
+      SELECT state FROM runtime_workspace_leases WHERE holder_turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'active' });
+
+    const deliveryService = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-service-provider-failure-timeout',
+      now: () => clock,
+      generateId: deterministicIds('delivery-provider-failure-timeout'),
+      throttleMs: 0,
+    });
+    for (let command = deliveryService.claimNext(); command; command = deliveryService.claimNext()) {
+      deliveryService.recordResult(deliveredResult(command, clock));
+    }
+    await expect(service.reconcileWorkspaceRecoveries()).resolves.toEqual({
+      isolated: [accepted.turn_id],
+      notification_pending: [],
+      isolation_pending: [],
+    });
+    expect(abortCalls).toBe(1);
+    expect(database.prepare(`
+      SELECT state FROM runtime_workspace_leases WHERE holder_turn_id = ?
+    `).get(accepted.turn_id)).toEqual({ state: 'released' });
+    expect(database.prepare(`
+      SELECT lease_owner, turn_id FROM runtime_executor_leases WHERE conversation_id = ?
+    `).get(accepted.conversation_id)).toEqual({ lease_owner: null, turn_id: null });
+
+    await service.close();
     database.close();
   });
 

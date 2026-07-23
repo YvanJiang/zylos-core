@@ -352,6 +352,7 @@ export function createExecutorService({
   const replyMappingRecoverySettlements = new Set();
   const endedResidentFences = new Map();
   const pendingInteractionRecoveries = new Map();
+  const executionRecoveryContexts = new Map();
   const pendingRecoveryIsolations = new Map();
   const orphanedWorkspaceRecoveryTurnIds = new Set();
   const recoveringOwnershipReleases = new Map();
@@ -501,6 +502,7 @@ export function createExecutorService({
       permissionSweep?.unref?.();
     }
     store.reconcileExpiredResidents();
+    store.reconcileExpiredExecutionRecoveries();
     adoptOrphanedWorkspaceRecoveries();
     store.reconcileExpiredStartedInteractionHandoffs();
     store.reconcileNonterminalTurns([], 'startup_reconciliation');
@@ -663,6 +665,7 @@ export function createExecutorService({
     const result = store.releaseRecoveringExecutorOwnership(turnContext);
     releasedRecoveringOwnershipTurnIds.add(turnContext.turn_id);
     recoveringOwnershipReleases.delete(turnContext.turn_id);
+    executionRecoveryContexts.delete(turnContext.turn_id);
     pendingRecoveryIsolations.delete(turnContext.turn_id);
     orphanedWorkspaceRecoveryTurnIds.delete(turnContext.turn_id);
     endedResidentFences.delete(turnContext.conversation_id);
@@ -974,6 +977,9 @@ export function createExecutorService({
       }
       if (normalizedError.side_effect_status === 'unknown') {
         const recovery = persist(() => store.markProviderFailure(turnContext, normalizedError));
+        if (recovery.status === 'recovering') {
+          executionRecoveryContexts.set(turnContext.turn_id, turnContext);
+        }
         activeRun.durableSettled = true;
         refresh();
         cleanupActiveRun(activeRun);
@@ -1625,6 +1631,7 @@ export function createExecutorService({
           }
           activeRun.providerFailureOutcome = outcome;
           if (outcome.status === 'recovering') {
+            executionRecoveryContexts.set(turnContext.turn_id, turnContext);
             reschedulePendingInteractionDeadlines();
             refresh();
             if (!activeRun.advancing) {
@@ -2112,6 +2119,47 @@ export function createExecutorService({
       return result;
     }
     clearInteractionDeadline(result.interaction_id);
+
+    if (result.execution_recovery_timed_out === true) {
+      if (releasedRecoveringOwnershipTurnIds.has(result.turn_id)) {
+        reschedulePendingInteractionDeadlines();
+        return {
+          ...result,
+          lease_released: true,
+          provider_stop_status: 'isolated',
+        };
+      }
+      const turnContext = executionRecoveryContexts.get(result.turn_id)
+        ?? pendingRecoveryIsolations.get(result.turn_id);
+      if (!turnContext) {
+        store.markProviderStopUnknown({
+          turn_id: result.turn_id,
+          attempt: result.attempt,
+        }, 'not_current');
+        reschedulePendingInteractionDeadlines();
+        return {
+          ...result,
+          lease_released: false,
+          provider_stop_status: 'not_current',
+        };
+      }
+      pendingRecoveryIsolations.set(result.turn_id, turnContext);
+      try {
+        const reconciliation = await reconcileWorkspaceRecoveries();
+        const providerStopStatus = reconciliation.isolated.includes(result.turn_id)
+          ? 'isolated'
+          : reconciliation.notification_pending.includes(result.turn_id)
+            ? 'notification_pending'
+            : 'isolation_pending';
+        return {
+          ...result,
+          lease_released: providerStopStatus === 'isolated',
+          provider_stop_status: providerStopStatus,
+        };
+      } finally {
+        reschedulePendingInteractionDeadlines();
+      }
+    }
 
     const timedOutRun = activeRuns.get(result.turn_id);
     if (timedOutRun) timedOutRun.timedOutExpiration = result;

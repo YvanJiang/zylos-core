@@ -88,7 +88,15 @@ const CANONICAL_TRANSITIONS = Object.freeze({
   ]),
   redirecting: Object.freeze(['interrupted']),
   waiting_user: Object.freeze(['running', 'recovering', 'stopped', 'timed_out', 'failed']),
-  recovering: Object.freeze(['starting', 'running', 'waiting_user', 'stopped', 'failed', 'interrupted']),
+  recovering: Object.freeze([
+    'starting',
+    'running',
+    'waiting_user',
+    'stopped',
+    'failed',
+    'interrupted',
+    'timed_out',
+  ]),
 });
 
 const TERMINAL_STATES = new Set([
@@ -6383,6 +6391,98 @@ export function createExecutorStore({
     };
   }
 
+  function finalizeExecutionRecoveryTimeoutInTransaction(
+    recovery,
+    expirationError,
+    expiredAt,
+  ) {
+    const recoveryUpdate = database.prepare(`
+      UPDATE runtime_execution_recoveries
+      SET state = 'stopped', recovery_version = recovery_version + 1, updated_at = ?
+      WHERE recovery_id = ? AND turn_id = ? AND state = 'waiting_decision'
+        AND recovery_version = ?
+    `).run(
+      expiredAt,
+      recovery.recovery_id,
+      recovery.turn_id,
+      recovery.recovery_version,
+    );
+    if (recoveryUpdate.changes !== 1) {
+      conflict('version_conflict', 'The expired execution recovery changed concurrently.');
+    }
+    const fence = {
+      attempt_id: recovery.attempt_id,
+      attempt_no: recovery.attempt_no,
+      lease_epoch: recovery.lease_epoch,
+    };
+    const terminalEvent = transitionInTransaction(database, {
+      turnId: recovery.turn_id,
+      fromState: 'recovering',
+      toState: 'timed_out',
+      fence,
+      provider,
+      serviceInstanceId,
+      occurredAt: expiredAt,
+      generateId,
+      reasonCode: 'execution_recovery_decision_expired',
+      error: expirationError,
+      requireActiveLease: false,
+      retainLease: true,
+    });
+    database.prepare(`
+      UPDATE runtime_provider_attempts
+      SET state = 'stopped', side_effect_status = 'unknown', updated_at = ?
+      WHERE turn_id = ? AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+    `).run(
+      expiredAt,
+      recovery.turn_id,
+      recovery.attempt_id,
+      recovery.attempt_no,
+      recovery.lease_epoch,
+    );
+    database.prepare(`
+      UPDATE runtime_turn_queue
+      SET wait_reason = NULL
+      WHERE turn_id = ? AND status = 'timed_out'
+    `).run(recovery.turn_id);
+    return { terminalEvent, fence };
+  }
+
+  function reconcileExpiredExecutionRecoveries() {
+    const reconcile = database.transaction(() => {
+      const reconciledAt = now();
+      const expirationError = createContractError({
+        code: 'interaction_expired',
+        category: 'conflict',
+        userMessage: 'The recovery decision expired before an answer was committed.',
+        occurredAt: reconciledAt,
+      });
+      const candidates = database.prepare(`
+        SELECT recovery.*
+        FROM runtime_execution_recoveries AS recovery
+        JOIN runtime_interactions AS interaction
+          ON interaction.interaction_id = recovery.interaction_id
+        JOIN runtime_turns AS turn ON turn.turn_id = recovery.turn_id
+        WHERE recovery.state = 'waiting_decision'
+          AND interaction.state = 'expired'
+          AND turn.state = 'recovering'
+        ORDER BY recovery.created_at, recovery.recovery_id
+      `).all();
+      for (const recovery of candidates) {
+        finalizeExecutionRecoveryTimeoutInTransaction(
+          recovery,
+          expirationError,
+          reconciledAt,
+        );
+      }
+      return Object.freeze({
+        reconciled: candidates.length,
+        turn_ids: Object.freeze(candidates.map(({ turn_id: turnId }) => turnId)),
+      });
+    });
+    return reconcile.immediate();
+  }
+
   function expireInteraction(expiration) {
     const expire = database.transaction(() => {
       const expiredAt = now();
@@ -6523,6 +6623,13 @@ export function createExecutorStore({
             AND bound_lineage_id IS NULL
         `).get(request.control_id, request.turn_id)
         : null;
+      const executionRecovery = !isProviderInteraction
+        ? database.prepare(`
+          SELECT *
+          FROM runtime_execution_recoveries
+          WHERE interaction_id = ? AND turn_id = ? AND state = 'waiting_decision'
+        `).get(request.interaction_id, request.turn_id)
+        : null;
       if (replyMappingRecovery) {
         const recoveryUpdate = database.prepare(`
           UPDATE runtime_reply_mapping_recoveries
@@ -6589,6 +6696,25 @@ export function createExecutorStore({
         generateId,
       });
       if (!isProviderInteraction) {
+        if (executionRecovery) {
+          const { terminalEvent, fence: recoveryFence }
+            = finalizeExecutionRecoveryTimeoutInTransaction(
+              executionRecovery,
+              expirationError,
+              expiredAt,
+            );
+          return {
+            status: 'expired',
+            newly_expired: true,
+            interaction_id: request.interaction_id,
+            interaction_version: updatedRequest.version,
+            turn_id: request.turn_id,
+            turn_state: 'timed_out',
+            turn_version: terminalEvent.turn_version,
+            attempt: recoveryFence,
+            execution_recovery_timed_out: true,
+          };
+        }
         return {
           status: 'expired',
           newly_expired: true,
@@ -9477,6 +9603,7 @@ export function createExecutorStore({
     releaseExecutorResident,
     releaseWorkspaceReservation: workspaceLeases.release,
     releaseRecoveringExecutorOwnership,
+    reconcileExpiredExecutionRecoveries,
     reconcileExpiredResidents,
     recordProviderEventDiagnostic,
     recordProviderEventActivity,
