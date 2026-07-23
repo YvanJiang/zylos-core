@@ -919,14 +919,14 @@ describe('runtime interaction happy path', () => {
     );
 
     await expect(service.deliverInteractionAnswer(committed.handoff_id)).resolves.toMatchObject({
-      status: 'recovering',
+      status: 'stopped',
       interaction_state: 'cancelled',
       handoff_state: 'cancelled',
-      turn_state: 'recovering',
+      turn_state: 'stopped',
     });
     expect(sendCalls).toBe(0);
     expect(readInteractionAuthority(database, accepted.turn_id)).toMatchObject({
-      turn: { state: 'recovering' },
+      turn: { state: 'stopped' },
       interactions: [expect.objectContaining({
         state: 'cancelled',
         handoff_state: 'cancelled',
@@ -938,6 +938,14 @@ describe('runtime interaction happy path', () => {
       audits: expect.arrayContaining([
         expect.objectContaining({ outcome: 'cancelled_pre_send' }),
       ]),
+    });
+    expect(database.prepare(`
+      SELECT state, side_effect_status
+      FROM runtime_provider_attempts
+      WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({
+      state: 'stopped',
+      side_effect_status: 'unknown',
     });
 
     database.close();

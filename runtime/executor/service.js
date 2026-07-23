@@ -2341,7 +2341,11 @@ export function createExecutorService({
         }
         activeRun.durableSettled = true;
         cleanupActiveRun(activeRun);
-        releaseRecoveringOwnership(activeRun.turnContext);
+        const ownership = releaseRecoveringOwnership(activeRun.turnContext);
+        if (ownership.terminal_state !== null) {
+          resolution.status = ownership.terminal_state;
+          resolution.turn_state = ownership.terminal_state;
+        }
       }
       reschedulePendingInteractionDeadlines();
       refresh();

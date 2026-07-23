@@ -1709,10 +1709,10 @@ describe('Claude conversation executor', () => {
     );
 
     await expect(service.deliverInteractionAnswer(answer.handoff_id)).resolves.toMatchObject({
-      status: 'recovering',
+      status: 'stopped',
       interaction_state: 'cancelled',
       handoff_state: 'cancelled',
-      turn_state: 'recovering',
+      turn_state: 'stopped',
     });
     expect(database.prepare(`
       SELECT interaction.state, interaction.handoff_state,
@@ -1726,15 +1726,26 @@ describe('Claude conversation executor', () => {
       state: 'cancelled',
       handoff_state: 'cancelled',
       durable_handoff_state: 'cancelled',
-      turn_state: 'recovering',
+      turn_state: 'stopped',
     });
     const latestEvent = JSON.parse(database.prepare(`
       SELECT event_json FROM runtime_normalized_events
       WHERE turn_id = ? ORDER BY event_sequence DESC LIMIT 1
     `).get(accepted.turn_id).event_json);
     expect(latestEvent).toMatchObject({
-      kind: 'recovery_started',
-      phase: 'recovering',
+      kind: 'turn_state_changed',
+      phase: 'stopped',
+    });
+    expect(JSON.stringify(latestEvent)).toContain(
+      'provider_isolated_manual_recovery_required',
+    );
+    expect(database.prepare(`
+      SELECT state, side_effect_status
+      FROM runtime_provider_attempts
+      WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({
+      state: 'stopped',
+      side_effect_status: 'unknown',
     });
 
     await service.close();
