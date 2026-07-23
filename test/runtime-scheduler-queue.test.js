@@ -6,7 +6,7 @@ import { afterEach, describe, expect, test } from '@jest/globals';
 import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/index.js';
 
 import { createIdempotencyKey } from '../contracts/public/index.js';
-import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { acceptQueuedInbound as acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
 import {
   acceptScheduledOccurrence,
   decideScheduledOccurrence,

@@ -16,7 +16,7 @@ import { createInstalledRuntimeUpgradeHost } from '../runtime/migration/installe
 import { createRuntimeUpgradeService } from '../runtime/migration/runtime-upgrade-service.js';
 import { createExecutorService } from '../runtime/executor/service.js';
 import { createExecutorStore } from '../runtime/persistence/executor-store.js';
-import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { acceptQueuedInbound as acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
 import { runSelfUpgrade } from '../cli/lib/self-upgrade.js';
 import { runtimeUpgradeOwnershipLockPath } from '../runtime/migration/upgrade-state.js';
 

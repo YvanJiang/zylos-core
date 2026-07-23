@@ -906,6 +906,52 @@ export function createExecutorStore({
     `).all(serviceInstanceId, serviceInstanceId, claimableAt);
   }
 
+  function getBackgroundTask(backgroundTaskId) {
+    if (typeof backgroundTaskId !== 'string' || backgroundTaskId.length === 0) {
+      throw new TypeError('backgroundTaskId must be a non-empty string');
+    }
+    const row = database.prepare(`
+      SELECT task.*, execution.turn_version AS execution_turn_version,
+        queue.status AS queue_status, queue.wait_reason,
+        attempt.attempt_id, attempt.attempt_no, attempt.lease_epoch,
+        attempt.provider, attempt.state AS attempt_state,
+        attempt.error_json AS attempt_error_json
+      FROM runtime_background_tasks AS task
+      JOIN runtime_turns AS execution
+        ON execution.turn_id = task.execution_turn_id
+      LEFT JOIN runtime_turn_queue AS queue
+        ON queue.turn_id = task.execution_turn_id
+      LEFT JOIN runtime_provider_attempts AS attempt
+        ON attempt.turn_id = task.execution_turn_id
+       AND attempt.attempt_id = execution.attempt_id
+      WHERE task.background_task_id = ?
+    `).get(backgroundTaskId);
+    if (!row) return null;
+    return Object.freeze({
+      background_task_id: row.background_task_id,
+      origin_conversation_id: row.origin_conversation_id,
+      dispatch_turn_id: row.dispatch_turn_id,
+      execution_conversation_id: row.execution_conversation_id,
+      execution_turn_id: row.execution_turn_id,
+      execution_turn_version: row.execution_turn_version,
+      state: row.state,
+      side_effect_status: row.side_effect_status,
+      queue_status: row.queue_status,
+      wait_reason: row.wait_reason,
+      attempt: row.attempt_id === null ? null : Object.freeze({
+        attempt_id: row.attempt_id,
+        attempt_no: row.attempt_no,
+        lease_epoch: row.lease_epoch,
+        provider: row.provider,
+        state: row.attempt_state,
+      }),
+      created_at: row.created_at,
+      started_at: row.started_at,
+      completed_at: row.completed_at,
+      error: row.attempt_error_json === null ? null : JSON.parse(row.attempt_error_json),
+    });
+  }
+
   function claimNextReplyMappingRecoveryNotice() {
     const claim = database.transaction(() => {
       const claimAt = now();
@@ -9588,6 +9634,7 @@ export function createExecutorStore({
     completeSteer,
     commitInteractionAnswer,
     completeReplyMappingRecovery,
+    getBackgroundTask,
     markProviderFailure,
     markProviderStopUnknown,
     heartbeatOwnedResidents,

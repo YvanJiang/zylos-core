@@ -13,7 +13,7 @@ import {
   validateInboundEnvelope,
 } from '../contracts/public/index.js';
 import {
-  acceptCompatibilityInbound,
+  acceptQueuedCompatibilityInbound as acceptCompatibilityInbound,
   createChannelNeutralTextRenderer,
 } from '../runtime/compatibility/c4-channel-fallback.js';
 import { createOutboxService } from '../runtime/delivery/outbox-service.js';

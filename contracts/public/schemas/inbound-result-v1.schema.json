@@ -27,6 +27,9 @@
     "inbound_event_id": { "$ref": "#/$defs/opaque_id" },
     "idempotency_key": { "$ref": "#/$defs/opaque_id" },
     "status": { "enum": ["accepted", "rejected"] },
+    "dispatch_status": { "const": "background_dispatched" },
+    "background_task_id": { "$ref": "#/$defs/opaque_id" },
+    "background_execution_turn_id": { "$ref": "#/$defs/opaque_id" },
     "conversation_id": { "$ref": "#/$defs/nullable_id" },
     "turn_id": { "$ref": "#/$defs/nullable_id" },
     "lineage_id": { "$ref": "#/$defs/nullable_id" },
@@ -103,6 +106,28 @@
             { "$ref": "#/$defs/error" },
             { "not": { "properties": { "code": { "const": "queue_full" } }, "required": ["code"] } }
           ]
+        }
+      }
+    }
+  ],
+  "allOf": [
+    {
+      "if": {
+        "anyOf": [
+          { "required": ["dispatch_status"] },
+          { "required": ["background_task_id"] },
+          { "required": ["background_execution_turn_id"] }
+        ]
+      },
+      "then": {
+        "required": [
+          "dispatch_status",
+          "background_task_id",
+          "background_execution_turn_id"
+        ],
+        "properties": {
+          "status": { "const": "accepted" },
+          "dispatch_status": { "const": "background_dispatched" }
         }
       }
     }

@@ -10,7 +10,9 @@ import Database from '../../skills/comm-bridge/node_modules/better-sqlite3/lib/i
 
 import { createIdempotencyKey } from '../../contracts/public/index.js';
 import { createExecutorService } from '../../runtime/executor/service.js';
-import { acceptNormalInbound } from '../../runtime/persistence/inbound-acceptance.js';
+import {
+  acceptQueuedInbound as acceptNormalInbound,
+} from '../../runtime/persistence/inbound-acceptance.js';
 import { createCodexAppServerAdapter } from '../../runtime/providers/codex-app-server-adapter.js';
 
 const execFileAsync = promisify(execFile);

@@ -8,7 +8,7 @@ import {
   validatePublicFixtureSafety,
 } from '../../contracts/public/index.js';
 import { initializeRuntimePersistence } from '../persistence/schema.js';
-import { acceptNormalInbound } from '../persistence/inbound-acceptance.js';
+import { acceptQueuedInbound } from '../persistence/inbound-acceptance.js';
 import { createExecutorStore } from '../persistence/executor-store.js';
 import {
   acceptScheduledOccurrence,
@@ -1287,7 +1287,7 @@ export function createRuntimeUpgradeService({
         let importedByUpgrade = 0;
         if (['migrated_pending', 'migrated_scheduler'].includes(classification.disposition)) {
           const accepted = classification.disposition === 'migrated_pending'
-            ? acceptNormalInbound(database, record.envelope, { now, generateId })
+            ? acceptQueuedInbound(database, record.envelope, { now, generateId })
             : acceptScheduledOccurrence(database, record.occurrence, { now, generateId });
           if (accepted.status !== 'accepted') {
             throw new Error(`Legacy C4 ${record.legacy_record_id} was not accepted.`);

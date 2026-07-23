@@ -136,6 +136,37 @@ const RUNTIME_SCHEMA = `
     PRIMARY KEY (conversation_id, queue_sequence)
   );
 
+  CREATE TABLE IF NOT EXISTS runtime_background_tasks (
+    background_task_id TEXT PRIMARY KEY,
+    origin_conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+    dispatch_turn_id TEXT NOT NULL UNIQUE
+      REFERENCES runtime_turns(turn_id) ON DELETE CASCADE,
+    execution_conversation_id TEXT NOT NULL UNIQUE
+      REFERENCES runtime_conversations(conversation_id),
+    execution_turn_id TEXT NOT NULL UNIQUE
+      REFERENCES runtime_turns(turn_id) ON DELETE CASCADE,
+    state TEXT NOT NULL CHECK (
+      state IN (
+        'queued', 'starting', 'running', 'waiting_user', 'redirecting',
+        'recovering', 'completed', 'stopped', 'cancelled', 'failed',
+        'interrupted', 'timed_out'
+      )
+    ),
+    side_effect_status TEXT NOT NULL DEFAULT 'none'
+      CHECK (side_effect_status IN ('none', 'known', 'unknown')),
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    CHECK (origin_conversation_id != execution_conversation_id),
+    CHECK (dispatch_turn_id != execution_turn_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS runtime_background_tasks_origin
+    ON runtime_background_tasks(origin_conversation_id, created_at, background_task_id);
+
+  CREATE INDEX IF NOT EXISTS runtime_background_tasks_state
+    ON runtime_background_tasks(state, created_at, background_task_id);
+
   CREATE UNIQUE INDEX IF NOT EXISTS runtime_turns_one_active_per_conversation
     ON runtime_turns(conversation_id)
     WHERE state IN ('starting', 'running', 'waiting_user', 'redirecting', 'recovering');
@@ -458,6 +489,36 @@ const RUNTIME_SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS runtime_provider_attempts_active
     ON runtime_provider_attempts(turn_id, state, service_instance_id);
+
+  CREATE TRIGGER IF NOT EXISTS runtime_background_task_turn_state_update
+  AFTER UPDATE OF state ON runtime_turns
+  BEGIN
+    UPDATE runtime_background_tasks
+    SET
+      state = NEW.state,
+      started_at = CASE
+        WHEN NEW.state IN (
+          'starting', 'running', 'waiting_user', 'redirecting', 'recovering',
+          'completed', 'stopped', 'cancelled', 'failed', 'interrupted', 'timed_out'
+        ) THEN COALESCE(started_at, NEW.committed_at)
+        ELSE started_at
+      END,
+      completed_at = CASE
+        WHEN NEW.state IN (
+          'completed', 'stopped', 'cancelled', 'failed', 'interrupted', 'timed_out'
+        ) THEN COALESCE(completed_at, NEW.committed_at)
+        ELSE NULL
+      END
+    WHERE execution_turn_id = NEW.turn_id;
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS runtime_background_task_attempt_update
+  AFTER UPDATE OF side_effect_status ON runtime_provider_attempts
+  BEGIN
+    UPDATE runtime_background_tasks
+    SET side_effect_status = NEW.side_effect_status
+    WHERE execution_turn_id = NEW.turn_id;
+  END;
 
   CREATE TABLE IF NOT EXISTS runtime_execution_recoveries (
     recovery_id TEXT PRIMARY KEY,

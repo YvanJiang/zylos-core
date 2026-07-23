@@ -9,8 +9,10 @@ import { afterEach, beforeEach, describe, expect, test } from '@jest/globals';
 import Database from '../skills/web-console/node_modules/better-sqlite3/lib/index.js';
 import WebSocket from '../skills/web-console/node_modules/ws/wrapper.mjs';
 import { createIdempotencyKey } from '../contracts/public/index.js';
-import { acceptCompatibilityInbound } from '../runtime/compatibility/c4-channel-fallback.js';
-import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import {
+  acceptQueuedCompatibilityInbound as acceptCompatibilityInbound,
+} from '../runtime/compatibility/c4-channel-fallback.js';
+import { acceptQueuedInbound as acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
 import { DeliveryMailbox } from '../skills/web-console/scripts/db.js';
 
 const SERVER_PATH = path.resolve('skills/web-console/scripts/server.js');

@@ -7,7 +7,7 @@ import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/inde
 
 import { createIdempotencyKey } from '../contracts/public/index.js';
 import { createExecutorService } from '../runtime/executor/service.js';
-import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { acceptQueuedInbound as acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
 import { createExecutorStore } from '../runtime/persistence/executor-store.js';
 import { interactionAnswer } from './helpers/runtime-interaction-fixtures.js';
 

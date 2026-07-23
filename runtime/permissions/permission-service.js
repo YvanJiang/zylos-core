@@ -1333,14 +1333,18 @@ function protectedActionDecision(database, {
   generateId,
 }) {
   const row = database.prepare(`
-    SELECT permission.*, turn.conversation_id,
+    SELECT permission.*,
+      COALESCE(background.origin_conversation_id, turn.conversation_id) AS conversation_id,
       conversation.region, conversation.tenant_id, conversation.bot_id,
       grant.grant_kind, grant.state AS grant_state, grant.expires_at,
       grant.consumed_by_turn_id, grant.policy_revision
     FROM runtime_turn_permissions AS permission
     JOIN runtime_turns AS turn ON turn.turn_id = permission.turn_id
+    LEFT JOIN runtime_background_tasks AS background
+      ON background.execution_turn_id = turn.turn_id
     JOIN runtime_conversations AS conversation
-      ON conversation.conversation_id = turn.conversation_id
+      ON conversation.conversation_id =
+        COALESCE(background.origin_conversation_id, turn.conversation_id)
     LEFT JOIN runtime_permission_grants AS grant ON grant.grant_id = permission.grant_id
     WHERE permission.turn_id = ?
   `).get(turnId);

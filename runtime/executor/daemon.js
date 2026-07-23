@@ -102,6 +102,7 @@ export async function runExecutorDaemon({
   createUpgradeHandler = null,
   hasResumableUpgrade = hasResumableRuntimeUpgrade,
   createPrerequisiteOwner = createExecutorPrerequisiteOwner,
+  maxConcurrentRuns = 20,
 } = {}) {
   if (!path.isAbsolute(zylosDir) || path.parse(zylosDir).root === zylosDir) {
     throw new TypeError('ZYLOS_DIR must be an explicit absolute non-root path');
@@ -194,6 +195,7 @@ export async function runExecutorDaemon({
       hostId,
       socketPath: path.join(zylosDir, 'runtime', 'executor-service.sock'),
       workspaceRoot: zylosDir,
+      maxConcurrentRuns,
       releaseRef: process.env.ZYLOS_RELEASE_REF || null,
       upgradeId: process.env.ZYLOS_UPGRADE_ID || null,
       onUpgrade,

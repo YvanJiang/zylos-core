@@ -3,7 +3,7 @@ import {
   validateInboundEnvelope,
   validateOpaqueId,
 } from '../../contracts/public/index.js';
-import { acceptNormalInbound } from '../persistence/inbound-acceptance.js';
+import { acceptQueuedInbound } from '../persistence/inbound-acceptance.js';
 
 function requireNonEmptyString(name, value) {
   if (typeof value !== 'string' || value.length === 0) {
@@ -126,7 +126,7 @@ export function createScheduledOccurrenceEnvelope(occurrence) {
 }
 
 export function acceptScheduledOccurrence(database, occurrence, options = {}) {
-  return acceptNormalInbound(database, createScheduledOccurrenceEnvelope(occurrence), options);
+  return acceptQueuedInbound(database, createScheduledOccurrenceEnvelope(occurrence), options);
 }
 
 export function decideScheduledOccurrence({

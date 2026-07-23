@@ -23,6 +23,29 @@
       }
     },
     {
+      "name": "detached_background_dispatch",
+      "document": {
+        "contract": "zylos.inbound-result",
+        "contract_version": "1.0",
+        "trace_id": "trace-result-background-001",
+        "inbound_event_id": "evt-background-001",
+        "idempotency_key": "zid:v1:inbound:a3b8aa74cbe7496c06d5b831ecbf5d940778fb1890f8b8c0121ad17e0286c917",
+        "status": "accepted",
+        "conversation_id": "conversation-A",
+        "turn_id": "turn-dispatch-A",
+        "lineage_id": "lineage-A",
+        "control_id": null,
+        "turn_version": 2,
+        "lineage_resolution_state": "bound",
+        "deduplicated": false,
+        "error": null,
+        "committed_at": "2026-07-19T05:00:02Z",
+        "dispatch_status": "background_dispatched",
+        "background_task_id": "background-task-A",
+        "background_execution_turn_id": "turn-background-A"
+      }
+    },
+    {
       "name": "control",
       "document": {
         "contract": "zylos.inbound-result",
@@ -165,6 +188,28 @@
     }
   ],
   "invalid": [
+    {
+      "name": "partial_detached_dispatch",
+      "error_code": "validation_error",
+      "document": {
+        "contract": "zylos.inbound-result",
+        "contract_version": "1.0",
+        "trace_id": "trace-invalid-background",
+        "inbound_event_id": "evt-background-001",
+        "idempotency_key": "zid:v1:inbound:a3b8aa74cbe7496c06d5b831ecbf5d940778fb1890f8b8c0121ad17e0286c917",
+        "status": "accepted",
+        "conversation_id": "conversation-A",
+        "turn_id": "turn-dispatch-A",
+        "lineage_id": "lineage-A",
+        "control_id": null,
+        "turn_version": 2,
+        "lineage_resolution_state": "bound",
+        "deduplicated": false,
+        "error": null,
+        "committed_at": "2026-07-19T05:00:02Z",
+        "dispatch_status": "background_dispatched"
+      }
+    },
     {
       "name": "accepted_with_error",
       "error_code": "validation_error",

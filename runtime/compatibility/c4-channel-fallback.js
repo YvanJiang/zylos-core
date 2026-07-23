@@ -4,7 +4,10 @@ import {
   validateDeliveryResult,
   validateInboundEnvelope,
 } from '../../contracts/public/index.js';
-import { acceptNormalInbound } from '../persistence/inbound-acceptance.js';
+import {
+  acceptNormalInbound,
+  acceptQueuedInbound,
+} from '../persistence/inbound-acceptance.js';
 
 const MAIN_CARD_CHANNELS = new Set(['feishu', 'lark']);
 
@@ -49,17 +52,25 @@ export function createCompatibilityEnvelope(message, {
   return validateInboundEnvelope(envelope).forwarded;
 }
 
-export function acceptCompatibilityInbound(database, message, options = {}) {
+function acceptCompatibilityInboundWith(database, message, options, acceptInbound) {
   const envelope = createCompatibilityEnvelope(message, {
     receivedAt: message?.received_at ?? options.now?.(),
     traceId: message?.trace_id ?? options.generateId?.('trace'),
   });
-  return acceptNormalInbound(database, envelope, {
+  return acceptInbound(database, envelope, {
     ...options,
     initialDeliveryOperation: MAIN_CARD_CHANNELS.has(envelope.channel)
       ? 'create_main'
       : 'send_text',
   });
+}
+
+export function acceptCompatibilityInbound(database, message, options = {}) {
+  return acceptCompatibilityInboundWith(database, message, options, acceptNormalInbound);
+}
+
+export function acceptQueuedCompatibilityInbound(database, message, options = {}) {
+  return acceptCompatibilityInboundWith(database, message, options, acceptQueuedInbound);
 }
 
 const PHASE_LABELS = Object.freeze({

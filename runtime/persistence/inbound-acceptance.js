@@ -465,7 +465,365 @@ function resolveNormalLineage(database, envelope, conversationId, committedAt, g
   return { ...lineage, recovery: null, pending_turn: null };
 }
 
-export function acceptNormalInbound(
+function acceptDetachedInboundInTransaction(database, {
+  envelope,
+  originConversationId,
+  payloadHash,
+  committedAt,
+  blockingUpgrade,
+  initialDeliveryOperation,
+  generateId,
+}) {
+  const originLineage = resolveOrCreateDefaultLineage(
+    database,
+    envelope,
+    originConversationId,
+    committedAt,
+    generateId,
+  );
+  const backgroundTaskId = generateId('background-task');
+  const dispatchTurnId = generateId('turn');
+  const executionConversationId = generateId('conversation');
+  const executionLineageId = generateId('lineage');
+  const executionTurnId = generateId('turn');
+  const executionInboundEventId = generateId('background-inbound-event');
+  const executionEnvelope = structuredClone(envelope);
+  executionEnvelope.inbound_event_id = executionInboundEventId;
+  executionEnvelope.idempotency_key = createIdempotencyKey('inbound', {
+    region: executionEnvelope.region,
+    tenant_id: executionEnvelope.tenant_id,
+    channel: executionEnvelope.channel,
+    bot_id: executionEnvelope.bot_id,
+    inbound_event_id: executionEnvelope.inbound_event_id,
+  });
+  const executionPayloadHash = createPayloadHash(executionEnvelope, {
+    scope: 'inbound',
+    knownFields: INBOUND_ENVELOPE_KNOWN_FIELDS,
+    extensionFields: Object.keys(executionEnvelope).filter(
+      (fieldName) => !INBOUND_ENVELOPE_KNOWN_FIELDS.includes(fieldName),
+    ),
+  });
+
+  database.prepare(`
+    UPDATE runtime_conversations
+    SET last_queue_sequence = last_queue_sequence + 1
+    WHERE conversation_id = ?
+  `).run(originConversationId);
+  const dispatchQueueSequence = database.prepare(`
+    SELECT last_queue_sequence
+    FROM runtime_conversations
+    WHERE conversation_id = ?
+  `).get(originConversationId).last_queue_sequence;
+
+  database.prepare(`
+    INSERT INTO runtime_inbound_events (
+      inbound_event_id, idempotency_key, conversation_id, message_id,
+      payload_hash, envelope_json, received_at, committed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    envelope.inbound_event_id,
+    envelope.idempotency_key,
+    originConversationId,
+    envelope.message_id,
+    payloadHash,
+    JSON.stringify(envelope),
+    envelope.received_at,
+    committedAt,
+  );
+  database.prepare(`
+    INSERT INTO runtime_turns (
+      turn_id, conversation_id, lineage_id, inbound_event_id, state,
+      turn_version, queue_sequence, provider_input_json, created_at, committed_at
+    ) VALUES (?, ?, ?, ?, 'received', 1, ?, NULL, ?, ?)
+  `).run(
+    dispatchTurnId,
+    originConversationId,
+    originLineage.lineage_id,
+    envelope.inbound_event_id,
+    dispatchQueueSequence,
+    committedAt,
+    committedAt,
+  );
+  database.prepare(`
+    INSERT INTO runtime_turn_queue (
+      conversation_id, queue_sequence, turn_id, status, wait_reason, enqueued_at
+    ) VALUES (?, ?, ?, 'queued', NULL, ?)
+  `).run(
+    originConversationId,
+    dispatchQueueSequence,
+    dispatchTurnId,
+    committedAt,
+  );
+
+  const dispatchReceivedEvent = buildLifecycleEvent({
+    eventId: generateId('event'),
+    traceId: envelope.trace_id,
+    conversationId: originConversationId,
+    turnId: dispatchTurnId,
+    lineageId: originLineage.lineage_id,
+    eventSequence: 1,
+    turnVersion: 1,
+    phase: 'received',
+    occurredAt: envelope.received_at,
+    persistedAt: committedAt,
+    fromState: null,
+    reasonCode: 'inbound_committed',
+    causationEventId: null,
+  });
+  const dispatchedEvent = buildLifecycleEvent({
+    eventId: generateId('event'),
+    traceId: envelope.trace_id,
+    conversationId: originConversationId,
+    turnId: dispatchTurnId,
+    lineageId: originLineage.lineage_id,
+    eventSequence: 2,
+    turnVersion: 2,
+    phase: 'completed',
+    occurredAt: committedAt,
+    persistedAt: committedAt,
+    fromState: 'received',
+    reasonCode: 'background_dispatched',
+    causationEventId: dispatchReceivedEvent.event_id,
+  });
+  for (const event of [dispatchReceivedEvent, dispatchedEvent]) {
+    validateNormalizedEvent(event);
+    database.prepare(`
+      INSERT INTO runtime_normalized_events (
+        event_id, turn_id, event_sequence, turn_version, event_json, persisted_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      event.event_id,
+      dispatchTurnId,
+      event.event_sequence,
+      event.turn_version,
+      JSON.stringify(event),
+      committedAt,
+    );
+  }
+  database.prepare(`
+    UPDATE runtime_turns
+    SET state = 'completed', turn_version = 2, committed_at = ?
+    WHERE turn_id = ? AND state = 'received' AND turn_version = 1
+  `).run(committedAt, dispatchTurnId);
+  database.prepare(`
+    UPDATE runtime_turn_queue
+    SET status = 'completed'
+    WHERE turn_id = ? AND status = 'queued'
+  `).run(dispatchTurnId);
+
+  database.prepare(`
+    INSERT INTO runtime_conversations (
+      conversation_id, conversation_key, region, tenant_id, bot_id,
+      chat_type, chat_id, native_thread_or_topic_id,
+      last_queue_sequence, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+  `).run(
+    executionConversationId,
+    canonicalizeJson(['background-task', backgroundTaskId]),
+    envelope.region,
+    envelope.tenant_id,
+    envelope.bot_id,
+    envelope.chat_type,
+    envelope.chat_id,
+    envelope.native_thread_or_topic_id,
+    committedAt,
+  );
+  database.prepare(`
+    INSERT INTO runtime_lineages (
+      lineage_id, conversation_id, lineage_kind, is_default, created_at
+    ) VALUES (?, ?, 'background', 1, ?)
+  `).run(
+    executionLineageId,
+    executionConversationId,
+    committedAt,
+  );
+  database.prepare(`
+    INSERT INTO runtime_inbound_events (
+      inbound_event_id, idempotency_key, conversation_id, message_id,
+      payload_hash, envelope_json, received_at, committed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    executionInboundEventId,
+    executionEnvelope.idempotency_key,
+    executionConversationId,
+    executionEnvelope.message_id,
+    executionPayloadHash,
+    JSON.stringify(executionEnvelope),
+    executionEnvelope.received_at,
+    committedAt,
+  );
+  database.prepare(`
+    INSERT INTO runtime_turns (
+      turn_id, conversation_id, lineage_id, inbound_event_id, state,
+      turn_version, queue_sequence, provider_input_json, created_at, committed_at
+    ) VALUES (?, ?, ?, ?, 'queued', 2, 1, ?, ?, ?)
+  `).run(
+    executionTurnId,
+    executionConversationId,
+    executionLineageId,
+    executionInboundEventId,
+    JSON.stringify(envelope.content),
+    committedAt,
+    committedAt,
+  );
+  database.prepare(`
+    INSERT INTO runtime_turn_queue (
+      conversation_id, queue_sequence, turn_id, status, wait_reason, enqueued_at
+    ) VALUES (?, 1, ?, 'queued', ?, ?)
+  `).run(
+    executionConversationId,
+    executionTurnId,
+    blockingUpgrade === null ? null : 'maintenance',
+    committedAt,
+  );
+  bindPermissionToAcceptedTurnInTransaction(database, {
+    turnId: executionTurnId,
+    actorId: envelope.actor.actor_id,
+    conversationId: originConversationId,
+    acceptedAt: committedAt,
+    generateId,
+  });
+
+  const executionReceivedEvent = buildLifecycleEvent({
+    eventId: generateId('event'),
+    traceId: envelope.trace_id,
+    conversationId: executionConversationId,
+    turnId: executionTurnId,
+    lineageId: executionLineageId,
+    eventSequence: 1,
+    turnVersion: 1,
+    phase: 'received',
+    occurredAt: envelope.received_at,
+    persistedAt: committedAt,
+    fromState: null,
+    reasonCode: 'background_task_created',
+    causationEventId: dispatchedEvent.event_id,
+  });
+  const executionQueuedEvent = buildLifecycleEvent({
+    eventId: generateId('event'),
+    traceId: envelope.trace_id,
+    conversationId: executionConversationId,
+    turnId: executionTurnId,
+    lineageId: executionLineageId,
+    eventSequence: 2,
+    turnVersion: 2,
+    phase: 'queued',
+    occurredAt: committedAt,
+    persistedAt: committedAt,
+    fromState: 'received',
+    reasonCode: blockingUpgrade === null
+      ? 'background_task_queued'
+      : 'maintenance',
+    causationEventId: executionReceivedEvent.event_id,
+  });
+  for (const event of [executionReceivedEvent, executionQueuedEvent]) {
+    validateNormalizedEvent(event);
+    database.prepare(`
+      INSERT INTO runtime_normalized_events (
+        event_id, turn_id, event_sequence, turn_version, event_json, persisted_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      event.event_id,
+      executionTurnId,
+      event.event_sequence,
+      event.turn_version,
+      JSON.stringify(event),
+      committedAt,
+    );
+  }
+
+  database.prepare(`
+    INSERT INTO runtime_background_tasks (
+      background_task_id, origin_conversation_id, dispatch_turn_id,
+      execution_conversation_id, execution_turn_id, state,
+      side_effect_status, created_at, started_at, completed_at
+    ) VALUES (?, ?, ?, ?, ?, 'queued', 'none', ?, NULL, NULL)
+  `).run(
+    backgroundTaskId,
+    originConversationId,
+    dispatchTurnId,
+    executionConversationId,
+    executionTurnId,
+    committedAt,
+  );
+
+  const deliveryCommand = buildInitialDeliveryCommand({
+    envelope,
+    traceId: envelope.trace_id,
+    conversationId: executionConversationId,
+    turnId: executionTurnId,
+    lineageId: executionLineageId,
+    committedAt,
+    generateId,
+    phase: 'received',
+    text: `Background task dispatched: ${backgroundTaskId}`,
+    terminal: false,
+    operation: initialDeliveryOperation,
+  });
+  validateDeliveryCommand(deliveryCommand);
+  const laneKey = initializeMainProjection(database, deliveryCommand);
+  database.prepare(`
+    INSERT INTO runtime_outbox (
+      outbox_id, delivery_id, aggregate_type, aggregate_id, turn_id, control_id,
+      lane_key, predecessor_delivery_id, aggregate_version, status, command_json,
+      priority, supersedable, terminal, next_attempt_at, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, 1, 'pending', ?, ?, 0, 0, ?, ?, ?)
+  `).run(
+    deliveryCommand.outbox_id,
+    deliveryCommand.delivery_id,
+    deliveryCommand.aggregate_type,
+    deliveryCommand.aggregate_id,
+    executionTurnId,
+    laneKey,
+    JSON.stringify(deliveryCommand),
+    deliveryCommand.priority,
+    deliveryCommand.not_before,
+    committedAt,
+    committedAt,
+  );
+  stageMainProjection(
+    database,
+    { turn_id: executionTurnId },
+    executionQueuedEvent,
+    { generateId },
+  );
+
+  const result = {
+    contract: 'zylos.inbound-result',
+    contract_version: '1.0',
+    trace_id: envelope.trace_id,
+    inbound_event_id: envelope.inbound_event_id,
+    idempotency_key: envelope.idempotency_key,
+    status: 'accepted',
+    conversation_id: originConversationId,
+    turn_id: dispatchTurnId,
+    lineage_id: originLineage.lineage_id,
+    control_id: null,
+    turn_version: 2,
+    lineage_resolution_state: 'bound',
+    deduplicated: false,
+    error: null,
+    committed_at: committedAt,
+    dispatch_status: 'background_dispatched',
+    background_task_id: backgroundTaskId,
+    background_execution_turn_id: executionTurnId,
+  };
+  validateInboundResult(result);
+  database.prepare(`
+    INSERT INTO runtime_inbound_idempotency (
+      idempotency_key, inbound_event_id, payload_hash, first_result_json, committed_at
+    ) VALUES (?, ?, ?, ?, ?)
+  `).run(
+    envelope.idempotency_key,
+    envelope.inbound_event_id,
+    payloadHash,
+    JSON.stringify(result),
+    committedAt,
+  );
+  return result;
+}
+
+function acceptInbound(
   database,
   envelope,
   {
@@ -473,6 +831,7 @@ export function acceptNormalInbound(
     generateId = defaultGenerateId,
     maxQueuedTurns = DEFAULT_MAX_QUEUED_TURNS,
     initialDeliveryOperation = 'create_main',
+    executionMode = 'detached',
     permissionMaxTimedDurationMs = DEFAULT_PERMISSION_MAX_TIMED_DURATION_MS,
     permissionConfirmationTimeoutMs = DEFAULT_PERMISSION_CONFIRMATION_TIMEOUT_MS,
   } = {},
@@ -482,6 +841,9 @@ export function acceptNormalInbound(
   }
   if (!['create_main', 'send_text'].includes(initialDeliveryOperation)) {
     throw new TypeError('initialDeliveryOperation must be create_main or send_text');
+  }
+  if (!['detached', 'queued'].includes(executionMode)) {
+    throw new TypeError('executionMode must be detached or queued');
   }
   if (!Number.isSafeInteger(permissionMaxTimedDurationMs) || permissionMaxTimedDurationMs <= 0) {
     throw new TypeError('permissionMaxTimedDurationMs must be a positive safe integer');
@@ -609,6 +971,21 @@ export function acceptNormalInbound(
         committedAt,
       );
       return permissionResult;
+    }
+
+    if (
+      executionMode === 'detached'
+      && validated.forwarded.source.kind === 'platform_original'
+    ) {
+      return acceptDetachedInboundInTransaction(database, {
+        envelope: validated.forwarded,
+        originConversationId: conversation.conversation_id,
+        payloadHash,
+        committedAt,
+        blockingUpgrade,
+        initialDeliveryOperation,
+        generateId,
+      });
     }
 
     const lineage = resolveNormalLineage(
@@ -929,4 +1306,18 @@ export function acceptNormalInbound(
   });
 
   return commit.immediate();
+}
+
+export function acceptNormalInbound(database, envelope, options = {}) {
+  return acceptInbound(database, envelope, {
+    ...options,
+    executionMode: 'detached',
+  });
+}
+
+export function acceptQueuedInbound(database, envelope, options = {}) {
+  return acceptInbound(database, envelope, {
+    ...options,
+    executionMode: 'queued',
+  });
 }

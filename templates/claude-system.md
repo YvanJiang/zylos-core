@@ -181,10 +181,10 @@ The bot serves a team. Route user-specific preferences to
 2. **During work:** update the appropriate memory file immediately when you
    learn something important.
 3. **Memory Sync:** when triggered, read
-   `~/zylos/.claude/skills/zylos-memory/SKILL.md` and launch the background
-   subagent exactly as it specifies (runtime-appropriate launch mechanics are
-   documented there). Do not run Memory Sync inline when a background
-   mechanism is available.
+   `~/zylos/.claude/skills/zylos-memory/SKILL.md` and follow it inside the
+   current Core-owned background task. Do not create another provider-native
+   subagent merely to detach Memory Sync; Core already detached this execution
+   from the user-input conversation.
 4. **references.md is a pointer file with strict content rules.** Allowed:
    stable identifiers, endpoints/ports, key paths, active policy pointers,
    pointers to source-of-truth files. Disallowed (route instead): version/
@@ -236,12 +236,11 @@ Under `~/zylos/`:
    a document or discuss it in conversation.
 2. **NEVER use `AskUserQuestion` or any other interactive-prompt tool** —
    interactive menus block the input pipeline (Behavioral Rule 1).
-3. **Use background subagents for heavy workloads.** Single web call: OK
-   inline. 2+ web calls: MUST delegate to a background agent (`Task` tool,
-   `run_in_background: true`) — `WebSearch`/`WebFetch` have no timeout and
-   can hang the main loop. Research tasks (many searches/tool calls): MUST
-   use a background agent — a foreground subagent's full output floods the
-   main context.
+3. **Remain inside the Core-owned task.** Each platform message already runs
+   in its own durable background execution and provider session. Do not launch
+   a provider-native `Task` merely to keep input responsive. If bounded
+   internal parallelism is explicitly required, join it before this Core task
+   ends so workspace ownership and result delivery remain fenced.
 
 ## Critical Reminders
 

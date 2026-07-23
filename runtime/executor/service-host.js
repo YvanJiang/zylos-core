@@ -6,7 +6,11 @@ import path from 'node:path';
 import { createExecutorService } from './service.js';
 
 const MAX_REQUEST_BYTES = 64 * 1024;
-const READ_ONLY_ACTIONS = new Set(['health', 'resolve_interaction']);
+const READ_ONLY_ACTIONS = new Set([
+  'get_background_task',
+  'health',
+  'resolve_interaction',
+]);
 
 function reportPollError(error) {
   console.error('[zylos-executor] Background poll failed.', error);
@@ -165,6 +169,7 @@ export function createExecutorServiceHost({
   socketPath,
   workspaceRoot,
   pollIntervalMs = 250,
+  maxConcurrentRuns = 1,
   onPollError = reportPollError,
   onUpgrade = null,
   onClose = null,
@@ -176,6 +181,9 @@ export function createExecutorServiceHost({
   requireSocketPath(socketPath);
   if (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs <= 0) {
     throw new TypeError('pollIntervalMs must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(maxConcurrentRuns) || maxConcurrentRuns <= 0) {
+    throw new TypeError('maxConcurrentRuns must be a positive safe integer');
   }
   if (typeof createService !== 'function') throw new TypeError('createService must be a function');
   if (typeof onPollError !== 'function') throw new TypeError('onPollError must be a function');
@@ -201,7 +209,7 @@ export function createExecutorServiceHost({
   });
   let lifecycle = 'created';
   let pollTimer = null;
-  let pollActive = false;
+  let pollDispatchActive = false;
   let resourceClosePromise = null;
   let closePromise = null;
   let ownedSocketIdentity = null;
@@ -209,14 +217,27 @@ export function createExecutorServiceHost({
   let resolveClosed;
   const closed = new Promise((resolve) => { resolveClosed = resolve; });
   const controlSockets = new Set();
+  const inFlightRuns = new Set();
 
   async function poll() {
-    if (lifecycle !== 'open' || pollActive) return;
-    pollActive = true;
+    if (lifecycle !== 'open' || pollDispatchActive) return;
+    pollDispatchActive = true;
     try {
-      await service.runNext();
+      while (lifecycle === 'open' && inFlightRuns.size < maxConcurrentRuns) {
+        const run = Promise.resolve().then(() => service.runNext());
+        inFlightRuns.add(run);
+        run.then(
+          () => {
+            inFlightRuns.delete(run);
+          },
+          (error) => {
+            inFlightRuns.delete(run);
+            onPollError(error);
+          },
+        );
+      }
     } finally {
-      pollActive = false;
+      pollDispatchActive = false;
     }
   }
 
@@ -259,6 +280,12 @@ export function createExecutorServiceHost({
         }
         if (request.action === 'resolve_interaction') {
           return service.resolveInteractionTarget(request.target);
+        }
+        if (request.action === 'get_background_task') {
+          return service.getBackgroundTask(request.background_task_id);
+        }
+        if (request.action === 'stop_background_task') {
+          return service.stopBackgroundTask(request);
         }
         if (request.action === 'submit_interaction_answer') {
           const result = service.submitInteractionAnswer(
@@ -358,6 +385,7 @@ export function createExecutorServiceHost({
         }
       }
       try { await service.close(); } catch (error) { failures.push(error); }
+      await Promise.allSettled([...inFlightRuns]);
       if (onClose !== null) {
         try { await onClose(); } catch (error) { failures.push(error); }
       }

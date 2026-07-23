@@ -12,7 +12,7 @@ import {
   createClaudeConversationAdapter,
   enforceWorkspaceFenceBeforeTool,
 } from '../runtime/providers/claude/conversation-adapter.js';
-import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { acceptQueuedInbound as acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
 import { deliveredResult } from './helpers/delivered-result.js';
 
 const inboundFixture = JSON.parse(fs.readFileSync(

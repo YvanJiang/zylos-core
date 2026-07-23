@@ -59,6 +59,7 @@ describe('zylos.inbound-result v1.0', () => {
     expect(inboundResultFixture.fixture_version).toBe('1.0');
     expect(inboundResultFixture.valid.map(({ name }) => name)).toEqual([
       'normal_bound',
+      'detached_background_dispatch',
       'control',
       'pending_recovery',
       'queue_full_failed',

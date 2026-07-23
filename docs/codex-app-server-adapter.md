@@ -19,6 +19,13 @@ authoritative.
 The normal Codex path contains no per-turn CLI child, `exec --json`, `exec resume`, transport
 fallback, feature flag, or dual-mode route.
 
+Platform-original ingress is detached by Core before it reaches this adapter.
+The user-facing dispatch turn completes immediately, while a durable background
+task owns a fresh execution conversation, Codex thread, provider attempt, and
+workspace lease. This adapter therefore keeps Codex collaboration/subagents
+disabled: responsiveness comes from Core scheduling rather than an unfenced
+provider-native child.
+
 ## Fixed-version protocol evidence
 
 The implementation was audited against:

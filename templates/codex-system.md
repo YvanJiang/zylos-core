@@ -181,10 +181,10 @@ The bot serves a team. Route user-specific preferences to
 2. **During work:** update the appropriate memory file immediately when you
    learn something important.
 3. **Memory Sync:** when triggered, read
-   `~/zylos/.claude/skills/zylos-memory/SKILL.md` and launch the background
-   subagent exactly as it specifies (runtime-appropriate launch mechanics are
-   documented there). Do not run Memory Sync inline when a background
-   mechanism is available.
+   `~/zylos/.claude/skills/zylos-memory/SKILL.md` and follow it inside the
+   current Core-owned background task. Do not create another provider-native
+   subagent merely to detach Memory Sync; Core already detached this execution
+   from the user-input conversation.
 4. **references.md is a pointer file with strict content rules.** Allowed:
    stable identifiers, endpoints/ports, key paths, active policy pointers,
    pointers to source-of-truth files. Disallowed (route instead): version/
@@ -237,14 +237,12 @@ Under `~/zylos/`:
    proceed?" (Behavioral Rule 1). If genuinely ambiguous, ask one clarifying
    question — never a menu. Destructive operations still require the C4
    confirmation from Behavioral Rule 2.
-2. **Use background agents for heavy workloads.** The session exposes
-   `spawn_agent` / `list_agents` / `wait_agent` — prefer them for research
-   and long tasks so the main loop stays responsive. For a single
-   long-running command, use an async exec session (`exec_command` returns a
-   `session_id`; collect results via `write_stdin`). Bare `nohup ... &` does
-   NOT survive the tool-call boundary — never rely on it. If a session
-   exposes none of these, note the limitation and work inline, reporting
-   progress as you go.
+2. **Remain inside the Core-owned task.** Each platform message already runs
+   in its own durable background execution and provider thread. Do not use
+   `spawn_agent` merely to keep user input responsive; Core owns that
+   detachment. Keep long-running command sessions attached and collect their
+   result before this task ends. Bare `nohup ... &` does not survive the
+   tool-call boundary and must never be used.
 3. **Use shell tools for web access.** No built-in WebSearch/WebFetch: use
    curl/wget, a search API, or browser automation.
 4. **Approvals are bypassed; consent is not.** You run with

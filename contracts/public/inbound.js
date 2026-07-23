@@ -37,6 +37,7 @@ export const INBOUND_SOURCE_KINDS = Object.freeze([
   'legacy_compat',
 ]);
 export const INBOUND_RESULT_STATUSES = Object.freeze(['accepted', 'rejected']);
+export const INBOUND_DISPATCH_STATUSES = Object.freeze(['background_dispatched']);
 export const LINEAGE_RESOLUTION_STATES = Object.freeze([
   'bound',
   'pending_recovery',
@@ -79,6 +80,12 @@ const RESULT_FIELDS = Object.freeze([
   'deduplicated',
   'error',
   'committed_at',
+]);
+
+const OPTIONAL_RESULT_FIELDS = Object.freeze([
+  'dispatch_status',
+  'background_task_id',
+  'background_execution_turn_id',
 ]);
 
 function validateActor(actor, occurredAt) {
@@ -467,7 +474,7 @@ export function validateInboundResult(value, { occurredAt } = {}) {
   const result = partitionContractDocument(
     value,
     INBOUND_RESULT_CONTRACT,
-    RESULT_FIELDS,
+    [...RESULT_FIELDS, ...OPTIONAL_RESULT_FIELDS],
     { occurredAt },
   );
   requireOwnFields('inbound-result', value, RESULT_FIELDS, { occurredAt });
@@ -493,6 +500,37 @@ export function validateInboundResult(value, { occurredAt } = {}) {
 
   if (value.status === 'accepted') validateAcceptedResult(value, occurredAt);
   else validateRejectedResult(value, occurredAt);
+  const detachedFields = OPTIONAL_RESULT_FIELDS.filter((fieldName) => (
+    Object.hasOwn(value, fieldName)
+  ));
+  if (detachedFields.length !== 0) {
+    if (detachedFields.length !== OPTIONAL_RESULT_FIELDS.length || value.status !== 'accepted') {
+      rejectContract(
+        'validation_error',
+        'Detached dispatch fields must appear together on an accepted result.',
+        { occurredAt },
+      );
+    }
+    requireCriticalEnum(
+      'dispatch_status',
+      value.dispatch_status,
+      INBOUND_DISPATCH_STATUSES,
+      { occurredAt },
+    );
+    validateOpaqueId('background_task_id', value.background_task_id, { occurredAt });
+    validateOpaqueId(
+      'background_execution_turn_id',
+      value.background_execution_turn_id,
+      { occurredAt },
+    );
+    if (value.background_execution_turn_id === value.turn_id) {
+      rejectContract(
+        'validation_error',
+        'The detached execution turn must differ from the foreground dispatch turn.',
+        { occurredAt },
+      );
+    }
+  }
   validatePublicFixtureSafety(value, { occurredAt });
   return result;
 }

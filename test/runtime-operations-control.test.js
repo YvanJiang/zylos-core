@@ -9,7 +9,7 @@ import { createIdempotencyKey } from '../contracts/public/index.js';
 import { createOperationsControlService } from '../runtime/control/operations-control-service.js';
 import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { createExecutorService } from '../runtime/executor/service.js';
-import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { acceptQueuedInbound as acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
 import { createExecutorStore } from '../runtime/persistence/executor-store.js';
 import { initializeRuntimePersistence } from '../runtime/persistence/schema.js';
 import { deliveredResult } from './helpers/delivered-result.js';

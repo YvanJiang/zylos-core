@@ -1839,6 +1839,46 @@ export function createExecutorService({
     return settlement;
   }
 
+  function getBackgroundTask(backgroundTaskId) {
+    return store.getBackgroundTask(backgroundTaskId);
+  }
+
+  async function stopBackgroundTask(request) {
+    const backgroundTaskId = request?.background_task_id;
+    if (typeof backgroundTaskId !== 'string' || backgroundTaskId.length === 0) {
+      throw new TypeError('background_task_id must be a non-empty string');
+    }
+    const task = store.getBackgroundTask(backgroundTaskId);
+    if (task === null) {
+      const error = new Error(`Background task ${backgroundTaskId} does not exist.`);
+      error.code = 'background_task_not_found';
+      throw error;
+    }
+    if (
+      request.target_turn_id !== undefined
+      && request.target_turn_id !== null
+      && request.target_turn_id !== task.execution_turn_id
+    ) {
+      const error = new Error('target_turn_id does not belong to the background task.');
+      error.code = 'background_task_target_mismatch';
+      throw error;
+    }
+    const queued = task.state === 'queued' && task.queue_status === 'queued';
+    const result = await stop({
+      conversation_id: task.execution_conversation_id,
+      stop_id: request.stop_id,
+      target_turn_id: queued ? null : task.execution_turn_id,
+      expected_turn_version: queued
+        ? null
+        : (request.expected_turn_version ?? task.execution_turn_version),
+      clear_unstarted_queue: request.clear_unstarted_queue ?? true,
+    });
+    return Object.freeze({
+      ...result,
+      background_task_id: backgroundTaskId,
+    });
+  }
+
   async function executeOperationsControl(request, trustedTransportContext) {
     if (operationsControl === null) {
       throw new Error('Operations control is unavailable without a deployment policy.');
@@ -2678,6 +2718,7 @@ export function createExecutorService({
     evictIdleExecutors,
     executeOperationsControl,
     expireInteraction,
+    getBackgroundTask,
     publishObservabilitySnapshot: observabilityPublisher.publish,
     reconcileWorkspaceRecoveries,
     reconcileInteractionHandoff,
@@ -2688,6 +2729,7 @@ export function createExecutorService({
     start,
     steer,
     stop,
+    stopBackgroundTask,
     submitInteractionAnswer,
   });
 }

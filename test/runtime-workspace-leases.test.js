@@ -14,7 +14,7 @@ import {
 import { createExecutorService } from '../runtime/executor/service.js';
 import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { createExecutorStore } from '../runtime/persistence/executor-store.js';
-import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { acceptQueuedInbound as acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
 import { createCodexAppServerAdapter } from '../runtime/providers/codex-app-server-adapter.js';
 import {
   createWorkspaceLeaseCoordinator,

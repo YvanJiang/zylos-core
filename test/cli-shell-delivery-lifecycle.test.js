@@ -11,7 +11,9 @@ import {
   createShellOutboxOwner,
   createShellRuntimeIdentity,
 } from '../cli/commands/shell.js';
-import { acceptCompatibilityInbound } from '../runtime/compatibility/c4-channel-fallback.js';
+import {
+  acceptQueuedCompatibilityInbound as acceptCompatibilityInbound,
+} from '../runtime/compatibility/c4-channel-fallback.js';
 
 describe('shell Core outbox owner lifecycle', () => {
   test('an expired shell claim cannot reach the non-idempotent socket boundary', async () => {

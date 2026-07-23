@@ -13,7 +13,7 @@ import {
 import { createExecutorService } from '../runtime/executor/service.js';
 import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { createRuntimeSnapshotPublisher } from '../runtime/observability/snapshot-publisher.js';
-import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { acceptQueuedInbound as acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
 import { acceptScheduledOccurrence } from '../runtime/scheduler/scheduler-queue.js';
 
 const inboundFixture = JSON.parse(fs.readFileSync(

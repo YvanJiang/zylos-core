@@ -4,16 +4,18 @@ description: >-
   Core memory system. Maintains persistent memory across sessions via tiered
   markdown files following the Inside Out model. Handles Memory Sync (processing
   conversations into structured memory), session rotation, consolidation, and
-  context-aware state saving. Must be launched via a runtime-appropriate
-  background subagent mechanism — do not invoke with the Skill tool.
+  context-aware state saving. Runs inside the current Core-owned detached task;
+  it must not create a second provider-native background agent.
 disable-model-invocation: true
 user-invocable: false
 ---
 
 # Memory System
 
-Maintains persistent memory across sessions via tiered markdown files.
-This skill must be run via a runtime-appropriate background subagent mechanism. For Claude, use the Task tool (`subagent_type: general-purpose`, `model: sonnet`, `run_in_background: true`). For Codex, prefer the session's native subagent tools `spawn_agent`/`wait_agent` (host session tools — they do not appear in `codex --help`) with a Codex-supported model; do not hardcode `sonnet`.
+Maintains persistent memory across sessions via tiered markdown files. The
+current provider execution is already a durable Core-owned background task.
+Run Memory Sync in that task and do not create a provider-native child merely
+to detach it again.
 
 ## Architecture
 
@@ -48,19 +50,13 @@ Memory sync is explicit and scoped to the current task/conversation. It may be
 requested by the user or by a canonical Core lifecycle interaction. Do not infer
 a trigger from provider files, terminal state, or a global conversation backlog.
 
-### Codex Background Execution
+### Execution Ownership
 
-In Codex, use the session's native subagent tools: `spawn_agent` to
-launch the sync subagent and `wait_agent` to collect its result. These are
-host session tools — they do not appear in `codex --help`. For a single
-long-running command, an async exec session (`exec_command` +
-`write_stdin`) also works. Bare `nohup ... &` does NOT survive the
-tool-call boundary and must never be used for sync. Never use PM2 for
-sync — do not create PM2 services, run `pm2 start ... codex exec ...`, or
-fork an extra `codex exec` sidecar: one-shot sync processes leave stopped
-services piling up in the PM2 list. If the session exposes no native
-background-agent capability, run the sync inline as a last resort and note
-that in the handoff/status.
+Keep sync work attached to the current Core background task. A long-running
+command may use an async exec session only when its result is collected before
+the task ends. Bare `nohup ... &`, PM2 sidecars, an extra `codex exec`, and
+provider-native subagents are not durable task ownership and must not be used
+for sync.
 
 ### Sync Flow
 

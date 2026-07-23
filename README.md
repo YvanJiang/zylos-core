@@ -300,6 +300,16 @@ must never infer the latest message or fall back to a parent chat. Each delivery
 attempt is fenced by a UTC-instant lease and an immutable full command snapshot;
 expired or altered claims cannot authorize rendering, delivery, or results.
 
+`acceptNormalInbound` detaches each authenticated platform message into a
+Core-owned background task. Its dispatch turn completes immediately and returns
+`dispatch_status`, `background_task_id`, and `background_execution_turn_id` as
+additive inbound-result fields. The background execution uses a fresh provider
+session and delivers its result through the original durable target. The C4
+channel bridge uses the same detached ingress. Scheduler, migration, and focused
+provider probes use the explicit `acceptQueuedInbound` seam where legacy FIFO
+behavior remains required. See
+[Detached background dispatch](docs/detached-background-dispatch.md).
+
 ---
 
 ## OpenClaw Compatibility

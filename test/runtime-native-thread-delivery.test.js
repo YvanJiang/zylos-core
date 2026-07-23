@@ -14,7 +14,7 @@ import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import {
   createDeliveryLaneKeyFromIdentity,
 } from '../runtime/persistence/delivery-lane-key.js';
-import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { acceptQueuedInbound as acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
 import {
   initializeMainProjection,
   stageMainProjection,

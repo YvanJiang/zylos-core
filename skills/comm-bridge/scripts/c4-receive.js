@@ -156,16 +156,25 @@ function compatibilityMessage(parsed, receivedAt) {
 function emitAccepted(json, result) {
   const output = {
     ok: result.status === 'accepted',
-    action: result.status === 'accepted' ? 'queued' : 'rejected',
+    action: result.status === 'accepted'
+      ? (result.dispatch_status ?? 'accepted')
+      : 'rejected',
     conversation_id: result.conversation_id,
     turn_id: result.turn_id,
+    dispatch_status: result.dispatch_status ?? null,
+    background_task_id: result.background_task_id ?? null,
+    background_execution_turn_id: result.background_execution_turn_id ?? null,
     lineage_id: result.lineage_id,
     turn_version: result.turn_version,
     deduplicated: result.deduplicated,
     error: result.error,
   };
   if (json) process.stdout.write(`${JSON.stringify(output)}\n`);
-  else if (output.ok) console.log(`[C4] Message durably queued in Core (turn=${output.turn_id})`);
+  else if (output.ok && output.background_task_id !== null) {
+    console.log(`[C4] Background task dispatched (task=${output.background_task_id})`);
+  } else if (output.ok) {
+    console.log('[C4] Message accepted by Core.');
+  }
   else console.error(`[C4] Core rejected the message: ${output.error?.user_message ?? 'unknown'}`);
   process.exitCode = output.ok ? 0 : 1;
 }

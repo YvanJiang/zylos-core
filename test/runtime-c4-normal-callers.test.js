@@ -55,7 +55,7 @@ afterEach(() => {
 });
 
 describe('normal C4 callers use durable Core contracts', () => {
-  test('compatibility ingress atomically persists one Core turn and send_text outbox command', () => {
+  test('compatibility ingress atomically dispatches a fresh Core background turn', () => {
     const { zylosDir, env } = fixture();
     const args = [
       '--channel', 'web-console',
@@ -71,9 +71,13 @@ describe('normal C4 callers use durable Core contracts', () => {
     assert.equal(first.status, 0, first.stderr);
     const accepted = JSON.parse(first.stdout.trim().split('\n').at(-1));
     assert.equal(accepted.ok, true);
-    assert.equal(accepted.action, 'queued');
+    assert.equal(accepted.action, 'background_dispatched');
+    assert.equal(accepted.dispatch_status, 'background_dispatched');
     assert.equal(accepted.deduplicated, false);
     assert.equal(typeof accepted.turn_id, 'string');
+    assert.equal(typeof accepted.background_task_id, 'string');
+    assert.equal(typeof accepted.background_execution_turn_id, 'string');
+    assert.notEqual(accepted.background_execution_turn_id, accepted.turn_id);
 
     const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
     const legacyTables = database.prepare(`
@@ -85,10 +89,12 @@ describe('normal C4 callers use durable Core contracts', () => {
     `).all();
     assert.equal(legacyTables.length, 0);
     assert.equal(database.prepare('SELECT state FROM runtime_turns WHERE turn_id = ?')
-      .get(accepted.turn_id).state, 'queued');
+      .get(accepted.turn_id).state, 'completed');
+    assert.equal(database.prepare('SELECT state FROM runtime_turns WHERE turn_id = ?')
+      .get(accepted.background_execution_turn_id).state, 'queued');
     const command = JSON.parse(database.prepare(
       'SELECT command_json FROM runtime_outbox WHERE turn_id = ?',
-    ).get(accepted.turn_id).command_json);
+    ).get(accepted.background_execution_turn_id).command_json);
     assert.equal(command.contract, 'zylos.delivery-command');
     assert.equal(command.contract_version, '1.1');
     assert.equal(command.operation, 'send_text');
@@ -102,8 +108,16 @@ describe('normal C4 callers use durable Core contracts', () => {
     const replayed = JSON.parse(replay.stdout.trim().split('\n').at(-1));
     assert.equal(replayed.ok, true);
     assert.equal(replayed.turn_id, accepted.turn_id);
+    assert.equal(replayed.background_task_id, accepted.background_task_id);
+    assert.equal(
+      replayed.background_execution_turn_id,
+      accepted.background_execution_turn_id,
+    );
     assert.equal(replayed.deduplicated, true);
-    assert.equal(database.prepare('SELECT COUNT(*) AS count FROM runtime_turns').get().count, 1);
+    assert.equal(database.prepare('SELECT COUNT(*) AS count FROM runtime_turns').get().count, 2);
+    assert.equal(database.prepare(
+      'SELECT COUNT(*) AS count FROM runtime_background_tasks',
+    ).get().count, 1);
     database.close();
   });
 
@@ -312,10 +326,11 @@ describe('normal C4 callers use durable Core contracts', () => {
     ], env);
     assert.equal(acceptedProcess.status, 0, acceptedProcess.stderr);
     const accepted = JSON.parse(acceptedProcess.stdout.trim());
+    const executionTurnId = accepted.background_execution_turn_id;
     const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
     assert.equal(database.prepare(`
       SELECT status FROM runtime_outbox WHERE turn_id = ?
-    `).get(accepted.turn_id).status, 'pending');
+    `).get(executionTurnId).status, 'pending');
     const browserDeliveries = [];
     const projectionOrder = [];
     const claimTime = claimTimeFor(database, 'web-console', 'console');
@@ -328,7 +343,7 @@ describe('normal C4 callers use durable Core contracts', () => {
       now: () => claimTime,
       projectInbound(command) {
         assert.equal(command.outbox_id.length > 0, true);
-        assert.equal(command.mapping.turn_id, accepted.turn_id);
+        assert.equal(command.mapping.turn_id, executionTurnId);
         projectionOrder.push('inbound');
       },
       deliverMessage(message, delivery) {
@@ -339,13 +354,13 @@ describe('normal C4 callers use durable Core contracts', () => {
     });
     assert.deepEqual(await owner.drain(), { status: 'delivered', delivered: 1 });
     assert.deepEqual(projectionOrder, ['inbound', 'outbox']);
-    assert.match(browserDeliveries[0].content, /Message received/);
+    assert.match(browserDeliveries[0].content, /Background task dispatched/);
     assert.equal(database.prepare(`
       SELECT status FROM runtime_outbox WHERE turn_id = ?
-    `).get(accepted.turn_id).status, 'delivered');
+    `).get(executionTurnId).status, 'delivered');
     assert.equal(database.prepare(`
       SELECT COUNT(*) AS count FROM runtime_message_mappings WHERE turn_id = ?
-    `).get(accepted.turn_id).count, 1);
+    `).get(executionTurnId).count, 1);
     database.close();
   });
 
@@ -358,6 +373,7 @@ describe('normal C4 callers use durable Core contracts', () => {
     ], env);
     assert.equal(acceptedProcess.status, 0, acceptedProcess.stderr);
     const accepted = JSON.parse(acceptedProcess.stdout.trim());
+    const executionTurnId = accepted.background_execution_turn_id;
     const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
     const mailboxDatabase = openDb(path.join(zylosDir, 'web-console', 'mailbox.db'));
     const mailbox = new DeliveryMailbox(mailboxDatabase, {
@@ -390,7 +406,7 @@ describe('normal C4 callers use durable Core contracts', () => {
     assert.deepEqual({ ...database.prepare(`
       SELECT status, result_json, pre_action_fenced_at
       FROM runtime_outbox WHERE turn_id = ?
-    `).get(accepted.turn_id) }, {
+    `).get(executionTurnId) }, {
       status: 'delivering', result_json: null, pre_action_fenced_at: claimTime,
     });
 
@@ -408,7 +424,7 @@ describe('normal C4 callers use durable Core contracts', () => {
     assert.equal(mailbox.list().length, 1);
     assert.equal(database.prepare(`
       SELECT status FROM runtime_outbox WHERE turn_id = ?
-    `).get(accepted.turn_id).status, 'delivered');
+    `).get(executionTurnId).status, 'delivered');
     mailboxDatabase.close();
     database.close();
   });
@@ -422,6 +438,7 @@ describe('normal C4 callers use durable Core contracts', () => {
     ], env);
     assert.equal(acceptedProcess.status, 0, acceptedProcess.stderr);
     const accepted = JSON.parse(acceptedProcess.stdout.trim());
+    const executionTurnId = accepted.background_execution_turn_id;
     const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
     const claimTime = claimTimeFor(database, 'web-console', 'console');
     let mailboxDeliveries = 0;
@@ -452,7 +469,7 @@ describe('normal C4 callers use durable Core contracts', () => {
     assert.equal(mailboxDeliveries, 0);
     assert.deepEqual({ ...database.prepare(`
       SELECT status, result_json, lease_owner FROM runtime_outbox WHERE turn_id = ?
-    `).get(accepted.turn_id) }, {
+    `).get(executionTurnId) }, {
       status: 'delivering',
       result_json: null,
       lease_owner: 'web-console-owner-command-change',

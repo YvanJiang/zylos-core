@@ -20,7 +20,9 @@ import {
   createIdempotencyKey,
 } from '../../../contracts/public/index.js';
 import { createExecutorService } from '../../../runtime/executor/service.js';
-import { acceptNormalInbound } from '../../../runtime/persistence/inbound-acceptance.js';
+import {
+  acceptQueuedInbound as acceptNormalInbound,
+} from '../../../runtime/persistence/inbound-acceptance.js';
 import {
   createClaudeConversationAdapter,
 } from '../../../runtime/providers/claude/conversation-adapter.js';

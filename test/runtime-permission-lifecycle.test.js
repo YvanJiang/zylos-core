@@ -12,7 +12,7 @@ import {
   validateInteractionAnswerResult,
   validateInteractionRequest,
 } from '../contracts/public/index.js';
-import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { acceptQueuedInbound as acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
 import { createExecutorService } from '../runtime/executor/service.js';
 import {
   createPermissionService,

@@ -77,6 +77,56 @@ function inertAdapter(provider = 'claude') {
 }
 
 describe('executor service lifecycle host', () => {
+  test('dispatches a second executor run without awaiting a long first run', async () => {
+    const state = fixture();
+    let releaseFirst;
+    let markFirstStarted;
+    let markSecondStarted;
+    const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+    const firstStarted = new Promise((resolve) => { markFirstStarted = resolve; });
+    const secondStarted = new Promise((resolve) => { markSecondStarted = resolve; });
+    let calls = 0;
+    const service = {
+      start: jest.fn(),
+      runNext: jest.fn(() => {
+        calls += 1;
+        if (calls === 1) {
+          markFirstStarted();
+          return firstGate;
+        }
+        markSecondStarted();
+        return Promise.resolve({ status: 'idle' });
+      }),
+      publishObservabilitySnapshot: jest.fn(() => ({ contract: 'fixture' })),
+      close: jest.fn(async () => {}),
+    };
+    const host = createExecutorServiceHost({
+      database: state.database,
+      adapter: inertAdapter(),
+      provider: 'codex',
+      serviceInstanceId: 'service-fixture-detached-poll',
+      socketPath: state.socketPath,
+      workspaceRoot: state.directory,
+      pollIntervalMs: 10_000,
+      maxConcurrentRuns: 2,
+      createService: () => service,
+    });
+    hosts.push(host);
+
+    const starting = host.start();
+    await firstStarted;
+    try {
+      await expect(settleWithin(starting.then(() => 'started'), 100, 'blocked'))
+        .resolves.toBe('started');
+      await expect(settleWithin(secondStarted.then(() => 'started'), 100, 'blocked'))
+        .resolves.toBe('started');
+      expect(service.runNext).toHaveBeenCalledTimes(2);
+    } finally {
+      releaseFirst();
+      await starting;
+    }
+  });
+
   test('reports background poll failures instead of discarding the provider error', async () => {
     const state = fixture();
     const pollFailure = new Error('provider hook rejected');
@@ -215,6 +265,59 @@ describe('executor service lifecycle host', () => {
     await new Promise((resolve) => setImmediate(resolve));
     expect(service.deliverInteractionAnswer).toHaveBeenCalledWith('handoff-A');
     expect(onPollError).not.toHaveBeenCalled();
+  });
+
+  test('queries and stops detached work through the task identity control seam', async () => {
+    const state = fixture();
+    const task = {
+      background_task_id: 'background-task-control-A',
+      state: 'running',
+      side_effect_status: 'none',
+    };
+    const service = {
+      start: jest.fn(),
+      runNext: jest.fn(async () => ({ status: 'idle' })),
+      publishObservabilitySnapshot: jest.fn(() => ({ contract: 'fixture' })),
+      getBackgroundTask: jest.fn(() => task),
+      stopBackgroundTask: jest.fn(async () => ({
+        status: 'stopped',
+        background_task_id: task.background_task_id,
+      })),
+      close: jest.fn(async () => {}),
+    };
+    const host = createExecutorServiceHost({
+      database: state.database,
+      adapter: inertAdapter(),
+      provider: 'codex',
+      serviceInstanceId: 'service-fixture-background-control',
+      socketPath: state.socketPath,
+      workspaceRoot: state.directory,
+      createService: () => service,
+    });
+    hosts.push(host);
+    await host.start();
+
+    await expect(requestExecutorService(state.socketPath, {
+      action: 'get_background_task',
+      background_task_id: task.background_task_id,
+    })).resolves.toEqual({ ok: true, result: task });
+    await expect(requestExecutorService(state.socketPath, {
+      action: 'stop_background_task',
+      background_task_id: task.background_task_id,
+      stop_id: 'stop-background-control-A',
+    })).resolves.toEqual({
+      ok: true,
+      result: {
+        status: 'stopped',
+        background_task_id: task.background_task_id,
+      },
+    });
+    expect(service.getBackgroundTask).toHaveBeenCalledWith(task.background_task_id);
+    expect(service.stopBackgroundTask).toHaveBeenCalledWith({
+      action: 'stop_background_task',
+      background_task_id: task.background_task_id,
+      stop_id: 'stop-background-control-A',
+    });
   });
 
   test('refuses to replace a non-socket control path', async () => {

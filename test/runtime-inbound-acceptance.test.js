@@ -14,7 +14,7 @@ import {
 } from '../contracts/public/index.js';
 import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import {
-  acceptNormalInbound,
+  acceptQueuedInbound as acceptNormalInbound,
   initializeRuntimePersistence,
 } from '../runtime/persistence/inbound-acceptance.js';
 import { deliveredResult } from './helpers/delivered-result.js';

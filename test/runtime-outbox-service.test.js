@@ -10,7 +10,7 @@ import { createIdempotencyKey } from '../contracts/public/index.js';
 import { createChannelNeutralTextRenderer } from '../runtime/compatibility/c4-channel-fallback.js';
 import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { createExecutorStore } from '../runtime/persistence/executor-store.js';
-import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { acceptQueuedInbound as acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
 import { stageMainProjection } from '../runtime/persistence/main-projection.js';
 import { initializeRuntimePersistence } from '../runtime/persistence/schema.js';
 import { deliveredResult } from './helpers/delivered-result.js';
