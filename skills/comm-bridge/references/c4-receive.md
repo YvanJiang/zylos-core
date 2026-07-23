@@ -8,6 +8,7 @@ node ~/zylos/.claude/skills/comm-bridge/scripts/c4-receive.js \
   --channel <channel> --endpoint <chat_id> \
   --message-id <stable_native_message_id> \
   --actor-id <authenticated_actor_id> \
+  [--actor-type user|service] \
   [--chat-type dm|group|thread] \
   [--thread-id <native_thread_id> --root-message-id <native_root_message_id>] \
   [--occurred-at <RFC3339>] \

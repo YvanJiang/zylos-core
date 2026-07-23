@@ -86,22 +86,39 @@ function downgradePersistedDeliveryToV10(database, turnId) {
   const target = structuredClone(lane.target);
   delete target.native_thread_root_message_id;
   delete target.native_thread_reply_target_message_id;
-  database.prepare(`
-    UPDATE runtime_delivery_lanes SET target_json = ? WHERE turn_id = ?
-  `).run(JSON.stringify(target), turnId);
-
-  const rows = database.prepare(`
-    SELECT outbox_id, command_json
-    FROM runtime_outbox
-    WHERE turn_id = ?
-  `).all(turnId);
-  for (const row of rows) {
-    const command = JSON.parse(row.command_json);
-    command.contract_version = '1.0';
-    command.target = target;
+  delete target.reply_target_message_id;
+  delete target.mention_actor_id;
+  const legacyLaneKey = createDeliveryLaneKeyFromIdentity({
+    target,
+    turnId,
+    aggregateType: 'turn_main',
+  });
+  database.pragma('foreign_keys = OFF');
+  try {
     database.prepare(`
-      UPDATE runtime_outbox SET command_json = ? WHERE outbox_id = ?
-    `).run(JSON.stringify(command), row.outbox_id);
+      UPDATE runtime_delivery_lanes
+      SET target_json = ?, lane_key = ?
+      WHERE turn_id = ?
+    `).run(JSON.stringify(target), legacyLaneKey, turnId);
+
+    const rows = database.prepare(`
+      SELECT outbox_id, command_json
+      FROM runtime_outbox
+      WHERE turn_id = ?
+    `).all(turnId);
+    for (const row of rows) {
+      const command = JSON.parse(row.command_json);
+      command.contract_version = '1.0';
+      command.target = target;
+      database.prepare(`
+        UPDATE runtime_outbox SET command_json = ?, lane_key = ? WHERE outbox_id = ?
+      `).run(JSON.stringify(command), legacyLaneKey, row.outbox_id);
+    }
+    database.prepare(`
+      UPDATE runtime_projection_snapshots SET lane_key = ? WHERE turn_id = ?
+    `).run(legacyLaneKey, turnId);
+  } finally {
+    database.pragma('foreign_keys = ON');
   }
   return target;
 }
@@ -218,6 +235,32 @@ describe('native-thread delivery authority', () => {
     })).not.toBe(createDeliveryLaneKeyFromIdentity({
       ...laneIdentity,
       target: { ...nonThreadTarget, chat_type: 'synthetic' },
+    }));
+
+    const responseTarget = {
+      ...nonThreadTarget,
+      reply_target_message_id: 'platform-trigger-message',
+      mention_actor_id: 'human-sender',
+    };
+    expect(createDeliveryLaneKeyFromIdentity({
+      ...laneIdentity,
+      target: responseTarget,
+    })).not.toBe(createDeliveryLaneKeyFromIdentity({
+      ...laneIdentity,
+      target: {
+        ...responseTarget,
+        reply_target_message_id: 'platform-trigger-message-tampered',
+      },
+    }));
+    expect(createDeliveryLaneKeyFromIdentity({
+      ...laneIdentity,
+      target: responseTarget,
+    })).not.toBe(createDeliveryLaneKeyFromIdentity({
+      ...laneIdentity,
+      target: {
+        ...responseTarget,
+        mention_actor_id: null,
+      },
     }));
   });
 

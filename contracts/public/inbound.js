@@ -22,7 +22,7 @@ export const INBOUND_ENVELOPE_CONTRACT = 'zylos.inbound-envelope';
 export const INBOUND_RESULT_CONTRACT = 'zylos.inbound-result';
 
 export const CHAT_TYPES = Object.freeze(['dm', 'group', 'thread', 'synthetic']);
-export const INBOUND_ACTOR_TYPES = Object.freeze(['user', 'scheduler', 'system']);
+export const INBOUND_ACTOR_TYPES = Object.freeze(['user', 'service', 'scheduler', 'system']);
 export const INBOUND_ACTOR_ROLES = Object.freeze([
   'member',
   'group_owner',
@@ -94,6 +94,13 @@ function validateActor(actor, occurredAt) {
   }
   for (const role of actor.roles) {
     requireCriticalEnum('actor.roles[]', role, INBOUND_ACTOR_ROLES, { occurredAt });
+  }
+  if (actor.type === 'service' && actor.roles.length > 0) {
+    rejectContract(
+      'validation_error',
+      'A service actor cannot inherit human authorization roles.',
+      { occurredAt },
+    );
   }
 }
 
@@ -293,10 +300,13 @@ function validateEnvelopeSource(value, occurredAt) {
     return;
   }
 
-  if (value.channel === 'scheduler' || value.actor.type !== 'user') {
+  if (
+    value.channel === 'scheduler'
+    || !['user', 'service'].includes(value.actor.type)
+  ) {
     rejectContract(
       'validation_error',
-      'platform_original source requires a non-scheduler channel and user actor.',
+      'platform_original source requires a non-scheduler channel and user or service actor.',
       { occurredAt },
     );
   }

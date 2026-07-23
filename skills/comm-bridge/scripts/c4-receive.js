@@ -21,7 +21,8 @@ function openCoreDatabase() {
 function printUsage() {
   console.error(`Usage: node c4-receive.js \\
   --channel <channel> --endpoint <chat_id> --message-id <native_message_id> \\
-  --actor-id <authenticated_actor_id> [--chat-type dm|group|thread] \\
+  --actor-id <authenticated_actor_id> [--actor-type user|service] \\
+  [--chat-type dm|group|thread] \\
   [--thread-id <native_thread_id>] [--root-message-id <native_root_message_id>] \\
   [--occurred-at <RFC3339>] [--attachments-json <json_array>] [--json] \\
   --content <message>`);
@@ -30,6 +31,7 @@ function printUsage() {
 function parseArgs(args) {
   const parsed = {
     actorId: null,
+    actorType: 'user',
     attachments: [],
     attachmentsJson: null,
     channel: null,
@@ -44,6 +46,7 @@ function parseArgs(args) {
   };
   const valueOptions = new Map([
     ['--actor-id', 'actorId'],
+    ['--actor-type', 'actorType'],
     ['--attachments-json', 'attachmentsJson'],
     ['--channel', 'channel'],
     ['--chat-type', 'chatType'],
@@ -106,6 +109,9 @@ function requireArguments(parsed) {
   if (!['dm', 'group', 'thread'].includes(parsed.chatType)) {
     throw new TypeError('--chat-type must be dm, group, or thread');
   }
+  if (!['user', 'service'].includes(parsed.actorType)) {
+    throw new TypeError('--actor-type must be user or service');
+  }
   if (parsed.chatType === 'thread') {
     if (!parsed.threadId) throw new TypeError('--thread-id is required for a thread');
     if (!parsed.rootMessageId) {
@@ -134,7 +140,7 @@ function compatibilityMessage(parsed, receivedAt) {
     native_thread_or_topic_id: parsed.threadId,
     message_id: parsed.messageId,
     actor: {
-      type: 'user',
+      type: parsed.actorType,
       actor_id: parsed.actorId,
       authenticated: true,
       roles: [],

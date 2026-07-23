@@ -10,6 +10,7 @@ import {
   DELIVERY_RESULT_STATUSES,
   DELIVERY_TARGET_FIELDS_V1_0,
   DELIVERY_TARGET_FIELDS_V1_1,
+  DELIVERY_TARGET_FIELDS_V1_2,
   MAPPING_BINDING_AUTHORITIES,
   MAPPING_BINDING_STATES,
   MAPPING_RECOVERY_REASONS,
@@ -22,7 +23,7 @@ import {
 
 describe('delivery/mapping v1 vocabulary', () => {
   test('publishes every safety-critical operation, result and binding state', () => {
-    expect(DELIVERY_COMMAND_VERSIONS).toEqual(['1.0', '1.1']);
+    expect(DELIVERY_COMMAND_VERSIONS).toEqual(['1.0', '1.1', '1.2']);
     expect(DELIVERY_TARGET_FIELDS_V1_0).toEqual([
       'region',
       'tenant_id',
@@ -36,6 +37,11 @@ describe('delivery/mapping v1 vocabulary', () => {
       ...DELIVERY_TARGET_FIELDS_V1_0,
       'native_thread_root_message_id',
       'native_thread_reply_target_message_id',
+    ]);
+    expect(DELIVERY_TARGET_FIELDS_V1_2).toEqual([
+      ...DELIVERY_TARGET_FIELDS_V1_1,
+      'reply_target_message_id',
+      'mention_actor_id',
     ]);
     expect(DELIVERY_OPERATIONS).toEqual([
       'create_main',
@@ -326,6 +332,47 @@ describe('delivery command v1 schema', () => {
       () => validateDeliveryCommand(threadIdAsReplyTarget),
       'unsupported_capability',
     );
+  });
+
+  test('v1.2 carries the exact triggering message and only mentions human group actors', () => {
+    const groupHuman = withDeliveryTarget(createMainCommand(), {
+      native_thread_root_message_id: null,
+      native_thread_reply_target_message_id: null,
+      reply_target_message_id: 'platform-inbound-message-A',
+      mention_actor_id: 'ou_human_sender_A',
+    }, '1.2');
+    expect(validateDeliveryCommand(groupHuman).forwarded).toEqual(groupHuman);
+
+    const groupBot = withDeliveryTarget(groupHuman, {
+      mention_actor_id: null,
+    });
+    expect(validateDeliveryCommand(groupBot).forwarded).toEqual(groupBot);
+
+    const dm = withDeliveryTarget(groupHuman, {
+      chat_type: 'dm',
+      mention_actor_id: null,
+    });
+    expect(validateDeliveryCommand(dm).forwarded).toEqual(dm);
+
+    const missingReplyTarget = structuredClone(groupHuman);
+    delete missingReplyTarget.target.reply_target_message_id;
+    expectContractFailure(
+      () => validateDeliveryCommand(missingReplyTarget),
+      'unsupported_capability',
+    );
+
+    const nullReplyTarget = withDeliveryTarget(groupBot, {
+      reply_target_message_id: null,
+    });
+    expectContractFailure(
+      () => validateDeliveryCommand(nullReplyTarget),
+      'unsupported_capability',
+    );
+
+    const dmMention = withDeliveryTarget(dm, {
+      mention_actor_id: 'ou_unexpected_dm_mention',
+    });
+    expectContractFailure(() => validateDeliveryCommand(dmMention), 'unsupported_capability');
   });
 
   test('fails closed for v1.0 native-thread create, text and fallback without blocking exact updates', () => {

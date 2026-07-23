@@ -107,6 +107,65 @@
     {
       "if": {
         "properties": {
+          "contract_version": { "pattern": "^1\\.([2-9]|[1-9][0-9]+)$" }
+        },
+        "required": ["contract_version"]
+      },
+      "then": {
+        "properties": {
+          "target": {
+            "required": [
+              "reply_target_message_id",
+              "mention_actor_id"
+            ],
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "chat_type": { "enum": ["dm", "synthetic"] }
+                  },
+                  "required": ["chat_type"]
+                },
+                "then": {
+                  "properties": {
+                    "mention_actor_id": { "type": "null" }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "chat_type": { "const": "synthetic" }
+                  },
+                  "required": ["chat_type"]
+                },
+                "then": {
+                  "properties": {
+                    "reply_target_message_id": { "type": "null" }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "chat_type": { "not": { "const": "synthetic" } }
+                  },
+                  "required": ["chat_type"]
+                },
+                "then": {
+                  "properties": {
+                    "reply_target_message_id": { "$ref": "#/$defs/opaque_id" }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
           "contract_version": { "const": "1.0" },
           "operation": { "enum": ["create_main", "send_text", "send_fallback"] },
           "target": {
@@ -213,7 +272,9 @@
         "chat_id": { "$ref": "#/$defs/opaque_id" },
         "native_thread_or_topic_id": { "$ref": "#/$defs/nullable_id" },
         "native_thread_root_message_id": { "$ref": "#/$defs/nullable_id" },
-        "native_thread_reply_target_message_id": { "$ref": "#/$defs/nullable_id" }
+        "native_thread_reply_target_message_id": { "$ref": "#/$defs/nullable_id" },
+        "reply_target_message_id": { "$ref": "#/$defs/nullable_id" },
+        "mention_actor_id": { "$ref": "#/$defs/nullable_id" }
       },
       "additionalProperties": true
     },

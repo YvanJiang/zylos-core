@@ -31,6 +31,7 @@ import {
   encodeConversationKey,
   INBOUND_ENVELOPE_KNOWN_FIELDS,
 } from './inbound-acceptance.js';
+import { resolveDeliveryCommandVersionForTarget } from './delivery-target-identity.js';
 import { initializeMainProjection, stageMainProjection } from './main-projection.js';
 import { initializeRuntimePersistence } from './schema.js';
 import { createRetentionCleanup } from './retention-cleanup.js';
@@ -6764,7 +6765,7 @@ export function createExecutorStore({
       };
       const command = {
         contract: 'zylos.delivery-command',
-        contract_version: target.chat_type === 'thread' ? '1.1' : '1.0',
+        contract_version: resolveDeliveryCommandVersionForTarget(target),
         outbox_id: outboxId,
         delivery_id: deliveryId,
         trace_id: generateId('delivery-trace'),

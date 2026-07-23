@@ -105,7 +105,7 @@
       "then": {
         "properties": {
           "channel": { "not": { "const": "scheduler" } },
-          "actor": { "properties": { "type": { "const": "user" } } }
+          "actor": { "properties": { "type": { "enum": ["user", "service"] } } }
         },
         "not": { "anyOf": [{ "required": ["schedule"] }, { "required": ["legacy"] }] }
       }
@@ -132,7 +132,7 @@
       "type": "object",
       "required": ["type", "actor_id", "authenticated", "roles"],
       "properties": {
-        "type": { "enum": ["user", "scheduler", "system"] },
+        "type": { "enum": ["user", "service", "scheduler", "system"] },
         "actor_id": { "$ref": "#/$defs/opaque_id" },
         "authenticated": { "type": "boolean" },
         "roles": {
@@ -141,6 +141,17 @@
           "items": { "enum": ["member", "group_owner", "tenant_admin", "bot_owner", "bot_admin"] }
         }
       },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "type": { "const": "service" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": { "roles": { "maxItems": 0 } }
+          }
+        }
+      ],
       "additionalProperties": true
     },
     "attachment": {
