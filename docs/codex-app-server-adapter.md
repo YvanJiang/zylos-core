@@ -87,9 +87,12 @@ acceptance from connection or in-memory request state and does not resend the an
 that Core must serialize; it is not forwarded as the provider sandbox. Core therefore acquires a
 writable workspace lease at the normalized configured cwd, while every new, resumed, and started
 Codex turn is forced to `read-only` plus `on-request`, with the user reviewer. The turn override is
-repeated even after a persisted thread is resumed. `danger-full-access` is rejected at construction,
-as is any writable configuration whose approval policy is not `on-request`. A request cannot
-self-report read-only access.
+repeated even after a persisted thread is resumed. A deployment-authorized exception may set
+`CODEX_SANDBOX_MODE=danger-full-access` together with `CODEX_APPROVAL_POLICY=never`; only that exact
+pair is forwarded to every thread and turn. The exception keeps Core's coarse writable workspace
+lease but deliberately removes the provider's synchronous pre-action write fence. Other writable
+configurations whose approval policy is not `on-request` are rejected. A request cannot self-report
+read-only access.
 
 Writable execution fails closed unless Core supplies `assertWorkspaceWrite`. Before a one-shot
 command/file approval, the adapter passes the exact connection, conversation, Core turn, lineage,

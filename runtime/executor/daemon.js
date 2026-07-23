@@ -28,6 +28,13 @@ function readConfig(zylosDir) {
   }
 }
 
+export function resolveCodexExecutionPolicy(environment = process.env) {
+  return Object.freeze({
+    approvalPolicy: environment.CODEX_APPROVAL_POLICY || 'on-request',
+    sandbox: environment.CODEX_SANDBOX_MODE || 'workspace-write',
+  });
+}
+
 export function createConfiguredProviderAdapter({ provider, zylosDir, environment = process.env }) {
   if (provider === 'claude') {
     return createClaudeConversationAdapter({
@@ -35,11 +42,12 @@ export function createConfiguredProviderAdapter({ provider, zylosDir, environmen
     });
   }
   if (provider === 'codex') {
+    const { approvalPolicy, sandbox } = resolveCodexExecutionPolicy(environment);
     return createCodexAppServerAdapter({
       cwd: zylosDir,
       env: environment,
-      approvalPolicy: 'on-request',
-      sandbox: 'workspace-write',
+      approvalPolicy,
+      sandbox,
     });
   }
   throw new Error(`Unsupported executor provider: ${provider}`);

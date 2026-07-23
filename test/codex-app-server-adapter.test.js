@@ -539,21 +539,32 @@ describe('Codex app-server provider adapter', () => {
     });
   });
 
-  test('rejects full access and any writable turn that would bypass synchronous approval', () => {
+  test('requires an explicit never policy for full access and preserves fenced workspace writes', () => {
     const spawnProcess = jest.fn();
 
     expect(() => createCodexAppServerAdapter({
       spawnProcess,
       cwd: '/workspace',
       sandbox: 'danger-full-access',
-      approvalPolicy: 'never',
-    })).toThrow(/danger-full-access/);
+      approvalPolicy: 'on-request',
+    })).toThrow(/approvalPolicy never/);
     expect(() => createCodexAppServerAdapter({
       spawnProcess,
       cwd: '/workspace',
       sandbox: 'workspace-write',
       approvalPolicy: 'never',
     })).toThrow(/on-request/);
+    expect(createCodexAppServerAdapter({
+      spawnProcess,
+      cwd: '/workspace',
+      sandbox: 'danger-full-access',
+      approvalPolicy: 'never',
+    }).getWorkspaceAccess()).toEqual({
+      root: '/workspace',
+      mode: 'writable',
+      read_only_enforced: false,
+      authority: 'core_workspace_lease',
+    });
     expect(spawnProcess).not.toHaveBeenCalled();
   });
 
@@ -784,6 +795,30 @@ describe('Codex app-server provider adapter', () => {
       type: 'readOnly',
       networkAccess: true,
     });
+  });
+
+  test('forwards explicitly authorized full access to every Codex thread and turn', async () => {
+    const server = createFakeAppServer();
+    const adapter = createCodexAppServerAdapter({
+      approvalPolicy: 'never',
+      sandbox: 'danger-full-access',
+      spawnProcess: () => server.child,
+    });
+
+    await collect(executeAdapter(adapter, executionContext()));
+
+    const threadStart = server.received.find(({ method }) => method === 'thread/start');
+    expect(threadStart.params).toEqual(expect.objectContaining({
+      approvalPolicy: 'never',
+      approvalsReviewer: 'user',
+      sandbox: 'danger-full-access',
+    }));
+    const turnStart = server.received.find(({ method }) => method === 'turn/start');
+    expect(turnStart.params).toEqual(expect.objectContaining({
+      approvalPolicy: 'never',
+      approvalsReviewer: 'user',
+      sandboxPolicy: { type: 'dangerFullAccess' },
+    }));
   });
 
   test('preserves enabled MCP servers and plugin-provided MCP discovery at app-server start', async () => {

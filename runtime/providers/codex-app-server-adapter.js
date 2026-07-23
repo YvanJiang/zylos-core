@@ -664,8 +664,8 @@ export function createCodexAppServerAdapter({
   if (!['read-only', 'workspace-write', 'danger-full-access'].includes(sandbox)) {
     throw new TypeError('sandbox must be read-only, workspace-write, or danger-full-access');
   }
-  if (sandbox === 'danger-full-access') {
-    throw new TypeError('danger-full-access is prohibited for the Codex app-server adapter');
+  if (sandbox === 'danger-full-access' && approvalPolicy !== 'never') {
+    throw new TypeError('danger-full-access requires approvalPolicy never');
   }
   if (sandbox === 'workspace-write' && approvalPolicy !== 'on-request') {
     throw new TypeError('Writable Codex app-server execution requires approvalPolicy on-request');
@@ -707,10 +707,17 @@ export function createCodexAppServerAdapter({
     read_only_enforced: sandbox === 'read-only',
     authority: sandbox === 'read-only' ? 'provider_sandbox' : 'core_workspace_lease',
   });
-  const providerApprovalPolicy = workspaceAccess.mode === 'writable'
+  const providerApprovalPolicy = sandbox === 'danger-full-access'
+    ? approvalPolicy
+    : workspaceAccess.mode === 'writable'
     ? 'on-request'
     : approvalPolicy;
-  const providerSandbox = 'read-only';
+  const providerSandbox = sandbox === 'danger-full-access'
+    ? 'danger-full-access'
+    : 'read-only';
+  const providerSandboxPolicy = sandbox === 'danger-full-access'
+    ? Object.freeze({ type: 'dangerFullAccess' })
+    : Object.freeze({ type: 'readOnly', networkAccess });
   const loadedThreads = new Set();
   const activeRuns = new Map();
   const startingRuns = new Map();
@@ -2350,7 +2357,7 @@ export function createCodexAppServerAdapter({
         cwd: effectiveCwd,
         approvalPolicy: providerApprovalPolicy,
         approvalsReviewer: 'user',
-        sandboxPolicy: { type: 'readOnly', networkAccess },
+        sandboxPolicy: providerSandboxPolicy,
         environments: [],
       }, {
         onResult: (response) => {

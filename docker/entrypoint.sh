@@ -11,7 +11,10 @@
 set -euo pipefail
 
 if [ "$(id -u)" = "0" ]; then
-  mkdir -p /home/zylos/.codex /home/zylos/.claude /home/zylos/zylos
+  mkdir -p /home/zylos/.codex/skills /home/zylos/.claude /home/zylos/zylos
+  if [ -d /opt/zylos/preinstalled-skills ]; then
+    cp -a /opt/zylos/preinstalled-skills/. /home/zylos/.codex/skills/
+  fi
   chown -R zylos:zylos /home/zylos/.codex /home/zylos/.claude /home/zylos/zylos
   export HOME=/home/zylos
   exec /usr/sbin/runuser --preserve-environment -u zylos -- "$0" "$@"
@@ -50,6 +53,19 @@ if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && \
   fi
 fi
 ok "Authentication configured"
+
+if [ -n "${FEISHU_APP_ID:-}" ] && [ -n "${FEISHU_APP_SECRET:-}" ]; then
+  if ! printf '%s\n' "${FEISHU_APP_SECRET}" | lark-cli config init \
+    --app-id "${FEISHU_APP_ID}" \
+    --app-secret-stdin \
+    --brand feishu \
+    --name feishu \
+    --lang "${FEISHU_LANG:-zh}" >/dev/null 2>&1; then
+    error "lark-cli credential initialization failed."
+    exit 1
+  fi
+  ok "lark-cli Feishu profile configured"
+fi
 
 if [ -z "${OPENAI_API_KEY:-}" ] && [ -n "${CODEX_API_KEY:-}" ]; then
   export OPENAI_API_KEY="${CODEX_API_KEY}"
@@ -130,6 +146,8 @@ upsert_env "CODEX_API_KEY" "${CODEX_API_KEY:-}"
 upsert_env "OPENAI_BASE_URL" "${OPENAI_BASE_URL:-}"
 upsert_env "CODEX_PROVIDER_BASE_URL" "${CODEX_PROVIDER_BASE_URL:-}"
 upsert_env "CODEX_NETWORK_ACCESS" "${CODEX_NETWORK_ACCESS:-}"
+upsert_env "CODEX_APPROVAL_POLICY" "${CODEX_APPROVAL_POLICY:-}"
+upsert_env "CODEX_SANDBOX_MODE" "${CODEX_SANDBOX_MODE:-}"
 upsert_env "CODEX_PROVIDER_TURN_TIMEOUT_MS" "${CODEX_PROVIDER_TURN_TIMEOUT_MS:-}"
 upsert_env "ZYLOS_PROVIDER_TURN_TIMEOUT_MS" "${ZYLOS_PROVIDER_TURN_TIMEOUT_MS:-}"
 
