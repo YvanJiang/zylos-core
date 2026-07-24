@@ -9571,6 +9571,48 @@ export function createExecutorStore({
       const reconciledAtMs = Date.parse(reconciledAt);
       for (const candidate of candidates) {
         if (candidate.state === 'recovering') {
+          const expiredForeignLease = candidate.lease_owner !== null
+            && candidate.lease_owner !== serviceInstanceId
+            && candidate.lease_expires_at !== null
+            && candidate.lease_expires_at <= reconciledAt;
+          if (
+            candidate.queue_status === 'claimed'
+            && expiredForeignLease
+            && candidate.has_blocking_interaction !== 1
+          ) {
+            const turnContext = {
+              turn_id: candidate.turn_id,
+              conversation_id: candidate.conversation_id,
+              executor_instance_id: candidate.executor_instance_id,
+              attempt: {
+                attempt_id: candidate.attempt_id,
+                attempt_no: candidate.attempt_no,
+                lease_epoch: candidate.lease_epoch,
+              },
+            };
+            const error = createContractError({
+              code: 'side_effect_unknown',
+              category: 'provider',
+              retryable: false,
+              sideEffectStatus: 'unknown',
+              userMessage: 'A recovering provider attempt outlived its executor lease.',
+              occurredAt: reconciledAt,
+            });
+            const recovery = persistExecutionRecoveryDecisionInTransaction(
+              turnContext,
+              error,
+              reconciledAt,
+              recoveryKind,
+              { requireActiveLease: false },
+            );
+            results.push({
+              turn_id: candidate.turn_id,
+              status: 'waiting_decision',
+              recovery_id: recovery.recovery_id,
+              interaction_id: recovery.interaction_id,
+            });
+            continue;
+          }
           if (
             candidate.queue_status === 'claimed'
             && candidate.lease_owner === null

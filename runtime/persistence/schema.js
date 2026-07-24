@@ -40,6 +40,7 @@ const OUTBOX_TABLE_SCHEMA = `(
   )`;
 
 const SAFE_RETRY_WORKSPACE_MIGRATION_ID = 'conversation-workspace-safe-provider-retry-v1';
+const SAFE_RETRY_WORKSPACE_REPAIR_MIGRATION_ID = 'conversation-workspace-safe-provider-retry-repair-v2';
 
 const CONVERSATION_WORKSPACE_STATE_TRANSITION_TRIGGER = `
   CREATE TRIGGER IF NOT EXISTS runtime_conversation_workspace_state_transition
@@ -2298,6 +2299,119 @@ function migrateDeliveryLaneIdentity(database) {
   migrate.immediate();
 }
 
+function repairConversationWorkspaceSafeRetryQuarantines(database) {
+  database.prepare(`
+    UPDATE runtime_conversation_workspaces
+    SET state = CASE
+        WHEN workspace_root IS NULL THEN 'requested'
+        ELSE 'ready'
+      END,
+      quarantined_at = NULL,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+      last_error_json = NULL
+    WHERE state = 'quarantined'
+      AND (
+        (workspace_root IS NULL AND ready_at IS NULL)
+        OR (workspace_root IS NOT NULL AND ready_at IS NOT NULL)
+      )
+      AND json_extract(last_error_json, '$.code') = 'workspace_runtime_uncertain'
+      AND EXISTS (
+        SELECT 1
+        FROM runtime_background_tasks AS background
+        JOIN runtime_turns AS turn
+          ON turn.turn_id = background.execution_turn_id
+        JOIN runtime_turn_queue AS retry_queue
+          ON retry_queue.turn_id = background.execution_turn_id
+        JOIN runtime_provider_attempts AS retry_attempt
+          ON retry_attempt.turn_id = background.execution_turn_id
+          AND retry_attempt.attempt_id = turn.attempt_id
+          AND retry_attempt.attempt_no = turn.attempt_no
+          AND retry_attempt.lease_epoch = turn.lease_epoch
+        WHERE background.execution_conversation_id
+            = runtime_conversation_workspaces.conversation_id
+          AND background.state = 'recovering'
+          AND background.side_effect_status = 'none'
+          AND turn.state = 'recovering'
+          AND retry_queue.status = 'queued'
+          AND retry_queue.wait_reason = 'provider_retry'
+          AND retry_attempt.state = 'retry_wait'
+          AND retry_attempt.side_effect_status = 'none'
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM runtime_background_tasks AS unsafe_background
+        WHERE unsafe_background.execution_conversation_id
+            = runtime_conversation_workspaces.conversation_id
+          AND (
+            unsafe_background.side_effect_status = 'unknown'
+            OR (
+              unsafe_background.state = 'recovering'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM runtime_turn_queue AS safe_queue
+                JOIN runtime_turns AS safe_turn
+                  ON safe_turn.turn_id = safe_queue.turn_id
+                JOIN runtime_provider_attempts AS safe_attempt
+                  ON safe_attempt.turn_id = safe_queue.turn_id
+                  AND safe_attempt.attempt_id = safe_turn.attempt_id
+                  AND safe_attempt.attempt_no = safe_turn.attempt_no
+                  AND safe_attempt.lease_epoch = safe_turn.lease_epoch
+                WHERE safe_queue.turn_id = unsafe_background.execution_turn_id
+                  AND safe_queue.status = 'queued'
+                  AND safe_queue.wait_reason = 'provider_retry'
+                  AND safe_attempt.state = 'retry_wait'
+                  AND safe_attempt.side_effect_status = 'none'
+              )
+            )
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM runtime_turns AS unsafe_turn
+        WHERE unsafe_turn.conversation_id
+            = runtime_conversation_workspaces.conversation_id
+          AND unsafe_turn.state = 'recovering'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM runtime_turn_queue AS safe_queue
+            JOIN runtime_provider_attempts AS safe_attempt
+              ON safe_attempt.turn_id = safe_queue.turn_id
+              AND safe_attempt.attempt_id = unsafe_turn.attempt_id
+              AND safe_attempt.attempt_no = unsafe_turn.attempt_no
+              AND safe_attempt.lease_epoch = unsafe_turn.lease_epoch
+            WHERE safe_queue.turn_id = unsafe_turn.turn_id
+              AND safe_queue.status = 'queued'
+              AND safe_queue.wait_reason = 'provider_retry'
+              AND safe_attempt.state = 'retry_wait'
+              AND safe_attempt.side_effect_status = 'none'
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM runtime_execution_recoveries AS recovery
+        JOIN runtime_turns AS recovery_turn ON recovery_turn.turn_id = recovery.turn_id
+        WHERE recovery_turn.conversation_id
+          = runtime_conversation_workspaces.conversation_id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM runtime_workspace_leases AS lease
+        WHERE lease.holder_conversation_id
+            = runtime_conversation_workspaces.conversation_id
+          AND lease.state = 'uncertain'
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM runtime_workspace_background_work AS background_work
+        JOIN runtime_workspace_leases AS lease
+          ON lease.workspace_lease_id = background_work.workspace_lease_id
+        WHERE lease.holder_conversation_id
+            = runtime_conversation_workspaces.conversation_id
+          AND background_work.state = 'unknown'
+      )
+  `).run();
+}
+
 function migrateConversationWorkspaceSafeRetryQuarantines(database) {
   const migrate = database.transaction(() => {
     const applied = database.prepare(`
@@ -2331,122 +2445,34 @@ function migrateConversationWorkspaceSafeRetryQuarantines(database) {
         DROP TRIGGER IF EXISTS runtime_conversation_workspace_state_transition;
         ${CONVERSATION_WORKSPACE_RUNTIME_QUARANTINE_TRIGGERS}
       `);
-      database.prepare(`
-      UPDATE runtime_conversation_workspaces
-      SET state = CASE
-          WHEN workspace_root IS NULL THEN 'requested'
-          ELSE 'ready'
-        END,
-        quarantined_at = NULL,
-        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-        last_error_json = NULL
-      WHERE state = 'quarantined'
-        AND (
-          (workspace_root IS NULL AND ready_at IS NULL)
-          OR (workspace_root IS NOT NULL AND ready_at IS NOT NULL)
-        )
-        AND json_extract(last_error_json, '$.code') = 'workspace_runtime_uncertain'
-        AND EXISTS (
-          SELECT 1
-          FROM runtime_background_tasks AS background
-          JOIN runtime_turns AS turn
-            ON turn.turn_id = background.execution_turn_id
-          JOIN runtime_turn_queue AS retry_queue
-            ON retry_queue.turn_id = background.execution_turn_id
-          JOIN runtime_provider_attempts AS retry_attempt
-            ON retry_attempt.turn_id = background.execution_turn_id
-            AND retry_attempt.attempt_id = turn.attempt_id
-            AND retry_attempt.attempt_no = turn.attempt_no
-            AND retry_attempt.lease_epoch = turn.lease_epoch
-          WHERE background.execution_conversation_id
-              = runtime_conversation_workspaces.conversation_id
-            AND background.state = 'recovering'
-            AND background.side_effect_status = 'none'
-            AND turn.state = 'recovering'
-            AND retry_queue.status = 'queued'
-            AND retry_queue.wait_reason = 'provider_retry'
-            AND retry_attempt.state = 'retry_wait'
-            AND retry_attempt.side_effect_status = 'none'
-        )
-        AND NOT EXISTS (
-          SELECT 1
-          FROM runtime_background_tasks AS unsafe_background
-          WHERE unsafe_background.execution_conversation_id
-              = runtime_conversation_workspaces.conversation_id
-            AND (
-              unsafe_background.side_effect_status = 'unknown'
-              OR (
-                unsafe_background.state = 'recovering'
-                AND NOT EXISTS (
-                  SELECT 1
-                  FROM runtime_turn_queue AS safe_queue
-                  JOIN runtime_turns AS safe_turn
-                    ON safe_turn.turn_id = safe_queue.turn_id
-                  JOIN runtime_provider_attempts AS safe_attempt
-                    ON safe_attempt.turn_id = safe_queue.turn_id
-                    AND safe_attempt.attempt_id = safe_turn.attempt_id
-                    AND safe_attempt.attempt_no = safe_turn.attempt_no
-                    AND safe_attempt.lease_epoch = safe_turn.lease_epoch
-                  WHERE safe_queue.turn_id = unsafe_background.execution_turn_id
-                    AND safe_queue.status = 'queued'
-                    AND safe_queue.wait_reason = 'provider_retry'
-                    AND safe_attempt.state = 'retry_wait'
-                    AND safe_attempt.side_effect_status = 'none'
-                )
-              )
-            )
-        )
-        AND NOT EXISTS (
-          SELECT 1
-          FROM runtime_turns AS unsafe_turn
-          WHERE unsafe_turn.conversation_id
-              = runtime_conversation_workspaces.conversation_id
-            AND unsafe_turn.state = 'recovering'
-            AND NOT EXISTS (
-              SELECT 1
-              FROM runtime_turn_queue AS safe_queue
-              JOIN runtime_provider_attempts AS safe_attempt
-                ON safe_attempt.turn_id = safe_queue.turn_id
-                AND safe_attempt.attempt_id = unsafe_turn.attempt_id
-                AND safe_attempt.attempt_no = unsafe_turn.attempt_no
-                AND safe_attempt.lease_epoch = unsafe_turn.lease_epoch
-              WHERE safe_queue.turn_id = unsafe_turn.turn_id
-                AND safe_queue.status = 'queued'
-                AND safe_queue.wait_reason = 'provider_retry'
-                AND safe_attempt.state = 'retry_wait'
-                AND safe_attempt.side_effect_status = 'none'
-            )
-        )
-        AND NOT EXISTS (
-          SELECT 1
-          FROM runtime_execution_recoveries AS recovery
-          JOIN runtime_turns AS recovery_turn ON recovery_turn.turn_id = recovery.turn_id
-          WHERE recovery_turn.conversation_id
-            = runtime_conversation_workspaces.conversation_id
-        )
-        AND NOT EXISTS (
-          SELECT 1
-          FROM runtime_workspace_leases AS lease
-          WHERE lease.holder_conversation_id
-              = runtime_conversation_workspaces.conversation_id
-            AND lease.state = 'uncertain'
-        )
-        AND NOT EXISTS (
-          SELECT 1
-          FROM runtime_workspace_background_work AS background_work
-          JOIN runtime_workspace_leases AS lease
-            ON lease.workspace_lease_id = background_work.workspace_lease_id
-          WHERE lease.holder_conversation_id
-              = runtime_conversation_workspaces.conversation_id
-            AND background_work.state = 'unknown'
-        )
-      `).run();
+      repairConversationWorkspaceSafeRetryQuarantines(database);
       database.exec(CONVERSATION_WORKSPACE_STATE_TRANSITION_TRIGGER);
     }
     database.prepare(`
       INSERT INTO runtime_schema_migrations (migration_id, applied_at)
       VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     `).run(SAFE_RETRY_WORKSPACE_MIGRATION_ID);
+  });
+  migrate.immediate();
+}
+
+function repairConversationWorkspaceSafeRetryQuarantinesV2(database) {
+  const migrate = database.transaction(() => {
+    const applied = database.prepare(`
+      SELECT 1
+      FROM runtime_schema_migrations
+      WHERE migration_id = ?
+    `).get(SAFE_RETRY_WORKSPACE_REPAIR_MIGRATION_ID);
+    if (applied) return;
+    database.exec(`
+      DROP TRIGGER IF EXISTS runtime_conversation_workspace_state_transition;
+    `);
+    repairConversationWorkspaceSafeRetryQuarantines(database);
+    database.exec(CONVERSATION_WORKSPACE_STATE_TRANSITION_TRIGGER);
+    database.prepare(`
+      INSERT INTO runtime_schema_migrations (migration_id, applied_at)
+      VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    `).run(SAFE_RETRY_WORKSPACE_REPAIR_MIGRATION_ID);
   });
   migrate.immediate();
 }
@@ -2470,6 +2496,7 @@ export function initializeRuntimePersistence(database) {
     'INTEGER CHECK (lease_epoch IS NULL OR lease_epoch > 0)',
   );
   migrateConversationWorkspaceSafeRetryQuarantines(database);
+  repairConversationWorkspaceSafeRetryQuarantinesV2(database);
   migrateOperationsReconciliationIntents(database);
   addColumnIfMissing(
     database,

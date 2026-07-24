@@ -517,6 +517,40 @@ describe('per-conversation detached execution workspaces', () => {
       migration_id: 'conversation-workspace-safe-provider-retry-v1',
     });
 
+    fixture.database.exec(`
+      DELETE FROM runtime_schema_migrations
+      WHERE migration_id = 'conversation-workspace-safe-provider-retry-repair-v2';
+    `);
+    fixture.database.prepare(`
+      UPDATE runtime_conversation_workspaces
+      SET state = 'quarantined',
+        quarantined_at = '2026-07-24T01:00:03Z',
+        last_error_json = json_object(
+          'code', 'workspace_runtime_uncertain',
+          'message', 'Conversation execution entered recovering state.',
+          'terminal', json('true'),
+          'occurred_at', '2026-07-24T01:00:03Z'
+        )
+      WHERE conversation_id = ?
+    `).run(conversationId);
+    initializeRuntimePersistence(fixture.database);
+    expect(fixture.database.prepare(`
+      SELECT state, quarantined_at, last_error_json
+      FROM runtime_conversation_workspaces
+      WHERE conversation_id = ?
+    `).get(conversationId)).toEqual({
+      state: 'ready',
+      quarantined_at: null,
+      last_error_json: null,
+    });
+    expect(fixture.database.prepare(`
+      SELECT migration_id
+      FROM runtime_schema_migrations
+      WHERE migration_id = 'conversation-workspace-safe-provider-retry-repair-v2'
+    `).get()).toEqual({
+      migration_id: 'conversation-workspace-safe-provider-retry-repair-v2',
+    });
+
     fixture.database.exec('SAVEPOINT stale_safe_retry_probe');
     try {
       fixture.database.prepare(`
