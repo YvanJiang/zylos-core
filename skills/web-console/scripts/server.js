@@ -50,6 +50,7 @@ const wss = new WebSocketServer({ server });
 
 const PORT = process.env.WEB_CONSOLE_PORT || 3456;
 const SERVICE_BIRTH_ID = crypto.randomUUID();
+const PREREQUISITE_CHILD_CONTRACT = 'zylos.prerequisite-child@1';
 
 // Paths
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
@@ -919,6 +920,14 @@ server.listen(PORT, BIND_HOST, () => {
   console.log(`WebSocket available at ws://${BIND_HOST}:${PORT}`);
   console.log(`Authentication: ${AUTH_ENABLED ? 'enabled' : 'disabled (no password set)'}`);
   console.log(`Database: ${DB_PATH}`);
+  process.send?.({
+    contract: PREREQUISITE_CHILD_CONTRACT,
+    type: 'ready',
+    service: 'web-console',
+    pid: process.pid,
+    host: BIND_HOST,
+    port: Number(PORT),
+  });
 });
 
 // Graceful shutdown: stop new claims, await every fenced dispatch result, then
@@ -944,5 +953,24 @@ function shutdown() {
   return shutdownPromise;
 }
 
+server.once('error', (error) => {
+  process.send?.({
+    contract: PREREQUISITE_CHILD_CONTRACT,
+    type: 'error',
+    service: 'web-console',
+    pid: process.pid,
+    code: error?.code ?? 'WEB_CONSOLE_LISTEN_FAILED',
+    message: error?.message ?? 'Web Console listen failed',
+    host: BIND_HOST,
+    port: Number(PORT),
+  });
+  console.error(`Web Console listen failed on ${BIND_HOST}:${PORT}: ${error.message}`);
+  process.exitCode = 1;
+  void shutdown();
+});
+
+if (typeof process.send === 'function') {
+  process.once('disconnect', () => { void shutdown(); });
+}
 process.once('SIGINT', () => { void shutdown(); });
 process.once('SIGTERM', () => { void shutdown(); });
