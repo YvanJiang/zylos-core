@@ -295,6 +295,52 @@ function requireExecutionContext(context) {
   }
 }
 
+function requireWorkspaceBinding(context, expectedMode) {
+  const workspace = context.workspace;
+  if (!workspace || typeof workspace !== 'object' || Array.isArray(workspace)) {
+    throw new TypeError('execution context.workspace must contain a durable workspace fence');
+  }
+  if (
+    typeof workspace.workspace_root !== 'string'
+    || workspace.workspace_root.length === 0
+    || workspace.workspace_root.length > 4_096
+    || workspace.workspace_root.includes('\0')
+    || !path.isAbsolute(workspace.workspace_root)
+    || path.resolve(workspace.workspace_root) !== workspace.workspace_root
+  ) {
+    throw new TypeError('workspace.workspace_root must be a normalized absolute path');
+  }
+  if (
+    typeof workspace.workspace_lease_id !== 'string'
+    || workspace.workspace_lease_id.length === 0
+    || workspace.holder_conversation_id !== context.conversation_id
+    || workspace.holder_turn_id !== context.turn_id
+    || !Number.isSafeInteger(workspace.lease_epoch)
+    || workspace.lease_epoch < 1
+    || workspace.mode !== expectedMode
+  ) {
+    throw new TypeError('execution context.workspace must contain a complete current holder fence');
+  }
+  if (
+    workspace.workspace_generation !== undefined
+    && (
+      !Number.isSafeInteger(workspace.workspace_generation)
+      || workspace.workspace_generation < 1
+    )
+  ) {
+    throw new TypeError('workspace.workspace_generation must be a positive safe integer when provided');
+  }
+  return Object.freeze({
+    workspace_root: workspace.workspace_root,
+    workspace_generation: workspace.workspace_generation ?? null,
+  });
+}
+
+function sameWorkspaceBinding(left, right) {
+  return left.workspace_root === right.workspace_root
+    && left.workspace_generation === right.workspace_generation;
+}
+
 function parseMessage(line) {
   try {
     const message = JSON.parse(line);
@@ -548,6 +594,54 @@ function isPathInside(root, candidate) {
     && !path.isAbsolute(relative);
 }
 
+function canonicalizeWithExistingAncestor(value) {
+  const missingSegments = [];
+  let existing = path.resolve(value);
+  while (!fs.existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) break;
+    missingSegments.unshift(path.basename(existing));
+    existing = parent;
+  }
+  return path.resolve(fs.realpathSync.native(existing), ...missingSegments);
+}
+
+function resolveContainedWorkspacePath(workspaceRoot, value, {
+  allowRoot = false,
+  message = 'Codex app-server requested a path outside the current workspace.',
+} = {}) {
+  if (
+    typeof value !== 'string'
+    || value.length === 0
+    || value.length > 4_096
+    || value.includes('\0')
+  ) {
+    rejectProtocol(message);
+  }
+  const normalizedRoot = path.resolve(workspaceRoot);
+  const normalized = path.resolve(normalizedRoot, value);
+  if (
+    (!allowRoot || normalized !== normalizedRoot)
+    && !isPathInside(normalizedRoot, normalized)
+  ) {
+    rejectProtocol(message);
+  }
+  try {
+    const canonicalRoot = canonicalizeWithExistingAncestor(normalizedRoot);
+    const canonical = canonicalizeWithExistingAncestor(normalized);
+    if (
+      (!allowRoot || canonical !== canonicalRoot)
+      && !isPathInside(canonicalRoot, canonical)
+    ) {
+      rejectProtocol(message);
+    }
+  } catch (cause) {
+    if (cause instanceof CodexAppServerAdapterError) throw cause;
+    rejectProtocol(message);
+  }
+  return normalized;
+}
+
 function validateProviderSavedPath(value, workspaceRoot) {
   if (value === undefined || value === null) return null;
   if (
@@ -559,11 +653,9 @@ function validateProviderSavedPath(value, workspaceRoot) {
   ) {
     rejectProtocol('Codex app-server emitted an invalid image saved path.');
   }
-  const normalized = path.resolve(value);
-  if (!isPathInside(path.resolve(workspaceRoot), normalized)) {
-    rejectProtocol('Codex app-server emitted an image saved path outside the workspace.');
-  }
-  return normalized;
+  return resolveContainedWorkspacePath(workspaceRoot, value, {
+    message: 'Codex app-server emitted an image saved path outside the workspace.',
+  });
 }
 
 function validateProviderSavedArtifact(filePath, workspaceRoot, expectedBytes, maxBytes) {
@@ -1019,7 +1111,8 @@ export function createCodexAppServerAdapter({
   const providerSandboxPolicy = sandbox === 'danger-full-access'
     ? Object.freeze({ type: 'dangerFullAccess' })
     : Object.freeze({ type: 'readOnly', networkAccess });
-  const loadedThreads = new Set();
+  const loadedThreads = new Map();
+  const threadWorkspaceBindings = new Map();
   const activeRuns = new Map();
   const startingRuns = new Map();
   const inFlightTurnStarts = new Set();
@@ -1033,6 +1126,18 @@ export function createCodexAppServerAdapter({
 
   function getWorkspaceAccess() {
     return workspaceAccess;
+  }
+
+  function bindThreadWorkspace(threadId, workspaceBinding) {
+    const existing = threadWorkspaceBindings.get(threadId);
+    if (existing !== undefined && !sameWorkspaceBinding(existing, workspaceBinding)) {
+      throw new CodexAppServerAdapterError(
+        'provider_context_invalid',
+        'The persisted Codex thread is bound to a different workspace root or generation.',
+      );
+    }
+    if (existing === undefined) threadWorkspaceBindings.set(threadId, workspaceBinding);
+    return existing ?? workspaceBinding;
   }
 
   function assertWorkspaceWrite(controls, approvalFence = undefined) {
@@ -1394,7 +1499,7 @@ export function createCodexAppServerAdapter({
           return;
         }
         if (item.type === 'imageGeneration') {
-          validateStartedImageItem(item, effectiveCwd, maxImageArtifactBytes);
+          validateStartedImageItem(item, run.workspace_root, maxImageArtifactBytes);
         }
         if (
           item.type === 'fileChange'
@@ -1485,7 +1590,7 @@ export function createCodexAppServerAdapter({
           }
           const metadata = completeImageItem(
             item,
-            effectiveCwd,
+            run.workspace_root,
             effectiveImageArtifactDirectory,
             maxImageArtifactBytes,
           );
@@ -2022,13 +2127,14 @@ export function createCodexAppServerAdapter({
   }
 
   function providerWritePaths(group) {
+    const workspaceRoot = group.run.workspace_root;
     if (group.method === 'item/fileChange/requestApproval') {
       const item = requireStartedTool(group.run, group.params.itemId, 'fileChange');
       const paths = [];
       for (const change of item.changes) {
-        paths.push(path.resolve(effectiveCwd, change.path));
+        paths.push(resolveContainedWorkspacePath(workspaceRoot, change.path));
         if (typeof change.kind.move_path === 'string') {
-          paths.push(path.resolve(effectiveCwd, change.kind.move_path));
+          paths.push(resolveContainedWorkspacePath(workspaceRoot, change.kind.move_path));
         }
       }
       if (group.params.grantRoot !== undefined && group.params.grantRoot !== null) {
@@ -2040,9 +2146,13 @@ export function createCodexAppServerAdapter({
       return [...new Set(paths)].sort();
     }
     const item = requireStartedTool(group.run, group.params.itemId, 'commandExecution');
+    const commandCwd = resolveContainedWorkspacePath(workspaceRoot, item.cwd, {
+      allowRoot: true,
+      message: 'Codex app-server requested a command outside the fenced local workspace environment.',
+    });
     if (
       !path.isAbsolute(item.cwd)
-      || path.resolve(item.cwd) !== path.resolve(effectiveCwd)
+      || commandCwd !== workspaceRoot
       || group.params.environmentId !== null
       || (group.params.networkApprovalContext !== undefined
         && group.params.networkApprovalContext !== null)
@@ -2053,7 +2163,7 @@ export function createCodexAppServerAdapter({
         'unsupported_capability',
       );
     }
-    const paths = [effectiveCwd];
+    const paths = [workspaceRoot];
     if (group.params.additionalPermissions !== undefined
       && group.params.additionalPermissions !== null) {
       rejectProtocol(
@@ -2082,7 +2192,7 @@ export function createCodexAppServerAdapter({
       connection_id: group.connection_id,
       conversation_id: context.conversation_id,
       core_turn_id: context.turn_id,
-      cwd: effectiveCwd,
+      cwd: group.run.workspace_root,
       environment_id: group.params.environmentId ?? null,
       executor_instance_id: context.executor_instance_id,
       lineage_id: context.lineage_id,
@@ -2512,11 +2622,19 @@ export function createCodexAppServerAdapter({
     return connecting;
   }
 
-  async function resumePersistedThread(target, threadId) {
-    if (!loadedThreads.has(threadId)) {
+  async function resumePersistedThread(target, threadId, workspaceBinding) {
+    const boundWorkspace = bindThreadWorkspace(threadId, workspaceBinding);
+    const loadedWorkspace = loadedThreads.get(threadId);
+    if (loadedWorkspace !== undefined && !sameWorkspaceBinding(loadedWorkspace, boundWorkspace)) {
+      throw new CodexAppServerAdapterError(
+        'provider_context_invalid',
+        'The loaded Codex thread does not match its requested workspace binding.',
+      );
+    }
+    if (loadedWorkspace === undefined) {
       await sendRequest(target, 'thread/resume', {
         threadId,
-        cwd: effectiveCwd,
+        cwd: boundWorkspace.workspace_root,
         approvalPolicy: providerApprovalPolicy,
         approvalsReviewer: 'user',
         sandbox: providerSandbox,
@@ -2533,7 +2651,7 @@ export function createCodexAppServerAdapter({
           }
         },
       });
-      loadedThreads.add(threadId);
+      loadedThreads.set(threadId, boundWorkspace);
     }
     return threadId;
   }
@@ -2542,7 +2660,7 @@ export function createCodexAppServerAdapter({
     const persistedThreadId = context.lineage.provider_native_id;
     if (persistedThreadId === null) {
       const result = await sendRequest(target, 'thread/start', {
-        cwd: effectiveCwd,
+        cwd: run.workspace_root,
         approvalPolicy: providerApprovalPolicy,
         approvalsReviewer: 'user',
         sandbox: providerSandbox,
@@ -2551,6 +2669,12 @@ export function createCodexAppServerAdapter({
         config: structuredClone(APP_SERVER_LOCKDOWN_CONFIG),
       });
       const threadId = requireThreadResult(result);
+      try {
+        bindThreadWorkspace(threadId, run.workspace_binding);
+      } catch (error) {
+        failConnection(target, error);
+        throw error;
+      }
       if (workspaceAccess.mode === 'writable') {
         assertWorkspaceWriteOrFail(target, controls, run);
       }
@@ -2564,10 +2688,10 @@ export function createCodexAppServerAdapter({
           run,
         );
       }
-      loadedThreads.add(threadId);
+      loadedThreads.set(threadId, run.workspace_binding);
       return threadId;
     }
-    await resumePersistedThread(target, persistedThreadId);
+    await resumePersistedThread(target, persistedThreadId, run.workspace_binding);
     return persistedThreadId;
   }
 
@@ -2590,7 +2714,12 @@ export function createCodexAppServerAdapter({
       throw new TypeError('Codex lineage recovery requires one complete persisted candidate fence');
     }
     const target = await ensureConnection();
-    await resumePersistedThread(target, candidate.provider_native_id);
+    const workspaceBinding = threadWorkspaceBindings.get(candidate.provider_native_id)
+      ?? Object.freeze({
+        workspace_root: effectiveCwd,
+        workspace_generation: null,
+      });
+    await resumePersistedThread(target, candidate.provider_native_id, workspaceBinding);
     return Object.freeze({
       status: 'recovered',
       recovery_id: request.recovery_id,
@@ -2605,6 +2734,10 @@ export function createCodexAppServerAdapter({
 
   async function* execute(context, controls = null) {
     requireExecutionContext(context);
+    const workspaceBinding = requireWorkspaceBinding(context, workspaceAccess.mode);
+    if (context.lineage.provider_native_id !== null) {
+      bindThreadWorkspace(context.lineage.provider_native_id, workspaceBinding);
+    }
     if (workspaceAccess.mode === 'writable') assertWorkspaceWrite(controls);
     const target = await ensureConnection();
     const processEvidence = Number.isSafeInteger(target.child.pid) && target.child.pid > 0
@@ -2645,6 +2778,8 @@ export function createCodexAppServerAdapter({
       terminal_status: null,
       last_provider_failure: null,
       side_effect_observed: false,
+      workspace_binding: workspaceBinding,
+      workspace_root: workspaceBinding.workspace_root,
     };
     inFlightTurnStarts.add(run);
     let executionTimeout = null;
@@ -2677,7 +2812,7 @@ export function createCodexAppServerAdapter({
       const result = await sendRequest(target, 'turn/start', {
         threadId,
         input: [{ type: 'text', text: context.input.text }],
-        cwd: effectiveCwd,
+        cwd: run.workspace_root,
         approvalPolicy: providerApprovalPolicy,
         approvalsReviewer: 'user',
         sandboxPolicy: providerSandboxPolicy,
