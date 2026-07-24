@@ -38,7 +38,7 @@ export function resolveCodexExecutionPolicy(environment = process.env) {
 export function createConfiguredProviderAdapter({ provider, zylosDir, environment = process.env }) {
   if (provider === 'claude') {
     return createClaudeConversationAdapter({
-      queryOptions: { cwd: zylosDir, env: environment },
+      queryOptions: { env: environment },
     });
   }
   if (provider === 'codex') {

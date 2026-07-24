@@ -1232,10 +1232,15 @@ export function createExecutorService({
             committedControlStatus(activeRun) !== null
             || activeRun.durableSettled
             || activeRuns.get(turnContext.turn_id) !== activeRun
-            || approvalFence.provider_thread_id !== activeRun.currentProviderNativeId
+            || (
+              approvalFence.action_kind !== 'claude_tool_write'
+              && approvalFence.provider_thread_id !== activeRun.currentProviderNativeId
+            )
           )
         ) {
-          const error = new Error('The Codex approval no longer matches the active provider run.');
+          const error = new Error(
+            'The provider write approval no longer matches the active provider run.',
+          );
           error.code = 'stale_attempt';
           throw error;
         }
@@ -1310,14 +1315,29 @@ export function createExecutorService({
   }
 
   function reserveWithWorkspace({ markCapacityWait = true } = {}) {
+    function resolveWorkspaceAccess(candidate) {
+      const binding = store.resolveConversationWorkspaceBinding(
+        candidate.conversation_id,
+        { legacyWorkspaceRoot: workspaceRoot },
+      );
+      if (binding.claimable === false) return binding;
+      return resolveProviderWorkspaceAccess(adapter, {
+        conversation_id: candidate.conversation_id,
+        turn_id: candidate.turn_id ?? null,
+        provider,
+      }, {
+        authoritativeRoot: binding.workspace_root,
+        bindingKind: binding.binding_kind,
+        defaultRoot: workspaceRoot,
+        workspaceGeneration: binding.workspace_generation,
+        workspaceId: binding.workspace_id,
+        workspaceState: binding.workspace_state,
+      });
+    }
     const workspaceAccessByConversation = new Map(
       store.listWorkspaceReservationCandidates().map((candidate) => [
         candidate.conversation_id,
-        resolveProviderWorkspaceAccess(adapter, {
-          conversation_id: candidate.conversation_id,
-          turn_id: candidate.turn_id,
-          provider,
-        }, { defaultRoot: workspaceRoot }),
+        resolveWorkspaceAccess(candidate),
       ]),
     );
     return {
@@ -1327,6 +1347,7 @@ export function createExecutorService({
         workspaceAccessByConversation,
       }),
       workspaceAccessByConversation,
+      resolveWorkspaceAccess,
     };
   }
 
@@ -1443,13 +1464,14 @@ export function createExecutorService({
     try {
       turnContext = store.claimNextQueuedTurn({
         conversationId: reservation.conversation_id,
+        legacyWorkspaceRoot: workspaceRoot,
         requireResident: provider === 'claude',
         workspaceAccess: reserved.workspaceAccessByConversation.get(
           reservation.conversation_id,
-        ) ?? resolveProviderWorkspaceAccess(adapter, {
+        ) ?? reserved.resolveWorkspaceAccess({
           conversation_id: reservation.conversation_id,
-          provider,
-        }, { defaultRoot: workspaceRoot }),
+          turn_id: null,
+        }),
         workspaceLease: reservation.workspace ?? null,
       });
     } catch (error) {
