@@ -8,10 +8,11 @@ It does not change the provider-neutral Core contracts or the migration consensu
 
 Each executor-service adapter instance supervises one locked-down `codex app-server` process group
 and multiplexes logical conversation executors over its newline-delimited bidirectional protocol.
-Before app-server starts, the adapter disables hooks, code-mode hosting, image generation, and
-multi-agent execution at the process layer. It deliberately preserves the effective Codex MCP,
-plugin, and app configuration, so every server that was already `enabled=true` remains available;
-servers disabled by the user's configuration stay disabled.
+Before app-server starts, the adapter disables hooks, code-mode hosting, and multi-agent execution
+at the process layer. Image generation remains enabled and is admitted only through its fixed
+app-server item lifecycle and Core-owned bounded artifact path. The adapter deliberately preserves
+the effective Codex MCP, plugin, and app configuration, so every server that was already
+`enabled=true` remains available; servers disabled by the user's configuration stay disabled.
 The child, connection, in-memory thread, request IDs, and active turn handles are not durable
 authority. Core's persisted lineage, turn, attempt, lease, interaction, and handoff records remain
 authoritative.
@@ -54,7 +55,8 @@ Private app-server method and item names remain inside the adapter:
 | `item/agentMessage/delta` and completed agent message | `text_delta` and `text_snapshot` |
 | command and file lifecycle | `tool_started`, `tool_progress`, `tool_finished`; item IDs, progress methods, and fixed-version statuses are fenced by type |
 | MCP tool lifecycle | `tool_started`, optional `tool_progress`, and `tool_finished`; normal MCP items do not cause an unsupported-capability recovery |
-| dynamic, collaboration, web, image, or provider-hook lifecycle | capability failure; these paths remain disabled because they are outside the authorized MCP exception |
+| image-generation lifecycle | `tool_started` and `tool_finished`; completion requires the fenced completed notification plus a bounded valid PNG result, even when a compatible proxy leaves the item status as `generating` |
+| dynamic, collaboration, web, or provider-hook lifecycle | capability failure; these paths remain disabled because they are outside the authorized MCP exception |
 | completed turn | adapter iterator completion; Core authors the canonical completed state |
 | failed/interrupted turn, error notification, or lost connection | typed provider failure; Core authors the canonical failure or recovery state |
 | fenced token-usage and moderation telemetry | intentionally omitted because the public normalized-event contract has no usage/score event and private provider scores must not escape the adapter |
@@ -119,14 +121,26 @@ The read-only OS sandbox is the enforcement layer that prevents the built-in she
 paths from writing before that response. An empty thread-level `mcp_servers` object is deliberately
 not sent: Codex 0.144.5 merges that object with inherited configuration instead of replacing it.
 The adapter now relies on that inheritance so effective enabled MCP and plugin-provided servers are
-loaded normally. Hooks, code mode, browser, computer use, image generation, web search,
-collaboration/subagents, and permission-request tools remain disabled outside MCP. Both legacy and
-v2/fanout/collaboration-mode multi-agent feature keys are disabled so an inherited local
-configuration cannot reopen those unrelated execution surfaces. An unexpected hook,
-dynamic/collaboration/web/image item, dynamic tool server request, permission-profile request, or
+loaded normally. Hooks, code mode, browser, computer use, web search, collaboration/subagents, and
+permission-request tools remain disabled outside MCP. Image generation is explicitly enabled. Its
+started and completed notifications remain fenced to
+the current connection/thread/turn/attempt; writable runs reopen the Core workspace lease at both
+boundaries. A completed result is decoded only within the configured size bound, must be a
+canonical PNG, and is persisted atomically under
+`$ZYLOS_DIR/runtime/artifacts/codex-image-generation/<sha256>.png`. A non-null provider
+`savedPath` must be a regular, non-symlink file inside the current workspace and match the returned
+PNG bytes. Tool events contain only bounded artifact metadata and never the base64 result.
+Both legacy and v2/fanout/collaboration-mode multi-agent feature keys are disabled so an inherited
+local configuration cannot reopen those unrelated execution surfaces. An unexpected hook,
+dynamic/collaboration/web item, dynamic tool server request, permission-profile request, or
 malformed MCP elicitation is refused and retires the
 connection; its item-start notification is only contradiction evidence, never claimed as the
 pre-action fence.
+
+The public normalized tool-event and delivery-command contracts do not yet carry a typed media
+artifact. The current implementation therefore completes only the Codex/Core internal image
+artifact lifecycle. Feishu/Lark image rendering and upload require a separate provider-neutral
+artifact/media delivery contract and are not inferred from a local path or added in this repository.
 
 Official 0.144.5 source does contain a conditional blocking seam for a model-initiated MCP tool
 when every server/tool uses prompt approval, review reaches app-server, no hook, Guardian, or cache
@@ -191,7 +205,8 @@ Deterministic tests inject the child process and stdio streams and cover handsha
 single-process multiplexing, thread binding/resume/reconnect, provider-start and text/tool
 normalization, every supported bidirectional interaction family, provider acknowledgement and
 request-ID tombstones, bounded and confirmed timeout interruption, terminal race tombstones,
-transport loss, stale request/answer/output fences, process-group escalation, and the rule that
+transport loss, stale request/answer/output fences, bounded PNG artifacts, image status
+compatibility, saved-path containment, base64 redaction, process-group escalation, and the rule that
 neither a surviving group nor an iterator return can release recovering authority. The
 current app-server protocol returns all questions in
 one JSON-RPC response, while Core requires each question to have a unique interaction and forbids

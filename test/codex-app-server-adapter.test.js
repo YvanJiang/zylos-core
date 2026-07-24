@@ -10,6 +10,10 @@ import { describe, expect, jest, test } from '@jest/globals';
 
 import { createCodexAppServerAdapter } from '../runtime/providers/codex-app-server-adapter.js';
 
+const ONE_PIXEL_PNG_BASE64 =
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+const ONE_PIXEL_PNG_SHA256 = '431ced6916a2a21a156e38701afe55bbd7f88969fbbfc56d7fe099d47f265460';
+
 function createFakeAppServer({
   afterThreadResume,
   afterTurnStart,
@@ -706,7 +710,6 @@ describe('Codex app-server provider adapter', () => {
         'app-server',
         '--disable', 'hooks',
         '--disable', 'code_mode_host',
-        '--disable', 'image_generation',
         '--disable', 'multi_agent',
         '--stdio',
       ]),
@@ -747,12 +750,13 @@ describe('Codex app-server provider adapter', () => {
             collaboration_modes: false,
             multi_agent_mode: false,
             code_mode: false,
-            image_generation: false,
             request_permissions: false,
           }),
         }),
       }),
     }));
+    expect(spawnProcess.mock.calls[0][1]).not.toContain('image_generation');
+    expect(server.received[2].params.config.features).not.toHaveProperty('image_generation');
     expect(server.received[2].params.config).not.toHaveProperty('mcp_servers');
     expect(context.bindProviderNativeId).toHaveBeenCalledWith('codex-thread-1');
     expect(context.reportProviderState).toHaveBeenCalledWith({
@@ -851,7 +855,6 @@ enabled = false
           'app-server',
           '--disable', 'hooks',
           '--disable', 'code_mode_host',
-          '--disable', 'image_generation',
           '--disable', 'multi_agent',
           '--stdio',
         ],
@@ -864,6 +867,7 @@ enabled = false
       expect(threadStart.params.config.features).not.toHaveProperty('plugins');
       expect(threadStart.params.config.features).not.toHaveProperty('tool_call_mcp_elicitation');
       expect(threadStart.params.config.features).not.toHaveProperty('tool_search');
+      expect(threadStart.params.config.features).not.toHaveProperty('image_generation');
     } finally {
       await adapter.close();
       fs.rmSync(codexHome, { recursive: true, force: true });
@@ -1303,6 +1307,432 @@ enabled = false
     expect(JSON.stringify(server.received)).not.toContain('exec --json');
   });
 
+  test('persists a bounded image artifact when the completed item still says generating', async () => {
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-image-artifact-'));
+    const workspaceDirectory = path.join(zylosDir, 'workspace');
+    const providerSavedPath = path.join(workspaceDirectory, 'generated', 'provider-image.png');
+    fs.mkdirSync(path.dirname(providerSavedPath), { recursive: true });
+    fs.writeFileSync(providerSavedPath, Buffer.from(ONE_PIXEL_PNG_BASE64, 'base64'));
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'item/started',
+          params: {
+            threadId,
+            turnId,
+            startedAtMs: 1,
+            item: {
+              type: 'imageGeneration',
+              id: 'image-1',
+              result: '',
+              status: 'generating',
+              savedPath: null,
+              revisedPrompt: null,
+            },
+          },
+        });
+        send({
+          method: 'item/completed',
+          params: {
+            threadId,
+            turnId,
+            completedAtMs: 2,
+            item: {
+              type: 'imageGeneration',
+              id: 'image-1',
+              result: ONE_PIXEL_PNG_BASE64,
+              status: 'generating',
+              savedPath: providerSavedPath,
+              revisedPrompt: 'A revised one-pixel image prompt.',
+            },
+          },
+        });
+        send({
+          method: 'turn/completed',
+          params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      cwd: workspaceDirectory,
+      env: { HOME: os.homedir(), ZYLOS_DIR: zylosDir },
+      spawnProcess: () => server.child,
+    });
+
+    try {
+      const events = await collect(executeAdapter(adapter, executionContext()));
+      expect(events[0]).toEqual({
+        kind: 'tool_started',
+        provider_native_id: 'codex-thread-1',
+        payload: {
+          tool_use_id: 'image-1',
+          tool_name: 'image_generation',
+          summary: 'Image generation started.',
+          side_effect_status: 'unknown',
+        },
+      });
+      expect(events[1]).toEqual(expect.objectContaining({
+        kind: 'tool_finished',
+        provider_native_id: 'codex-thread-1',
+        payload: expect.objectContaining({
+          tool_use_id: 'image-1',
+          tool_name: 'image_generation',
+          side_effect_status: 'known',
+        }),
+      }));
+      const metadata = JSON.parse(
+        events[1].payload.summary.slice('Image generation completed: '.length),
+      );
+      expect(metadata).toEqual({
+        artifact_path: path.join(
+          zylosDir,
+          'runtime',
+          'artifacts',
+          'codex-image-generation',
+          `${ONE_PIXEL_PNG_SHA256}.png`,
+        ),
+        mime_type: 'image/png',
+        byte_size: 68,
+        sha256: ONE_PIXEL_PNG_SHA256,
+        provider_status: 'generating',
+        provider_saved_path: providerSavedPath,
+        revised_prompt: 'A revised one-pixel image prompt.',
+      });
+      expect(fs.readFileSync(metadata.artifact_path)).toEqual(
+        Buffer.from(ONE_PIXEL_PNG_BASE64, 'base64'),
+      );
+      expect(JSON.stringify(events)).not.toContain(ONE_PIXEL_PNG_BASE64);
+    } finally {
+      await adapter.close();
+      fs.rmSync(zylosDir, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects an explicitly failed image item even when it carries PNG bytes', async () => {
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-image-failed-'));
+    const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'item/started',
+          params: {
+            threadId,
+            turnId,
+            startedAtMs: 1,
+            item: {
+              type: 'imageGeneration',
+              id: 'image-failed',
+              result: '',
+              status: 'generating',
+            },
+          },
+        });
+        send({
+          method: 'item/completed',
+          params: {
+            threadId,
+            turnId,
+            completedAtMs: 2,
+            item: {
+              type: 'imageGeneration',
+              id: 'image-failed',
+              result: ONE_PIXEL_PNG_BASE64,
+              status: 'failed',
+            },
+          },
+        });
+        send({
+          method: 'turn/completed',
+          params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      cwd: '/workspace',
+      env: { ZYLOS_DIR: zylosDir },
+      spawnProcess: () => server.child,
+    });
+
+    try {
+      await expect(collect(executeAdapter(adapter, executionContext({ reportProviderFailure }))))
+        .rejects.toMatchObject({
+          code: 'provider_protocol_invalid',
+          providerError: { code: 'side_effect_unknown' },
+        });
+      expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(path.join(zylosDir, 'runtime', 'artifacts'))).toBe(false);
+    } finally {
+      await adapter.close();
+      fs.rmSync(zylosDir, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    [
+      'non-PNG bytes',
+      { result: Buffer.from('not a png', 'utf8').toString('base64') },
+      {},
+      'provider_protocol_invalid',
+    ],
+    [
+      'a non-PNG data URL',
+      { result: `data:image/jpeg;base64,${ONE_PIXEL_PNG_BASE64}` },
+      {},
+      'provider_protocol_invalid',
+    ],
+    [
+      'an oversized result',
+      { result: Buffer.alloc(33, 1).toString('base64') },
+      { maxImageArtifactBytes: 32 },
+      'unsupported_capability',
+    ],
+    [
+      'a missing result',
+      { result: undefined },
+      {},
+      'provider_protocol_invalid',
+    ],
+    [
+      'a saved path that escapes the workspace',
+      {
+        result: ONE_PIXEL_PNG_BASE64,
+        savedPath: '/workspace/../private/provider-image.png',
+      },
+      {},
+      'provider_protocol_invalid',
+    ],
+    [
+      'an oversized revised prompt',
+      {
+        result: ONE_PIXEL_PNG_BASE64,
+        revisedPrompt: 'x'.repeat(8_001),
+      },
+      {},
+      'provider_protocol_invalid',
+    ],
+  ])('fails closed for image generation with %s', async (
+    _label,
+    completedPatch,
+    adapterOptions,
+    expectedCode,
+  ) => {
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-image-invalid-'));
+    const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
+    const completedItem = {
+      type: 'imageGeneration',
+      id: 'image-invalid',
+      result: ONE_PIXEL_PNG_BASE64,
+      status: 'completed',
+      ...completedPatch,
+    };
+    if (completedPatch.result === undefined) delete completedItem.result;
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'item/started',
+          params: {
+            threadId,
+            turnId,
+            startedAtMs: 1,
+            item: {
+              type: 'imageGeneration',
+              id: 'image-invalid',
+              result: '',
+              status: 'generating',
+            },
+          },
+        });
+        send({
+          method: 'item/completed',
+          params: {
+            threadId,
+            turnId,
+            completedAtMs: 2,
+            item: completedItem,
+          },
+        });
+        send({
+          method: 'turn/completed',
+          params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      cwd: '/workspace',
+      env: { ZYLOS_DIR: zylosDir },
+      spawnProcess: () => server.child,
+      ...adapterOptions,
+    });
+
+    try {
+      await expect(collect(executeAdapter(adapter, executionContext({ reportProviderFailure }))))
+        .rejects.toMatchObject({
+          code: expectedCode,
+          providerError: {
+            code: expectedCode === 'unsupported_capability'
+              ? 'unsupported_capability'
+              : 'side_effect_unknown',
+            side_effect_status: 'unknown',
+          },
+        });
+      expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(path.join(zylosDir, 'runtime', 'artifacts'))).toBe(false);
+    } finally {
+      await adapter.close();
+      fs.rmSync(zylosDir, { recursive: true, force: true });
+    }
+  });
+
+  test('maps an unsafe artifact root to side-effect-unknown without retaining base64 diagnostics', async () => {
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-image-root-'));
+    const realArtifactDirectory = path.join(zylosDir, 'real-artifacts');
+    const linkedArtifactDirectory = path.join(zylosDir, 'linked-artifacts');
+    fs.mkdirSync(realArtifactDirectory);
+    fs.symlinkSync(realArtifactDirectory, linkedArtifactDirectory, 'dir');
+    const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'item/started',
+          params: {
+            threadId,
+            turnId,
+            startedAtMs: 1,
+            item: {
+              type: 'imageGeneration',
+              id: 'image-unsafe-root',
+              result: '',
+              status: 'generating',
+            },
+          },
+        });
+        send({
+          method: 'item/completed',
+          params: {
+            threadId,
+            turnId,
+            completedAtMs: 2,
+            item: {
+              type: 'imageGeneration',
+              id: 'image-unsafe-root',
+              result: ONE_PIXEL_PNG_BASE64,
+              status: 'completed',
+            },
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      imageArtifactDirectory: linkedArtifactDirectory,
+      spawnProcess: () => server.child,
+    });
+
+    try {
+      let failure;
+      try {
+        await collect(executeAdapter(adapter, executionContext({ reportProviderFailure })));
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toMatchObject({
+        code: 'side_effect_unknown',
+        providerError: {
+          code: 'side_effect_unknown',
+          side_effect_status: 'unknown',
+        },
+      });
+      expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+      const diagnostics = JSON.stringify({
+        message: failure.message,
+        code: failure.code,
+        providerError: failure.providerError,
+        reported: reportProviderFailure.mock.calls.map(([error]) => ({
+          message: error.message,
+          code: error.code,
+          providerError: error.providerError,
+        })),
+      });
+      expect(diagnostics).not.toContain(ONE_PIXEL_PNG_BASE64);
+      expect(fs.readdirSync(realArtifactDirectory)).toEqual([]);
+    } finally {
+      await adapter.close();
+      fs.rmSync(zylosDir, { recursive: true, force: true });
+    }
+  });
+
+  test('reopens the workspace fence before persisting a completed image', async () => {
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-image-fence-'));
+    const staleLease = new Error('workspace lease expired before image completion');
+    let fenceChecks = 0;
+    const controls = workspaceControls({
+      assertWorkspaceWrite: jest.fn(() => {
+        fenceChecks += 1;
+        if (fenceChecks === 6) throw staleLease;
+        return { status: 'current' };
+      }),
+    });
+    const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'item/started',
+          params: {
+            threadId,
+            turnId,
+            startedAtMs: 1,
+            item: {
+              type: 'imageGeneration',
+              id: 'image-stale-fence',
+              result: '',
+              status: 'generating',
+            },
+          },
+        });
+        send({
+          method: 'item/completed',
+          params: {
+            threadId,
+            turnId,
+            completedAtMs: 2,
+            item: {
+              type: 'imageGeneration',
+              id: 'image-stale-fence',
+              result: ONE_PIXEL_PNG_BASE64,
+              status: 'completed',
+            },
+          },
+        });
+        send({
+          method: 'turn/completed',
+          params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      cwd: '/workspace',
+      env: { ZYLOS_DIR: zylosDir },
+      spawnProcess: () => server.child,
+    });
+
+    try {
+      await expect(collect(executeAdapter(
+        adapter,
+        executionContext({ reportProviderFailure }),
+        controls,
+      ))).rejects.toMatchObject({
+        code: 'provider_connection_lost',
+        cause: staleLease,
+        providerError: { side_effect_status: 'unknown' },
+      });
+      expect(controls.assertWorkspaceWrite).toHaveBeenCalledTimes(6);
+      expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(path.join(zylosDir, 'runtime', 'artifacts'))).toBe(false);
+    } finally {
+      await adapter.close();
+      fs.rmSync(zylosDir, { recursive: true, force: true });
+    }
+  });
+
   test('buffers whitespace-only agent deltas until displayable text arrives', async () => {
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
@@ -1726,7 +2156,6 @@ enabled = false
     'dynamicToolCall',
     'collabAgentToolCall',
     'webSearch',
-    'imageGeneration',
   ])('fails closed if disabled %s execution appears despite the locked thread config', async (type) => {
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {

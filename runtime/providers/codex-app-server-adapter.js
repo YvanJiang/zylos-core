@@ -1,4 +1,6 @@
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 
@@ -33,11 +35,21 @@ const DEFAULT_ENV_ALLOWLIST = Object.freeze([
   'no_proxy',
 ]);
 const DEFAULT_TURN_EXECUTION_TIMEOUT_MS = 600_000;
+const DEFAULT_MAX_IMAGE_ARTIFACT_BYTES = 20 * 1024 * 1024;
+const MAX_IMAGE_REVISED_PROMPT_LENGTH = 8_000;
+const PNG_DATA_URL_PREFIX = 'data:image/png;base64,';
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const IMAGE_FAILURE_STATUSES = Object.freeze(new Set([
+  'cancelled',
+  'canceled',
+  'declined',
+  'error',
+  'failed',
+]));
 
 const APP_SERVER_FEATURE_DISABLES = Object.freeze([
   'hooks',
   'code_mode_host',
-  'image_generation',
   'multi_agent',
 ]);
 
@@ -391,7 +403,6 @@ const DISABLED_SIDE_EFFECT_TOOL_TYPES = Object.freeze(new Set([
   'dynamicToolCall',
   'collabAgentToolCall',
   'webSearch',
-  'imageGeneration',
 ]));
 const APP_SERVER_LOCKDOWN_CONFIG = Object.freeze({
   web_search: 'disabled',
@@ -403,7 +414,6 @@ const APP_SERVER_LOCKDOWN_CONFIG = Object.freeze({
     enable_fanout: false,
     exec_permission_approvals: false,
     hooks: false,
-    image_generation: false,
     in_app_browser: false,
     multi_agent: false,
     multi_agent_mode: false,
@@ -530,6 +540,282 @@ function toolDescriptor(run, itemId, specification, kind, verb) {
   };
 }
 
+function isPathInside(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative.length > 0
+    && relative !== '..'
+    && !relative.startsWith(`..${path.sep}`)
+    && !path.isAbsolute(relative);
+}
+
+function validateProviderSavedPath(value, workspaceRoot) {
+  if (value === undefined || value === null) return null;
+  if (
+    typeof value !== 'string'
+    || value.length === 0
+    || value.length > 4_096
+    || value.includes('\0')
+    || !path.isAbsolute(value)
+  ) {
+    rejectProtocol('Codex app-server emitted an invalid image saved path.');
+  }
+  const normalized = path.resolve(value);
+  if (!isPathInside(path.resolve(workspaceRoot), normalized)) {
+    rejectProtocol('Codex app-server emitted an image saved path outside the workspace.');
+  }
+  return normalized;
+}
+
+function validateProviderSavedArtifact(filePath, workspaceRoot, expectedBytes, maxBytes) {
+  if (filePath === null) return;
+  let descriptor = null;
+  try {
+    const workspaceRealPath = fs.realpathSync(workspaceRoot);
+    const fileStat = fs.lstatSync(filePath);
+    const fileRealPath = fs.realpathSync(filePath);
+    if (
+      fileStat.isSymbolicLink()
+      || !fileStat.isFile()
+      || !isPathInside(workspaceRealPath, fileRealPath)
+    ) {
+      rejectProtocol('Codex app-server emitted an unsafe image saved artifact.');
+    }
+    if (fileStat.size > maxBytes) {
+      rejectProtocol(
+        'Codex app-server saved image exceeds the configured artifact size limit.',
+        'unsupported_capability',
+      );
+    }
+    descriptor = fs.openSync(
+      filePath,
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0),
+    );
+    const openedStat = fs.fstatSync(descriptor);
+    const savedBytes = fs.readFileSync(descriptor);
+    if (
+      !openedStat.isFile()
+      || openedStat.size !== fileStat.size
+      || !savedBytes.equals(expectedBytes)
+    ) {
+      rejectProtocol('Codex app-server saved image does not match its completed result.');
+    }
+  } catch (cause) {
+    if (cause instanceof CodexAppServerAdapterError) throw cause;
+    rejectProtocol('Codex app-server emitted an unreadable image saved artifact.');
+  } finally {
+    if (descriptor !== null) fs.closeSync(descriptor);
+  }
+}
+
+function isWellFormedUnicode(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return false;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function validateRevisedPrompt(value) {
+  if (value === undefined || value === null) return null;
+  if (
+    typeof value !== 'string'
+    || value.length > MAX_IMAGE_REVISED_PROMPT_LENGTH
+    || !isWellFormedUnicode(value)
+  ) {
+    rejectProtocol('Codex app-server emitted an invalid image revised prompt.');
+  }
+  return value;
+}
+
+function maximumBase64Length(maxBytes) {
+  return Math.ceil(maxBytes / 3) * 4;
+}
+
+function decodePngResult(result, maxBytes) {
+  if (typeof result !== 'string' || result.length === 0) {
+    rejectProtocol('Codex app-server completed image generation without an image result.');
+  }
+  const encoded = result.startsWith(PNG_DATA_URL_PREFIX)
+    ? result.slice(PNG_DATA_URL_PREFIX.length)
+    : result;
+  if (encoded.length === 0 || encoded.length > maximumBase64Length(maxBytes)) {
+    rejectProtocol(
+      'Codex app-server image result exceeds the configured artifact size limit.',
+      'unsupported_capability',
+    );
+  }
+  if (
+    encoded.length % 4 !== 0
+    || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)
+  ) {
+    rejectProtocol('Codex app-server emitted an invalid base64 image result.');
+  }
+  const bytes = Buffer.from(encoded, 'base64');
+  if (bytes.length > maxBytes) {
+    rejectProtocol(
+      'Codex app-server image result exceeds the configured artifact size limit.',
+      'unsupported_capability',
+    );
+  }
+  if (bytes.length === 0 || bytes.toString('base64') !== encoded) {
+    rejectProtocol('Codex app-server emitted a non-canonical image result.');
+  }
+  const hasPngStructure = bytes.length >= 33
+    && bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)
+    && bytes.readUInt32BE(8) === 13
+    && bytes.subarray(12, 16).toString('ascii') === 'IHDR'
+    && bytes.readUInt32BE(bytes.length - 12) === 0
+    && bytes.subarray(bytes.length - 8, bytes.length - 4).toString('ascii') === 'IEND';
+  if (!hasPngStructure) {
+    rejectProtocol('Codex app-server emitted an image result without a valid PNG structure.');
+  }
+  return bytes;
+}
+
+function resolveImageArtifactDirectory(env, configuredDirectory) {
+  if (configuredDirectory !== undefined) return configuredDirectory;
+  const zylosRoot = typeof env.ZYLOS_DIR === 'string' && path.isAbsolute(env.ZYLOS_DIR)
+    ? env.ZYLOS_DIR
+    : typeof env.HOME === 'string' && path.isAbsolute(env.HOME)
+      ? path.join(env.HOME, 'zylos')
+      : null;
+  return zylosRoot === null
+    ? null
+    : path.join(zylosRoot, 'runtime', 'artifacts', 'codex-image-generation');
+}
+
+function verifyExistingImageArtifact(filePath, expectedBytes) {
+  const stat = fs.lstatSync(filePath);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== expectedBytes.length) return false;
+  return fs.readFileSync(filePath).equals(expectedBytes);
+}
+
+function persistImageArtifact(bytes, artifactDirectory) {
+  if (artifactDirectory === null) {
+    throw new CodexAppServerAdapterError(
+      'unsupported_capability',
+      'Codex image generation requires a configured Core artifact directory.',
+    );
+  }
+  const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+  const filePath = path.join(artifactDirectory, `${sha256}.png`);
+  let temporaryPath = null;
+  let descriptor = null;
+  try {
+    fs.mkdirSync(artifactDirectory, { recursive: true, mode: 0o700 });
+    const directoryStat = fs.lstatSync(artifactDirectory);
+    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+      throw new Error('Artifact root is not a direct directory.');
+    }
+    if (!isPathInside(artifactDirectory, filePath)) {
+      throw new Error('Artifact path escaped its configured root.');
+    }
+    if (fs.existsSync(filePath)) {
+      if (!verifyExistingImageArtifact(filePath, bytes)) {
+        throw new Error('Existing artifact does not match its content hash.');
+      }
+      return { artifact_path: filePath, byte_size: bytes.length, sha256 };
+    }
+    temporaryPath = path.join(
+      artifactDirectory,
+      `.${sha256}.${process.pid}.${crypto.randomUUID()}.tmp`,
+    );
+    descriptor = fs.openSync(temporaryPath, 'wx', 0o600);
+    fs.writeFileSync(descriptor, bytes);
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = null;
+    try {
+      fs.linkSync(temporaryPath, filePath);
+    } catch (cause) {
+      if (cause?.code !== 'EEXIST' || !verifyExistingImageArtifact(filePath, bytes)) throw cause;
+    }
+    fs.unlinkSync(temporaryPath);
+    temporaryPath = null;
+    return { artifact_path: filePath, byte_size: bytes.length, sha256 };
+  } catch (cause) {
+    if (descriptor !== null) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {
+        // The primary bounded artifact failure remains authoritative.
+      }
+    }
+    if (temporaryPath !== null) {
+      try {
+        fs.unlinkSync(temporaryPath);
+      } catch {
+        // The artifact root is owner-only and future writes use unique names.
+      }
+    }
+    throw new CodexAppServerAdapterError(
+      'side_effect_unknown',
+      'Codex image generation completed but its artifact could not be persisted safely.',
+      { cause },
+    );
+  }
+}
+
+function validateImageStatus(value, { completed }) {
+  if (
+    typeof value !== 'string'
+    || !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(value)
+    || (completed && IMAGE_FAILURE_STATUSES.has(value.toLowerCase()))
+  ) {
+    rejectProtocol(`Codex app-server emitted an invalid image generation ${completed ? 'completion' : 'start'} status.`);
+  }
+  return value;
+}
+
+function validateStartedImageItem(item, workspaceRoot, maxBytes) {
+  if (
+    typeof item.result !== 'string'
+    || item.result.length > maximumBase64Length(maxBytes) + PNG_DATA_URL_PREFIX.length
+  ) {
+    rejectProtocol('Codex app-server emitted an invalid image generation start.');
+  }
+  validateImageStatus(item.status, { completed: false });
+  validateProviderSavedPath(item.savedPath, workspaceRoot);
+  validateRevisedPrompt(item.revisedPrompt);
+}
+
+function completeImageItem(item, workspaceRoot, artifactDirectory, maxBytes) {
+  const providerStatus = validateImageStatus(item.status, { completed: true });
+  const providerSavedPath = validateProviderSavedPath(item.savedPath, workspaceRoot);
+  const revisedPrompt = validateRevisedPrompt(item.revisedPrompt);
+  const bytes = decodePngResult(item.result, maxBytes);
+  validateProviderSavedArtifact(providerSavedPath, workspaceRoot, bytes, maxBytes);
+  const artifact = persistImageArtifact(bytes, artifactDirectory);
+  return {
+    artifact_path: artifact.artifact_path,
+    mime_type: 'image/png',
+    byte_size: artifact.byte_size,
+    sha256: artifact.sha256,
+    provider_status: providerStatus,
+    provider_saved_path: providerSavedPath,
+    revised_prompt: revisedPrompt,
+  };
+}
+
+function completedImageDescriptor(run, item, metadata) {
+  return {
+    kind: 'tool_finished',
+    provider_native_id: run.thread_id,
+    payload: {
+      tool_use_id: item.id,
+      tool_name: 'image_generation',
+      summary: `Image generation completed: ${JSON.stringify(metadata)}`,
+      side_effect_status: 'known',
+    },
+  };
+}
+
 function textSnapshot(run) {
   return run.text_item_order.map((itemId) => run.text_by_item.get(itemId) ?? '').join('');
 }
@@ -642,6 +928,8 @@ export function createCodexAppServerAdapter({
   interruptConfirmationTimeoutMs = 5_000,
   processTerminationGraceMs = 5_000,
   maxConnectionFenceEntries = 4_096,
+  imageArtifactDirectory,
+  maxImageArtifactBytes = DEFAULT_MAX_IMAGE_ARTIFACT_BYTES,
   signalProcessGroup = signalSupervisedProcessGroup,
   isProcessGroupAlive = supervisedProcessGroupIsAlive,
   setTimeoutFn = setTimeout,
@@ -682,6 +970,15 @@ export function createCodexAppServerAdapter({
   if (!Number.isSafeInteger(maxConnectionFenceEntries) || maxConnectionFenceEntries <= 0) {
     throw new TypeError('maxConnectionFenceEntries must be a positive safe integer');
   }
+  if (
+    imageArtifactDirectory !== undefined
+    && (typeof imageArtifactDirectory !== 'string' || !path.isAbsolute(imageArtifactDirectory))
+  ) {
+    throw new TypeError('imageArtifactDirectory must be an absolute path when provided');
+  }
+  if (!Number.isSafeInteger(maxImageArtifactBytes) || maxImageArtifactBytes <= 0) {
+    throw new TypeError('maxImageArtifactBytes must be a positive safe integer');
+  }
   if (typeof signalProcessGroup !== 'function' || typeof isProcessGroupAlive !== 'function') {
     throw new TypeError('process-group supervision functions must be callable');
   }
@@ -701,6 +998,10 @@ export function createCodexAppServerAdapter({
 
   const childEnvironment = selectEnvironment(env, envAllowlist);
   const effectiveCwd = cwd ?? process.cwd();
+  const effectiveImageArtifactDirectory = resolveImageArtifactDirectory(
+    env,
+    imageArtifactDirectory,
+  );
   const workspaceAccess = Object.freeze({
     root: effectiveCwd,
     mode: sandbox === 'read-only' ? 'read_only' : 'writable',
@@ -1092,14 +1393,22 @@ export function createCodexAppServerAdapter({
           ));
           return;
         }
+        if (item.type === 'imageGeneration') {
+          validateStartedImageItem(item, effectiveCwd, maxImageArtifactBytes);
+        }
         if (
           item.type === 'fileChange'
-          || (item.type === 'commandExecution' && workspaceAccess.mode === 'writable')
+          || (
+            workspaceAccess.mode === 'writable'
+            && ['commandExecution', 'imageGeneration'].includes(item.type)
+          )
         ) {
           assertWorkspaceWriteOrFail(target, run.controls, run);
         }
         run.tool_items.set(item.id, {
-          item: structuredClone(item),
+          item: item.type === 'imageGeneration'
+            ? { id: item.id, status: item.status, type: item.type }
+            : structuredClone(item),
           specification,
         });
         if (specification.sideEffect !== 'none') run.side_effect_observed = true;
@@ -1168,6 +1477,20 @@ export function createCodexAppServerAdapter({
             'provider_protocol_invalid',
             'Codex app-server completed a tool that was not started.',
           ));
+          return;
+        }
+        if (item.type === 'imageGeneration') {
+          if (workspaceAccess.mode === 'writable') {
+            assertWorkspaceWriteOrFail(target, run.controls, run);
+          }
+          const metadata = completeImageItem(
+            item,
+            effectiveCwd,
+            effectiveImageArtifactDirectory,
+            maxImageArtifactBytes,
+          );
+          run.queue.push(completedImageDescriptor(run, item, metadata));
+          run.tool_items.delete(item.id);
           return;
         }
         const invalidTerminalStatus = specification.statusMode === 'enum'
