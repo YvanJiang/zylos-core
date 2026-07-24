@@ -12,6 +12,7 @@ import {
 import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { createExecutorService } from '../runtime/executor/service.js';
 import { createPermissionService } from '../runtime/permissions/permission-service.js';
+import { createExecutorStore } from '../runtime/persistence/executor-store.js';
 import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
 import { deliveredResult } from './helpers/delivered-result.js';
 
@@ -237,6 +238,199 @@ describe('Core-owned detached background dispatch', () => {
         text: expectedText,
       },
     });
+    database.close();
+  });
+
+  test('projects a privacy-safe recovery blocker for a cross-origin uncertain workspace lease', async () => {
+    const database = openTestDatabase();
+    const workspaceRoot = fs.realpathSync.native(path.dirname(database.name));
+    const blockerEnvelope = normalEnvelope(
+      'queue-summary-uncertain-blocker',
+      'Private recovery work from another chat',
+    );
+    blockerEnvelope.chat_id = 'chat-dm-private-recovery';
+    const blocker = acceptNormalInbound(database, blockerEnvelope, {
+      now: () => '2026-07-23T00:55:00Z',
+      generateId: deterministicIds('inbound-queue-summary-uncertain-blocker'),
+    });
+    const blockerTask = readBackgroundTask(database, blocker.background_task_id);
+    let clock = '2026-07-23T00:55:00Z';
+    const oldStore = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-queue-summary-orphaned',
+      now: () => clock,
+      generateId: deterministicIds('executor-queue-summary-orphaned'),
+      leaseDurationMs: 1_000,
+      workspaceLeaseDurationMs: 1_000,
+    });
+    const workspaceAccess = {
+      workspace_root: workspaceRoot,
+      mode: 'writable',
+    };
+    const reservation = oldStore.reserveNextExecutor({
+      maxResidentExecutorsPerBot: 1,
+      workspaceAccessByConversation: new Map([[
+        blockerTask.execution_conversation_id,
+        workspaceAccess,
+      ]]),
+    });
+    const blockerContext = oldStore.claimNextQueuedTurn({
+      conversationId: blockerTask.execution_conversation_id,
+      workspaceAccess,
+      workspaceLease: reservation.workspace,
+    });
+    oldStore.transitionTurn(blockerContext, 'starting', 'running');
+    oldStore.transitionTurn(blockerContext, 'running', 'recovering', {
+      reasonCode: 'workspace_lease_expired',
+      recovery: {
+        waitForDecision: true,
+        error: {
+          code: 'workspace_lease_expired',
+          category: 'conflict',
+          retryable: false,
+          side_effect_status: 'unknown',
+          user_message: 'Workspace ownership became uncertain during provider execution.',
+        },
+      },
+    });
+
+    const waiting = acceptDetached(
+      database,
+      'queue-summary-uncertain-waiter',
+      'Generate a customer image',
+      '2026-07-23T00:55:01Z',
+    );
+    clock = '2026-07-23T00:55:02Z';
+    const service = createExecutorService({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-queue-summary-restarted',
+      now: () => clock,
+      generateId: deterministicIds('executor-queue-summary-restarted'),
+      workspaceRoot,
+      adapter: {
+        getWorkspaceAccess() {
+          return {
+            root: workspaceRoot,
+            mode: 'writable',
+            read_only_enforced: false,
+            authority: 'provider_sandbox',
+          };
+        },
+        async *execute() {
+          throw new Error('uncertain workspace waiter must not reach the provider');
+        },
+        async close() {
+          return [blockerTask.execution_conversation_id];
+        },
+      },
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'workspace_wait',
+      turn_id: waiting.background_execution_turn_id,
+      wait_reason: 'workspace_lease',
+      wait_detail: { recovery_required: true },
+    });
+    const projection = database.prepare(`
+      SELECT render_model_json
+      FROM runtime_projection_snapshots
+      WHERE turn_id = ?
+      ORDER BY aggregate_version DESC
+      LIMIT 1
+    `).get(waiting.background_execution_turn_id);
+    const text = JSON.parse(projection.render_model_json).text;
+
+    expect(text).toContain(
+      'Another task is recovering and requires recovery handling before this workspace can be reused.',
+    );
+    expect(text).not.toContain('Running tasks:\n- None');
+    expect(text).not.toContain('Private recovery work from another chat');
+
+    await expect(service.close()).rejects.toThrow(
+      'Workspace recovery must wait for a delivered user notification.',
+    );
+    database.close();
+  });
+
+  test('projects a privacy-safe active blocker for a cross-origin workspace lease', () => {
+    const database = openTestDatabase();
+    const workspaceRoot = fs.realpathSync.native(path.dirname(database.name));
+    const blockerEnvelope = normalEnvelope(
+      'queue-summary-active-blocker',
+      'Private active work from another chat',
+    );
+    blockerEnvelope.chat_id = 'chat-dm-private-active';
+    const blocker = acceptNormalInbound(database, blockerEnvelope, {
+      now: () => '2026-07-23T00:56:00Z',
+      generateId: deterministicIds('inbound-queue-summary-active-blocker'),
+    });
+    const blockerTask = readBackgroundTask(database, blocker.background_task_id);
+    const workspaceAccess = {
+      workspace_root: workspaceRoot,
+      mode: 'writable',
+    };
+    const holderStore = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-queue-summary-active-holder',
+      now: () => '2026-07-23T00:56:00Z',
+      generateId: deterministicIds('executor-queue-summary-active-holder'),
+      workspaceLeaseDurationMs: 60_000,
+    });
+    const holderReservation = holderStore.reserveNextExecutor({
+      maxResidentExecutorsPerBot: 1,
+      workspaceAccessByConversation: new Map([[
+        blockerTask.execution_conversation_id,
+        workspaceAccess,
+      ]]),
+    });
+    const holderContext = holderStore.claimNextQueuedTurn({
+      conversationId: blockerTask.execution_conversation_id,
+      workspaceAccess,
+      workspaceLease: holderReservation.workspace,
+    });
+    holderStore.transitionTurn(holderContext, 'starting', 'running');
+
+    const waiting = acceptDetached(
+      database,
+      'queue-summary-active-waiter',
+      'Prepare another deliverable',
+      '2026-07-23T00:56:01Z',
+    );
+    const waitingTask = readBackgroundTask(database, waiting.background_task_id);
+    const waitingStore = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-queue-summary-active-waiter',
+      now: () => '2026-07-23T00:56:01Z',
+      generateId: deterministicIds('executor-queue-summary-active-waiter'),
+      workspaceLeaseDurationMs: 60_000,
+    });
+    expect(waitingStore.reserveNextExecutor({
+      maxResidentExecutorsPerBot: 1,
+      workspaceAccessByConversation: new Map([[
+        waitingTask.execution_conversation_id,
+        workspaceAccess,
+      ]]),
+    })).toMatchObject({
+      status: 'workspace_wait',
+      turn_id: waiting.background_execution_turn_id,
+      wait_detail: { recovery_required: false },
+    });
+
+    const projection = database.prepare(`
+      SELECT render_model_json
+      FROM runtime_projection_snapshots
+      WHERE turn_id = ?
+      ORDER BY aggregate_version DESC
+      LIMIT 1
+    `).get(waiting.background_execution_turn_id);
+    const text = JSON.parse(projection.render_model_json).text;
+    expect(text).toContain('Another task is currently using this workspace.');
+    expect(text).not.toContain('Running tasks:\n- None');
+    expect(text).not.toContain('Private active work from another chat');
     database.close();
   });
 

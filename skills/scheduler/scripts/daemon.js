@@ -30,6 +30,17 @@ const ZYLOS_DIR = process.env.ZYLOS_DIR || join(homedir(), 'zylos');
 
 let db;
 let running = true;
+const PREREQUISITE_CHILD_CONTRACT = 'zylos.prerequisite-child@1';
+
+function requestShutdown(reason) {
+  if (!running) return;
+  console.log(`\nShutting down scheduler (${reason})...`);
+  running = false;
+}
+
+if (typeof process.send === 'function') {
+  process.once('disconnect', () => requestShutdown('owner disconnected'));
+}
 
 try {
   process.env.TZ = loadTimezone();
@@ -240,20 +251,19 @@ function sleep(ms) {
 }
 
 // Graceful shutdown
-process.on('SIGINT', () => {
-  console.log('\nShutting down scheduler...');
-  running = false;
-});
-
-process.on('SIGTERM', () => {
-  console.log('\nShutting down scheduler...');
-  running = false;
-});
+process.on('SIGINT', () => requestShutdown('SIGINT'));
+process.on('SIGTERM', () => requestShutdown('SIGTERM'));
 
 // Start the scheduler
 db = getDb();
 migrateLegacyTaskScopes(db);
 recoverLegacyRunningTasksFromCore(db);
+process.send?.({
+  contract: PREREQUISITE_CHILD_CONTRACT,
+  type: 'ready',
+  service: 'scheduler',
+  pid: process.pid,
+});
 mainLoop().then(() => {
   console.log('Scheduler stopped');
   if (db) db.close();

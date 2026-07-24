@@ -695,6 +695,63 @@ describe('executor service lifecycle host', () => {
 });
 
 describe('executor daemon resource ownership', () => {
+  test('reconciles stale prerequisites before opening SQLite and starts children after upgrade probing', async () => {
+    const state = fixture();
+    const events = [];
+    const database = { close: () => events.push('database-close') };
+    let hostOptions;
+    const owner = {
+      async acquire() { events.push('prerequisites-acquire'); },
+      async start() { events.push('prerequisites-start'); },
+      health() { return { ok: true }; },
+      async close() { events.push('prerequisites-close'); },
+    };
+    const host = {
+      closed: Promise.resolve(),
+      async start() { events.push('host-start'); },
+      async close() {
+        events.push('host-close');
+        await hostOptions.onClose();
+      },
+    };
+
+    const daemon = await runExecutorDaemon({
+      zylosDir: state.directory,
+      Database: function DatabaseFixture() {
+        events.push('database-open');
+        return database;
+      },
+      createPrerequisiteOwner: () => owner,
+      hasResumableUpgrade: () => {
+        events.push('upgrade-probe');
+        return false;
+      },
+      createAdapter: () => {
+        events.push('adapter-create');
+        return inertAdapter();
+      },
+      createHost: (options) => {
+        hostOptions = options;
+        return host;
+      },
+    });
+
+    expect(events).toEqual([
+      'prerequisites-acquire',
+      'database-open',
+      'upgrade-probe',
+      'prerequisites-start',
+      'adapter-create',
+      'host-start',
+    ]);
+    await daemon.close();
+    expect(events.slice(-3)).toEqual([
+      'host-close',
+      'prerequisites-close',
+      'database-close',
+    ]);
+  });
+
   test('exits for supervisor restart after a resumed rollback restores the old release', async () => {
     const state = fixture();
     const events = [];
@@ -771,10 +828,19 @@ describe('executor daemon resource ownership', () => {
       Database: function DatabaseFixture() { return database; },
       hasResumableUpgrade: () => { throw new Error('upgrade probe unavailable'); },
       createAdapter: () => { throw new Error('normal adapter must not be created'); },
-      createPrerequisiteOwner: () => { throw new Error('prerequisites must not start'); },
+      createPrerequisiteOwner: () => ({
+        async acquire() { events.push('prerequisites-acquire'); },
+        async start() { throw new Error('prerequisites must not start'); },
+        health() { return { ok: true }; },
+        async close() { events.push('prerequisites-close'); },
+      }),
       createHost: () => { throw new Error('normal host must not be created'); },
     })).rejects.toThrow('upgrade probe unavailable');
-    expect(events).toEqual(['database-close']);
+    expect(events).toEqual([
+      'prerequisites-acquire',
+      'database-close',
+      'prerequisites-close',
+    ]);
   });
 
   test('does not start executor prerequisites without the one-time reconciliation fence', async () => {
@@ -789,7 +855,7 @@ describe('executor daemon resource ownership', () => {
       createPrerequisiteOwner: () => { throw new Error('prerequisites must not start'); },
       createHost: () => { throw new Error('normal host must not be created'); },
     })).rejects.toThrow('one-time runtime reconciliation');
-    expect(events).toEqual(['database-close']);
+    expect(events).toEqual([]);
   });
 
   test('recovers a committed upgrade until postcommit cleanup is durable', async () => {
@@ -834,7 +900,12 @@ describe('executor daemon resource ownership', () => {
     const daemon = await runExecutorDaemon({
       zylosDir: state.directory, Database: function DatabaseFixture() { return database; },
       createAdapter: () => inertAdapter(),
-      createPrerequisiteOwner: () => ({ async start() {}, health() { return { ok: true }; }, async close() {} }),
+      createPrerequisiteOwner: () => ({
+        async acquire() {},
+        async start() {},
+        health() { return { ok: true }; },
+        async close() {},
+      }),
       createHost: () => host,
     });
     expect(events).toEqual(['host-start']);
@@ -860,6 +931,7 @@ describe('executor daemon resource ownership', () => {
       createAdapter: () => inertAdapter(),
       createUpgradeHandler: () => async () => ({ state: 'committed' }),
       createPrerequisiteOwner: () => ({
+        async acquire() { events.push('prerequisites-acquire'); },
         async start() { events.push('prerequisites-start'); },
         health() { return { ok: true }; },
         async close() { events.push('prerequisites-close'); },
@@ -872,7 +944,7 @@ describe('executor daemon resource ownership', () => {
 
     await daemon.close();
     expect(events).toEqual([
-      'prerequisites-start', 'host-start', 'host-close',
+      'prerequisites-acquire', 'prerequisites-start', 'host-start', 'host-close',
       'prerequisites-close', 'database-close',
     ]);
   });
@@ -897,6 +969,7 @@ describe('executor daemon resource ownership', () => {
       }),
       createUpgradeHandler: () => async () => ({ state: 'committed' }),
       createPrerequisiteOwner: () => ({
+        async acquire() {},
         async start() {},
         health() { return { ok: true }; },
         async close() {},
@@ -923,25 +996,61 @@ describe('executor prerequisite ownership', () => {
     fs.writeFileSync(scheduler, '');
     fs.writeFileSync(webConsole, '');
     const spawned = [];
+    const childrenByPid = new Map();
+    const liveGroups = new Set();
+    let nextPid = 91_000;
 
     class ChildFixture extends EventEmitter {
+      constructor(pid) {
+        super();
+        this.pid = pid;
+      }
       exitCode = null;
       signalCode = null;
       kill(signal) {
         this.signalCode = signal;
-        setImmediate(() => this.emit('close', null, signal));
+        liveGroups.delete(this.pid);
+        setImmediate(() => {
+          this.emit('exit', null, signal);
+          this.emit('close', null, signal);
+        });
         return true;
       }
     }
+    const identity = (pid, command = process.execPath) => ({
+      pid,
+      ppid: pid === process.pid ? process.ppid : process.pid,
+      pgid: pid,
+      uid: process.getuid?.() ?? 0,
+      start_token: `fixture:${pid}`,
+      command: [command],
+    });
     const owner = createExecutorPrerequisiteOwner({
       zylosDir: state.directory,
       releasePath,
       spawnFn: (command, args, options) => {
         spawned.push({ command, args, options });
-        const child = new ChildFixture();
-        setImmediate(() => child.emit('spawn'));
+        const child = new ChildFixture(nextPid++);
+        childrenByPid.set(child.pid, child);
+        liveGroups.add(child.pid);
+        setImmediate(() => {
+          child.emit('spawn');
+          setImmediate(() => {
+            child.emit('message', {
+              contract: 'zylos.prerequisite-child@1',
+              type: 'ready',
+              service: args[0] === scheduler ? 'scheduler' : 'web-console',
+              pid: child.pid,
+            });
+          });
+        });
         return child;
       },
+      inspectProcessFn: (pid) => identity(pid),
+      probePortFn: async () => ({ available: true, code: null }),
+      signalProcessGroupFn: (pgid, signal) => childrenByPid.get(pgid)?.kill(signal),
+      processGroupIsAliveFn: (pgid) => liveGroups.has(pgid),
+      waitForProcessGroupExitFn: async (pgid) => !liveGroups.has(pgid),
     });
 
     await expect(owner.start()).resolves.toMatchObject({
@@ -949,6 +1058,9 @@ describe('executor prerequisite ownership', () => {
       services: ['scheduler', 'web-console'],
     });
     expect(spawned.map(({ args }) => args[0])).toEqual([scheduler, webConsole]);
+    expect(spawned.every(({ options }) => (
+      options.detached === true && options.stdio.at(-1) === 'ipc'
+    ))).toBe(true);
     expect(JSON.stringify(spawned)).not.toMatch(/activity-monitor|c4-dispatcher|tmux/);
     await owner.close();
     expect(owner.health()).toMatchObject({ ok: true, services: [] });
