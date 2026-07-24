@@ -14,7 +14,9 @@ import { createExecutorService } from '../runtime/executor/service.js';
 import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { createRuntimeSnapshotPublisher } from '../runtime/observability/snapshot-publisher.js';
 import { acceptQueuedInbound as acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { stageMainProjection } from '../runtime/persistence/main-projection.js';
 import { acceptScheduledOccurrence } from '../runtime/scheduler/scheduler-queue.js';
+import { deliveredResult } from './helpers/delivered-result.js';
 
 const inboundFixture = JSON.parse(fs.readFileSync(
   new URL('../contracts/public/fixtures/inbound-envelope-v1.json', import.meta.url),
@@ -532,6 +534,9 @@ describe('Core runtime observability snapshot publisher', () => {
       status: 'delivery_unknown',
       count: 1,
       oldest_age_seconds: 17,
+      stale_delivering_age_seconds: 1,
+      reconciliation_state: 'not_reconcilable',
+      error_code: 'delivery_side_effect_unknown_fail_closed',
     });
     database.close();
   });
@@ -562,6 +567,63 @@ describe('Core runtime observability snapshot publisher', () => {
       status: 'delivery_unknown',
       count: 1,
       oldest_age_seconds: 17,
+      stale_delivering_age_seconds: 0,
+      reconciliation_state: 'not_applicable',
+      error_code: 'delivery_claim_authority_unverifiable',
+    });
+    database.close();
+  });
+
+  test('publishes an expired update_main with explicit reconciliation-required diagnostics', () => {
+    const { database } = openDatabase();
+    const accepted = acceptNormalInbound(database, normalEnvelope('update-reconciliation-required'), {
+      now: () => '2026-07-20T07:59:50Z',
+      generateId: deterministicIds('update-reconciliation-required'),
+    });
+    let ownerTime = '2026-07-20T07:59:51Z';
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: 'update-reconciliation-required-owner',
+      now: () => ownerTime,
+      generateId: deterministicIds('update-reconciliation-required-owner'),
+      leaseDurationMs: 10_000,
+      throttleMs: 0,
+    });
+    const create = owner.claimNext();
+    owner.recordResult(deliveredResult(create, ownerTime));
+    stageMainProjection(database, { turn_id: accepted.turn_id }, {
+      event_id: 'event-update-reconciliation-required',
+      trace_id: 'trace-update-reconciliation-required',
+      conversation_id: accepted.conversation_id,
+      turn_id: accepted.turn_id,
+      lineage_id: accepted.lineage_id,
+      event_sequence: 3,
+      turn_version: 3,
+      kind: 'text_snapshot',
+      phase: 'running',
+      payload: { text: 'update requiring reconciliation', end_offset: 31 },
+      error: null,
+      persisted_at: '2026-07-20T07:59:52Z',
+    }, {
+      generateId: deterministicIds('update-reconciliation-required-projection'),
+      throttleMs: 0,
+    });
+    ownerTime = '2026-07-20T07:59:53Z';
+    const update = owner.claimNext();
+    expect(update.operation).toBe('update_main');
+    owner.assertCurrentClaim(update);
+
+    const snapshot = createPublisher(database, {
+      now: () => '2026-07-20T08:00:04Z',
+    }).publish();
+    expect(snapshot.outbox.items).toContainEqual({
+      channel: update.target.channel,
+      status: 'delivery_unknown',
+      count: 1,
+      oldest_age_seconds: 14,
+      stale_delivering_age_seconds: 1,
+      reconciliation_state: 'required',
+      error_code: 'delivery_reconciliation_required',
     });
     database.close();
   });

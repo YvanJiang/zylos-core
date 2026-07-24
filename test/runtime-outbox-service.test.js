@@ -213,6 +213,32 @@ afterEach(() => {
 });
 
 describe('durable outbox service', () => {
+  test('legacy outbox migration leaves reconciliation foreign keys bound to the rebuilt table', () => {
+    const database = openTestDatabase();
+    createExactBaseDeliveringOutbox(database);
+    database.exec(`
+      CREATE UNIQUE INDEX runtime_outbox_legacy_aggregate_version
+      ON runtime_outbox(aggregate_type, aggregate_id, aggregate_version);
+    `);
+
+    createOutboxService({
+      database,
+      serviceInstanceId: 'legacy-reconciliation-schema-owner',
+      now: () => '2026-07-19T04:00:12Z',
+      generateId: deterministicIds('legacy-reconciliation-schema-owner'),
+    });
+
+    expect(database.prepare(`
+      PRAGMA foreign_key_list('runtime_outbox_reconciliations')
+    `).all().map(({ table, from, to }) => ({ table, from, to }))).toContainEqual({
+      table: 'runtime_outbox',
+      from: 'outbox_id',
+      to: 'outbox_id',
+    });
+    expect(database.pragma('foreign_key_check')).toEqual([]);
+    database.close();
+  });
+
   test('quarantines an expired exact-base delivering claim without replay or new authority', async () => {
     const database = openTestDatabase();
     const databasePath = database.name;
@@ -1163,6 +1189,339 @@ describe('durable outbox service', () => {
       lease_expires_at: '2026-07-19T09:00:15.000Z',
       pre_action_fenced_at: '2026-07-19T09:00:05Z',
     });
+    database.close();
+  });
+
+  test('reconciles an expired fenced update and materializes the next lane projection once', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptNormalInbound(database, normalEnvelope('fenced-update-reconciliation'), {
+      now: () => '2026-07-19T09:05:00Z',
+      generateId: deterministicIds('fenced-update-reconciliation-inbound'),
+    });
+    let currentTime = '2026-07-19T09:05:00Z';
+    const firstOwner = createOutboxService({
+      database,
+      serviceInstanceId: 'fenced-update-reconciliation-first-owner',
+      now: () => currentTime,
+      generateId: deterministicIds('fenced-update-reconciliation-first-owner'),
+      leaseDurationMs: 10_000,
+      throttleMs: 0,
+    });
+    const createCommand = firstOwner.claimNext();
+    expect(firstOwner.recordResult(deliveredResult(createCommand, currentTime))).toEqual({
+      status: 'applied',
+      outbox_status: 'delivered',
+    });
+
+    stageMainProjection(database, { turn_id: accepted.turn_id }, projectionEvent(accepted, {
+      version: 3,
+      kind: 'text_snapshot',
+      phase: 'running',
+      payload: { text: 'timed-out update', end_offset: 16 },
+      persistedAt: '2026-07-19T09:05:01Z',
+    }), {
+      generateId: deterministicIds('fenced-update-reconciliation-projection-3'),
+      throttleMs: 0,
+    });
+    currentTime = '2026-07-19T09:05:02Z';
+    const timedOutUpdate = firstOwner.claimNext();
+    expect(timedOutUpdate.operation).toBe('update_main');
+    firstOwner.assertCurrentClaim(timedOutUpdate);
+
+    stageMainProjection(database, { turn_id: accepted.turn_id }, projectionEvent(accepted, {
+      version: 4,
+      kind: 'text_snapshot',
+      phase: 'running',
+      payload: { text: 'must advance after reconciliation', end_offset: 33 },
+      persistedAt: '2026-07-19T09:05:03Z',
+    }), {
+      generateId: deterministicIds('fenced-update-reconciliation-projection-4'),
+      throttleMs: 0,
+    });
+
+    currentTime = '2026-07-19T09:05:13Z';
+    const replacementCalls = [];
+    const reconciler = {
+      async inspect(command) {
+        return {
+          evidence: {
+            source: 'platform_read',
+            platform_message_id: command.target_platform_message_id,
+            observed_at: currentTime,
+            platform_updated_at: '2026-07-19T09:05:02.336Z',
+            observed_content_sha256: 'a'.repeat(64),
+            expected_content_sha256: 'b'.repeat(64),
+          },
+          result: deliveredResult(command, currentTime),
+        };
+      },
+      async replace(command) {
+        replacementCalls.push(command.delivery_id);
+        return deliveredResult(command, currentTime);
+      },
+    };
+    const recoveryOwner = createOutboxService({
+      database,
+      serviceInstanceId: 'fenced-update-reconciliation-recovery-owner',
+      now: () => currentTime,
+      generateId: deterministicIds('fenced-update-reconciliation-recovery-owner'),
+      leaseDurationMs: 10_000,
+      throttleMs: 0,
+      reconciler,
+    });
+    const contender = createOutboxService({
+      database,
+      serviceInstanceId: 'fenced-update-reconciliation-contender',
+      now: () => currentTime,
+      generateId: deterministicIds('fenced-update-reconciliation-contender'),
+      leaseDurationMs: 10_000,
+      throttleMs: 0,
+      reconciler: {
+        async inspect() {
+          throw new Error('a concurrent owner must not inspect');
+        },
+        async replace() {
+          throw new Error('a concurrent owner must not replace');
+        },
+      },
+    });
+
+    expect(recoveryOwner.claimNext()).toBeNull();
+    const [recovered, contested] = await Promise.all([
+      recoveryOwner.reconcileNext(),
+      contender.reconcileNext(),
+    ]);
+    expect(recovered).toEqual({
+      status: 'applied',
+      outbox_status: 'delivered',
+      reconciliation_outcome: 'replaced',
+    });
+    expect(contested).toEqual({ status: 'idle' });
+    expect(replacementCalls).toEqual([timedOutUpdate.delivery_id]);
+    expect(database.prepare(`
+      SELECT status, result_json, last_error_json
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(timedOutUpdate.outbox_id)).toMatchObject({
+      status: 'delivered',
+      result_json: JSON.stringify(deliveredResult(timedOutUpdate, currentTime)),
+      last_error_json: null,
+    });
+    expect(database.prepare(`
+      SELECT state, evidence_json, result_json, replacement_fenced_at
+      FROM runtime_outbox_reconciliations
+      WHERE outbox_id = ?
+      ORDER BY reconciliation_epoch
+    `).all(timedOutUpdate.outbox_id)).toEqual([{
+      state: 'resolved',
+      evidence_json: JSON.stringify({
+        source: 'platform_read',
+        platform_message_id: timedOutUpdate.target_platform_message_id,
+        observed_at: currentTime,
+        platform_updated_at: '2026-07-19T09:05:02.336Z',
+        observed_content_sha256: 'a'.repeat(64),
+        expected_content_sha256: 'b'.repeat(64),
+      }),
+      result_json: JSON.stringify(deliveredResult(timedOutUpdate, currentTime)),
+      replacement_fenced_at: currentTime,
+    }]);
+    expect(database.prepare(`
+      SELECT aggregate_version, status
+      FROM runtime_outbox
+      WHERE turn_id = ?
+      ORDER BY aggregate_version
+    `).all(accepted.turn_id)).toEqual([
+      { aggregate_version: 1, status: 'delivered' },
+      { aggregate_version: 3, status: 'delivered' },
+      { aggregate_version: 4, status: 'pending' },
+    ]);
+
+    currentTime = '2026-07-19T09:05:14Z';
+    const confirmedUpdate = recoveryOwner.claimNext();
+    expect(confirmedUpdate.operation).toBe('update_main');
+    recoveryOwner.assertCurrentClaim(confirmedUpdate);
+    currentTime = '2026-07-19T09:05:25Z';
+    const confirmingOwner = createOutboxService({
+      database,
+      serviceInstanceId: 'fenced-update-reconciliation-confirming-owner',
+      now: () => currentTime,
+      generateId: deterministicIds('fenced-update-reconciliation-confirming-owner'),
+      leaseDurationMs: 10_000,
+      throttleMs: 0,
+      reconciler: {
+        async inspect(command) {
+          return {
+            evidence: {
+              source: 'platform_read',
+              platform_message_id: command.target_platform_message_id,
+              observed_at: currentTime,
+              platform_updated_at: '2026-07-19T09:05:14.336Z',
+              observed_content_sha256: 'c'.repeat(64),
+              expected_content_sha256: 'c'.repeat(64),
+            },
+            result: deliveredResult(command, currentTime),
+          };
+        },
+        async replace() {
+          throw new Error('confirmed content must not be replaced');
+        },
+      },
+    });
+    await expect(confirmingOwner.reconcileNext()).resolves.toEqual({
+      status: 'applied',
+      outbox_status: 'delivered',
+      reconciliation_outcome: 'confirmed',
+    });
+    expect(database.prepare(`
+      SELECT state, replacement_fenced_at
+      FROM runtime_outbox_reconciliations
+      WHERE outbox_id = ?
+    `).get(confirmedUpdate.outbox_id)).toEqual({
+      state: 'resolved',
+      replacement_fenced_at: null,
+    });
+
+    stageMainProjection(database, { turn_id: accepted.turn_id }, projectionEvent(accepted, {
+      version: 5,
+      kind: 'text_snapshot',
+      phase: 'running',
+      payload: { text: 'read failure stays fenced', end_offset: 25 },
+      persistedAt: '2026-07-19T09:05:26Z',
+    }), {
+      generateId: deterministicIds('fenced-update-reconciliation-projection-5'),
+      throttleMs: 0,
+    });
+    currentTime = '2026-07-19T09:05:27Z';
+    const unreadableUpdate = confirmingOwner.claimNext();
+    confirmingOwner.assertCurrentClaim(unreadableUpdate);
+    currentTime = '2026-07-19T09:05:38Z';
+    const readFailureOwner = createOutboxService({
+      database,
+      serviceInstanceId: 'fenced-update-reconciliation-read-failure-owner',
+      now: () => currentTime,
+      generateId: deterministicIds('fenced-update-reconciliation-read-failure-owner'),
+      leaseDurationMs: 10_000,
+      throttleMs: 0,
+      reconciler: {
+        async inspect() {
+          const error = new Error('platform read timed out');
+          error.code = 500;
+          throw error;
+        },
+        async replace() {
+          throw new Error('a failed read must not authorize replacement');
+        },
+      },
+    });
+    await expect(readFailureOwner.reconcileNext()).resolves.toEqual({
+      status: 'fenced',
+      outbox_status: 'delivering',
+      reconciliation_outcome: 'failed',
+      error_code: 'delivery_reconciliation_read_failed',
+    });
+    expect(database.prepare(`
+      SELECT reconciliation.state, reconciliation.last_error_code,
+        json_extract(outbox.last_error_json, '$.code') AS outbox_error_code
+      FROM runtime_outbox_reconciliations AS reconciliation
+      JOIN runtime_outbox AS outbox ON outbox.outbox_id = reconciliation.outbox_id
+      WHERE reconciliation.outbox_id = ?
+      ORDER BY reconciliation.reconciliation_epoch DESC
+      LIMIT 1
+    `).get(unreadableUpdate.outbox_id)).toEqual({
+      state: 'failed',
+      last_error_code: 'delivery_reconciliation_read_failed',
+      outbox_error_code: 'delivery_reconciliation_read_failed',
+    });
+    database.close();
+  });
+
+  test.each([
+    'create_main_bound',
+    'send_text_bound',
+    'send_fallback_bound',
+  ])('side-effect-unknown %s remains fail closed and cannot enter reconciliation', async (
+    vectorName,
+  ) => {
+    const database = openTestDatabase();
+    initializeRuntimePersistence(database);
+    const command = structuredClone(deliveryMappingFixture.command_vectors.find(
+      ({ name }) => name === vectorName,
+    ).document);
+    const commandJson = JSON.stringify(command);
+    const commandHash = crypto.createHash('sha256').update(commandJson).digest('hex');
+    const leaseOwner = `unsafe-${command.operation}-owner`;
+    let inspectCalls = 0;
+    const owner = createOutboxService({
+      database,
+      serviceInstanceId: `unsafe-${command.operation}-reconciler`,
+      now: () => '2026-07-19T09:05:13Z',
+      throttleMs: 0,
+      reconciler: {
+        async inspect() {
+          inspectCalls += 1;
+          throw new Error('unsafe operation must not be inspected for replay');
+        },
+        async replace() {
+          throw new Error('unsafe operation must not be replayed');
+        },
+      },
+    });
+    database.prepare(`
+      INSERT INTO runtime_outbox (
+        outbox_id, delivery_id, aggregate_type, aggregate_id, turn_id, control_id,
+        lane_key, predecessor_delivery_id, aggregate_version, status, command_json,
+        claimed_command_hash, priority, supersedable, terminal, attempt_count,
+        delivery_attempt_id, delivery_attempt_no, outbox_lease_epoch, lease_owner,
+        lease_expires_at, lease_expires_epoch_ms, pre_action_fenced_at,
+        last_attempt_at, next_attempt_at, last_error_json, result_json,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, 'delivering', ?, ?, ?, 0, 0, 1,
+        ?, ?, ?, ?, '2026-07-19T09:05:12Z', ?, '2026-07-19T09:05:02Z',
+        '2026-07-19T09:05:02Z', NULL, NULL, NULL, ?, '2026-07-19T09:05:02Z')
+    `).run(
+      command.outbox_id,
+      command.delivery_id,
+      command.aggregate_type,
+      command.aggregate_id,
+      command.predecessor_delivery_id,
+      command.aggregate_version,
+      commandJson,
+      commandHash,
+      command.priority,
+      command.delivery_attempt_id,
+      command.delivery_attempt_no,
+      command.outbox_lease_epoch,
+      leaseOwner,
+      Date.parse('2026-07-19T09:05:12Z'),
+      command.created_at,
+    );
+    database.prepare(`
+      INSERT INTO runtime_outbox_claim_snapshots (
+        outbox_id, delivery_attempt_id, delivery_attempt_no, outbox_lease_epoch,
+        lease_owner, command_json, command_hash, claimed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, '2026-07-19T09:05:02Z')
+    `).run(
+      command.outbox_id,
+      command.delivery_attempt_id,
+      command.delivery_attempt_no,
+      command.outbox_lease_epoch,
+      leaseOwner,
+      commandJson,
+      commandHash,
+    );
+
+    expect(owner.claimNextReconciliation()).toBeNull();
+    await expect(owner.reconcileNext()).resolves.toEqual({ status: 'idle' });
+    expect(inspectCalls).toBe(0);
+    expect(database.prepare(`
+      SELECT status, pre_action_fenced_at
+      FROM runtime_outbox WHERE outbox_id = ?
+    `).get(command.outbox_id)).toEqual({
+      status: 'delivering',
+      pre_action_fenced_at: '2026-07-19T09:05:02Z',
+    });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_outbox_reconciliations
+    `).get()).toEqual({ count: 0 });
     database.close();
   });
 
