@@ -386,6 +386,31 @@ function commitTurnEvent(database, {
   persistEvent(database, turn, event, generateId);
 }
 
+function commitTurnEventWithoutStateUpdate(database, {
+  turn,
+  event,
+  fence,
+  staleMessage,
+  generateId,
+}) {
+  const updated = database.prepare(`
+    UPDATE runtime_turns
+    SET turn_version = ?, committed_at = ?
+    WHERE turn_id = ? AND state = ?
+      AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+  `).run(
+    event.turn_version,
+    event.persisted_at,
+    turn.turn_id,
+    turn.state,
+    fence.attempt_id,
+    fence.attempt_no,
+    fence.lease_epoch,
+  );
+  if (updated.changes !== 1) conflict('stale_attempt', staleMessage);
+  persistEvent(database, turn, event, generateId);
+}
+
 function transitionInTransaction(database, {
   turnId,
   fromState,
@@ -2645,12 +2670,7 @@ export function createExecutorStore({
         current.attempt_no,
         current.lease_epoch,
       );
-      const queueUpdate = database.prepare(`
-        UPDATE runtime_turn_queue
-        SET status = 'claimed', wait_reason = NULL, wait_detail_json = NULL
-        WHERE turn_id = ? AND status = 'queued'
-      `).run(current.turn_id);
-      if (turnUpdate.changes !== 1 || queueUpdate.changes !== 1) {
+      if (turnUpdate.changes !== 1) {
         conflict('stale_attempt', 'The durable queue entry was claimed concurrently.');
       }
       database.prepare(`
@@ -2695,14 +2715,21 @@ export function createExecutorStore({
           occurredAt: claimedAt,
           generateId,
         });
-        commitTurnEvent(database, {
+        commitTurnEventWithoutStateUpdate(database, {
           turn: loadTurn(database, current.turn_id),
           event: retryEvent,
           fence,
-          nextState: 'recovering',
           staleMessage: 'The retry attempt start lost its provider attempt fence.',
           generateId,
         });
+      }
+      const queueUpdate = database.prepare(`
+        UPDATE runtime_turn_queue
+        SET status = 'claimed', wait_reason = NULL, wait_detail_json = NULL
+        WHERE turn_id = ? AND status = 'queued'
+      `).run(current.turn_id);
+      if (queueUpdate.changes !== 1) {
+        conflict('stale_attempt', 'The durable queue entry was claimed concurrently.');
       }
       transitionInTransaction(database, {
         turnId: current.turn_id,
@@ -2775,6 +2802,33 @@ export function createExecutorStore({
         conflict('illegal_transition', `Provider retry is invalid while turn is ${turn.state}.`);
       }
       recordProviderEventActivityInTransaction(turnContext, occurredAt);
+      const retryNo = turnContext.attempt.attempt_no;
+      const nextRetryAt = new Date(Date.parse(occurredAt) + backoffMs).toISOString();
+      const attemptUpdate = database.prepare(`
+        UPDATE runtime_provider_attempts
+        SET state = 'retry_wait', side_effect_status = 'none', error_json = ?,
+          retry_backoff_ms = ?, next_retry_at = ?, updated_at = ?
+        WHERE turn_id = ? AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+          AND service_instance_id = ? AND state IN ('starting', 'running')
+      `).run(
+        JSON.stringify(error),
+        backoffMs,
+        nextRetryAt,
+        occurredAt,
+        turn.turn_id,
+        turnContext.attempt.attempt_id,
+        turnContext.attempt.attempt_no,
+        turnContext.attempt.lease_epoch,
+        serviceInstanceId,
+      );
+      const queueUpdate = database.prepare(`
+        UPDATE runtime_turn_queue
+        SET status = 'queued', wait_reason = 'provider_retry'
+        WHERE turn_id = ? AND status = 'claimed'
+      `).run(turn.turn_id);
+      if (attemptUpdate.changes !== 1 || queueUpdate.changes !== 1) {
+        conflict('stale_attempt', 'The provider retry schedule changed concurrently.');
+      }
       transitionInTransaction(database, {
         turnId: turn.turn_id,
         fromState: turn.state,
@@ -2787,7 +2841,6 @@ export function createExecutorStore({
         reasonCode: 'provider_retry_scheduled',
       });
       turn = loadTurn(database, turn.turn_id);
-      const retryNo = turnContext.attempt.attempt_no;
       const event = buildEvent({
         turn,
         lastEvent: loadLastEvent(database, turn.turn_id),
@@ -2816,29 +2869,6 @@ export function createExecutorStore({
         staleMessage: 'The retry schedule lost its provider attempt fence.',
         generateId,
       });
-      const nextRetryAt = new Date(Date.parse(occurredAt) + backoffMs).toISOString();
-      const attemptUpdate = database.prepare(`
-        UPDATE runtime_provider_attempts
-        SET state = 'retry_wait', side_effect_status = 'none', error_json = ?,
-          retry_backoff_ms = ?, next_retry_at = ?, updated_at = ?
-        WHERE turn_id = ? AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
-          AND service_instance_id = ? AND state IN ('starting', 'running')
-      `).run(
-        JSON.stringify(error),
-        backoffMs,
-        nextRetryAt,
-        occurredAt,
-        turn.turn_id,
-        turnContext.attempt.attempt_id,
-        turnContext.attempt.attempt_no,
-        turnContext.attempt.lease_epoch,
-        serviceInstanceId,
-      );
-      const queueUpdate = database.prepare(`
-        UPDATE runtime_turn_queue
-        SET status = 'queued', wait_reason = 'provider_retry'
-        WHERE turn_id = ? AND status = 'claimed'
-      `).run(turn.turn_id);
       if (turnContext.workspace) workspaceLeases.release(turnContext.workspace);
       const leaseUpdate = database.prepare(`
         UPDATE runtime_executor_leases
@@ -2855,7 +2885,7 @@ export function createExecutorStore({
         turnContext.attempt.attempt_no,
         turnContext.attempt.lease_epoch,
       );
-      if (attemptUpdate.changes !== 1 || queueUpdate.changes !== 1 || leaseUpdate.changes !== 1) {
+      if (leaseUpdate.changes !== 1) {
         conflict('stale_attempt', 'The provider retry schedule changed concurrently.');
       }
       return Object.freeze({

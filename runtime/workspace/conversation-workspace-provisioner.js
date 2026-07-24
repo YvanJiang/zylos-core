@@ -559,12 +559,43 @@ function loadUnsafeRuntimeEvidence(database, conversationId) {
       WHERE execution_conversation_id = ? AND side_effect_status = 'unknown'
       UNION ALL
       SELECT 'background_recovering' AS reason
-      FROM runtime_background_tasks
-      WHERE execution_conversation_id = ? AND state = 'recovering'
+      FROM runtime_background_tasks AS background
+      WHERE background.execution_conversation_id = ?
+        AND background.state = 'recovering'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM runtime_turn_queue AS retry_queue
+          JOIN runtime_turns AS retry_turn
+            ON retry_turn.turn_id = retry_queue.turn_id
+          JOIN runtime_provider_attempts AS retry_attempt
+            ON retry_attempt.turn_id = retry_queue.turn_id
+            AND retry_attempt.attempt_id = retry_turn.attempt_id
+            AND retry_attempt.attempt_no = retry_turn.attempt_no
+            AND retry_attempt.lease_epoch = retry_turn.lease_epoch
+          WHERE retry_queue.turn_id = background.execution_turn_id
+            AND retry_queue.status = 'queued'
+            AND retry_queue.wait_reason = 'provider_retry'
+            AND retry_attempt.state = 'retry_wait'
+            AND retry_attempt.side_effect_status = 'none'
+        )
       UNION ALL
       SELECT 'turn_recovering' AS reason
-      FROM runtime_turns
-      WHERE conversation_id = ? AND state = 'recovering'
+      FROM runtime_turns AS turn
+      WHERE turn.conversation_id = ? AND turn.state = 'recovering'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM runtime_turn_queue AS retry_queue
+          JOIN runtime_provider_attempts AS retry_attempt
+            ON retry_attempt.turn_id = retry_queue.turn_id
+            AND retry_attempt.attempt_id = turn.attempt_id
+            AND retry_attempt.attempt_no = turn.attempt_no
+            AND retry_attempt.lease_epoch = turn.lease_epoch
+          WHERE retry_queue.turn_id = turn.turn_id
+            AND retry_queue.status = 'queued'
+            AND retry_queue.wait_reason = 'provider_retry'
+            AND retry_attempt.state = 'retry_wait'
+            AND retry_attempt.side_effect_status = 'none'
+        )
       UNION ALL
       SELECT 'workspace_lease_uncertain' AS reason
       FROM runtime_workspace_leases

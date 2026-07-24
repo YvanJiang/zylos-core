@@ -101,6 +101,41 @@ afterEach(() => {
 });
 
 describe('detached conversation workspace admission', () => {
+  test('adds legacy turn attempt fences before installing the safe-retry migration', () => {
+    const { database } = createFixture();
+    database.exec(`
+      CREATE TABLE runtime_turns (
+        turn_id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES runtime_conversations(conversation_id),
+        lineage_id TEXT REFERENCES runtime_lineages(lineage_id),
+        inbound_event_id TEXT NOT NULL UNIQUE REFERENCES runtime_inbound_events(inbound_event_id),
+        state TEXT NOT NULL,
+        turn_version INTEGER NOT NULL CHECK (turn_version > 0),
+        queue_sequence INTEGER NOT NULL CHECK (queue_sequence > 0),
+        provider_input_json TEXT,
+        redirected_from_turn_id TEXT UNIQUE REFERENCES runtime_turns(turn_id),
+        created_at TEXT NOT NULL,
+        committed_at TEXT NOT NULL,
+        UNIQUE (conversation_id, queue_sequence)
+      );
+    `);
+
+    expect(() => initializeRuntimePersistence(database)).not.toThrow();
+    expect(database.prepare(`PRAGMA table_info('runtime_turns')`).all()
+      .filter(({ name }) => ['attempt_id', 'attempt_no', 'lease_epoch'].includes(name))
+      .map(({ name }) => name)
+      .sort()).toEqual(['attempt_id', 'attempt_no', 'lease_epoch']);
+    expect(database.prepare(`
+      SELECT migration_id
+      FROM runtime_schema_migrations
+      WHERE migration_id = 'conversation-workspace-safe-provider-retry-v1'
+    `).get()).toEqual({
+      migration_id: 'conversation-workspace-safe-provider-retry-v1',
+    });
+
+    database.close();
+  });
+
   test('atomically requests one workspace only for the detached execution conversation', () => {
     const { database } = createFixture();
     const envelope = normalEnvelope('detached-admission');

@@ -12,6 +12,7 @@ import {
   acceptQueuedInbound,
 } from '../runtime/persistence/inbound-acceptance.js';
 import { createExecutorStore } from '../runtime/persistence/executor-store.js';
+import { initializeRuntimePersistence } from '../runtime/persistence/schema.js';
 import { createClaudeConversationAdapter } from '../runtime/providers/claude/conversation-adapter.js';
 import {
   createConversationWorkspaceProvisioner,
@@ -410,6 +411,163 @@ describe('per-conversation detached execution workspaces', () => {
       status: 'completed',
       turn_id: second.background_execution_turn_id,
     });
+    await service.close();
+    fixture.database.close();
+  });
+
+  test('keeps a ready detached workspace claimable across proven no-side-effect retries', async () => {
+    const fixture = createFixture();
+    const accepted = acceptDetached(fixture.database, 'safe-retry');
+    const conversationId = executionConversationId(fixture.database, accepted);
+    let currentTimeMs = Date.parse('2026-07-24T01:00:02Z');
+    let executions = 0;
+    const service = createExecutorService({
+      database: fixture.database,
+      adapter: {
+        getWorkspaceAccess() {
+          return { mode: 'writable', read_only_enforced: false, authority: 'provider_sandbox' };
+        },
+        async *execute() {
+          executions += 1;
+          if (executions === 1) {
+            const error = new Error('private transient provider failure');
+            error.providerError = {
+              code: 'delivery_transient',
+              category: 'provider',
+              retryable: true,
+              side_effect_status: 'none',
+              user_message: 'The provider is temporarily unavailable.',
+            };
+            throw error;
+          }
+          yield {
+            kind: 'text_snapshot',
+            payload: { text: 'done', end_offset: 4 },
+            provider_native_id: null,
+          };
+        },
+      },
+      provider: 'codex',
+      serviceInstanceId: 'executor-conversation-workspace-safe-retry',
+      now: () => new Date(currentTimeMs).toISOString(),
+      generateId: deterministicIds('executor-safe-retry'),
+      workspaceRoot: fixture.legacyRoot,
+      conversationWorkspaceOptions: conversationWorkspaceOptions(fixture, 'safe-retry'),
+      providerRetryBaseDelayMs: 1_000,
+      providerRetryJitterRatio: 0,
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'retry_scheduled',
+      turn_id: accepted.background_execution_turn_id,
+      retry: { backoff_ms: 1_000 },
+    });
+    expect(fixture.database.prepare(`
+      SELECT state FROM runtime_conversation_workspaces WHERE conversation_id = ?
+    `).get(conversationId)).toEqual({ state: 'ready' });
+
+    fixture.database.exec(`
+      DROP TRIGGER runtime_workspace_quarantine_recovering_turn;
+      CREATE TRIGGER runtime_workspace_quarantine_recovering_turn
+      AFTER UPDATE OF state ON runtime_turns
+      WHEN NEW.state = 'recovering'
+      BEGIN
+        UPDATE runtime_conversation_workspaces
+        SET state = 'quarantined',
+          quarantined_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+          last_error_json = json_object(
+            'code', 'workspace_runtime_uncertain',
+            'message', 'Conversation execution entered recovering state.',
+            'terminal', json('true'),
+            'occurred_at', strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+          )
+        WHERE conversation_id = NEW.conversation_id
+          AND state IN ('requested', 'provisioning', 'ready');
+      END;
+      DELETE FROM runtime_schema_migrations
+      WHERE migration_id = 'conversation-workspace-safe-provider-retry-v1';
+    `);
+    fixture.database.prepare(`
+      UPDATE runtime_conversation_workspaces
+      SET state = 'quarantined',
+        quarantined_at = '2026-07-24T01:00:02Z',
+        last_error_json = json_object(
+          'code', 'workspace_runtime_uncertain',
+          'message', 'Conversation execution entered recovering state.',
+          'terminal', json('true'),
+          'occurred_at', '2026-07-24T01:00:02Z'
+        )
+      WHERE conversation_id = ?
+    `).run(conversationId);
+    initializeRuntimePersistence(fixture.database);
+    expect(fixture.database.prepare(`
+      SELECT state, quarantined_at, last_error_json
+      FROM runtime_conversation_workspaces
+      WHERE conversation_id = ?
+    `).get(conversationId)).toEqual({
+      state: 'ready',
+      quarantined_at: null,
+      last_error_json: null,
+    });
+    expect(fixture.database.prepare(`
+      SELECT migration_id
+      FROM runtime_schema_migrations
+      WHERE migration_id = 'conversation-workspace-safe-provider-retry-v1'
+    `).get()).toEqual({
+      migration_id: 'conversation-workspace-safe-provider-retry-v1',
+    });
+
+    fixture.database.exec('SAVEPOINT stale_safe_retry_probe');
+    try {
+      fixture.database.prepare(`
+        INSERT INTO runtime_provider_attempts (
+          attempt_id, turn_id, conversation_id, attempt_no, lease_epoch,
+          provider, service_instance_id, executor_instance_id, state,
+          last_lease_renewed_at, side_effect_status, started_at, updated_at
+        ) VALUES (
+          'attempt-stale-safe-retry-probe',
+          ?, ?, 2, 2,
+          'codex', 'executor-conversation-workspace-safe-retry',
+          'executor-stale-safe-retry-probe', 'starting',
+          '2026-07-24T01:00:02Z', 'none',
+          '2026-07-24T01:00:02Z', '2026-07-24T01:00:02Z'
+        )
+      `).run(accepted.background_execution_turn_id, conversationId);
+      fixture.database.prepare(`
+        UPDATE runtime_turns
+        SET attempt_id = 'attempt-stale-safe-retry-probe',
+          attempt_no = 2, lease_epoch = 2
+        WHERE turn_id = ?
+      `).run(accepted.background_execution_turn_id);
+      fixture.database.prepare(`
+        UPDATE runtime_turns SET state = state WHERE turn_id = ?
+      `).run(accepted.background_execution_turn_id);
+      expect(fixture.database.prepare(`
+        SELECT state, json_extract(last_error_json, '$.code') AS error_code
+        FROM runtime_conversation_workspaces
+        WHERE conversation_id = ?
+      `).get(conversationId)).toEqual({
+        state: 'quarantined',
+        error_code: 'workspace_runtime_uncertain',
+      });
+    } finally {
+      fixture.database.exec(`
+        ROLLBACK TO stale_safe_retry_probe;
+        RELEASE stale_safe_retry_probe;
+      `);
+    }
+
+    currentTimeMs += 1_000;
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: accepted.background_execution_turn_id,
+      attempt_no: 2,
+    });
+    expect(executions).toBe(2);
+    expect(fixture.database.prepare(`
+      SELECT state FROM runtime_conversation_workspaces WHERE conversation_id = ?
+    `).get(conversationId)).toEqual({ state: 'ready' });
+
     await service.close();
     fixture.database.close();
   });
