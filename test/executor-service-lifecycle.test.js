@@ -202,6 +202,48 @@ describe('executor service lifecycle host', () => {
     expect(fs.existsSync(state.socketPath)).toBe(false);
   });
 
+  test('accepts bounded health responses larger than the control request limit', async () => {
+    const state = fixture();
+    const padding = 'x'.repeat(96 * 1024);
+    const service = {
+      start: jest.fn(),
+      runNext: jest.fn(async () => ({ status: 'idle' })),
+      publishObservabilitySnapshot: jest.fn(() => ({
+        contract: 'zylos.observability-snapshot',
+        padding,
+      })),
+      close: jest.fn(async () => {}),
+    };
+    const host = createExecutorServiceHost({
+      database: state.database,
+      adapter: inertAdapter(),
+      provider: 'codex',
+      serviceInstanceId: 'service-fixture-large-health',
+      socketPath: state.socketPath,
+      workspaceRoot: state.directory,
+      pollIntervalMs: 10_000,
+      createService: () => service,
+    });
+    hosts.push(host);
+    await host.start();
+
+    await expect(requestExecutorService(state.socketPath, { action: 'health' }))
+      .resolves.toMatchObject({
+        ok: true,
+        result: {
+          executor: { service_instance_id: 'service-fixture-large-health' },
+          snapshot: { padding },
+        },
+      });
+    await expect(requestExecutorService(
+      state.socketPath,
+      { action: 'health' },
+      { maxResponseBytes: 64 * 1024 },
+    )).rejects.toMatchObject({ code: 'EMSGSIZE' });
+    await expect(requestExecutorService(state.socketPath, { action: 'health' }))
+      .resolves.toMatchObject({ ok: true });
+  });
+
   test('resolves and submits channel interactions through the running executor owner', async () => {
     const state = fixture();
     const resolution = {

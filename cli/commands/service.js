@@ -29,23 +29,31 @@ function configuredProvider() {
   return getZylosConfig().runtime === 'codex' ? 'codex' : 'claude';
 }
 
-export async function showStatus() {
-  console.log(`${heading('Zylos Executor Service')}\n${dim('======================')}\n`);
-  const result = await getExecutorServiceHealth({ zylosDir: ZYLOS_DIR });
-  if (!result.ok) {
-    console.log(`${bold('Health:')} ${red(result.health?.toUpperCase() ?? 'OFFLINE')}`);
-    console.log(`  ${dim(`Reason: ${result.error}`)}`);
-    console.log(`  ${dim('Run: zylos doctor or zylos start')}`);
-    process.exitCode = 1;
+export async function showStatus({
+  zylosDir = ZYLOS_DIR,
+  getHealth = getExecutorServiceHealth,
+  write = console.log,
+  setExitCode = (code) => { process.exitCode = code; },
+} = {}) {
+  write(`${heading('Zylos Executor Service')}\n${dim('======================')}\n`);
+  const result = await getHealth({ zylosDir });
+  if (!result.ready) {
+    write(`${bold('Health:')} ${red(result.health?.toUpperCase() ?? 'OFFLINE')}`);
+    write(`${bold('Readiness:')} ${red('NOT READY')}`);
+    write(`  ${dim(`Reason: ${result.readinessError ?? result.error}`)}`);
+    write(`  ${dim('Run: zylos doctor or zylos start')}`);
+    setExitCode(1);
     return result;
   }
   const service = result.snapshot.service;
-  console.log(`${bold('Health:')} ${green(service.health.toUpperCase())}`);
-  console.log(`${bold('Service identity:')} ${service.service_instance_id}`);
-  console.log(`${bold('Host identity:')} ${service.host_id}`);
-  console.log(`${bold('Started:')} ${service.started_at}`);
-  console.log(`${bold('Maintenance:')} ${service.maintenance ? yellow('yes') : 'no'}`);
-  console.log(`${bold('Draining:')} ${service.draining ? yellow('yes') : 'no'}`);
+  const renderHealth = service.health === 'healthy' ? green : yellow;
+  write(`${bold('Health:')} ${renderHealth(service.health.toUpperCase())}`);
+  write(`${bold('Readiness:')} ${green('READY')}`);
+  write(`${bold('Service identity:')} ${service.service_instance_id}`);
+  write(`${bold('Host identity:')} ${service.host_id}`);
+  write(`${bold('Started:')} ${service.started_at}`);
+  write(`${bold('Maintenance:')} ${service.maintenance ? yellow('yes') : 'no'}`);
+  write(`${bold('Draining:')} ${service.draining ? yellow('yes') : 'no'}`);
   return result;
 }
 

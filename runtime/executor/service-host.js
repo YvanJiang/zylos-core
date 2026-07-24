@@ -6,6 +6,7 @@ import path from 'node:path';
 import { createExecutorService } from './service.js';
 
 const MAX_REQUEST_BYTES = 64 * 1024;
+const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const READ_ONLY_ACTIONS = new Set([
   'get_background_task',
   'health',
@@ -16,6 +17,7 @@ const PEER_DISCONNECT_ERROR_CODES = new Set([
   'ECONNRESET',
   'ENOTCONN',
   'EPIPE',
+  'ERR_STREAM_WRITE_AFTER_END',
 ]);
 
 function reportPollError(error) {
@@ -113,7 +115,10 @@ function writeResponse(socket, payload) {
   socket.end(`${JSON.stringify(payload)}\n`);
 }
 
-export function requestExecutorService(socketPath, request, { timeoutMs = 5_000 } = {}) {
+export function requestExecutorService(socketPath, request, {
+  timeoutMs = 5_000,
+  maxResponseBytes = MAX_RESPONSE_BYTES,
+} = {}) {
   requireSocketPath(socketPath);
   if (!request || typeof request !== 'object' || Array.isArray(request)) {
     throw new TypeError('request must be an object');
@@ -121,9 +126,13 @@ export function requestExecutorService(socketPath, request, { timeoutMs = 5_000 
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
     throw new TypeError('timeoutMs must be a positive safe integer');
   }
+  if (!Number.isSafeInteger(maxResponseBytes) || maxResponseBytes <= 0) {
+    throw new TypeError('maxResponseBytes must be a positive safe integer');
+  }
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(socketPath);
     let data = '';
+    let responseBytes = 0;
     let dispatched = false;
     const classifyFailure = (error) => {
       if (dispatched && !READ_ONLY_ACTIONS.has(request.action)) {
@@ -145,8 +154,11 @@ export function requestExecutorService(socketPath, request, { timeoutMs = 5_000 
     });
     socket.on('data', (chunk) => {
       data += chunk;
-      if (data.length > MAX_REQUEST_BYTES) {
-        socket.destroy(new Error('Executor service control response exceeded its size limit.'));
+      responseBytes += Buffer.byteLength(chunk);
+      if (responseBytes > maxResponseBytes) {
+        const error = new Error('Executor service control response exceeded its size limit.');
+        error.code = 'EMSGSIZE';
+        socket.destroy(error);
       }
     });
     socket.on('error', (error) => {

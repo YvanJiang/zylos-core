@@ -88,7 +88,13 @@ afterEach(async () => {
   }
 });
 
-test.each(['EPIPE', 'ECONNRESET', 'ECONNABORTED', 'ENOTCONN'])(
+test.each([
+  'EPIPE',
+  'ECONNRESET',
+  'ECONNABORTED',
+  'ENOTCONN',
+  'ERR_STREAM_WRITE_AFTER_END',
+])(
   'keeps the executor host alive when a timed-out control caller causes late-response %s',
   async (errorCode) => {
     const scenario = await startChild(errorCode);
