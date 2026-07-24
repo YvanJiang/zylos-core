@@ -45,6 +45,14 @@ workspace lease. Read-only tasks may run concurrently only when the provider
 sandbox proves read-only enforcement. Unknown side effects enter the existing
 recovery-notification barrier and are never replayed automatically.
 
+Each internal detached execution conversation also atomically receives a
+`requested` Core workspace binding. Filesystem provisioning happens only after
+that admission transaction and must reach `ready` before executor claim.
+Requested/provisioning bindings wait, while quarantined/failed/retired bindings
+fail closed. The origin/channel conversation and the explicit queued
+compatibility seam do not receive an independent binding. See
+[Detached conversation workspaces](conversation-workspaces.md).
+
 Codex provider-native collaboration remains disabled. Claude/Codex prompts also
 must not spawn a provider-native child merely to detach work, because such a
 child would bypass Core task identity, control, and recovery ownership.
