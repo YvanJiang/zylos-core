@@ -1090,7 +1090,7 @@ describe('durable workspace lease coordinator', () => {
       turn_id: second.turn_id,
       wait_reason: 'workspace_lease',
       wait_detail: {
-        workspace_root: nested,
+        workspace_root: workspace,
         conflicting_workspace_root: workspace,
         holder_conversation_id: first.conversation_id,
         holder_turn_id: first.turn_id,

@@ -2255,6 +2255,10 @@ describe('runtime executor service', () => {
         workspace: {
           workspace_lease_id: 'workspace-lease-executor-1',
           workspace_root: process.cwd(),
+          binding_kind: 'legacy_shared',
+          workspace_id: null,
+          workspace_generation: 0,
+          workspace_state: 'legacy_shared',
           mode: 'writable',
           status: 'current',
           holder_service_instance_id: 'executor-service-A',
