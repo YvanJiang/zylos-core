@@ -6,9 +6,15 @@ import crypto from 'node:crypto';
 import { afterEach, describe, expect, test } from '@jest/globals';
 import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/index.js';
 
-import { createIdempotencyKey } from '../contracts/public/index.js';
+import {
+  createIdempotencyKey,
+  validateDeliveryResult,
+} from '../contracts/public/index.js';
 import { createChannelNeutralTextRenderer } from '../runtime/compatibility/c4-channel-fallback.js';
-import { reconcileOutboxNoEffect } from '../runtime/delivery/outbox-reconciliation.js';
+import {
+  correctDeliveredOutboxNoEffect,
+  reconcileOutboxNoEffect,
+} from '../runtime/delivery/outbox-reconciliation.js';
 import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { createExecutorStore } from '../runtime/persistence/executor-store.js';
 import { acceptQueuedInbound as acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
@@ -1391,6 +1397,170 @@ describe('durable outbox service', () => {
       replacement_outbox_id: result.replacement_outbox_id,
     });
     expect(accepted.turn_id).toBe(updateCommand.mapping.turn_id);
+
+    database.close();
+  });
+
+  test('corrects an exact false delivered terminal update into the existing final fallback', () => {
+    const database = openTestDatabase();
+    let currentTime = '2026-07-19T09:30:00Z';
+    acceptNormalInbound(database, normalEnvelope('delivered-readback-no-effect'), {
+      now: () => currentTime,
+      generateId: deterministicIds('delivered-readback-no-effect-inbound'),
+    });
+    const outbox = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-delivered-readback-no-effect',
+      now: () => currentTime,
+      generateId: deterministicIds('delivered-readback-no-effect-delivery'),
+      throttleMs: 0,
+    });
+    const createCommand = outbox.claimNext();
+    expect(outbox.recordResult(deliveredResult(createCommand, currentTime))).toEqual({
+      status: 'applied',
+      outbox_status: 'delivered',
+    });
+
+    const executor = createExecutorStore({
+      database,
+      provider: 'claude',
+      serviceInstanceId: 'executor-delivered-readback-no-effect',
+      now: () => currentTime,
+      generateId: deterministicIds('delivered-readback-no-effect-executor'),
+    });
+    const turnContext = executor.claimNextQueuedTurn();
+    currentTime = '2026-07-19T09:30:01Z';
+    executor.transitionTurn(turnContext, 'starting', 'running');
+    const uncertainUpdate = outbox.claimNext();
+    outbox.assertCurrentClaim(uncertainUpdate, { sideEffectBoundary: true });
+    currentTime = '2026-07-19T09:30:02Z';
+    executor.appendAdapterEvent(turnContext, {
+      kind: 'text_snapshot',
+      payload: { text: 'the terminal fallback result', end_offset: 28 },
+      provider_native_id: null,
+    });
+    executor.transitionTurn(turnContext, 'running', 'completed');
+    currentTime = '2026-07-19T09:30:20Z';
+
+    const uncertainExpected = database.prepare(`
+      SELECT outbox_id, delivery_attempt_id, delivery_attempt_no,
+        outbox_lease_epoch, claimed_command_hash, aggregate_version
+      FROM runtime_outbox
+      WHERE outbox_id = ?
+    `).get(uncertainUpdate.outbox_id);
+    const authorization = {
+      actor_id: 'deployment-operator',
+      authorization_ref: 'codex-task-delivered-readback-no-effect',
+      reason: 'Read-only platform comparison proved the exact update was absent.',
+    };
+    const firstReconciliation = reconcileOutboxNoEffect({
+      database,
+      expected: uncertainExpected,
+      evidence: {
+        kind: 'platform_readback_no_effect',
+        observed_at: currentTime,
+        platform_message_id: uncertainUpdate.target_platform_message_id,
+        query_succeeded: true,
+        expected_effect_present: false,
+        expected_delivery_hash: 'a'.repeat(64),
+        observed_delivery_hash: 'b'.repeat(64),
+      },
+      authorization,
+      now: () => currentTime,
+      generateId: deterministicIds('delivered-readback-first-reconciliation'),
+      throttleMs: 0,
+    });
+    const replacement = outbox.claimNext();
+    expect(replacement.outbox_id).toBe(firstReconciliation.replacement_outbox_id);
+    currentTime = '2026-07-19T09:30:21Z';
+    expect(outbox.recordResult(deliveredResult(replacement, currentTime))).toEqual({
+      status: 'applied',
+      outbox_status: 'delivered',
+    });
+
+    const expected = database.prepare(`
+      SELECT outbox_id, delivery_attempt_id, delivery_attempt_no,
+        outbox_lease_epoch, claimed_command_hash, aggregate_version
+      FROM runtime_outbox
+      WHERE outbox_id = ?
+    `).get(replacement.outbox_id);
+    const evidence = {
+      kind: 'platform_readback_no_effect',
+      observed_at: currentTime,
+      platform_message_id: replacement.target_platform_message_id,
+      query_succeeded: true,
+      expected_effect_present: false,
+      expected_delivery_hash: 'c'.repeat(64),
+      observed_delivery_hash: 'd'.repeat(64),
+    };
+    const result = correctDeliveredOutboxNoEffect({
+      database,
+      expected,
+      evidence,
+      authorization,
+      now: () => currentTime,
+      generateId: deterministicIds('delivered-readback-correction'),
+    });
+
+    expect(result).toMatchObject({
+      status: 'applied',
+      outbox_status: 'dead_letter',
+      correction_id: expect.any(String),
+      fallback_outbox_id: expect.any(String),
+    });
+    const correctedRow = database.prepare(`
+      SELECT status, json_extract(last_error_json, '$.code') AS error_code,
+        json_extract(result_json, '$.status') AS result_status, result_json
+      FROM runtime_outbox
+      WHERE outbox_id = ?
+    `).get(replacement.outbox_id);
+    expect(validateDeliveryResult(JSON.parse(correctedRow.result_json), {
+      command: replacement,
+    }).forwarded.status).toBe('permanent_failure');
+    expect(correctedRow).toEqual({
+      status: 'dead_letter',
+      error_code: 'authorized_platform_readback_delivery_absent',
+      result_status: 'permanent_failure',
+      result_json: expect.any(String),
+    });
+    const fallback = database.prepare(`
+      SELECT status, command_json, predecessor_delivery_id
+      FROM runtime_outbox
+      WHERE outbox_id = ?
+    `).get(result.fallback_outbox_id);
+    expect(fallback.status).toBe('pending');
+    expect(fallback.predecessor_delivery_id).toBe(replacement.delivery_id);
+    expect(JSON.parse(fallback.command_json)).toMatchObject({
+      operation: 'send_fallback',
+      aggregate_version: replacement.aggregate_version,
+      render_model: { terminal: true },
+    });
+    expect(database.prepare(`
+      SELECT decision, previous_status, terminal_status, actor_id,
+        authorization_ref, evidence_hash, fallback_outbox_id
+      FROM runtime_outbox_delivery_corrections
+      WHERE correction_id = ?
+    `).get(result.correction_id)).toEqual({
+      decision: 'platform_readback_delivery_absent',
+      previous_status: 'delivered',
+      terminal_status: 'dead_letter',
+      actor_id: authorization.actor_id,
+      authorization_ref: authorization.authorization_ref,
+      evidence_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      fallback_outbox_id: result.fallback_outbox_id,
+    });
+    expect(correctDeliveredOutboxNoEffect({
+      database,
+      expected,
+      evidence,
+      authorization,
+      now: () => currentTime,
+    })).toEqual({
+      status: 'duplicate',
+      outbox_status: 'dead_letter',
+      correction_id: result.correction_id,
+      fallback_outbox_id: result.fallback_outbox_id,
+    });
 
     database.close();
   });

@@ -1042,6 +1042,26 @@ const RUNTIME_SCHEMA = `
     UNIQUE (outbox_id, delivery_attempt_id, delivery_attempt_no, outbox_lease_epoch)
   );
 
+  CREATE TABLE IF NOT EXISTS runtime_outbox_delivery_corrections (
+    correction_id TEXT PRIMARY KEY,
+    request_hash TEXT NOT NULL UNIQUE,
+    outbox_id TEXT NOT NULL,
+    delivery_attempt_id TEXT NOT NULL,
+    delivery_attempt_no INTEGER NOT NULL CHECK (delivery_attempt_no > 0),
+    outbox_lease_epoch INTEGER NOT NULL CHECK (outbox_lease_epoch > 0),
+    decision TEXT NOT NULL CHECK (decision = 'platform_readback_delivery_absent'),
+    previous_status TEXT NOT NULL CHECK (previous_status = 'delivered'),
+    terminal_status TEXT NOT NULL CHECK (terminal_status = 'dead_letter'),
+    actor_id TEXT NOT NULL,
+    authorization_ref TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    evidence_hash TEXT NOT NULL,
+    fallback_outbox_id TEXT NOT NULL,
+    committed_at TEXT NOT NULL,
+    UNIQUE (outbox_id, delivery_attempt_id, delivery_attempt_no, outbox_lease_epoch)
+  );
+
   CREATE TABLE IF NOT EXISTS runtime_delivery_lanes (
     lane_key TEXT PRIMARY KEY,
     turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
@@ -2736,6 +2756,18 @@ export function initializeRuntimePersistence(database) {
     BEFORE DELETE ON runtime_outbox_reconciliations
     BEGIN
       SELECT RAISE(ABORT, 'outbox reconciliation audit is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_outbox_delivery_correction_update_immutable
+    BEFORE UPDATE ON runtime_outbox_delivery_corrections
+    BEGIN
+      SELECT RAISE(ABORT, 'outbox delivery correction audit is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS runtime_outbox_delivery_correction_delete_immutable
+    BEFORE DELETE ON runtime_outbox_delivery_corrections
+    BEGIN
+      SELECT RAISE(ABORT, 'outbox delivery correction audit is immutable');
     END;
 
     DROP TRIGGER IF EXISTS runtime_bound_reply_recovery_immutable;

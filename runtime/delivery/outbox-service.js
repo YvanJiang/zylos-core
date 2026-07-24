@@ -196,7 +196,7 @@ function enqueueInitialTextAcknowledgement(database, command, resultAt, generate
   );
 }
 
-function enqueueFinalFallback(database, command, resultAt, generateId) {
+export function enqueueFinalFallback(database, command, resultAt, generateId) {
   const existing = database.prepare(`
     SELECT command_json
     FROM runtime_outbox
