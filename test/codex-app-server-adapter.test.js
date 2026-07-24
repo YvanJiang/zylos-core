@@ -109,9 +109,25 @@ function createFakeAppServer({
 }
 
 function executionContext(overrides = {}) {
+  const conversationId = overrides.conversation_id ?? 'conversation-1';
+  const turnId = overrides.turn_id ?? 'turn-1';
+  const workspace = overrides.workspace === null
+    ? null
+    : {
+        workspace_lease_id: 'workspace-lease-1',
+        workspace_root: '/workspace',
+        workspace_generation: 1,
+        mode: 'writable',
+        holder_service_instance_id: 'service-1',
+        holder_conversation_id: conversationId,
+        holder_turn_id: turnId,
+        lease_epoch: 11,
+        lease_expires_at: '2026-07-19T05:10:00Z',
+        ...(overrides.workspace ?? {}),
+      };
   return {
-    conversation_id: 'conversation-1',
-    turn_id: 'turn-1',
+    conversation_id: conversationId,
+    turn_id: turnId,
     lineage_id: 'lineage-1',
     trace_id: 'trace-1',
     input: { kind: 'text', text: 'Hello Codex', attachments: [] },
@@ -124,18 +140,9 @@ function executionContext(overrides = {}) {
       allowed_sources: ['main_card_reply', 'card_action'],
     },
     executor_instance_id: 'executor-1',
-    workspace: {
-      workspace_lease_id: 'workspace-lease-1',
-      workspace_root: '/workspace',
-      mode: 'writable',
-      holder_service_instance_id: 'service-1',
-      holder_conversation_id: 'conversation-1',
-      holder_turn_id: 'turn-1',
-      lease_epoch: 11,
-      lease_expires_at: '2026-07-19T05:10:00Z',
-    },
     attempt: { attempt_id: 'attempt-1', attempt_no: 1, lease_epoch: 3 },
     ...overrides,
+    workspace,
   };
 }
 
@@ -210,7 +217,11 @@ async function deliverPreparedInteractionAnswer(adapter, delivery) {
   return prepared.send(delivery);
 }
 
-function sendStartedFileChange({ send, threadId, turnId }, itemId) {
+function sendStartedFileChange(
+  { send, threadId, turnId },
+  itemId,
+  { workspaceRoot = '/workspace' } = {},
+) {
   send({
     method: 'item/started',
     params: {
@@ -222,7 +233,7 @@ function sendStartedFileChange({ send, threadId, turnId }, itemId) {
         id: itemId,
         status: 'inProgress',
         changes: [{
-          path: `/workspace/${itemId}.txt`,
+          path: path.join(workspaceRoot, `${itemId}.txt`),
           kind: { type: 'update', move_path: null },
           diff: '+provider requested change',
         }],
@@ -572,6 +583,25 @@ describe('Codex app-server provider adapter', () => {
     expect(spawnProcess).not.toHaveBeenCalled();
   });
 
+  test.each([
+    ['missing workspace', { workspace: null }],
+    ['relative root', { workspace: { workspace_root: 'conversation-1' } }],
+    ['mismatched holder', {
+      workspace: { holder_conversation_id: 'conversation-other' },
+    }],
+    ['invalid generation', { workspace: { workspace_generation: 0 } }],
+  ])('rejects a detached execution with %s before app-server can start', async (
+    _label,
+    contextPatch,
+  ) => {
+    const spawnProcess = jest.fn();
+    const adapter = createCodexAppServerAdapter({ spawnProcess, cwd: '/workspace/default' });
+
+    await expect(collect(adapter.execute(executionContext(contextPatch), workspaceControls())))
+      .rejects.toBeInstanceOf(TypeError);
+    expect(spawnProcess).not.toHaveBeenCalled();
+  });
+
   test('fails closed before starting a writable turn without a current workspace fence', async () => {
     const spawnProcess = jest.fn();
     const adapter = createCodexAppServerAdapter({ spawnProcess, cwd: '/workspace' });
@@ -805,22 +835,27 @@ describe('Codex app-server provider adapter', () => {
     const server = createFakeAppServer();
     const adapter = createCodexAppServerAdapter({
       approvalPolicy: 'never',
+      cwd: '/workspace/default',
       sandbox: 'danger-full-access',
       spawnProcess: () => server.child,
     });
 
-    await collect(executeAdapter(adapter, executionContext()));
+    await collect(executeAdapter(adapter, executionContext({
+      workspace: { workspace_root: '/workspace/conversation-A' },
+    })));
 
     const threadStart = server.received.find(({ method }) => method === 'thread/start');
     expect(threadStart.params).toEqual(expect.objectContaining({
       approvalPolicy: 'never',
       approvalsReviewer: 'user',
+      cwd: '/workspace/conversation-A',
       sandbox: 'danger-full-access',
     }));
     const turnStart = server.received.find(({ method }) => method === 'turn/start');
     expect(turnStart.params).toEqual(expect.objectContaining({
       approvalPolicy: 'never',
       approvalsReviewer: 'user',
+      cwd: '/workspace/conversation-A',
       sandboxPolicy: { type: 'dangerFullAccess' },
     }));
   });
@@ -877,13 +912,22 @@ enabled = false
   test('resumes and multiplexes persisted lineages over the same supervised process', async () => {
     const server = createFakeAppServer();
     const spawnProcess = jest.fn(() => server.child);
-    const adapter = createCodexAppServerAdapter({ spawnProcess });
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess,
+      cwd: '/workspace/default',
+    });
 
     await Promise.all([
       collect(executeAdapter(adapter, executionContext({
         turn_id: 'turn-A',
         lineage_id: 'lineage-A',
         lineage: { provider_native_id: 'codex-thread-A' },
+        workspace: {
+          workspace_lease_id: 'workspace-lease-A',
+          workspace_root: '/workspace/conversation-A',
+          holder_turn_id: 'turn-A',
+          lease_epoch: 21,
+        },
         attempt: { attempt_id: 'attempt-A', attempt_no: 1, lease_epoch: 3 },
       }))),
       collect(executeAdapter(adapter, executionContext({
@@ -891,6 +935,13 @@ enabled = false
         turn_id: 'turn-B',
         lineage_id: 'lineage-B',
         lineage: { provider_native_id: 'codex-thread-B' },
+        workspace: {
+          workspace_lease_id: 'workspace-lease-B',
+          workspace_root: '/workspace/conversation-B',
+          holder_conversation_id: 'conversation-B',
+          holder_turn_id: 'turn-B',
+          lease_epoch: 22,
+        },
         attempt: { attempt_id: 'attempt-B', attempt_no: 1, lease_epoch: 4 },
       }))),
     ]);
@@ -916,7 +967,139 @@ enabled = false
       }));
       expect(resume.params.config).not.toHaveProperty('mcp_servers');
     }
-    expect(server.received.filter(({ method }) => method === 'turn/start')).toHaveLength(2);
+    expect(server.received.filter(({ method }) => method === 'thread/resume').map((message) => [
+      message.params.threadId,
+      message.params.cwd,
+    ])).toEqual(expect.arrayContaining([
+      ['codex-thread-A', '/workspace/conversation-A'],
+      ['codex-thread-B', '/workspace/conversation-B'],
+    ]));
+    expect(server.received.filter(({ method }) => method === 'turn/start').map((message) => [
+      message.params.threadId,
+      message.params.cwd,
+    ])).toEqual(expect.arrayContaining([
+      ['codex-thread-A', '/workspace/conversation-A'],
+      ['codex-thread-B', '/workspace/conversation-B'],
+    ]));
+  });
+
+  test.each([
+    [
+      'root',
+      { workspace_root: '/workspace/conversation-B', workspace_generation: 7 },
+    ],
+    [
+      'generation',
+      { workspace_root: '/workspace/conversation-A', workspace_generation: 8 },
+    ],
+  ])('rejects the same persisted thread when its workspace %s changes', async (
+    _label,
+    changedWorkspace,
+  ) => {
+    const server = createFakeAppServer();
+    const spawnProcess = jest.fn(() => server.child);
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess,
+      cwd: '/workspace/default',
+    });
+    const firstContext = executionContext({
+      lineage: { provider_native_id: 'codex-thread-bound' },
+      workspace: {
+        workspace_root: '/workspace/conversation-A',
+        workspace_generation: 7,
+      },
+    });
+
+    await expect(collect(executeAdapter(adapter, firstContext))).resolves.toEqual([]);
+    await expect(collect(executeAdapter(adapter, executionContext({
+      turn_id: 'turn-2',
+      lineage: { provider_native_id: 'codex-thread-bound' },
+      workspace: changedWorkspace,
+      attempt: { attempt_id: 'attempt-2', attempt_no: 1, lease_epoch: 4 },
+    })))).rejects.toMatchObject({
+      code: 'provider_context_invalid',
+      providerError: { side_effect_status: 'none' },
+    });
+
+    expect(spawnProcess).toHaveBeenCalledTimes(1);
+    expect(server.received.filter(({ method }) => method === 'thread/resume')).toHaveLength(1);
+    expect(server.received.filter(({ method }) => method === 'turn/start')).toHaveLength(1);
+  });
+
+  test('resumes the same thread and workspace binding after reconnect', async () => {
+    const firstServer = createFakeAppServer();
+    const secondServer = createFakeAppServer();
+    const spawnProcess = jest.fn()
+      .mockImplementationOnce(() => firstServer.child)
+      .mockImplementationOnce(() => secondServer.child);
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess,
+      cwd: '/workspace/default',
+    });
+    const workspace = {
+      workspace_root: '/workspace/conversation-A',
+      workspace_generation: 7,
+    };
+
+    await collect(executeAdapter(adapter, executionContext({
+      lineage: { provider_native_id: 'codex-thread-reconnect' },
+      workspace,
+    })));
+    firstServer.child.emit('close', 1, null);
+    await collect(executeAdapter(adapter, executionContext({
+      turn_id: 'turn-2',
+      lineage: { provider_native_id: 'codex-thread-reconnect' },
+      workspace,
+      attempt: { attempt_id: 'attempt-2', attempt_no: 1, lease_epoch: 4 },
+    })));
+
+    expect(spawnProcess).toHaveBeenCalledTimes(2);
+    expect(secondServer.received).toContainEqual(expect.objectContaining({
+      method: 'thread/resume',
+      params: expect.objectContaining({
+        threadId: 'codex-thread-reconnect',
+        cwd: '/workspace/conversation-A',
+      }),
+    }));
+    expect(secondServer.received).toContainEqual(expect.objectContaining({
+      method: 'turn/start',
+      params: expect.objectContaining({
+        threadId: 'codex-thread-reconnect',
+        cwd: '/workspace/conversation-A',
+      }),
+    }));
+  });
+
+  test('rejects a changed thread generation after the shared connection is lost', async () => {
+    const server = createFakeAppServer();
+    const spawnProcess = jest.fn(() => server.child);
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess,
+      cwd: '/workspace/default',
+    });
+
+    await collect(executeAdapter(adapter, executionContext({
+      lineage: { provider_native_id: 'codex-thread-generation-reconnect' },
+      workspace: {
+        workspace_root: '/workspace/conversation-A',
+        workspace_generation: 7,
+      },
+    })));
+    server.child.emit('close', 1, null);
+
+    await expect(collect(executeAdapter(adapter, executionContext({
+      turn_id: 'turn-2',
+      lineage: { provider_native_id: 'codex-thread-generation-reconnect' },
+      workspace: {
+        workspace_root: '/workspace/conversation-A',
+        workspace_generation: 8,
+      },
+      attempt: { attempt_id: 'attempt-2', attempt_no: 1, lease_epoch: 4 },
+    })))).rejects.toMatchObject({
+      code: 'provider_context_invalid',
+      providerError: { side_effect_status: 'none' },
+    });
+    expect(spawnProcess).toHaveBeenCalledTimes(1);
   });
 
   test('recovers one persisted lineage through app-server thread/resume without starting work', async () => {
@@ -962,7 +1145,9 @@ enabled = false
     const server = createFakeAppServer({
       afterTurnStart(details) {
         if (details.turnId !== 'codex-turn-1') return;
-        sendStartedFileChange(details, 'late-file-change');
+        sendStartedFileChange(details, 'late-file-change', {
+          workspaceRoot: '/workspace/conversation-A',
+        });
         details.send({
           id: 'run-a-approval',
           method: 'item/fileChange/requestApproval',
@@ -984,10 +1169,13 @@ enabled = false
     });
     const adapter = createCodexAppServerAdapter({
       spawnProcess: () => server.child,
-      cwd: '/workspace',
+      cwd: '/workspace/default',
     });
     const runAContext = executionContext({
       lineage: { provider_native_id: 'codex-thread-A' },
+      workspace: {
+        workspace_root: '/workspace/conversation-A',
+      },
     });
     const runA = executeAdapter(adapter, runAContext)[Symbol.asyncIterator]();
     const interaction = await nextInteraction(runA);
@@ -1023,6 +1211,13 @@ enabled = false
       lineage_id: 'lineage-B',
       lineage: { provider_native_id: 'codex-thread-B' },
       reportProviderFailure: reportRunBFailure,
+      workspace: {
+        workspace_lease_id: 'workspace-lease-B',
+        workspace_root: '/workspace/conversation-B',
+        holder_conversation_id: 'conversation-B',
+        holder_turn_id: 'turn-B',
+        lease_epoch: 12,
+      },
       attempt: { attempt_id: 'attempt-B', attempt_no: 1, lease_epoch: 4 },
     });
     const runB = executeAdapter(adapter, runBContext)[Symbol.asyncIterator]();
@@ -1360,7 +1555,9 @@ enabled = false
     });
 
     try {
-      const events = await collect(executeAdapter(adapter, executionContext()));
+      const events = await collect(executeAdapter(adapter, executionContext({
+        workspace: { workspace_root: workspaceDirectory },
+      })));
       expect(events[0]).toEqual({
         kind: 'tool_started',
         provider_native_id: 'codex-thread-1',
@@ -1575,6 +1772,73 @@ enabled = false
             side_effect_status: 'unknown',
           },
         });
+      expect(reportProviderFailure).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(path.join(zylosDir, 'runtime', 'artifacts'))).toBe(false);
+    } finally {
+      await adapter.close();
+      fs.rmSync(zylosDir, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects an image saved path that escapes through a sibling symlink', async () => {
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-image-symlink-'));
+    const workspaceDirectory = path.join(zylosDir, 'conversation-A');
+    const siblingDirectory = path.join(zylosDir, 'conversation-B');
+    fs.mkdirSync(workspaceDirectory);
+    fs.mkdirSync(siblingDirectory);
+    const siblingImage = path.join(siblingDirectory, 'provider-image.png');
+    fs.writeFileSync(siblingImage, Buffer.from(ONE_PIXEL_PNG_BASE64, 'base64'));
+    const linkedSibling = path.join(workspaceDirectory, 'linked-sibling');
+    fs.symlinkSync(siblingDirectory, linkedSibling, 'dir');
+    const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'item/started',
+          params: {
+            threadId,
+            turnId,
+            startedAtMs: 1,
+            item: {
+              type: 'imageGeneration',
+              id: 'image-symlink-escape',
+              result: '',
+              status: 'generating',
+              savedPath: null,
+            },
+          },
+        });
+        send({
+          method: 'item/completed',
+          params: {
+            threadId,
+            turnId,
+            completedAtMs: 2,
+            item: {
+              type: 'imageGeneration',
+              id: 'image-symlink-escape',
+              result: ONE_PIXEL_PNG_BASE64,
+              status: 'completed',
+              savedPath: path.join(linkedSibling, 'provider-image.png'),
+            },
+          },
+        });
+      },
+    });
+    const adapter = createCodexAppServerAdapter({
+      cwd: zylosDir,
+      env: { ZYLOS_DIR: zylosDir },
+      spawnProcess: () => server.child,
+    });
+
+    try {
+      await expect(collect(executeAdapter(adapter, executionContext({
+        workspace: { workspace_root: workspaceDirectory },
+        reportProviderFailure,
+      })))).rejects.toMatchObject({
+        code: 'provider_protocol_invalid',
+        providerError: { side_effect_status: 'unknown' },
+      });
       expect(reportProviderFailure).toHaveBeenCalledTimes(1);
       expect(fs.existsSync(path.join(zylosDir, 'runtime', 'artifacts'))).toBe(false);
     } finally {
@@ -2516,7 +2780,7 @@ enabled = false
     const assertWorkspaceWrite = jest.fn(() => ({ status: 'current' }));
     const adapter = createCodexAppServerAdapter({
       spawnProcess: () => server.child,
-      cwd: '/workspace',
+      cwd: '/workspace/default',
     });
 
     const events = await collect(adapter.execute(executionContext(), {
@@ -2602,7 +2866,7 @@ enabled = false
     });
     const adapter = createCodexAppServerAdapter({
       spawnProcess: () => server.child,
-      cwd: '/workspace',
+      cwd: '/workspace/default',
     });
 
     await expect(collect(adapter.execute(executionContext(), {
@@ -2663,6 +2927,110 @@ enabled = false
       id: 'sticky-permission-approval',
       result: { decision: 'accept' },
     });
+  });
+
+  test('declines a file approval whose path escapes into a sibling workspace through a symlink', async () => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-sibling-workspaces-'));
+    const workspaceA = path.join(parent, 'conversation-A');
+    const workspaceB = path.join(parent, 'conversation-B');
+    fs.mkdirSync(workspaceA);
+    fs.mkdirSync(workspaceB);
+    const linkedSibling = path.join(workspaceA, 'linked-sibling');
+    fs.symlinkSync(workspaceB, linkedSibling, 'dir');
+    const server = createFakeAppServer({
+      afterTurnStart({ send, threadId, turnId }) {
+        send({
+          method: 'item/started',
+          params: {
+            threadId,
+            turnId,
+            startedAtMs: 1,
+            item: {
+              type: 'fileChange',
+              id: 'sibling-file-change',
+              status: 'inProgress',
+              changes: [{
+                path: path.join(linkedSibling, 'escaped.txt'),
+                kind: { type: 'update', move_path: null },
+                diff: '+must not cross workspace',
+              }],
+            },
+          },
+        });
+        send({
+          id: 'sibling-file-approval',
+          method: 'item/fileChange/requestApproval',
+          params: {
+            threadId,
+            turnId,
+            itemId: 'sibling-file-change',
+            startedAtMs: 1,
+            reason: 'Attempt sibling write.',
+          },
+        });
+      },
+      onClientResponse({ message, send }) {
+        if (message.id !== 'sibling-file-approval') return;
+        send({
+          method: 'serverRequest/resolved',
+          params: { threadId: 'codex-thread-1', requestId: message.id },
+        });
+        send({
+          method: 'item/completed',
+          params: {
+            threadId: 'codex-thread-1',
+            turnId: 'codex-turn-1',
+            item: {
+              type: 'fileChange',
+              id: 'sibling-file-change',
+              status: 'completed',
+              changes: [],
+            },
+          },
+        });
+        send({
+          method: 'turn/completed',
+          params: {
+            threadId: 'codex-thread-1',
+            turn: { id: 'codex-turn-1', status: 'completed', items: [] },
+          },
+        });
+      },
+    });
+    const assertWorkspaceWrite = jest.fn(() => ({ status: 'current' }));
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: () => server.child,
+      cwd: parent,
+    });
+
+    try {
+      await expect(collect(adapter.execute(executionContext({
+        workspace: {
+          workspace_root: workspaceA,
+        },
+        reportProviderFailure: jest.fn(() => ({ status: 'recovering' })),
+      }), {
+        assertWorkspaceWrite,
+        authorizeProtectedAction: jest.fn(() => ({ trusted: true })),
+      }))).rejects.toMatchObject({
+        providerError: { side_effect_status: 'unknown' },
+      });
+      expect(server.received).toContainEqual({
+        id: 'sibling-file-approval',
+        result: { decision: 'decline' },
+      });
+      expect(server.received).not.toContainEqual({
+        id: 'sibling-file-approval',
+        result: { decision: 'accept' },
+      });
+      expect(assertWorkspaceWrite).not.toHaveBeenCalledWith(expect.objectContaining({
+        provider_item_id: 'sibling-file-change',
+        write_paths: [path.join(linkedSibling, 'escaped.txt')],
+      }));
+    } finally {
+      await adapter.close();
+      fs.rmSync(parent, { recursive: true, force: true });
+    }
   });
 
   test.each([
@@ -2740,7 +3108,7 @@ enabled = false
     });
     const adapter = createCodexAppServerAdapter({
       spawnProcess: () => server.child,
-      cwd: '/workspace',
+      cwd: '/workspace/default',
     });
 
     await expect(collect(adapter.execute(executionContext(), {
@@ -2759,6 +3127,11 @@ enabled = false
       id: 'stale-auto-approval',
       result: { decision: 'accept' },
     });
+    expect(assertWorkspaceWrite).toHaveBeenLastCalledWith(expect.objectContaining({
+      cwd: '/workspace',
+      provider_item_id: 'stale-file-change',
+      write_paths: ['/workspace/stale-file-change.txt'],
+    }));
     expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
   });
 
