@@ -14,7 +14,10 @@ import {
   createExecutorServiceHost,
   requestExecutorService,
 } from '../runtime/executor/service-host.js';
-import { runExecutorDaemon } from '../runtime/executor/daemon.js';
+import {
+  prepareConversationWorkspaceOptions,
+  runExecutorDaemon,
+} from '../runtime/executor/daemon.js';
 import { createExecutorPrerequisiteOwner } from '../runtime/executor/prerequisite-owner.js';
 import {
   cleanupObsoleteLifecycleArtifacts,
@@ -77,6 +80,17 @@ function inertAdapter(provider = 'claude') {
 }
 
 describe('executor service lifecycle host', () => {
+  test('rejects a symlinked runtime parent for conversation workspace control paths', () => {
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-workspace-parent-'));
+    const redirectedRuntime = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-workspace-redirect-'));
+    directories.push(zylosDir, redirectedRuntime);
+    fs.symlinkSync(redirectedRuntime, path.join(zylosDir, 'runtime'), 'dir');
+
+    expect(() => prepareConversationWorkspaceOptions(zylosDir))
+      .toThrow('Conversation workspace control path must be a real directory');
+    expect(fs.readdirSync(redirectedRuntime)).toEqual([]);
+  });
+
   test('dispatches a second executor run without awaiting a long first run', async () => {
     const state = fixture();
     let releaseFirst;
@@ -786,6 +800,24 @@ describe('executor daemon resource ownership', () => {
       'adapter-create',
       'host-start',
     ]);
+    expect(hostOptions.conversationWorkspaceOptions).toMatchObject({
+      workspaceStoreRoot: fs.realpathSync.native(path.join(
+        state.directory,
+        'runtime',
+        'conversation-workspaces',
+      )),
+      baseSnapshotRoot: fs.realpathSync.native(path.join(
+        state.directory,
+        'runtime',
+        'conversation-workspace-base-v1',
+      )),
+      baseSnapshotRef: 'zylos-empty-conversation-workspace@1',
+      snapshotFiles: [],
+    });
+    expect(fs.statSync(hostOptions.conversationWorkspaceOptions.workspaceStoreRoot).mode & 0o777)
+      .toBe(0o700);
+    expect(fs.statSync(hostOptions.conversationWorkspaceOptions.baseSnapshotRoot).mode & 0o777)
+      .toBe(0o500);
     await daemon.close();
     expect(events.slice(-3)).toEqual([
       'host-close',

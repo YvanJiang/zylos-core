@@ -98,8 +98,10 @@ acceptance from connection or in-memory request state and does not resend the an
 `sandbox: "workspace-write"` is a trusted adapter-construction declaration of the logical access
 that Core must serialize; it is not forwarded as the provider sandbox. `getWorkspaceAccess()` owns
 only that mode/enforcement declaration. Its configured root remains a controlled compatibility
-default for lease discovery and non-run lineage recovery; it is never allowed to override a
-detached execution's durable `context.workspace`. Every new, resumed, and started Codex turn is
+default for lease discovery; it is never allowed to override a detached
+execution's durable `context.workspace`. Native lineage recovery also requires
+Core to supply the exact durable lineage workspace root and generation; it has
+no adapter-local cwd fallback. Every new, resumed, and started Codex turn is
 forced to `read-only` plus `on-request`, with the user reviewer. The turn override is repeated even
 after a persisted thread is resumed. A deployment-authorized exception may set
 `CODEX_SANDBOX_MODE=danger-full-access` together with `CODEX_APPROVAL_POLICY=never`; only that exact
@@ -112,7 +114,8 @@ containment. Other writable configurations whose approval policy is not
 The execution context workspace fence is validated in one place before a
 connection can start. Its required shape is:
 
-- `workspace_root`: normalized absolute path;
+- `workspace_root`: existing canonical real directory; nonexistent roots and
+  symlink aliases fail closed;
 - `workspace_lease_id`: non-empty string;
 - `mode`: exactly the adapter-declared `writable` or `read_only` mode;
 - `holder_conversation_id` and `holder_turn_id`: exact matches for the current

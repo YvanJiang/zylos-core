@@ -73,11 +73,11 @@ const GENERIC_WRITE_PATH_FIELDS = Object.freeze(new Set([
   'target_path',
 ]));
 
-function workspaceIdentity(context, fallbackCwd = null) {
+function workspaceIdentity(context) {
   const workspace = context?.workspace;
-  const workspaceRoot = workspace?.workspace_root ?? fallbackCwd;
-  const workspaceGeneration = workspace?.workspace_generation ?? 0;
-  const bindingKind = workspace?.binding_kind ?? 'legacy_shared';
+  const workspaceRoot = workspace?.workspace_root;
+  const workspaceGeneration = workspace?.workspace_generation;
+  const bindingKind = workspace?.binding_kind;
   if (typeof workspaceRoot !== 'string' || workspaceRoot.length === 0) {
     throw new TypeError('Claude execution requires a Core-selected workspace root.');
   }
@@ -981,7 +981,7 @@ export function createClaudeConversationAdapter({
     throw new TypeError('resolveEnvironment must return an environment object');
   }
   const {
-    cwd: fallbackCwd = process.cwd(),
+    cwd: _callerCwd,
     sandbox: _callerSandbox,
     ...callerQueryOptions
   } = queryOptions;
@@ -1021,7 +1021,7 @@ export function createClaudeConversationAdapter({
     if (controls.interactionPolicy && typeof controls.persistInteraction !== 'function') {
       throw new TypeError('controls.persistInteraction must be a function for durable interactions');
     }
-    const workspace = workspaceIdentity(context, fallbackCwd);
+    const workspace = workspaceIdentity(context);
     let executor = executors.get(context.conversation_id);
     if (executor?.closing) {
       throw new Error('The Claude conversation query is closing or failed to close.');

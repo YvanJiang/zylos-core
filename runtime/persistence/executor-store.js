@@ -39,6 +39,11 @@ import {
   normalizeReadyWorkspaceRoot,
   normalizeWorkspaceRoot,
 } from '../workspace/lease-coordinator.js';
+import {
+  bindLineageWorkspaceInTransaction as bindConversationLineageWorkspaceInTransaction,
+  getConversationWorkspaceBinding,
+  getLineageWorkspaceBinding,
+} from '../workspace/conversation-workspace-provisioner.js';
 import { BLOCKING_UPGRADE_STATES_SQL } from '../migration/upgrade-state.js';
 
 const RELEASE_FENCE_PREDICATE_SQL = `
@@ -113,33 +118,6 @@ const WORKSPACE_NOTIFICATION_BARRIER_CODES = new Set([
   'workspace_lease_expired',
   'workspace_lease_orphaned',
 ]);
-const CONVERSATION_WORKSPACE_BINDING_TABLE = 'runtime_conversation_workspaces';
-const CONVERSATION_WORKSPACE_BINDING_COLUMNS = Object.freeze([
-  'workspace_id',
-  'conversation_id',
-  'workspace_root',
-  'base_snapshot_root',
-  'base_snapshot_ref',
-  'generation',
-  'state',
-]);
-const LINEAGE_WORKSPACE_BINDING_TABLE = 'runtime_lineage_workspace_bindings';
-const LINEAGE_WORKSPACE_BINDING_COLUMNS = Object.freeze([
-  'lineage_id',
-  'workspace_id',
-  'conversation_id',
-  'workspace_root',
-  'generation',
-  'bound_at',
-]);
-const CONVERSATION_WORKSPACE_WAIT_REASON_BY_STATE = Object.freeze({
-  requested: 'workspace_provisioning',
-  provisioning: 'workspace_provisioning',
-  ready: null,
-  quarantined: 'workspace_quarantined',
-  failed: 'workspace_failed',
-  retired: 'workspace_retired',
-});
 
 const ANSWER_CONFLICT_CODES = new Set([
   'idempotency_conflict',
@@ -659,8 +637,12 @@ export function createExecutorStore({
   workspaceLeaseDurationMs = 10_000,
   interactionTimeoutMs = 10 * 60_000,
   retentionCleanupSleep,
+  legacyWorkspaceRoot = null,
 }) {
   initializeRuntimePersistence(database);
+  const normalizedLegacyWorkspaceRoot = legacyWorkspaceRoot === null
+    ? null
+    : normalizeWorkspaceRoot(legacyWorkspaceRoot);
   const workspaceLeases = createWorkspaceLeaseCoordinator({
     database,
     serviceInstanceId,
@@ -675,15 +657,6 @@ export function createExecutorStore({
     ...(retentionCleanupSleep === undefined ? {} : { sleep: retentionCleanupSleep }),
   });
 
-  function loadConversationWorkspaceBinding(conversationId) {
-    if (!hasRuntimeTable(CONVERSATION_WORKSPACE_BINDING_TABLE)) return null;
-    return database.prepare(`
-      SELECT ${CONVERSATION_WORKSPACE_BINDING_COLUMNS.join(', ')}
-      FROM ${CONVERSATION_WORKSPACE_BINDING_TABLE}
-      WHERE conversation_id = ?
-    `).get(conversationId) ?? null;
-  }
-
   function isDetachedExecutionConversation(conversationId) {
     return database.prepare(`
       SELECT 1
@@ -693,83 +666,13 @@ export function createExecutorStore({
     `).get(conversationId) !== undefined;
   }
 
-  function hasRuntimeTable(tableName) {
-    return database.prepare(`
-      SELECT 1
-      FROM sqlite_master
-      WHERE type = 'table' AND name = ?
-    `).get(tableName) !== undefined;
-  }
-
-  function loadLineageWorkspaceBinding(lineageId) {
-    if (!hasRuntimeTable(LINEAGE_WORKSPACE_BINDING_TABLE)) return null;
-    return database.prepare(`
-      SELECT ${LINEAGE_WORKSPACE_BINDING_COLUMNS.join(', ')}
-      FROM ${LINEAGE_WORKSPACE_BINDING_TABLE}
-      WHERE lineage_id = ?
-    `).get(lineageId) ?? null;
-  }
-
-  function bindLineageWorkspaceInTransaction({
-    lineageId,
-    conversationId,
-    binding,
-    boundAt,
-  }) {
-    if (!database.inTransaction) {
-      throw new Error('Lineage workspace binding must join the executor claim transaction.');
-    }
-    if (!hasRuntimeTable(LINEAGE_WORKSPACE_BINDING_TABLE)) {
-      conflict(
-        'workspace_lineage_binding_unavailable',
-        'Detached execution requires the durable lineage workspace binding table.',
-      );
-    }
-    const existing = loadLineageWorkspaceBinding(lineageId);
-    const expected = {
-      lineage_id: lineageId,
-      workspace_id: binding.workspace_id,
-      conversation_id: conversationId,
-      workspace_root: binding.workspace_root,
-      generation: binding.workspace_generation,
-    };
-    if (existing !== null) {
-      if (
-        existing.lineage_id !== expected.lineage_id
-        || existing.workspace_id !== expected.workspace_id
-        || existing.conversation_id !== expected.conversation_id
-        || existing.workspace_root !== expected.workspace_root
-        || existing.generation !== expected.generation
-      ) {
-        conflict(
-          'workspace_generation_mismatch',
-          'The durable lineage is bound to a different workspace generation.',
-        );
-      }
-      return Object.freeze({ ...existing });
-    }
-    database.prepare(`
-      INSERT INTO ${LINEAGE_WORKSPACE_BINDING_TABLE} (
-        lineage_id, workspace_id, conversation_id, workspace_root, generation, bound_at
-      ) VALUES (?, ?, ?, ?, ?, ?)
-    `).run(
-      lineageId,
-      expected.workspace_id,
-      conversationId,
-      expected.workspace_root,
-      expected.generation,
-      boundAt,
-    );
-    return Object.freeze({ ...expected, bound_at: boundAt });
-  }
-
   function resolveConversationWorkspaceBinding(conversationId, {
     legacyWorkspaceRoot,
   } = {}) {
     if (typeof conversationId !== 'string' || conversationId.length === 0) {
       throw new TypeError('conversationId must be a non-empty string');
     }
-    const binding = loadConversationWorkspaceBinding(conversationId);
+    const binding = getConversationWorkspaceBinding(database, conversationId);
     if (binding === null) {
       if (isDetachedExecutionConversation(conversationId)) {
         return Object.freeze({
@@ -805,7 +708,6 @@ export function createExecutorStore({
         wait_detail: null,
       });
     }
-    const waitReason = CONVERSATION_WORKSPACE_WAIT_REASON_BY_STATE[binding.state];
     const generationValid = Number.isSafeInteger(binding.generation) && binding.generation > 0;
     const identityValid = typeof binding.workspace_id === 'string'
       && binding.workspace_id.length > 0
@@ -819,9 +721,9 @@ export function createExecutorStore({
       }
     }
     if (
-      waitReason === undefined
-      || !generationValid
+      !generationValid
       || !identityValid
+      || binding.claimable !== (binding.state === 'ready')
       || binding.state === 'ready' && canonicalRoot === null
     ) {
       return Object.freeze({
@@ -852,8 +754,8 @@ export function createExecutorStore({
       workspace_root: canonicalRoot,
       workspace_generation: binding.generation,
       workspace_state: binding.state,
-      wait_reason: waitReason,
-      wait_detail: waitReason === null ? null : Object.freeze({
+      wait_reason: binding.wait_reason,
+      wait_detail: binding.wait_reason === null ? null : Object.freeze({
         binding_kind: 'conversation',
         workspace_id: binding.workspace_id,
         workspace_generation: binding.generation,
@@ -1606,7 +1508,25 @@ export function createExecutorStore({
         && recovery.candidate_lineage_id !== null
         && recovery.candidate_provider === provider
         && recovery.candidate_provider_native_id !== null;
-      if (!canAttemptNative) {
+      const lineageWorkspace = recovery.candidate_lineage_id === null
+        ? null
+        : getLineageWorkspaceBinding(database, recovery.candidate_lineage_id);
+      const candidateWorkspaceBinding = lineageWorkspace !== null
+        && lineageWorkspace.conversation_id === recovery.conversation_id
+        ? Object.freeze({
+          workspace_root: lineageWorkspace.workspace_root,
+          workspace_generation: lineageWorkspace.generation,
+        })
+        : !isDetachedExecutionConversation(recovery.conversation_id)
+          && normalizedLegacyWorkspaceRoot !== null
+          ? Object.freeze({
+            workspace_root: normalizedLegacyWorkspaceRoot,
+            workspace_generation: null,
+          })
+          : null;
+      const canAttemptProviderNative = canAttemptNative
+        && (provider !== 'codex' || candidateWorkspaceBinding !== null);
+      if (!canAttemptProviderNative) {
         const claimed = database.prepare(`
           UPDATE runtime_reply_mapping_recoveries
           SET state = 'native_recovery_not_applicable',
@@ -1677,6 +1597,9 @@ export function createExecutorStore({
           lineage_id: recovery.candidate_lineage_id,
           provider: recovery.candidate_provider,
           provider_native_id: recovery.candidate_provider_native_id,
+          ...(provider === 'codex'
+            ? { workspace_binding: candidateWorkspaceBinding }
+            : {}),
         },
       };
     });
@@ -2551,6 +2474,19 @@ export function createExecutorStore({
 
       const claimedAt = now();
       const current = loadTurn(database, turn.turn_id);
+      if (
+        isDetachedExecutionConversation(current.conversation_id)
+        && workspaceAccess?.binding_kind !== 'conversation'
+      ) {
+        const currentBinding = resolveConversationWorkspaceBinding(current.conversation_id);
+        if (currentBinding.claimable === false) {
+          return markWorkspaceWaitInTransaction(current.turn_id, currentBinding, claimedAt);
+        }
+        conflict(
+          'workspace_access_required',
+          'Detached execution cannot be claimed without its ready conversation workspace fence.',
+        );
+      }
       if (workspaceAccess?.binding_kind !== undefined) {
         const currentBinding = resolveConversationWorkspaceBinding(
           current.conversation_id,
@@ -2561,10 +2497,27 @@ export function createExecutorStore({
         }
         assertWorkspaceAccessMatchesBinding(workspaceAccess, currentBinding);
         if (currentBinding.binding_kind === 'conversation') {
-          bindLineageWorkspaceInTransaction({
+          const existingLineageBinding = getLineageWorkspaceBinding(
+            database,
+            current.lineage_id,
+          );
+          if (
+            existingLineageBinding !== null
+            && (
+              existingLineageBinding.workspace_id !== currentBinding.workspace_id
+              || existingLineageBinding.conversation_id !== current.conversation_id
+              || existingLineageBinding.workspace_root !== currentBinding.workspace_root
+              || existingLineageBinding.generation !== currentBinding.workspace_generation
+            )
+          ) {
+            conflict(
+              'workspace_generation_mismatch',
+              'The durable lineage is bound to a different workspace generation.',
+            );
+          }
+          bindConversationLineageWorkspaceInTransaction(database, {
             lineageId: current.lineage_id,
             conversationId: current.conversation_id,
-            binding: currentBinding,
             boundAt: claimedAt,
           });
         }

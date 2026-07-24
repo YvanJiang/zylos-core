@@ -22,6 +22,15 @@ const inboundFixture = JSON.parse(fs.readFileSync(
 
 const temporaryDirectories = [];
 
+function explicitLegacyWorkspace() {
+  return {
+    binding_kind: 'legacy_shared',
+    workspace_id: null,
+    workspace_root: fs.realpathSync.native(process.cwd()),
+    workspace_generation: 0,
+  };
+}
+
 function openTestDatabase() {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-claude-executor-'));
   temporaryDirectories.push(directory);
@@ -1069,6 +1078,32 @@ afterEach(() => {
 });
 
 describe('Claude conversation executor', () => {
+  test('fails closed when Core does not supply an explicit workspace projection', async () => {
+    let queryCalled = false;
+    const adapter = createClaudeConversationAdapter({
+      query() {
+        queryCalled = true;
+        throw new Error('Claude query must not start without a Core workspace.');
+      },
+    });
+
+    const execution = adapter.execute({
+      conversation_id: 'conversation-missing-workspace',
+      turn_id: 'turn-missing-workspace',
+      lineage_id: 'lineage-missing-workspace',
+      provider_native_id: null,
+      trace_id: 'trace-missing-workspace',
+      input: { text: 'must fail closed' },
+      attempt: { attempt_id: 'attempt-missing-workspace', attempt_no: 1, lease_epoch: 1 },
+    }, {
+      requestPermission: async () => ({ behavior: 'deny' }),
+    });
+
+    await expect(execution.next()).rejects.toThrow('Core-selected workspace root');
+    expect(queryCalled).toBe(false);
+    await adapter.close();
+  });
+
   test('rejects caller-controlled SDK continuity options', () => {
     expect(() => createClaudeConversationAdapter({
       query: () => {},
@@ -2348,6 +2383,7 @@ describe('Claude conversation executor', () => {
       trace_id: `trace-${turnId}`,
       input: { text: `input ${turnId}` },
       attempt: { attempt_id: `attempt-${turnId}`, attempt_no: 1, lease_epoch: 1 },
+      workspace: explicitLegacyWorkspace(),
     });
     const controls = { requestPermission: async () => ({ behavior: 'deny' }) };
     const consume = async (turnId) => {
@@ -3157,6 +3193,7 @@ describe('Claude conversation executor', () => {
         trace_id: `trace-${conversationId}`,
         input: { text: conversationId },
         attempt: { attempt_id: `attempt-${conversationId}`, attempt_no: 1, lease_epoch: 1 },
+        workspace: explicitLegacyWorkspace(),
       }, controls)) {
         records.push(record);
         if (record.type === 'provider_native_id') record.acknowledge();
@@ -3210,6 +3247,7 @@ describe('Claude conversation executor', () => {
       trace_id: `trace-${turnId}`,
       input: { text: turnId },
       attempt: { attempt_id: `attempt-${turnId}`, attempt_no: 1, lease_epoch: 1 },
+      workspace: explicitLegacyWorkspace(),
     });
     const consume = async (turnId, lineageId) => {
       for await (const record of adapter.execute(context(turnId, lineageId), controls)) {
@@ -3240,6 +3278,7 @@ describe('Claude conversation executor', () => {
       trace_id: `trace-${turnId}`,
       input: { text: turnId },
       attempt: { attempt_id: `attempt-${turnId}`, attempt_no: 1, lease_epoch: 1 },
+      workspace: explicitLegacyWorkspace(),
     });
     const consume = async (turnId, lineageId) => {
       for await (const record of adapter.execute(context(turnId, lineageId), controls)) {

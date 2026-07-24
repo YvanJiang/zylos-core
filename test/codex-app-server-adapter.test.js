@@ -6,13 +6,40 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PassThrough } from 'node:stream';
 
-import { describe, expect, jest, test } from '@jest/globals';
+import {
+  afterAll,
+  describe,
+  expect,
+  jest,
+  test,
+} from '@jest/globals';
 
 import { createCodexAppServerAdapter } from '../runtime/providers/codex-app-server-adapter.js';
 
 const ONE_PIXEL_PNG_BASE64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
 const ONE_PIXEL_PNG_SHA256 = '431ced6916a2a21a156e38701afe55bbd7f88969fbbfc56d7fe099d47f265460';
+const TEST_WORKSPACE_ROOT = fs.realpathSync.native(
+  fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-adapter-workspace-')),
+);
+
+function workspacePath(relativePath = '') {
+  return path.join(TEST_WORKSPACE_ROOT, relativePath);
+}
+
+for (const relativePath of [
+  'conversation-A',
+  'conversation-B',
+  'conversation-generation',
+  'default',
+  'review',
+]) {
+  fs.mkdirSync(workspacePath(relativePath));
+}
+
+afterAll(() => {
+  fs.rmSync(TEST_WORKSPACE_ROOT, { recursive: true, force: true });
+});
 
 function createFakeAppServer({
   afterThreadResume,
@@ -115,7 +142,7 @@ function executionContext(overrides = {}) {
     ? null
     : {
         workspace_lease_id: 'workspace-lease-1',
-        workspace_root: '/workspace',
+        workspace_root: TEST_WORKSPACE_ROOT,
         workspace_generation: 1,
         mode: 'writable',
         holder_service_instance_id: 'service-1',
@@ -220,7 +247,7 @@ async function deliverPreparedInteractionAnswer(adapter, delivery) {
 function sendStartedFileChange(
   { send, threadId, turnId },
   itemId,
-  { workspaceRoot = '/workspace' } = {},
+  { workspaceRoot = TEST_WORKSPACE_ROOT } = {},
 ) {
   send({
     method: 'item/started',
@@ -244,7 +271,7 @@ function sendStartedFileChange(
 
 function sendStartedCommand({ send, threadId, turnId }, itemId, {
   command = 'touch approved.txt',
-  cwd = '/workspace',
+  cwd = TEST_WORKSPACE_ROOT,
 } = {}) {
   send({
     method: 'item/started',
@@ -504,7 +531,7 @@ describe('Codex app-server provider adapter', () => {
       [5678, true],
     ]);
     const adapter = createCodexAppServerAdapter({
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
       isProcessGroupAlive: (processGroupId) => processGroupStates.get(processGroupId) ?? false,
     });
 
@@ -533,10 +560,10 @@ describe('Codex app-server provider adapter', () => {
 
     expect(createCodexAppServerAdapter({
       spawnProcess,
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
       sandbox: 'workspace-write',
     }).getWorkspaceAccess()).toEqual({
-      root: '/workspace',
+      root: TEST_WORKSPACE_ROOT,
       mode: 'writable',
       read_only_enforced: false,
       authority: 'core_workspace_lease',
@@ -544,10 +571,10 @@ describe('Codex app-server provider adapter', () => {
 
     expect(createCodexAppServerAdapter({
       spawnProcess,
-      cwd: '/workspace/review',
+      cwd: workspacePath('review'),
       sandbox: 'read-only',
     }).getWorkspaceAccess()).toEqual({
-      root: '/workspace/review',
+      root: workspacePath('review'),
       mode: 'read_only',
       read_only_enforced: true,
       authority: 'provider_sandbox',
@@ -559,23 +586,23 @@ describe('Codex app-server provider adapter', () => {
 
     expect(() => createCodexAppServerAdapter({
       spawnProcess,
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
       sandbox: 'danger-full-access',
       approvalPolicy: 'on-request',
     })).toThrow(/approvalPolicy never/);
     expect(() => createCodexAppServerAdapter({
       spawnProcess,
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
       sandbox: 'workspace-write',
       approvalPolicy: 'never',
     })).toThrow(/on-request/);
     expect(createCodexAppServerAdapter({
       spawnProcess,
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
       sandbox: 'danger-full-access',
       approvalPolicy: 'never',
     }).getWorkspaceAccess()).toEqual({
-      root: '/workspace',
+      root: TEST_WORKSPACE_ROOT,
       mode: 'writable',
       read_only_enforced: false,
       authority: 'core_workspace_lease',
@@ -590,21 +617,39 @@ describe('Codex app-server provider adapter', () => {
       workspace: { holder_conversation_id: 'conversation-other' },
     }],
     ['invalid generation', { workspace: { workspace_generation: 0 } }],
+    ['nonexistent root', {
+      workspace: { workspace_root: workspacePath('missing-workspace') },
+    }],
   ])('rejects a detached execution with %s before app-server can start', async (
     _label,
     contextPatch,
   ) => {
     const spawnProcess = jest.fn();
-    const adapter = createCodexAppServerAdapter({ spawnProcess, cwd: '/workspace/default' });
+    const adapter = createCodexAppServerAdapter({ spawnProcess, cwd: workspacePath('default') });
 
     await expect(collect(adapter.execute(executionContext(contextPatch), workspaceControls())))
       .rejects.toBeInstanceOf(TypeError);
     expect(spawnProcess).not.toHaveBeenCalled();
   });
 
+  test('rejects a symlink alias instead of accepting it as a canonical workspace root', async () => {
+    const aliasedRoot = workspacePath('conversation-alias');
+    fs.symlinkSync(workspacePath('conversation-A'), aliasedRoot, 'dir');
+    const spawnProcess = jest.fn();
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess,
+      cwd: workspacePath('default'),
+    });
+
+    await expect(collect(adapter.execute(executionContext({
+      workspace: { workspace_root: aliasedRoot },
+    }), workspaceControls()))).rejects.toThrow('existing canonical directory');
+    expect(spawnProcess).not.toHaveBeenCalled();
+  });
+
   test('fails closed before starting a writable turn without a current workspace fence', async () => {
     const spawnProcess = jest.fn();
-    const adapter = createCodexAppServerAdapter({ spawnProcess, cwd: '/workspace' });
+    const adapter = createCodexAppServerAdapter({ spawnProcess, cwd: TEST_WORKSPACE_ROOT });
 
     await expect(collect(adapter.execute(executionContext()))).rejects.toMatchObject({
       code: 'unsupported_capability',
@@ -622,7 +667,7 @@ describe('Codex app-server provider adapter', () => {
         throw staleLease;
       }),
     });
-    const adapter = createCodexAppServerAdapter({ spawnProcess, cwd: '/workspace' });
+    const adapter = createCodexAppServerAdapter({ spawnProcess, cwd: TEST_WORKSPACE_ROOT });
 
     await expect(collect(executeAdapter(adapter, executionContext(), controls)))
       .rejects.toBe(staleLease);
@@ -649,7 +694,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({
       spawnProcess: () => server.child,
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
     });
     const running = collect(executeAdapter(adapter, context, controls));
     await waitFor(() => context.bindProviderNativeId.mock.calls.length === 1);
@@ -685,7 +730,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({
       spawnProcess: () => server.child,
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
     });
     const waiting = executeAdapter(
       adapter,
@@ -727,7 +772,7 @@ describe('Codex app-server provider adapter', () => {
     });
     const adapter = createCodexAppServerAdapter({
       spawnProcess,
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
       now: () => '2026-07-19T05:00:00Z',
     });
 
@@ -764,7 +809,7 @@ describe('Codex app-server provider adapter', () => {
     expect(server.received[2]).toEqual(expect.objectContaining({
       method: 'thread/start',
       params: expect.objectContaining({
-        cwd: '/workspace',
+        cwd: TEST_WORKSPACE_ROOT,
         approvalPolicy: 'on-request',
         approvalsReviewer: 'user',
         sandbox: 'read-only',
@@ -806,7 +851,7 @@ describe('Codex app-server provider adapter', () => {
       params: expect.objectContaining({
         threadId: 'codex-thread-1',
         input: [{ type: 'text', text: 'Hello Codex' }],
-        cwd: '/workspace',
+        cwd: TEST_WORKSPACE_ROOT,
         approvalPolicy: 'on-request',
         approvalsReviewer: 'user',
         sandboxPolicy: { type: 'readOnly', networkAccess: false },
@@ -835,27 +880,27 @@ describe('Codex app-server provider adapter', () => {
     const server = createFakeAppServer();
     const adapter = createCodexAppServerAdapter({
       approvalPolicy: 'never',
-      cwd: '/workspace/default',
+      cwd: workspacePath('default'),
       sandbox: 'danger-full-access',
       spawnProcess: () => server.child,
     });
 
     await collect(executeAdapter(adapter, executionContext({
-      workspace: { workspace_root: '/workspace/conversation-A' },
+      workspace: { workspace_root: workspacePath('conversation-A') },
     })));
 
     const threadStart = server.received.find(({ method }) => method === 'thread/start');
     expect(threadStart.params).toEqual(expect.objectContaining({
       approvalPolicy: 'never',
       approvalsReviewer: 'user',
-      cwd: '/workspace/conversation-A',
+      cwd: workspacePath('conversation-A'),
       sandbox: 'danger-full-access',
     }));
     const turnStart = server.received.find(({ method }) => method === 'turn/start');
     expect(turnStart.params).toEqual(expect.objectContaining({
       approvalPolicy: 'never',
       approvalsReviewer: 'user',
-      cwd: '/workspace/conversation-A',
+      cwd: workspacePath('conversation-A'),
       sandboxPolicy: { type: 'dangerFullAccess' },
     }));
   });
@@ -874,7 +919,7 @@ enabled = false
     const spawnProcess = jest.fn(() => server.child);
     const adapter = createCodexAppServerAdapter({
       spawnProcess,
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
       env: {
         CODEX_HOME: codexHome,
         PATH: process.env.PATH,
@@ -914,7 +959,7 @@ enabled = false
     const spawnProcess = jest.fn(() => server.child);
     const adapter = createCodexAppServerAdapter({
       spawnProcess,
-      cwd: '/workspace/default',
+      cwd: workspacePath('default'),
     });
 
     await Promise.all([
@@ -924,7 +969,7 @@ enabled = false
         lineage: { provider_native_id: 'codex-thread-A' },
         workspace: {
           workspace_lease_id: 'workspace-lease-A',
-          workspace_root: '/workspace/conversation-A',
+          workspace_root: workspacePath('conversation-A'),
           holder_turn_id: 'turn-A',
           lease_epoch: 21,
         },
@@ -937,7 +982,7 @@ enabled = false
         lineage: { provider_native_id: 'codex-thread-B' },
         workspace: {
           workspace_lease_id: 'workspace-lease-B',
-          workspace_root: '/workspace/conversation-B',
+          workspace_root: workspacePath('conversation-B'),
           holder_conversation_id: 'conversation-B',
           holder_turn_id: 'turn-B',
           lease_epoch: 22,
@@ -971,26 +1016,26 @@ enabled = false
       message.params.threadId,
       message.params.cwd,
     ])).toEqual(expect.arrayContaining([
-      ['codex-thread-A', '/workspace/conversation-A'],
-      ['codex-thread-B', '/workspace/conversation-B'],
+      ['codex-thread-A', workspacePath('conversation-A')],
+      ['codex-thread-B', workspacePath('conversation-B')],
     ]));
     expect(server.received.filter(({ method }) => method === 'turn/start').map((message) => [
       message.params.threadId,
       message.params.cwd,
     ])).toEqual(expect.arrayContaining([
-      ['codex-thread-A', '/workspace/conversation-A'],
-      ['codex-thread-B', '/workspace/conversation-B'],
+      ['codex-thread-A', workspacePath('conversation-A')],
+      ['codex-thread-B', workspacePath('conversation-B')],
     ]));
   });
 
   test.each([
     [
       'root',
-      { workspace_root: '/workspace/conversation-B', workspace_generation: 7 },
+      { workspace_root: workspacePath('conversation-B'), workspace_generation: 7 },
     ],
     [
       'generation',
-      { workspace_root: '/workspace/conversation-A', workspace_generation: 8 },
+      { workspace_root: workspacePath('conversation-A'), workspace_generation: 8 },
     ],
   ])('rejects the same persisted thread when its workspace %s changes', async (
     _label,
@@ -1000,12 +1045,12 @@ enabled = false
     const spawnProcess = jest.fn(() => server.child);
     const adapter = createCodexAppServerAdapter({
       spawnProcess,
-      cwd: '/workspace/default',
+      cwd: workspacePath('default'),
     });
     const firstContext = executionContext({
       lineage: { provider_native_id: 'codex-thread-bound' },
       workspace: {
-        workspace_root: '/workspace/conversation-A',
+        workspace_root: workspacePath('conversation-A'),
         workspace_generation: 7,
       },
     });
@@ -1034,10 +1079,10 @@ enabled = false
       .mockImplementationOnce(() => secondServer.child);
     const adapter = createCodexAppServerAdapter({
       spawnProcess,
-      cwd: '/workspace/default',
+      cwd: workspacePath('default'),
     });
     const workspace = {
-      workspace_root: '/workspace/conversation-A',
+      workspace_root: workspacePath('conversation-A'),
       workspace_generation: 7,
     };
 
@@ -1058,14 +1103,14 @@ enabled = false
       method: 'thread/resume',
       params: expect.objectContaining({
         threadId: 'codex-thread-reconnect',
-        cwd: '/workspace/conversation-A',
+        cwd: workspacePath('conversation-A'),
       }),
     }));
     expect(secondServer.received).toContainEqual(expect.objectContaining({
       method: 'turn/start',
       params: expect.objectContaining({
         threadId: 'codex-thread-reconnect',
-        cwd: '/workspace/conversation-A',
+        cwd: workspacePath('conversation-A'),
       }),
     }));
   });
@@ -1075,13 +1120,13 @@ enabled = false
     const spawnProcess = jest.fn(() => server.child);
     const adapter = createCodexAppServerAdapter({
       spawnProcess,
-      cwd: '/workspace/default',
+      cwd: workspacePath('default'),
     });
 
     await collect(executeAdapter(adapter, executionContext({
       lineage: { provider_native_id: 'codex-thread-generation-reconnect' },
       workspace: {
-        workspace_root: '/workspace/conversation-A',
+        workspace_root: workspacePath('conversation-A'),
         workspace_generation: 7,
       },
     })));
@@ -1091,7 +1136,7 @@ enabled = false
       turn_id: 'turn-2',
       lineage: { provider_native_id: 'codex-thread-generation-reconnect' },
       workspace: {
-        workspace_root: '/workspace/conversation-A',
+        workspace_root: workspacePath('conversation-A'),
         workspace_generation: 8,
       },
       attempt: { attempt_id: 'attempt-2', attempt_no: 1, lease_epoch: 4 },
@@ -1116,6 +1161,10 @@ enabled = false
         lineage_id: 'lineage-codex-A',
         provider: 'codex',
         provider_native_id: 'codex-thread-recovery-A',
+        workspace_binding: {
+          workspace_root: workspacePath('conversation-A'),
+          workspace_generation: 7,
+        },
       },
     };
 
@@ -1133,10 +1182,68 @@ enabled = false
       .toEqual([expect.objectContaining({
         params: expect.objectContaining({
           threadId: request.candidate.provider_native_id,
+          cwd: request.candidate.workspace_binding.workspace_root,
         }),
       })]);
     expect(server.received.filter(({ method }) => method === 'turn/start')).toHaveLength(0);
     await expect(adapter.recoverLineage(request)).resolves.toMatchObject({ status: 'recovered' });
+    expect(server.received.filter(({ method }) => method === 'thread/resume')).toHaveLength(1);
+  });
+
+  test('fails closed when native lineage recovery lacks a durable workspace binding', async () => {
+    const spawnProcess = jest.fn();
+    const adapter = createCodexAppServerAdapter({ spawnProcess });
+
+    await expect(adapter.recoverLineage({
+      recovery_id: 'mapping-recovery-codex-missing-workspace',
+      turn_id: 'turn-recovery-codex-missing-workspace',
+      native_recovery_attempt_id: 'native-recovery-attempt-codex-missing-workspace',
+      native_recovery_attempt_no: 1,
+      candidate: {
+        lineage_id: 'lineage-codex-missing-workspace',
+        provider: 'codex',
+        provider_native_id: 'codex-thread-recovery-missing-workspace',
+      },
+    })).rejects.toThrow('durable workspace binding');
+    expect(spawnProcess).not.toHaveBeenCalled();
+  });
+
+  test('rejects a changed durable workspace generation during repeated native recovery', async () => {
+    const server = createFakeAppServer();
+    const adapter = createCodexAppServerAdapter({
+      spawnProcess: jest.fn(() => server.child),
+    });
+    const request = {
+      recovery_id: 'mapping-recovery-codex-generation',
+      turn_id: 'turn-recovery-codex-generation',
+      native_recovery_attempt_id: 'native-recovery-attempt-codex-generation',
+      native_recovery_attempt_no: 1,
+      candidate: {
+        lineage_id: 'lineage-codex-generation',
+        provider: 'codex',
+        provider_native_id: 'codex-thread-recovery-generation',
+        workspace_binding: {
+          workspace_root: workspacePath('conversation-generation'),
+          workspace_generation: 4,
+        },
+      },
+    };
+
+    await expect(adapter.recoverLineage(request)).resolves.toMatchObject({
+      status: 'recovered',
+    });
+    await expect(adapter.recoverLineage({
+      ...request,
+      candidate: {
+        ...request.candidate,
+        workspace_binding: {
+          ...request.candidate.workspace_binding,
+          workspace_generation: 5,
+        },
+      },
+    })).rejects.toMatchObject({
+      code: 'provider_context_invalid',
+    });
     expect(server.received.filter(({ method }) => method === 'thread/resume')).toHaveLength(1);
   });
 
@@ -1146,7 +1253,7 @@ enabled = false
       afterTurnStart(details) {
         if (details.turnId !== 'codex-turn-1') return;
         sendStartedFileChange(details, 'late-file-change', {
-          workspaceRoot: '/workspace/conversation-A',
+          workspaceRoot: workspacePath('conversation-A'),
         });
         details.send({
           id: 'run-a-approval',
@@ -1169,12 +1276,12 @@ enabled = false
     });
     const adapter = createCodexAppServerAdapter({
       spawnProcess: () => server.child,
-      cwd: '/workspace/default',
+      cwd: workspacePath('default'),
     });
     const runAContext = executionContext({
       lineage: { provider_native_id: 'codex-thread-A' },
       workspace: {
-        workspace_root: '/workspace/conversation-A',
+        workspace_root: workspacePath('conversation-A'),
       },
     });
     const runA = executeAdapter(adapter, runAContext)[Symbol.asyncIterator]();
@@ -1213,7 +1320,7 @@ enabled = false
       reportProviderFailure: reportRunBFailure,
       workspace: {
         workspace_lease_id: 'workspace-lease-B',
-        workspace_root: '/workspace/conversation-B',
+        workspace_root: workspacePath('conversation-B'),
         holder_conversation_id: 'conversation-B',
         holder_turn_id: 'turn-B',
         lease_epoch: 12,
@@ -1503,7 +1610,7 @@ enabled = false
   });
 
   test('persists a bounded image artifact when the completed item still says generating', async () => {
-    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-image-artifact-'));
+    const zylosDir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-image-artifact-')));
     const workspaceDirectory = path.join(zylosDir, 'workspace');
     const providerSavedPath = path.join(workspaceDirectory, 'generated', 'provider-image.png');
     fs.mkdirSync(path.dirname(providerSavedPath), { recursive: true });
@@ -1606,7 +1713,7 @@ enabled = false
   });
 
   test('rejects an explicitly failed image item even when it carries PNG bytes', async () => {
-    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-image-failed-'));
+    const zylosDir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-image-failed-')));
     const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
     const server = createFakeAppServer({
       afterTurnStart({ send, threadId, turnId }) {
@@ -1645,7 +1752,7 @@ enabled = false
       },
     });
     const adapter = createCodexAppServerAdapter({
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
       env: { ZYLOS_DIR: zylosDir },
       spawnProcess: () => server.child,
     });
@@ -1693,7 +1800,7 @@ enabled = false
       'a saved path that escapes the workspace',
       {
         result: ONE_PIXEL_PNG_BASE64,
-        savedPath: '/workspace/../private/provider-image.png',
+        savedPath: workspacePath('../private/provider-image.png'),
       },
       {},
       'provider_protocol_invalid',
@@ -1713,7 +1820,7 @@ enabled = false
     adapterOptions,
     expectedCode,
   ) => {
-    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-image-invalid-'));
+    const zylosDir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-image-invalid-')));
     const reportProviderFailure = jest.fn(() => ({ status: 'recovering' }));
     const completedItem = {
       type: 'imageGeneration',
@@ -1755,7 +1862,7 @@ enabled = false
       },
     });
     const adapter = createCodexAppServerAdapter({
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
       env: { ZYLOS_DIR: zylosDir },
       spawnProcess: () => server.child,
       ...adapterOptions,
@@ -1781,7 +1888,7 @@ enabled = false
   });
 
   test('rejects an image saved path that escapes through a sibling symlink', async () => {
-    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-image-symlink-'));
+    const zylosDir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-image-symlink-')));
     const workspaceDirectory = path.join(zylosDir, 'conversation-A');
     const siblingDirectory = path.join(zylosDir, 'conversation-B');
     fs.mkdirSync(workspaceDirectory);
@@ -1848,7 +1955,7 @@ enabled = false
   });
 
   test('maps an unsafe artifact root to side-effect-unknown without retaining base64 diagnostics', async () => {
-    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-image-root-'));
+    const zylosDir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-image-root-')));
     const realArtifactDirectory = path.join(zylosDir, 'real-artifacts');
     const linkedArtifactDirectory = path.join(zylosDir, 'linked-artifacts');
     fs.mkdirSync(realArtifactDirectory);
@@ -1925,7 +2032,7 @@ enabled = false
   });
 
   test('reopens the workspace fence before persisting a completed image', async () => {
-    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-image-fence-'));
+    const zylosDir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-image-fence-')));
     const staleLease = new Error('workspace lease expired before image completion');
     let fenceChecks = 0;
     const controls = workspaceControls({
@@ -1973,7 +2080,7 @@ enabled = false
       },
     });
     const adapter = createCodexAppServerAdapter({
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
       env: { ZYLOS_DIR: zylosDir },
       spawnProcess: () => server.child,
     });
@@ -2613,11 +2720,13 @@ enabled = false
         environmentId: null,
         reason: 'Network access is required.',
         command: 'npm test',
-        cwd: '/workspace',
+        cwd: TEST_WORKSPACE_ROOT,
       },
       expected: {
         kind: 'tool_approval',
-        prompt: expect.stringMatching(/Command: npm test\nWorking directory: \/workspace/),
+        prompt: expect.stringContaining(
+          `Command: npm test\nWorking directory: ${TEST_WORKSPACE_ROOT}`,
+        ),
       },
       answer: { kind: 'decision', decision: 'approve' },
       result: { decision: 'accept' },
@@ -2629,7 +2738,9 @@ enabled = false
       params: { itemId: 'patch-1', startedAtMs: 1, reason: null },
       expected: {
         kind: 'tool_approval',
-        prompt: expect.stringMatching(/File update: \/workspace\/file\.txt\nDiff:\n\+safe change/),
+        prompt: expect.stringContaining(
+          `File update: ${workspacePath('file.txt')}\nDiff:\n+safe change`,
+        ),
       },
       answer: { kind: 'decision', decision: 'deny' },
       result: { decision: 'decline' },
@@ -2674,7 +2785,7 @@ enabled = false
                 id: params.itemId,
                 status: 'inProgress',
                 changes: [{
-                  path: '/workspace/file.txt',
+                  path: workspacePath('file.txt'),
                   kind: { type: 'update', move_path: null },
                   diff: '+safe change',
                 }],
@@ -2698,7 +2809,7 @@ enabled = false
     const controls = workspaceControls();
     const adapter = createCodexAppServerAdapter({
       spawnProcess: () => server.child,
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
     });
     const iterator = executeAdapter(
       adapter,
@@ -2780,7 +2891,7 @@ enabled = false
     const assertWorkspaceWrite = jest.fn(() => ({ status: 'current' }));
     const adapter = createCodexAppServerAdapter({
       spawnProcess: () => server.child,
-      cwd: '/workspace/default',
+      cwd: workspacePath('default'),
     });
 
     const events = await collect(adapter.execute(executionContext(), {
@@ -2804,7 +2915,7 @@ enabled = false
       connection_id: 'codex-app-server-1',
       conversation_id: 'conversation-1',
       core_turn_id: 'turn-1',
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
       environment_id: null,
       executor_instance_id: 'executor-1',
       lineage_id: 'lineage-1',
@@ -2819,7 +2930,7 @@ enabled = false
         holder_turn_id: 'turn-1',
         lease_epoch: 11,
       }),
-      write_paths: ['/workspace/trusted-file-change.txt'],
+      write_paths: [workspacePath('trusted-file-change.txt')],
     });
   });
 
@@ -2837,7 +2948,7 @@ enabled = false
             startedAtMs: 1,
             environmentId: null,
             command: 'touch approved.txt',
-            cwd: '/workspace',
+            cwd: TEST_WORKSPACE_ROOT,
             availableDecisions: ['accept', 'acceptForSession', 'decline'],
           },
         });
@@ -2866,7 +2977,7 @@ enabled = false
     });
     const adapter = createCodexAppServerAdapter({
       spawnProcess: () => server.child,
-      cwd: '/workspace/default',
+      cwd: workspacePath('default'),
     });
 
     await expect(collect(adapter.execute(executionContext(), {
@@ -2899,10 +3010,10 @@ enabled = false
             startedAtMs: 1,
             environmentId: null,
             command: 'touch approved.txt',
-            cwd: '/workspace',
+            cwd: TEST_WORKSPACE_ROOT,
             additionalPermissions: {
               network: null,
-              fileSystem: { read: [], write: ['/workspace'] },
+              fileSystem: { read: [], write: [TEST_WORKSPACE_ROOT] },
             },
           },
         });
@@ -2910,7 +3021,7 @@ enabled = false
     });
     const adapter = createCodexAppServerAdapter({
       spawnProcess: () => server.child,
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
     });
 
     await expect(collect(adapter.execute(executionContext(), {
@@ -2930,7 +3041,7 @@ enabled = false
   });
 
   test('declines a file approval whose path escapes into a sibling workspace through a symlink', async () => {
-    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-sibling-workspaces-'));
+    const parent = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-sibling-workspaces-')));
     const workspaceA = path.join(parent, 'conversation-A');
     const workspaceB = path.join(parent, 'conversation-B');
     fs.mkdirSync(workspaceA);
@@ -3035,8 +3146,8 @@ enabled = false
 
   test.each([
     ['cwd', '/outside', null, null],
-    ['environment', '/workspace', 'remote-environment', null],
-    ['network', '/workspace', null, { host: 'example.com', protocol: 'https' }],
+    ['environment', TEST_WORKSPACE_ROOT, 'remote-environment', null],
+    ['network', TEST_WORKSPACE_ROOT, null, { host: 'example.com', protocol: 'https' }],
   ])('declines a trusted command whose %s fence escapes the local workspace', async (
     _label,
     commandCwd,
@@ -3064,7 +3175,7 @@ enabled = false
     });
     const adapter = createCodexAppServerAdapter({
       spawnProcess: () => server.child,
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
     });
 
     await expect(collect(adapter.execute(executionContext(), {
@@ -3108,7 +3219,7 @@ enabled = false
     });
     const adapter = createCodexAppServerAdapter({
       spawnProcess: () => server.child,
-      cwd: '/workspace/default',
+      cwd: workspacePath('default'),
     });
 
     await expect(collect(adapter.execute(executionContext(), {
@@ -3128,9 +3239,9 @@ enabled = false
       result: { decision: 'accept' },
     });
     expect(assertWorkspaceWrite).toHaveBeenLastCalledWith(expect.objectContaining({
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
       provider_item_id: 'stale-file-change',
-      write_paths: ['/workspace/stale-file-change.txt'],
+      write_paths: [workspacePath('stale-file-change.txt')],
     }));
     expect(server.child.kill).toHaveBeenCalledWith('SIGTERM');
   });
@@ -3147,11 +3258,11 @@ enabled = false
             itemId: 'permission-grant-item',
             startedAtMs: 1,
             environmentId: null,
-            cwd: '/workspace',
+            cwd: TEST_WORKSPACE_ROOT,
             reason: 'Request a broad grant.',
             permissions: {
               network: { enabled: true },
-              fileSystem: { read: [], write: ['/workspace'] },
+              fileSystem: { read: [], write: [TEST_WORKSPACE_ROOT] },
             },
           },
         });
@@ -3159,7 +3270,7 @@ enabled = false
     });
     const adapter = createCodexAppServerAdapter({
       spawnProcess: () => server.child,
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
     });
 
     await expect(collect(adapter.execute(executionContext(), {
@@ -3234,7 +3345,7 @@ enabled = false
             turnId,
             callId: 'dynamic-call-1',
             tool: 'writeFile',
-            arguments: { path: '/workspace/unapproved.txt' },
+            arguments: { path: workspacePath('unapproved.txt') },
           },
         });
       },
@@ -3460,7 +3571,7 @@ enabled = false
       params: {
         itemId: 'permission-malformed',
         startedAtMs: 1,
-        cwd: '/workspace',
+        cwd: TEST_WORKSPACE_ROOT,
         environmentId: null,
         reason: null,
         permissions: { network: 'all', fileSystem: null },
@@ -3472,7 +3583,7 @@ enabled = false
       params: {
         itemId: 'permission-required-missing',
         startedAtMs: 1,
-        cwd: '/workspace',
+        cwd: TEST_WORKSPACE_ROOT,
         permissions: { network: null, fileSystem: null },
       },
     },
@@ -3482,7 +3593,7 @@ enabled = false
       params: {
         itemId: 'permission-profile-missing',
         startedAtMs: 1,
-        cwd: '/workspace',
+        cwd: TEST_WORKSPACE_ROOT,
         environmentId: null,
         reason: null,
         permissions: {},
@@ -3494,7 +3605,7 @@ enabled = false
       params: {
         itemId: 'permission-nested-missing',
         startedAtMs: 1,
-        cwd: '/workspace',
+        cwd: TEST_WORKSPACE_ROOT,
         environmentId: null,
         reason: null,
         permissions: { network: {}, fileSystem: {} },
@@ -4384,7 +4495,7 @@ enabled = false
     });
     const adapter = createCodexAppServerAdapter({
       spawnProcess: () => server.child,
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
     });
     const iterator = executeAdapter(adapter, executionContext(), controls)[Symbol.asyncIterator]();
     const interaction = await nextInteraction(iterator);
@@ -4428,7 +4539,7 @@ enabled = false
     });
     const adapter = createCodexAppServerAdapter({
       spawnProcess: () => server.child,
-      cwd: '/workspace',
+      cwd: TEST_WORKSPACE_ROOT,
     });
     const waiting = executeAdapter(
       adapter,

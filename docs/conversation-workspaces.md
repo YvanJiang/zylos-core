@@ -98,6 +98,33 @@ snapshot. `ZYLOS_DIR`, Core SQLite, sockets, provider homes, PM2 state, home
 directories, and arbitrary working directories are control-plane or
 machine-local data and must never be supplied as a base snapshot.
 
+## Runtime bootstrap
+
+The executor daemon creates two controlled paths beneath `ZYLOS_DIR/runtime`:
+
+- `conversation-workspaces/` is the private store for final and staging roots;
+- `conversation-workspace-base-v1/` is a read-only empty snapshot whose durable
+  reference is `zylos-empty-conversation-workspace@1`.
+
+The empty snapshot is deliberate. Core does not copy `.env`, credentials,
+provider homes, SQLite, sockets, PM2 state, global memory, dependencies, or the
+installation directory into a conversation workspace. Managed identity,
+skills, credentials, and memory retain their existing global ownership while
+the provider cwd and output paths are isolated per detached execution
+conversation.
+
+Executor startup reconciles every durable binding. Before reservation, a
+`requested` or reclaimable `provisioning` binding is passed through
+`createConversationWorkspaceProvisioner.ensure`; only the resulting `ready`
+root can reach lease acquisition and provider execution. A live foreign
+provisioner remains `workspace_provisioning`, while a durable failure or
+quarantine keeps only that conversation unclaimable.
+
+`acceptQueuedInbound` remains an explicit compatibility seam and uses the
+legacy shared root. Because that root can contain the conversation-workspace
+store, its writable or uncertain lease can conservatively overlap isolated
+roots. Detached conversation roots are siblings and do not overlap each other.
+
 ## Recovery, quarantine, and retirement
 
 `side_effect_status=unknown`, a recovering execution/background task, an

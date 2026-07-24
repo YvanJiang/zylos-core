@@ -13,6 +13,10 @@ import {
 } from '../runtime/persistence/inbound-acceptance.js';
 import { createExecutorStore } from '../runtime/persistence/executor-store.js';
 import { createClaudeConversationAdapter } from '../runtime/providers/claude/conversation-adapter.js';
+import {
+  createConversationWorkspaceProvisioner,
+  requestConversationWorkspaceInTransaction,
+} from '../runtime/workspace/conversation-workspace-provisioner.js';
 
 const inboundFixture = JSON.parse(fs.readFileSync(
   new URL('../contracts/public/fixtures/inbound-envelope-v1.json', import.meta.url),
@@ -47,6 +51,23 @@ function createFixture() {
     directory,
     legacyRoot: fs.realpathSync.native(legacyRoot),
     workspacesRoot: fs.realpathSync.native(workspacesRoot),
+  };
+}
+
+function conversationWorkspaceOptions(
+  fixture,
+  namespace,
+  timestamp = '2026-07-24T01:00:01Z',
+) {
+  const baseSnapshotRoot = path.join(fixture.directory, `base-${namespace}`);
+  fs.mkdirSync(baseSnapshotRoot, { mode: 0o700 });
+  return {
+    workspaceStoreRoot: fixture.workspacesRoot,
+    baseSnapshotRoot,
+    baseSnapshotRef: `empty:${namespace}`,
+    snapshotFiles: [],
+    now: () => timestamp,
+    generateId: deterministicIds(`provisioner-${namespace}`),
   };
 }
 
@@ -259,14 +280,23 @@ describe('per-conversation detached execution workspaces', () => {
       workspaceRoot: fixture.legacyRoot,
     });
 
+    fixture.database.exec('DROP TRIGGER runtime_conversation_workspace_delete_forbidden;');
+    fixture.database.prepare(`
+      DELETE FROM runtime_conversation_workspaces
+      WHERE conversation_id = ?
+    `).run(conversationId);
     await expect(service.runNext()).resolves.toMatchObject({
       status: 'workspace_wait',
       wait_reason: 'workspace_binding_missing',
     });
-    putWorkspaceBinding(fixture.database, {
-      conversationId,
-      state: 'requested',
-    });
+    fixture.database.transaction(() => requestConversationWorkspaceInTransaction(
+      fixture.database,
+      {
+        workspaceId: 'workspace-restored-provisioning',
+        conversationId,
+        requestedAt: '2026-07-24T01:00:01Z',
+      },
+    )).immediate();
     await expect(service.runNext()).resolves.toMatchObject({
       status: 'workspace_wait',
       wait_reason: 'workspace_provisioning',
@@ -309,6 +339,114 @@ describe('per-conversation detached execution workspaces', () => {
     });
 
     await service.close();
+    fixture.database.close();
+  });
+
+  test('automatically provisions distinct roots before detached provider execution', async () => {
+    const fixture = createFixture();
+    const first = acceptDetached(fixture.database, 'automatic-first');
+    const second = acceptDetached(fixture.database, 'automatic-second');
+    const firstStarted = deferred();
+    const secondStarted = deferred();
+    const releaseFirst = deferred();
+    const observed = [];
+    const service = createExecutorService({
+      database: fixture.database,
+      adapter: {
+        getWorkspaceAccess() {
+          return { mode: 'writable', read_only_enforced: false, authority: 'provider_sandbox' };
+        },
+        async *execute(context) {
+          observed.push(context.workspace);
+          if (observed.length === 1) {
+            firstStarted.resolve();
+            await releaseFirst.promise;
+          } else {
+            secondStarted.resolve();
+          }
+          yield {
+            kind: 'text_snapshot',
+            payload: { text: 'done', end_offset: 4 },
+            provider_native_id: null,
+          };
+        },
+      },
+      provider: 'claude',
+      serviceInstanceId: 'executor-conversation-workspace-automatic',
+      now: () => '2026-07-24T01:00:02Z',
+      generateId: deterministicIds('executor-automatic'),
+      workspaceRoot: fixture.legacyRoot,
+      conversationWorkspaceOptions: conversationWorkspaceOptions(fixture, 'automatic'),
+    });
+
+    const firstRun = service.runNext();
+    await firstStarted.promise;
+    const secondRun = service.runNext();
+    await secondStarted.promise;
+
+    expect(observed).toHaveLength(2);
+    expect(observed[0]).toMatchObject({
+      binding_kind: 'conversation',
+      workspace_generation: 1,
+    });
+    expect(observed[1]).toMatchObject({
+      binding_kind: 'conversation',
+      workspace_generation: 1,
+    });
+    expect(observed[0].workspace_root).not.toBe(observed[1].workspace_root);
+    expect(path.dirname(observed[0].workspace_root)).toBe(fixture.workspacesRoot);
+    expect(path.dirname(observed[1].workspace_root)).toBe(fixture.workspacesRoot);
+    expect(fixture.database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM runtime_lineage_workspace_bindings
+    `).get()).toEqual({ count: 2 });
+
+    releaseFirst.resolve();
+    await expect(firstRun).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: first.background_execution_turn_id,
+    });
+    await expect(secondRun).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: second.background_execution_turn_id,
+    });
+    await service.close();
+    fixture.database.close();
+  });
+
+  test('never lets the low-level store claim a detached turn without its workspace fence', () => {
+    const fixture = createFixture();
+    const accepted = acceptDetached(fixture.database, 'low-level-claim');
+    const conversationId = executionConversationId(fixture.database, accepted);
+    const store = createExecutorStore({
+      database: fixture.database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-low-level-claim',
+      now: () => '2026-07-24T01:00:02Z',
+      generateId: deterministicIds('executor-low-level-claim'),
+      legacyWorkspaceRoot: fixture.legacyRoot,
+    });
+
+    expect(store.claimNextQueuedTurn({
+      conversationId,
+    })).toMatchObject({
+      status: 'workspace_wait',
+      wait_reason: 'workspace_provisioning',
+    });
+
+    createConversationWorkspaceProvisioner({
+      database: fixture.database,
+      ...conversationWorkspaceOptions(fixture, 'low-level-claim'),
+    }).ensure(conversationId);
+    expect(() => store.claimNextQueuedTurn({
+      conversationId,
+    })).toThrow('ready conversation workspace fence');
+    expect(fixture.database.prepare(`
+      SELECT status
+      FROM runtime_turn_queue
+      WHERE turn_id = ?
+    `).get(accepted.background_execution_turn_id)).toEqual({ status: 'queued' });
+
     fixture.database.close();
   });
 

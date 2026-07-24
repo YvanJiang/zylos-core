@@ -295,21 +295,41 @@ function requireExecutionContext(context) {
   }
 }
 
-function requireWorkspaceBinding(context, expectedMode) {
-  const workspace = context.workspace;
-  if (!workspace || typeof workspace !== 'object' || Array.isArray(workspace)) {
-    throw new TypeError('execution context.workspace must contain a durable workspace fence');
-  }
+function requireCanonicalWorkspaceRoot(workspace, label) {
   if (
-    typeof workspace.workspace_root !== 'string'
+    !workspace
+    || typeof workspace !== 'object'
+    || Array.isArray(workspace)
+    || typeof workspace.workspace_root !== 'string'
     || workspace.workspace_root.length === 0
     || workspace.workspace_root.length > 4_096
     || workspace.workspace_root.includes('\0')
     || !path.isAbsolute(workspace.workspace_root)
     || path.resolve(workspace.workspace_root) !== workspace.workspace_root
   ) {
-    throw new TypeError('workspace.workspace_root must be a normalized absolute path');
+    throw new TypeError(`${label} must contain a normalized absolute workspace root`);
   }
+  let canonicalRoot;
+  try {
+    canonicalRoot = fs.realpathSync.native(workspace.workspace_root);
+  } catch {
+    throw new TypeError(`${label} workspace root must be an existing canonical directory`);
+  }
+  if (
+    canonicalRoot !== workspace.workspace_root
+    || !fs.lstatSync(canonicalRoot).isDirectory()
+  ) {
+    throw new TypeError(`${label} workspace root must be an existing canonical directory`);
+  }
+  return canonicalRoot;
+}
+
+function requireWorkspaceBinding(context, expectedMode) {
+  const workspace = context.workspace;
+  const workspaceRoot = requireCanonicalWorkspaceRoot(
+    workspace,
+    'execution context.workspace',
+  );
   if (
     typeof workspace.workspace_lease_id !== 'string'
     || workspace.workspace_lease_id.length === 0
@@ -331,8 +351,34 @@ function requireWorkspaceBinding(context, expectedMode) {
     throw new TypeError('workspace.workspace_generation must be a positive safe integer when provided');
   }
   return Object.freeze({
-    workspace_root: workspace.workspace_root,
+    workspace_root: workspaceRoot,
     workspace_generation: workspace.workspace_generation ?? null,
+  });
+}
+
+function requireRecoveryWorkspaceBinding(candidate) {
+  const workspace = candidate?.workspace_binding;
+  if (!workspace || typeof workspace !== 'object' || Array.isArray(workspace)) {
+    throw new TypeError('Codex lineage recovery requires a durable workspace binding');
+  }
+  const workspaceRoot = requireCanonicalWorkspaceRoot(
+    workspace,
+    'Codex lineage recovery workspace binding',
+  );
+  if (
+    workspace.workspace_generation !== null
+    && (
+      !Number.isSafeInteger(workspace.workspace_generation)
+      || workspace.workspace_generation < 1
+    )
+  ) {
+    throw new TypeError(
+      'Codex lineage recovery workspace generation must be null or a positive safe integer',
+    );
+  }
+  return Object.freeze({
+    workspace_root: workspaceRoot,
+    workspace_generation: workspace.workspace_generation,
   });
 }
 
@@ -2713,12 +2759,12 @@ export function createCodexAppServerAdapter({
     ) {
       throw new TypeError('Codex lineage recovery requires one complete persisted candidate fence');
     }
+    const requestedWorkspace = requireRecoveryWorkspaceBinding(candidate);
+    const workspaceBinding = bindThreadWorkspace(
+      candidate.provider_native_id,
+      requestedWorkspace,
+    );
     const target = await ensureConnection();
-    const workspaceBinding = threadWorkspaceBindings.get(candidate.provider_native_id)
-      ?? Object.freeze({
-        workspace_root: effectiveCwd,
-        workspace_generation: null,
-      });
     await resumePersistedThread(target, candidate.provider_native_id, workspaceBinding);
     return Object.freeze({
       status: 'recovered',
