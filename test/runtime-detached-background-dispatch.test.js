@@ -46,6 +46,7 @@ function normalEnvelope(suffix, text) {
   envelope.trace_id = `trace-${suffix}`;
   envelope.message_id = `message-${suffix}`;
   envelope.content = { kind: 'text', text, attachments: [] };
+  envelope.content.task_summary = text;
   envelope.idempotency_key = createIdempotencyKey('inbound', {
     region: envelope.region,
     tenant_id: envelope.tenant_id,
@@ -84,6 +85,161 @@ afterEach(() => {
 });
 
 describe('Core-owned detached background dispatch', () => {
+  test('projects same-conversation running tasks and queued count into Feishu Queue cards', async () => {
+    const database = openTestDatabase();
+    const first = acceptDetached(
+      database,
+      'queue-summary-running',
+      'Prepare the launch report',
+      '2026-07-23T00:40:00Z',
+    );
+    const foreignEnvelope = normalEnvelope(
+      'queue-summary-foreign',
+      'Private work from another chat',
+    );
+    foreignEnvelope.chat_id = 'chat-dm-foreign';
+    const foreign = acceptNormalInbound(database, foreignEnvelope, {
+      now: () => '2026-07-23T00:40:02Z',
+      generateId: deterministicIds('inbound-queue-summary-foreign'),
+    });
+    let startFirst;
+    let startForeign;
+    let releaseRuns;
+    const firstStarted = new Promise((resolve) => { startFirst = resolve; });
+    const foreignStarted = new Promise((resolve) => { startForeign = resolve; });
+    const runGate = new Promise((resolve) => { releaseRuns = resolve; });
+    let startedCount = 0;
+    const service = createExecutorService({
+      database,
+      provider: 'claude',
+      serviceInstanceId: 'executor-queue-summary',
+      now: () => '2026-07-23T00:40:03Z',
+      generateId: deterministicIds('executor-queue-summary'),
+      adapter: {
+        getWorkspaceAccess() {
+          return {
+            root: process.cwd(),
+            mode: 'read_only',
+            read_only_enforced: true,
+            authority: 'provider_sandbox',
+          };
+        },
+        async *execute(context) {
+          context.reportProviderState({ state: 'started', provider_native_id: null });
+          startedCount += 1;
+          if (startedCount === 1) startFirst();
+          if (startedCount === 2) startForeign();
+          await runGate;
+          yield {
+            kind: 'text_snapshot',
+            payload: { text: 'done', end_offset: 4 },
+            provider_native_id: null,
+          };
+        },
+      },
+    });
+    const firstRun = service.runNext();
+    await firstStarted;
+    const foreignRun = service.runNext();
+    await foreignStarted;
+    const stale = acceptDetached(
+      database,
+      'queue-summary-stale',
+      'Stale running row without a live lease',
+      '2026-07-23T00:40:03.500Z',
+    );
+    database.transaction(() => {
+      database.prepare(`
+        UPDATE runtime_turn_queue
+        SET status = 'claimed'
+        WHERE turn_id = ? AND status = 'queued'
+      `).run(stale.background_execution_turn_id);
+      database.prepare(`
+        UPDATE runtime_turns
+        SET state = 'running', turn_version = turn_version + 1,
+          committed_at = '2026-07-23T00:40:03.500Z'
+        WHERE turn_id = ? AND state = 'queued'
+      `).run(stale.background_execution_turn_id);
+    }).immediate();
+
+    const queued = acceptDetached(
+      database,
+      'queue-summary-queued',
+      'Review the launch report',
+      '2026-07-23T00:40:04Z',
+    );
+    const projection = database.prepare(`
+      SELECT render_model_json
+      FROM runtime_projection_snapshots
+      WHERE turn_id = ? AND aggregate_version = 2
+    `).get(queued.background_execution_turn_id);
+    const renderModel = JSON.parse(projection.render_model_json);
+
+    expect(renderModel).toMatchObject({
+      phase: 'queued',
+      terminal: false,
+    });
+    expect(renderModel.text).toContain('Your task is queued.');
+    expect(renderModel.text).toContain('Running tasks:');
+    expect(renderModel.text).toContain('- [running] Prepare the launch report');
+    expect(renderModel.text).toContain('Queued tasks: 1 (including this task).');
+    expect(renderModel.text).not.toContain('Private work from another chat');
+    expect(renderModel.text).not.toContain('Stale running row without a live lease');
+
+    releaseRuns();
+    await Promise.all([firstRun, foreignRun]);
+    await service.close();
+    database.close();
+  });
+
+  test('delivers an empty running set for the first queued Feishu task', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptDetached(
+      database,
+      'queue-summary-first',
+      'First task in this chat',
+      '2026-07-23T00:50:00Z',
+    );
+    const expectedText = [
+      'Your task is queued.',
+      '',
+      'Running tasks:',
+      '- None',
+      '',
+      'Queued tasks: 1 (including this task).',
+    ].join('\n');
+    const delivered = [];
+    const outbox = createOutboxService({
+      database,
+      renderer: {
+        async deliver(command) {
+          delivered.push(command);
+          return deliveredResult(command, '2026-07-23T00:50:01Z');
+        },
+      },
+      serviceInstanceId: 'delivery-queue-summary-first',
+      now: () => '2026-07-23T00:50:01Z',
+      generateId: deterministicIds('delivery-queue-summary-first'),
+      throttleMs: 0,
+    });
+
+    await expect(outbox.dispatchNext()).resolves.toMatchObject({ status: 'applied' });
+    await expect(outbox.dispatchNext()).resolves.toMatchObject({ status: 'applied' });
+    expect(delivered).toHaveLength(2);
+    expect(delivered[0]).toMatchObject({
+      operation: 'create_main',
+      render_model: { phase: 'received' },
+    });
+    expect(delivered[1]).toMatchObject({
+      operation: 'update_main',
+      render_model: {
+        phase: 'queued',
+        text: expectedText,
+      },
+    });
+    database.close();
+  });
+
   test('finishes foreground dispatch immediately and runs later inputs in fresh provider sessions', async () => {
     const database = openTestDatabase();
     const first = acceptDetached(

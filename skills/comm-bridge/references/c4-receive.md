@@ -12,8 +12,13 @@ node ~/zylos/.claude/skills/comm-bridge/scripts/c4-receive.js \
   [--thread-id <native_thread_id> --root-message-id <native_root_message_id>] \
   [--occurred-at <RFC3339>] \
   [--attachments-json <validated_public_attachment_array>] \
+  [--task-summary <short_user_visible_description>] \
   --content <text> [--json]
 ```
+
+`--task-summary` is optional channel-supplied display text for queue status.
+Core stores it with the inbound content and only lists it back to the same
+source conversation. It never broadens queue visibility across chats.
 
 Channel owners may supply canonical public attachment facts with
 `--attachments-json`; their `attachment_id` and `content_ref` must be stable

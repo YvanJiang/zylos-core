@@ -23,7 +23,8 @@ function printUsage() {
   --channel <channel> --endpoint <chat_id> --message-id <native_message_id> \\
   --actor-id <authenticated_actor_id> [--chat-type dm|group|thread] \\
   [--thread-id <native_thread_id>] [--root-message-id <native_root_message_id>] \\
-  [--occurred-at <RFC3339>] [--attachments-json <json_array>] [--json] \\
+  [--occurred-at <RFC3339>] [--attachments-json <json_array>] \\
+  [--task-summary <display_text>] [--json] \\
   --content <message>`);
 }
 
@@ -40,6 +41,7 @@ function parseArgs(args) {
     messageId: null,
     occurredAt: null,
     rootMessageId: null,
+    taskSummary: null,
     threadId: null,
   };
   const valueOptions = new Map([
@@ -52,6 +54,7 @@ function parseArgs(args) {
     ['--message-id', 'messageId'],
     ['--occurred-at', 'occurredAt'],
     ['--root-message-id', 'rootMessageId'],
+    ['--task-summary', 'taskSummary'],
     ['--thread-id', 'threadId'],
   ]);
   for (let index = 0; index < args.length; index += 1) {
@@ -63,7 +66,10 @@ function parseArgs(args) {
     const field = valueOptions.get(argument);
     if (field === undefined) return { error: `Unknown option: ${argument}`, json: parsed.json };
     const value = args[index + 1];
-    if (value === undefined || (field !== 'content' && value.startsWith('--'))) {
+    if (
+      value === undefined
+      || (!['content', 'taskSummary'].includes(field) && value.startsWith('--'))
+    ) {
       return { error: `${argument} requires a value`, json: parsed.json };
     }
     parsed[field] = value;
@@ -117,6 +123,9 @@ function requireArguments(parsed) {
   if (parsed.occurredAt !== null && Number.isNaN(Date.parse(parsed.occurredAt))) {
     throw new TypeError('--occurred-at must be an RFC3339 timestamp');
   }
+  if (parsed.taskSummary !== null && parsed.taskSummary.length === 0) {
+    throw new TypeError('--task-summary must not be empty');
+  }
 }
 
 function compatibilityMessage(parsed, receivedAt) {
@@ -143,6 +152,7 @@ function compatibilityMessage(parsed, receivedAt) {
       kind: parsed.attachments.length > 0 ? 'mixed' : 'text',
       text: parsed.content,
       attachments: parsed.attachments,
+      ...(parsed.taskSummary === null ? {} : { task_summary: parsed.taskSummary }),
     },
     reply: {
       root_message_id: parsed.rootMessageId,

@@ -8,6 +8,7 @@ import {
   assertDeliveryTargetIdentity,
   resolveDeliveryCommandVersionForTarget,
 } from './delivery-target-identity.js';
+import { buildQueuedTaskStatusText } from './queue-status-summary.js';
 
 const TERMINAL_PHASES = new Set([
   'completed',
@@ -363,7 +364,18 @@ export function stageMainProjection(database, turn, event, {
     occurredAt: event.persisted_at,
   });
 
-  const renderModel = projectRenderModel(loadLatestRenderModel(database, lane.lane_key), event);
+  let renderModel = projectRenderModel(loadLatestRenderModel(database, lane.lane_key), event);
+  if (event.phase === 'queued' && durableTarget.channel === 'feishu') {
+    const queueStatusText = buildQueuedTaskStatusText(
+      database,
+      turn.turn_id,
+      event.payload?.reason_code,
+      event.persisted_at,
+    );
+    if (queueStatusText !== null) {
+      renderModel = { ...renderModel, text: queueStatusText };
+    }
+  }
   const critical = isCriticalProjectionEvent(event);
   if (
     event.kind === 'turn_state_changed'

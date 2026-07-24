@@ -64,6 +64,7 @@ describe('normal C4 callers use durable Core contracts', () => {
       '--message-id', 'web-message-1',
       '--actor-id', 'local-console-user',
       '--occurred-at', '2026-07-21T00:00:00.000Z',
+      '--task-summary', 'Compatibility channel greeting',
       '--content', 'hello from the compatibility channel',
       '--json',
     ];
@@ -102,6 +103,15 @@ describe('normal C4 callers use durable Core contracts', () => {
     assert.equal(command.target.chat_id, 'console');
     assert.equal(command.target.native_thread_root_message_id, null);
     assert.equal(command.target.native_thread_reply_target_message_id, null);
+    const acceptedEnvelope = JSON.parse(database.prepare(`
+      SELECT envelope_json
+      FROM runtime_inbound_events
+      WHERE inbound_event_id = 'web-message-1'
+    `).get().envelope_json);
+    assert.equal(
+      acceptedEnvelope.content.task_summary,
+      'Compatibility channel greeting',
+    );
 
     const replay = run(receiveCli, args, env);
     assert.equal(replay.status, 0, replay.stderr);
@@ -126,6 +136,7 @@ describe('normal C4 callers use durable Core contracts', () => {
     const result = run(receiveCli, [
       '--channel', 'web-console', '--endpoint', 'console',
       '--message-id', 'option-like-content', '--actor-id', 'local-console-user',
+      '--task-summary', '--summary-like',
       '--content', '--literal-text', '--json',
     ], env);
     assert.equal(result.status, 0, result.stderr);
@@ -136,6 +147,7 @@ describe('normal C4 callers use durable Core contracts', () => {
     `).get('option-like-content').envelope_json);
     database.close();
     assert.equal(envelope.content.text, '--literal-text');
+    assert.equal(envelope.content.task_summary, '--summary-like');
   });
 
   test('compatibility ingress still rejects option-like control and identity values', () => {

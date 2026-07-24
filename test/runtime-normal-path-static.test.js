@@ -344,11 +344,13 @@ describe('normal product paths have no retired runtime authority', () => {
     expect(reconciliationSource).not.toMatch(/javascript:|https?:\/\/|latest|parent/i);
   });
 
-  test('compatibility ingress accepts option-like text values without model or terminal routing', () => {
+  test('compatibility ingress accepts option-like display text without model or terminal routing', () => {
     const source = fs.readFileSync(
       path.resolve('skills/comm-bridge/scripts/c4-receive.js'), 'utf8',
     );
-    expect(source).toMatch(/field !== 'content' && value\.startsWith\('--'\)/);
+    expect(source).toMatch(
+      /!\['content', 'taskSummary'\]\.includes\(field\) && value\.startsWith\('--'\)/,
+    );
     expect(source).toMatch(/value === undefined/);
   });
 
