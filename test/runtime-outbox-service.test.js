@@ -8,6 +8,7 @@ import Database from '../skills/comm-bridge/node_modules/better-sqlite3/lib/inde
 
 import { createIdempotencyKey } from '../contracts/public/index.js';
 import { createChannelNeutralTextRenderer } from '../runtime/compatibility/c4-channel-fallback.js';
+import { reconcileOutboxNoEffect } from '../runtime/delivery/outbox-reconciliation.js';
 import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { createExecutorStore } from '../runtime/persistence/executor-store.js';
 import { acceptQueuedInbound as acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
@@ -1163,6 +1164,234 @@ describe('durable outbox service', () => {
       lease_expires_at: '2026-07-19T09:00:15.000Z',
       pre_action_fenced_at: '2026-07-19T09:00:05Z',
     });
+    database.close();
+  });
+
+  test('retries a busy result transaction without invoking the renderer again', async () => {
+    const database = openTestDatabase();
+    const blocker = new Database(database.name);
+    database.pragma('busy_timeout = 0');
+    blocker.pragma('busy_timeout = 0');
+    acceptNormalInbound(database, normalEnvelope('busy-result-retry'), {
+      now: () => '2026-07-19T09:05:00Z',
+      generateId: deterministicIds('busy-result-retry'),
+    });
+    let rendererCalls = 0;
+    const sleeps = [];
+    let outbox;
+    outbox = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-busy-result-retry',
+      now: () => '2026-07-19T09:05:01Z',
+      generateId: deterministicIds('delivery-busy-result-retry'),
+      resultRecordRetryDelaysMs: [7],
+      sleep: async (milliseconds) => {
+        sleeps.push(milliseconds);
+        blocker.exec('COMMIT');
+      },
+      renderer: {
+        async deliver(command) {
+          rendererCalls += 1;
+          outbox.assertCurrentClaim(command, { sideEffectBoundary: true });
+          blocker.exec('BEGIN IMMEDIATE');
+          return deliveredResult(command, '2026-07-19T09:05:02Z');
+        },
+      },
+    });
+
+    await expect(outbox.dispatchNext()).resolves.toEqual({
+      status: 'applied',
+      outbox_status: 'delivered',
+    });
+    expect(rendererCalls).toBe(1);
+    expect(sleeps).toEqual([7]);
+    expect(database.prepare('SELECT status FROM runtime_outbox').get()).toEqual({
+      status: 'delivered',
+    });
+
+    blocker.close();
+    database.close();
+  });
+
+  test('exhausts busy result retries without replaying the fenced platform action', async () => {
+    const database = openTestDatabase();
+    const blocker = new Database(database.name);
+    database.pragma('busy_timeout = 0');
+    blocker.pragma('busy_timeout = 0');
+    acceptNormalInbound(database, normalEnvelope('busy-result-exhausted'), {
+      now: () => '2026-07-19T09:07:00Z',
+      generateId: deterministicIds('busy-result-exhausted'),
+    });
+    let rendererCalls = 0;
+    let outbox;
+    outbox = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-busy-result-exhausted',
+      now: () => '2026-07-19T09:07:01Z',
+      generateId: deterministicIds('delivery-busy-result-exhausted'),
+      resultRecordRetryDelaysMs: [0, 0],
+      sleep: async () => {},
+      renderer: {
+        async deliver(command) {
+          rendererCalls += 1;
+          outbox.assertCurrentClaim(command, { sideEffectBoundary: true });
+          blocker.exec('BEGIN IMMEDIATE');
+          return deliveredResult(command, '2026-07-19T09:07:02Z');
+        },
+      },
+    });
+
+    await expect(outbox.dispatchNext()).rejects.toMatchObject({ code: 'SQLITE_BUSY' });
+    expect(rendererCalls).toBe(1);
+    expect(database.prepare(`
+      SELECT status, result_json,
+        CASE WHEN pre_action_fenced_at IS NULL THEN 0 ELSE 1 END AS pre_action_fenced
+      FROM runtime_outbox
+    `).get()).toEqual({
+      status: 'delivering',
+      result_json: null,
+      pre_action_fenced: 1,
+    });
+
+    blocker.exec('ROLLBACK');
+    blocker.close();
+    database.close();
+  });
+
+  test('supersedes an expired fenced update only from exact no-effect readback evidence', () => {
+    const database = openTestDatabase();
+    let currentTime = '2026-07-19T09:20:00Z';
+    const accepted = acceptNormalInbound(database, normalEnvelope('readback-no-effect'), {
+      now: () => currentTime,
+      generateId: deterministicIds('readback-no-effect-inbound'),
+    });
+    const outbox = createOutboxService({
+      database,
+      serviceInstanceId: 'delivery-readback-no-effect',
+      now: () => currentTime,
+      generateId: deterministicIds('readback-no-effect-delivery'),
+      throttleMs: 0,
+    });
+    const createCommand = outbox.claimNext();
+    expect(outbox.recordResult(deliveredResult(createCommand, currentTime))).toEqual({
+      status: 'applied',
+      outbox_status: 'delivered',
+    });
+
+    const executor = createExecutorStore({
+      database,
+      provider: 'claude',
+      serviceInstanceId: 'executor-readback-no-effect',
+      now: () => currentTime,
+      generateId: deterministicIds('readback-no-effect-executor'),
+    });
+    const turnContext = executor.claimNextQueuedTurn();
+    currentTime = '2026-07-19T09:20:01Z';
+    executor.transitionTurn(turnContext, 'starting', 'running');
+    const updateCommand = outbox.claimNext();
+    outbox.assertCurrentClaim(updateCommand, { sideEffectBoundary: true });
+    currentTime = '2026-07-19T09:20:02Z';
+    executor.appendAdapterEvent(turnContext, {
+      kind: 'text_snapshot',
+      payload: { text: 'the current terminal result', end_offset: 27 },
+      provider_native_id: null,
+    });
+    executor.transitionTurn(turnContext, 'running', 'completed');
+    currentTime = '2026-07-19T09:20:20Z';
+
+    const expected = database.prepare(`
+      SELECT outbox_id, delivery_attempt_id, delivery_attempt_no,
+        outbox_lease_epoch, claimed_command_hash, aggregate_version
+      FROM runtime_outbox
+      WHERE outbox_id = ?
+    `).get(updateCommand.outbox_id);
+    const evidence = {
+      kind: 'platform_readback_no_effect',
+      observed_at: currentTime,
+      platform_message_id: updateCommand.target_platform_message_id,
+      query_succeeded: true,
+      expected_effect_present: false,
+      expected_delivery_hash: 'a'.repeat(64),
+      observed_delivery_hash: 'b'.repeat(64),
+    };
+    const authorization = {
+      actor_id: 'deployment-operator',
+      authorization_ref: 'codex-task-readback-no-effect',
+      reason: 'Read-only platform comparison proved the fenced update was absent.',
+    };
+
+    expect(() => reconcileOutboxNoEffect({
+      database,
+      expected,
+      evidence: { ...evidence, platform_message_id: 'different-platform-message' },
+      authorization,
+      now: () => currentTime,
+      generateId: deterministicIds('readback-no-effect-reconciliation'),
+      throttleMs: 0,
+    })).toThrow('does not identify the claimed delivery target');
+    const result = reconcileOutboxNoEffect({
+      database,
+      expected,
+      evidence,
+      authorization,
+      now: () => currentTime,
+      generateId: deterministicIds('readback-no-effect-reconciliation'),
+      throttleMs: 0,
+    });
+
+    expect(result).toMatchObject({
+      status: 'applied',
+      outbox_status: 'superseded',
+      reconciliation_id: expect.any(String),
+      replacement_outbox_id: expect.any(String),
+    });
+    expect(database.prepare(`
+      SELECT status, lease_owner, lease_expires_at, lease_expires_epoch_ms,
+        json_extract(last_error_json, '$.code') AS error_code
+      FROM runtime_outbox
+      WHERE outbox_id = ?
+    `).get(updateCommand.outbox_id)).toEqual({
+      status: 'superseded',
+      lease_owner: null,
+      lease_expires_at: null,
+      lease_expires_epoch_ms: null,
+      error_code: 'authorized_platform_readback_no_effect',
+    });
+    const replacement = database.prepare(`
+      SELECT status, aggregate_version
+      FROM runtime_outbox
+      WHERE outbox_id = ?
+    `).get(result.replacement_outbox_id);
+    expect(replacement).toMatchObject({ status: 'pending' });
+    expect(replacement.aggregate_version).toBeGreaterThan(updateCommand.aggregate_version);
+    expect(database.prepare(`
+      SELECT decision, previous_status, terminal_status, actor_id,
+        authorization_ref, evidence_hash, replacement_outbox_id
+      FROM runtime_outbox_reconciliations
+      WHERE reconciliation_id = ?
+    `).get(result.reconciliation_id)).toEqual({
+      decision: 'platform_readback_no_effect',
+      previous_status: 'delivering',
+      terminal_status: 'superseded',
+      actor_id: authorization.actor_id,
+      authorization_ref: authorization.authorization_ref,
+      evidence_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      replacement_outbox_id: result.replacement_outbox_id,
+    });
+    expect(reconcileOutboxNoEffect({
+      database,
+      expected,
+      evidence,
+      authorization,
+      now: () => currentTime,
+    })).toEqual({
+      status: 'duplicate',
+      outbox_status: 'superseded',
+      reconciliation_id: result.reconciliation_id,
+      replacement_outbox_id: result.replacement_outbox_id,
+    });
+    expect(accepted.turn_id).toBe(updateCommand.mapping.turn_id);
+
     database.close();
   });
 

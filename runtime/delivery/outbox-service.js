@@ -19,6 +19,7 @@ import {
 } from '../persistence/schema.js';
 
 const DELIVERY_RETRY_DELAYS_MS = Object.freeze([2_000, 4_000, 8_000]);
+const RESULT_RECORD_RETRY_DELAYS_MS = Object.freeze([100, 250, 500]);
 
 function defaultGenerateId(kind) {
   return `${kind}-${crypto.randomUUID()}`;
@@ -38,6 +39,16 @@ function parseAuthorityEpochMs(timestamp) {
 
 function createCommandSnapshotHash(commandJson) {
   return crypto.createHash('sha256').update(commandJson).digest('hex');
+}
+
+function isSqliteBusyError(error) {
+  return (
+    typeof error?.code === 'string' && error.code.startsWith('SQLITE_BUSY')
+  ) || /database (?:table )?is locked/i.test(error?.message ?? '');
+}
+
+function defaultSleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function isCurrentFence(row, result) {
@@ -269,6 +280,8 @@ export function createOutboxService({
   leaseDurationMs = 10_000,
   throttleMs = 1_500,
   expiredClaimRecovery = 'fenced',
+  resultRecordRetryDelaysMs = RESULT_RECORD_RETRY_DELAYS_MS,
+  sleep = defaultSleep,
 }) {
   if (!database || typeof database.transaction !== 'function') {
     throw new TypeError('database must be a better-sqlite3 connection');
@@ -301,6 +314,18 @@ export function createOutboxService({
   if (!['fenced', 'same_delivery_id'].includes(expiredClaimRecovery)) {
     throw new TypeError('expiredClaimRecovery must be fenced or same_delivery_id');
   }
+  if (!Array.isArray(resultRecordRetryDelaysMs)
+    || resultRecordRetryDelaysMs.some(
+      (delay) => !Number.isSafeInteger(delay) || delay < 0,
+    )) {
+    throw new TypeError('resultRecordRetryDelaysMs must contain non-negative safe integers');
+  }
+  if (typeof sleep !== 'function') {
+    throw new TypeError('sleep must be a function');
+  }
+  const normalizedResultRecordRetryDelaysMs = Object.freeze([
+    ...resultRecordRetryDelaysMs,
+  ]);
   initializeRuntimePersistence(database);
 
   function claimNext() {
@@ -773,7 +798,15 @@ export function createOutboxService({
     if (!command) return { status: 'idle' };
     assertCurrentClaim(command, { sideEffectBoundary: false });
     const result = await renderer.deliver(command);
-    return recordResult(result);
+    for (let retryIndex = 0; ; retryIndex += 1) {
+      try {
+        return recordResult(result);
+      } catch (error) {
+        const retryDelay = normalizedResultRecordRetryDelaysMs[retryIndex];
+        if (!isSqliteBusyError(error) || retryDelay === undefined) throw error;
+        await sleep(retryDelay);
+      }
+    }
   }
 
   return Object.freeze({ claimNext, assertCurrentClaim, dispatchNext, recordResult });
