@@ -83,11 +83,11 @@ describe('instruction format version protocol', () => {
 describe('split instruction assembler', () => {
   it('pins the system templates to the approved content-redraft bytes', () => {
     // Reintroduction guard: any template edit must consciously update these
-    // pins alongside the reviewed content change (issues #722 and #28).
+    // pins alongside the reviewed content changes (issues #722, #28, and #742).
     const managedHeader = '> **Zylos-managed system instructions.** This file is replaced during upgrades. Put all custom instructions in `~/zylos/ZYLOS.md`.\n\n';
     const expected = {
-      claude: '9e9017db78b03cd9c7768208e13ec6351b1044c683d656526542a2e8814afcec',
-      codex: '4e3c54bc867bfe57e14bbe32cca54ab829431a6b92153507f67e3cf8f113d13c',
+      claude: '56243e3817d954d19ab01dc3818e0a9fff35f05cd0a99fcc295c430dfbd5ebd4',
+      codex: 'c2e8a57e96e0a5521350d79cfa873a4397ecd128a8aeca93f91f3f64690ce4ff',
     };
     for (const runtime of ['claude', 'codex']) {
       const content = fs.readFileSync(path.join(TEMPLATES_DIR, `${runtime}-system.md`), 'utf8');
