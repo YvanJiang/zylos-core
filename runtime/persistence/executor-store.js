@@ -32,6 +32,7 @@ import {
   INBOUND_ENVELOPE_KNOWN_FIELDS,
 } from './inbound-acceptance.js';
 import { resolveDeliveryCommandVersionForTarget } from './delivery-target-identity.js';
+import { materializeInputGroupProviderInput } from './input-coalescing.js';
 import { initializeMainProjection, stageMainProjection } from './main-projection.js';
 import { initializeRuntimePersistence } from './schema.js';
 import { createRetentionCleanup } from './retention-cleanup.js';
@@ -1013,6 +1014,10 @@ export function createExecutorStore({
       JOIN runtime_conversations AS conversation
         ON conversation.conversation_id = turn.conversation_id
       WHERE queue.status = 'queued'
+        AND (
+          queue.available_at IS NULL
+          OR julianday(queue.available_at) <= julianday(?)
+        )
         AND NOT EXISTS (
           SELECT 1 FROM runtime_upgrade_runs AS upgrade
           WHERE upgrade.state IN (${BLOCKING_UPGRADE_STATES_SQL})
@@ -1075,7 +1080,7 @@ export function createExecutorStore({
             AND workspace.state IN ('active', 'uncertain')
         )
       ORDER BY turn.created_at ASC, turn.conversation_id ASC, queue.queue_sequence ASC
-    `).all(serviceInstanceId, serviceInstanceId, claimableAt);
+    `).all(claimableAt, serviceInstanceId, serviceInstanceId, claimableAt);
   }
 
   function getBackgroundTask(backgroundTaskId) {
@@ -1084,7 +1089,10 @@ export function createExecutorStore({
     }
     const row = database.prepare(`
       SELECT task.*, execution.turn_version AS execution_turn_version,
-        queue.status AS queue_status, queue.wait_reason,
+        queue.status AS queue_status, queue.wait_reason, queue.available_at,
+        input_group.input_group_id, input_group.state AS input_group_state,
+        input_group.member_count AS input_group_member_count,
+        input_group.collect_until AS input_group_collect_until,
         attempt.attempt_id, attempt.attempt_no, attempt.lease_epoch,
         attempt.provider, attempt.state AS attempt_state,
         attempt.error_json AS attempt_error_json
@@ -1093,6 +1101,8 @@ export function createExecutorStore({
         ON execution.turn_id = task.execution_turn_id
       LEFT JOIN runtime_turn_queue AS queue
         ON queue.turn_id = task.execution_turn_id
+      LEFT JOIN runtime_input_groups AS input_group
+        ON input_group.background_task_id = task.background_task_id
       LEFT JOIN runtime_provider_attempts AS attempt
         ON attempt.turn_id = task.execution_turn_id
        AND attempt.attempt_id = execution.attempt_id
@@ -1106,10 +1116,23 @@ export function createExecutorStore({
       execution_conversation_id: row.execution_conversation_id,
       execution_turn_id: row.execution_turn_id,
       execution_turn_version: row.execution_turn_version,
-      state: row.state,
+      state: row.state === 'queued' && row.input_group_state === 'collecting'
+        ? 'input_settling'
+        : row.state,
       side_effect_status: row.side_effect_status,
       queue_status: row.queue_status,
       wait_reason: row.wait_reason,
+      available_at: row.available_at,
+      input_group_id: row.input_group_id ?? null,
+      input_group_state: row.input_group_state === 'collecting'
+        ? 'input_settling'
+        : (row.input_group_state ?? null),
+      input_group_member_count: row.input_group_member_count ?? null,
+      input_group_supplement_count: row.input_group_member_count === null
+        || row.input_group_member_count === undefined
+        ? null
+        : row.input_group_member_count - 1,
+      input_group_collect_until: row.input_group_collect_until ?? null,
       attempt: row.attempt_id === null ? null : Object.freeze({
         attempt_id: row.attempt_id,
         attempt_no: row.attempt_no,
@@ -2435,6 +2458,10 @@ export function createExecutorStore({
         JOIN runtime_conversations AS conversation
           ON conversation.conversation_id = turn.conversation_id
         WHERE queue.status = 'queued'
+          AND (
+            queue.available_at IS NULL
+            OR julianday(queue.available_at) <= julianday(?)
+          )
           AND NOT EXISTS (
             SELECT 1 FROM runtime_upgrade_runs AS upgrade
             WHERE upgrade.state IN (${BLOCKING_UPGRADE_STATES_SQL})
@@ -2494,12 +2521,17 @@ export function createExecutorStore({
         ORDER BY turn.created_at ASC, turn.conversation_id ASC, queue.queue_sequence ASC
         LIMIT 1
       `).get(
-        serviceInstanceId, serviceInstanceId, claimableAt, conversationId, conversationId,
+        claimableAt,
+        serviceInstanceId,
+        serviceInstanceId,
+        claimableAt,
+        conversationId,
+        conversationId,
       );
       if (!turn) return null;
 
       const claimedAt = now();
-      const current = loadTurn(database, turn.turn_id);
+      let current = loadTurn(database, turn.turn_id);
       if (
         isDetachedExecutionConversation(current.conversation_id)
         && workspaceAccess?.binding_kind !== 'conversation'
@@ -2607,6 +2639,46 @@ export function createExecutorStore({
         )
       ) {
         conflict('stale_workspace_lease', 'The workspace reservation does not match this turn.');
+      }
+      const inputGroup = database.prepare(`
+        SELECT input_group_id, state, collect_until
+        FROM runtime_input_groups
+        WHERE execution_turn_id = ?
+      `).get(current.turn_id);
+      if (inputGroup?.state === 'collecting') {
+        if (Date.parse(inputGroup.collect_until) > Date.parse(claimedAt)) {
+          conflict('stale_attempt', 'The input group quiet window has not elapsed.');
+        }
+        const providerInput = materializeInputGroupProviderInput(
+          database,
+          inputGroup.input_group_id,
+        );
+        const groupUpdate = database.prepare(`
+          UPDATE runtime_input_groups
+          SET state = 'sealed', sealed_at = ?, updated_at = ?
+          WHERE input_group_id = ? AND state = 'collecting'
+            AND julianday(collect_until) <= julianday(?)
+        `).run(
+          claimedAt,
+          claimedAt,
+          inputGroup.input_group_id,
+          claimedAt,
+        );
+        const inputUpdate = database.prepare(`
+          UPDATE runtime_turns
+          SET provider_input_json = ?, committed_at = ?
+          WHERE turn_id = ? AND state = 'queued' AND provider_input_json IS NULL
+        `).run(
+          JSON.stringify(providerInput),
+          claimedAt,
+          current.turn_id,
+        );
+        if (groupUpdate.changes !== 1 || inputUpdate.changes !== 1) {
+          conflict('stale_attempt', 'The input group seal lost its queued turn fence.');
+        }
+        current = loadTurn(database, current.turn_id);
+      } else if (inputGroup?.state === 'sealed' && current.provider_input_json === null) {
+        conflict('provider_context_invalid', 'The sealed input group has no provider input.');
       }
       const existingLease = database.prepare(`
         SELECT lease_epoch

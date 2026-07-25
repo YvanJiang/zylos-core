@@ -96,6 +96,7 @@ function acceptDetached(database, suffix) {
   return acceptNormalInbound(database, normalEnvelope(suffix), {
     now: () => '2026-07-24T01:00:00Z',
     generateId: deterministicIds(`detached-${suffix}`),
+    inputCoalescingPolicy: { enabled: false },
   });
 }
 

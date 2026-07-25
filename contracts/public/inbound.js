@@ -6,6 +6,7 @@ import {
   requireBoolean,
   requireCriticalEnum,
   requireDisplayString,
+  requireNonNegativeInteger,
   requireNullableOpaqueId,
   requireOwnFields,
   requirePlainObject,
@@ -38,6 +39,7 @@ export const INBOUND_SOURCE_KINDS = Object.freeze([
 ]);
 export const INBOUND_RESULT_STATUSES = Object.freeze(['accepted', 'rejected']);
 export const INBOUND_DISPATCH_STATUSES = Object.freeze(['background_dispatched']);
+export const INBOUND_INPUT_GROUP_ACTIONS = Object.freeze(['opened', 'appended']);
 export const LINEAGE_RESOLUTION_STATES = Object.freeze([
   'bound',
   'pending_recovery',
@@ -86,6 +88,13 @@ const OPTIONAL_RESULT_FIELDS = Object.freeze([
   'dispatch_status',
   'background_task_id',
   'background_execution_turn_id',
+]);
+const OPTIONAL_INPUT_GROUP_RESULT_FIELDS = Object.freeze([
+  'input_group_id',
+  'input_group_action',
+  'input_group_member_count',
+  'input_group_supplement_count',
+  'input_group_collect_until',
 ]);
 
 function validateActor(actor, occurredAt) {
@@ -484,7 +493,11 @@ export function validateInboundResult(value, { occurredAt } = {}) {
   const result = partitionContractDocument(
     value,
     INBOUND_RESULT_CONTRACT,
-    [...RESULT_FIELDS, ...OPTIONAL_RESULT_FIELDS],
+    [
+      ...RESULT_FIELDS,
+      ...OPTIONAL_RESULT_FIELDS,
+      ...OPTIONAL_INPUT_GROUP_RESULT_FIELDS,
+    ],
     { occurredAt },
   );
   requireOwnFields('inbound-result', value, RESULT_FIELDS, { occurredAt });
@@ -537,6 +550,61 @@ export function validateInboundResult(value, { occurredAt } = {}) {
       rejectContract(
         'validation_error',
         'The detached execution turn must differ from the foreground dispatch turn.',
+        { occurredAt },
+      );
+    }
+  }
+  const inputGroupFields = OPTIONAL_INPUT_GROUP_RESULT_FIELDS.filter((fieldName) => (
+    Object.hasOwn(value, fieldName)
+  ));
+  if (inputGroupFields.length !== 0) {
+    if (
+      inputGroupFields.length !== OPTIONAL_INPUT_GROUP_RESULT_FIELDS.length
+      || detachedFields.length !== OPTIONAL_RESULT_FIELDS.length
+      || value.status !== 'accepted'
+    ) {
+      rejectContract(
+        'validation_error',
+        'Input group fields must appear together with detached dispatch fields.',
+        { occurredAt },
+      );
+    }
+    validateOpaqueId('input_group_id', value.input_group_id, { occurredAt });
+    requireCriticalEnum(
+      'input_group_action',
+      value.input_group_action,
+      INBOUND_INPUT_GROUP_ACTIONS,
+      { occurredAt },
+    );
+    requirePositiveInteger(
+      'input_group_member_count',
+      value.input_group_member_count,
+      { occurredAt },
+    );
+    requireNonNegativeInteger(
+      'input_group_supplement_count',
+      value.input_group_supplement_count,
+      { occurredAt },
+    );
+    requireTimestamp(
+      'input_group_collect_until',
+      value.input_group_collect_until,
+      { occurredAt },
+    );
+    if (
+      value.input_group_supplement_count !== value.input_group_member_count - 1
+      || (
+        value.input_group_action === 'opened'
+        && value.input_group_member_count !== 1
+      )
+      || (
+        value.input_group_action === 'appended'
+        && value.input_group_member_count < 2
+      )
+    ) {
+      rejectContract(
+        'validation_error',
+        'Input group action and member counts are inconsistent.',
         { occurredAt },
       );
     }

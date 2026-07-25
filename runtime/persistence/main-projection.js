@@ -80,6 +80,11 @@ function projectRenderModel(renderModel, event) {
     text = `${currentText.slice(0, event.payload.start_offset)}${event.payload.text}`;
   } else if (
     event.kind === 'turn_state_changed'
+    && event.payload.reason_code === 'input_group_appended'
+  ) {
+    text = `已收到 ${event.payload.supplement_count} 条补充`;
+  } else if (
+    event.kind === 'turn_state_changed'
     && event.payload.reason_code === 'executor_capacity'
   ) {
     text = 'Waiting for executor capacity.';
@@ -355,7 +360,11 @@ export function stageMainProjection(database, turn, event, {
   });
 
   let renderModel = projectRenderModel(loadLatestRenderModel(database, lane.lane_key), event);
-  if (event.phase === 'queued' && durableTarget.channel === 'feishu') {
+  if (
+    event.phase === 'queued'
+    && durableTarget.channel === 'feishu'
+    && event.payload?.reason_code !== 'input_group_appended'
+  ) {
     const queueStatusText = buildQueuedTaskStatusText(
       database,
       turn.turn_id,
