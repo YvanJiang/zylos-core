@@ -41,6 +41,11 @@ pm2 restart scheduler
 
 SQLite at `~/zylos/scheduler/scheduler.db`
 
+Each task durably captures the Core `region`, `tenant_id`, and `bot_id` scope
+when it is created. A one-time schema migration captures the current configured
+scope for older tasks. Daemon restarts and later environment changes reuse the
+stored values so an occurrence's idempotency identity cannot fork.
+
 ## Priority Levels
 
 | Priority | Type | Description |
@@ -49,16 +54,21 @@ SQLite at `~/zylos/scheduler/scheduler.db`
 | 2 | High | Important tasks, execute soon |
 | 3 | Normal | Default priority, standard execution |
 
-Priority only affects dispatch order, not idle waiting. Use `--block-queue-until-idle` for this queue-blocking idle gate.
+Priority only affects canonical Core queue ordering. Authoritative Core
+maintenance state controls admission; the scheduler has no host-idle gate.
 
 ## Retry / Missed Task Behavior
 
 Scheduler uses an implicit retry mechanism based on `miss_threshold` (default 300s), not an explicit retry counter:
 
-1. Task reaches `next_run_at` but runtime is offline → task stays `pending`
-2. Daemon retries dispatch every 5s while within the `miss_threshold` window
-3. Runtime comes back online within window → task dispatched (late but successful)
+1. Task reaches `next_run_at` but Core admission is temporarily unavailable → task stays `pending`
+2. Daemon retries with durable bounded backoff while within the `miss_threshold` window
+3. Core accepts within the window → task is idempotently enqueued
 4. Window expires → one-time tasks marked `failed`, recurring/interval skip to next schedule
+
+A missed-occurrence delivery notice rejected only for `queue_full` receives
+durable exponential backoff. Any non-retryable Core rejection terminalizes the
+local task and its history instead of polling the same rejected notice forever.
 
 The `retry_count` / `max_retries` columns in the database are reserved but unused. Adjust `--miss-threshold <seconds>` per task to control the retry window.
 

@@ -1,0 +1,932 @@
+{
+  "fixture_version": "1.0",
+  "requests": [
+    {
+      "name": "provider_turn",
+      "document": {
+        "contract": "zylos.interaction-request",
+        "contract_version": "1.0",
+        "trace_id": "trace-provider-question",
+        "interaction_id": "interaction-provider-1",
+        "conversation_id": "conversation-A",
+        "turn_id": "turn-A",
+        "lineage_id": "lineage-A",
+        "control_id": null,
+        "parent_type": "provider_turn",
+        "tool_use_id": "tool-use-A",
+        "ordinal": 1,
+        "kind": "tool_approval",
+        "prompt": "Allow the requested workspace write?",
+        "choices": [],
+        "authorized_subjects": [
+          { "type": "actor", "actor_id": "user-A" }
+        ],
+        "allowed_sources": ["main_card_reply", "card_action"],
+        "runtime_fence": {
+          "provider_attempt_id": "provider-attempt-A",
+          "lease_epoch": 7,
+          "provider_interaction_ref": "provider-interaction-A"
+        },
+        "state": "pending",
+        "version": 1,
+        "handoff_state": "not_started",
+        "created_at": "2026-07-19T05:00:00Z",
+        "expires_at": "2026-07-19T05:10:00Z",
+        "card_delivery_id": null
+      }
+    },
+    {
+      "name": "provider_turn_ordinal_2",
+      "document": {
+        "contract": "zylos.interaction-request",
+        "contract_version": "1.0",
+        "trace_id": "trace-provider-question-B",
+        "interaction_id": "interaction-provider-2",
+        "conversation_id": "conversation-A",
+        "turn_id": "turn-A",
+        "lineage_id": "lineage-A",
+        "control_id": null,
+        "parent_type": "provider_turn",
+        "tool_use_id": "tool-use-B",
+        "ordinal": 2,
+        "kind": "question",
+        "prompt": "Which output format should the provider use?",
+        "choices": [],
+        "authorized_subjects": [
+          { "type": "actor", "actor_id": "user-A" }
+        ],
+        "allowed_sources": ["main_card_reply", "card_action"],
+        "runtime_fence": {
+          "provider_attempt_id": "provider-attempt-A",
+          "lease_epoch": 7,
+          "provider_interaction_ref": "provider-interaction-B"
+        },
+        "state": "pending",
+        "version": 1,
+        "handoff_state": "not_started",
+        "created_at": "2026-07-19T05:00:01Z",
+        "expires_at": "2026-07-19T05:10:00Z",
+        "card_delivery_id": null
+      }
+    },
+    {
+      "name": "security_control",
+      "document": {
+        "contract": "zylos.interaction-request",
+        "contract_version": "1.0",
+        "trace_id": "trace-security-control",
+        "interaction_id": "interaction-security-1",
+        "conversation_id": "conversation-A",
+        "turn_id": null,
+        "lineage_id": null,
+        "control_id": "control-security-1",
+        "parent_type": "security_control",
+        "tool_use_id": null,
+        "ordinal": 1,
+        "kind": "permission_approval",
+        "prompt": "Enable trusted mode for this bot?",
+        "choices": [
+          { "choice_id": "approve", "label": "Enable trusted mode" },
+          { "choice_id": "deny", "label": "Keep safe mode" }
+        ],
+        "authorized_subjects": [
+          {
+            "type": "capability",
+            "capability": "permission.bot.manage",
+            "scope": {
+              "scope_type": "bot",
+              "region": "cn",
+              "tenant_id": "tenant-A",
+              "bot_id": "bot-A",
+              "conversation_id": null,
+              "service_instance_id": null,
+              "recovery_id": null
+            }
+          }
+        ],
+        "allowed_sources": ["card_action", "magic_command_repeat"],
+        "runtime_fence": null,
+        "state": "pending",
+        "version": 1,
+        "handoff_state": "not_started",
+        "created_at": "2026-07-19T05:00:00Z",
+        "expires_at": "2026-07-19T05:10:00Z",
+        "card_delivery_id": "delivery-security-card-A"
+      }
+    },
+    {
+      "name": "recovery_control",
+      "document": {
+        "contract": "zylos.interaction-request",
+        "contract_version": "1.0",
+        "trace_id": "trace-recovery-control",
+        "interaction_id": "interaction-recovery-1",
+        "conversation_id": "conversation-A",
+        "turn_id": "turn-recovery-A",
+        "lineage_id": null,
+        "control_id": "control-recovery-1",
+        "parent_type": "recovery_control",
+        "tool_use_id": null,
+        "ordinal": 1,
+        "kind": "recovery_decision",
+        "prompt": "Continue recovery with a new lineage?",
+        "choices": [
+          { "choice_id": "approve", "label": "Continue recovery" },
+          { "choice_id": "deny", "label": "Stop recovery" }
+        ],
+        "authorized_subjects": [
+          { "type": "actor", "actor_id": "user-A" },
+          {
+            "type": "capability",
+            "capability": "recovery.decide",
+            "scope": {
+              "scope_type": "recovery",
+              "region": "cn",
+              "tenant_id": "tenant-A",
+              "bot_id": "bot-A",
+              "conversation_id": "conversation-A",
+              "service_instance_id": null,
+              "recovery_id": "recovery-A"
+            }
+          }
+        ],
+        "allowed_sources": ["operations_control"],
+        "runtime_fence": null,
+        "state": "pending",
+        "version": 1,
+        "handoff_state": "not_started",
+        "created_at": "2026-07-19T05:00:00Z",
+        "expires_at": "2026-07-19T05:10:00Z",
+        "card_delivery_id": "delivery-recovery-card-A"
+      }
+    }
+  ],
+  "request_scopes": {
+    "provider_turn": {
+      "region": "cn",
+      "tenant_id": "tenant-A",
+      "channel": "feishu",
+      "bot_id": "bot-A",
+      "chat_id": "chat-A",
+      "native_thread_or_topic_id": null
+    },
+    "provider_turn_ordinal_2": {
+      "region": "cn",
+      "tenant_id": "tenant-A",
+      "channel": "feishu",
+      "bot_id": "bot-A",
+      "chat_id": "chat-A",
+      "native_thread_or_topic_id": null
+    },
+    "security_control": {
+      "region": "cn",
+      "tenant_id": "tenant-A",
+      "channel": "feishu",
+      "bot_id": "bot-A",
+      "chat_id": "chat-A",
+      "native_thread_or_topic_id": null
+    },
+    "recovery_control": {
+      "region": "cn",
+      "tenant_id": "tenant-A",
+      "channel": "feishu",
+      "bot_id": "bot-A",
+      "chat_id": "chat-A",
+      "native_thread_or_topic_id": null
+    }
+  },
+  "answers": [
+    {
+      "name": "main_card_reply",
+      "document": {
+        "contract": "zylos.interaction-answer",
+        "contract_version": "1.0",
+        "trace_id": "trace-message-reply-A",
+        "interaction_id": "interaction-provider-1",
+        "interaction_version": 1,
+        "answer_id": "answer-message-reply-A",
+        "source_event_or_action_id": "message-reply-A",
+        "actor": {
+          "type": "user",
+          "actor_id": "user-A",
+          "authenticated": true,
+          "roles": ["member"]
+        },
+        "source_context": {
+          "region": "cn",
+          "tenant_id": "tenant-A",
+          "channel": "feishu",
+          "bot_id": "bot-A",
+          "chat_id": "chat-A",
+          "native_thread_or_topic_id": null,
+          "platform_message_or_action_id": "message-reply-A"
+        },
+        "source": "main_card_reply",
+        "value": { "kind": "decision", "decision": "approve" },
+        "answered_at": "2026-07-19T05:04:00Z",
+        "idempotency_key": "zid:v1:interaction:135aa995a3f4c5e1c8ea30fe7e59a5df43d5f186bf428b20d19f4d452bf9a22a"
+      }
+    },
+    {
+      "name": "card_action",
+      "document": {
+        "contract": "zylos.interaction-answer",
+        "contract_version": "1.0",
+        "trace_id": "trace-card-action-A",
+        "interaction_id": "interaction-provider-1",
+        "interaction_version": 1,
+        "answer_id": "answer-card-action-A",
+        "source_event_or_action_id": "card-action-A",
+        "actor": {
+          "type": "user",
+          "actor_id": "user-A",
+          "authenticated": true,
+          "roles": ["member"]
+        },
+        "source_context": {
+          "region": "cn",
+          "tenant_id": "tenant-A",
+          "channel": "feishu",
+          "bot_id": "bot-A",
+          "chat_id": "chat-A",
+          "native_thread_or_topic_id": null,
+          "platform_message_or_action_id": "card-action-A"
+        },
+        "source": "card_action",
+        "value": { "kind": "choice", "choice_id": "choice-safe" },
+        "answered_at": "2026-07-19T05:04:00Z",
+        "idempotency_key": "zid:v1:interaction:c91cd6cb96f48ba048b4ca0914a6edf0faa271da6a491daafa5f27664472fa3a"
+      }
+    },
+    {
+      "name": "magic_command_repeat",
+      "document": {
+        "contract": "zylos.interaction-answer",
+        "contract_version": "1.0",
+        "trace_id": "trace-inbound-event-repeat-A",
+        "interaction_id": "interaction-security-1",
+        "interaction_version": 1,
+        "answer_id": "answer-inbound-event-repeat-A",
+        "source_event_or_action_id": "inbound-event-repeat-A",
+        "actor": {
+          "type": "user",
+          "actor_id": "user-A",
+          "authenticated": true,
+          "roles": ["bot_owner"]
+        },
+        "source_context": {
+          "region": "cn",
+          "tenant_id": "tenant-A",
+          "channel": "feishu",
+          "bot_id": "bot-A",
+          "chat_id": "chat-A",
+          "native_thread_or_topic_id": null,
+          "platform_message_or_action_id": "inbound-event-repeat-A"
+        },
+        "source": "magic_command_repeat",
+        "value": { "kind": "decision", "decision": "approve" },
+        "answered_at": "2026-07-19T05:04:00Z",
+        "idempotency_key": "zid:v1:interaction:fe3aa5da08f0b5e2af92be7a55b57baa1a4eb83e54811aae873e5d28482171de"
+      }
+    },
+    {
+      "name": "operations_control",
+      "document": {
+        "contract": "zylos.interaction-answer",
+        "contract_version": "1.0",
+        "trace_id": "trace-operations-action-A",
+        "interaction_id": "interaction-recovery-1",
+        "interaction_version": 1,
+        "answer_id": "answer-operations-action-A",
+        "source_event_or_action_id": "operations-action-A",
+        "actor": {
+          "type": "service",
+          "actor_id": "dashboard-operator-A",
+          "authenticated": true,
+          "roles": []
+        },
+        "source_context": {
+          "region": "cn",
+          "tenant_id": "tenant-A",
+          "channel": "operations",
+          "bot_id": "bot-A",
+          "chat_id": null,
+          "native_thread_or_topic_id": null,
+          "platform_message_or_action_id": "operations-action-A"
+        },
+        "source": "operations_control",
+        "value": { "kind": "decision", "decision": "deny" },
+        "answered_at": "2026-07-19T05:04:00Z",
+        "idempotency_key": "zid:v1:interaction:5000dbdf499fbeccb1397bd5cac3d2b87fe97f1391a17e6a788a22e69b48e1e4"
+      }
+    },
+    {
+      "name": "provider_turn_ordinal_2",
+      "document": {
+        "contract": "zylos.interaction-answer",
+        "contract_version": "1.0",
+        "trace_id": "trace-message-reply-B",
+        "interaction_id": "interaction-provider-2",
+        "interaction_version": 1,
+        "answer_id": "answer-message-reply-B",
+        "source_event_or_action_id": "message-reply-B",
+        "actor": {
+          "type": "user",
+          "actor_id": "user-A",
+          "authenticated": true,
+          "roles": ["member"]
+        },
+        "source_context": {
+          "region": "cn",
+          "tenant_id": "tenant-A",
+          "channel": "feishu",
+          "bot_id": "bot-A",
+          "chat_id": "chat-A",
+          "native_thread_or_topic_id": null,
+          "platform_message_or_action_id": "message-reply-B"
+        },
+        "source": "main_card_reply",
+        "value": { "kind": "text", "text": "Use structured JSON." },
+        "answered_at": "2026-07-19T05:04:00Z",
+        "idempotency_key": "zid:v1:interaction:cc463de2b8fffad26109f69b12b186195a0b1565208493f4929cc68d440584bb"
+      }
+    },
+    {
+      "name": "provider_magic_command_prohibited",
+      "document": {
+        "contract": "zylos.interaction-answer",
+        "contract_version": "1.0",
+        "trace_id": "trace-provider-command-repeat-A",
+        "interaction_id": "interaction-provider-1",
+        "interaction_version": 1,
+        "answer_id": "answer-provider-command-repeat-A",
+        "source_event_or_action_id": "provider-command-repeat-A",
+        "actor": {
+          "type": "user",
+          "actor_id": "user-A",
+          "authenticated": true,
+          "roles": ["bot_owner"]
+        },
+        "source_context": {
+          "region": "cn",
+          "tenant_id": "tenant-A",
+          "channel": "feishu",
+          "bot_id": "bot-A",
+          "chat_id": "chat-A",
+          "native_thread_or_topic_id": null,
+          "platform_message_or_action_id": "provider-command-repeat-A"
+        },
+        "source": "magic_command_repeat",
+        "value": { "kind": "decision", "decision": "approve" },
+        "answered_at": "2026-07-19T05:04:00Z",
+        "idempotency_key": "zid:v1:interaction:b6388143cb21c3686ebf670e22fb6fe9a10340fcf819d485f12c2aa1ae2cf954"
+      }
+    },
+    {
+      "name": "unauthorized_actor",
+      "document": {
+        "contract": "zylos.interaction-answer",
+        "contract_version": "1.0",
+        "trace_id": "trace-unauthorized-action-A",
+        "interaction_id": "interaction-provider-1",
+        "interaction_version": 1,
+        "answer_id": "answer-unauthorized-action-A",
+        "source_event_or_action_id": "unauthorized-action-A",
+        "actor": {
+          "type": "user",
+          "actor_id": "user-B",
+          "authenticated": true,
+          "roles": ["member"]
+        },
+        "source_context": {
+          "region": "cn",
+          "tenant_id": "tenant-A",
+          "channel": "feishu",
+          "bot_id": "bot-A",
+          "chat_id": "chat-A",
+          "native_thread_or_topic_id": null,
+          "platform_message_or_action_id": "unauthorized-action-A"
+        },
+        "source": "card_action",
+        "value": { "kind": "decision", "decision": "approve" },
+        "answered_at": "2026-07-19T05:04:00Z",
+        "idempotency_key": "zid:v1:interaction:72364aefab7d9930212b4152928c8c44b6199b3692b8af9723856b231ad162cb"
+      }
+    },
+    {
+      "name": "wrong_chat",
+      "document": {
+        "contract": "zylos.interaction-answer",
+        "contract_version": "1.0",
+        "trace_id": "trace-wrong-chat-action-A",
+        "interaction_id": "interaction-provider-1",
+        "interaction_version": 1,
+        "answer_id": "answer-wrong-chat-action-A",
+        "source_event_or_action_id": "wrong-chat-action-A",
+        "actor": {
+          "type": "user",
+          "actor_id": "user-A",
+          "authenticated": true,
+          "roles": ["member"]
+        },
+        "source_context": {
+          "region": "cn",
+          "tenant_id": "tenant-A",
+          "channel": "feishu",
+          "bot_id": "bot-A",
+          "chat_id": "chat-B",
+          "native_thread_or_topic_id": null,
+          "platform_message_or_action_id": "wrong-chat-action-A"
+        },
+        "source": "card_action",
+        "value": { "kind": "decision", "decision": "approve" },
+        "answered_at": "2026-07-19T05:04:00Z",
+        "idempotency_key": "zid:v1:interaction:6e7713a86025b259f0a70ba0fee8229cfaaa35f34b661cb8aa904f822505f36d"
+      }
+    }
+  ],
+  "answer_validation_examples": [
+    {
+      "name": "provider_reply_current_ordinal",
+      "request": "provider_turn",
+      "answer": "main_card_reply",
+      "interactions": ["provider_turn", "provider_turn_ordinal_2"],
+      "expected": "allowed"
+    },
+    {
+      "name": "provider_magic_command_prohibited",
+      "request": "provider_turn",
+      "answer": "provider_magic_command_prohibited",
+      "interactions": ["provider_turn", "provider_turn_ordinal_2"],
+      "expected": "prohibited",
+      "error_code": "validation_error"
+    },
+    {
+      "name": "unauthorized_actor_prohibited",
+      "request": "provider_turn",
+      "answer": "unauthorized_actor",
+      "interactions": ["provider_turn", "provider_turn_ordinal_2"],
+      "expected": "prohibited",
+      "error_code": "interaction_actor_forbidden"
+    },
+    {
+      "name": "wrong_chat_prohibited",
+      "request": "provider_turn",
+      "answer": "wrong_chat",
+      "interactions": ["provider_turn", "provider_turn_ordinal_2"],
+      "expected": "prohibited",
+      "error_code": "validation_error"
+    },
+    {
+      "name": "later_ordinal_blocked",
+      "request": "provider_turn_ordinal_2",
+      "answer": "provider_turn_ordinal_2",
+      "interactions": ["provider_turn", "provider_turn_ordinal_2"],
+      "expected": "prohibited",
+      "error_code": "interaction_out_of_order"
+    },
+    {
+      "name": "later_ordinal_after_first_answer",
+      "request": "provider_turn_ordinal_2",
+      "answer": "provider_turn_ordinal_2",
+      "interactions": ["provider_turn", "provider_turn_ordinal_2"],
+      "interaction_overrides": {
+        "provider_turn": {
+          "state": "answered",
+          "version": 2,
+          "handoff_state": "accepted"
+        }
+      },
+      "expected": "allowed"
+    },
+    {
+      "name": "permission_command_repeat",
+      "request": "security_control",
+      "answer": "magic_command_repeat",
+      "interactions": ["security_control"],
+      "actor_capabilities": [
+        {
+          "type": "capability",
+          "capability": "permission.bot.manage",
+          "scope": {
+            "scope_type": "bot",
+            "region": "cn",
+            "tenant_id": "tenant-A",
+            "bot_id": "bot-A",
+            "conversation_id": null,
+            "service_instance_id": null,
+            "recovery_id": null
+          }
+        }
+      ],
+      "expected": "allowed"
+    },
+    {
+      "name": "recovery_operations_control",
+      "request": "recovery_control",
+      "answer": "operations_control",
+      "interactions": ["recovery_control"],
+      "actor_capabilities": [
+        {
+          "type": "capability",
+          "capability": "recovery.decide",
+          "scope": {
+            "scope_type": "recovery",
+            "region": "cn",
+            "tenant_id": "tenant-A",
+            "bot_id": "bot-A",
+            "conversation_id": "conversation-A",
+            "service_instance_id": null,
+            "recovery_id": "recovery-A"
+          }
+        }
+      ],
+      "expected": "allowed"
+    }
+  ],
+  "answer_results": [
+    {
+      "name": "accepted",
+      "document": {
+        "contract": "zylos.interaction-answer-result",
+        "contract_version": "1.0",
+        "trace_id": "trace-answer-result-A",
+        "interaction_id": "interaction-provider-1",
+        "answer_id": "answer-card-action-A",
+        "idempotency_key": "zid:v1:interaction:c91cd6cb96f48ba048b4ca0914a6edf0faa271da6a491daafa5f27664472fa3a",
+        "status": "accepted",
+        "interaction_state": "answer_committed",
+        "interaction_version": 2,
+        "handoff_state": "pending",
+        "handoff_id": "handoff-A",
+        "turn_id": "turn-A",
+        "turn_version": 6,
+        "control_id": null,
+        "error": null,
+        "received_at": "2026-07-19T05:04:01Z",
+        "committed_at": "2026-07-19T05:04:01Z"
+      }
+    },
+    {
+      "name": "duplicate",
+      "document": {
+        "contract": "zylos.interaction-answer-result",
+        "contract_version": "1.0",
+        "trace_id": "trace-answer-result-replay",
+        "interaction_id": "interaction-provider-1",
+        "answer_id": "answer-card-action-A",
+        "idempotency_key": "zid:v1:interaction:c91cd6cb96f48ba048b4ca0914a6edf0faa271da6a491daafa5f27664472fa3a",
+        "status": "duplicate",
+        "interaction_state": "answer_committed",
+        "interaction_version": 2,
+        "handoff_state": "pending",
+        "handoff_id": "handoff-A",
+        "turn_id": "turn-A",
+        "turn_version": 6,
+        "control_id": null,
+        "error": null,
+        "received_at": "2026-07-19T05:04:01Z",
+        "committed_at": "2026-07-19T05:04:01Z"
+      }
+    },
+    {
+      "name": "rejected",
+      "document": {
+        "contract": "zylos.interaction-answer-result",
+        "contract_version": "1.0",
+        "trace_id": "trace-answer-result-rejected",
+        "interaction_id": "interaction-provider-1",
+        "answer_id": "answer-card-action-A",
+        "idempotency_key": "zid:v1:interaction:c91cd6cb96f48ba048b4ca0914a6edf0faa271da6a491daafa5f27664472fa3a",
+        "status": "rejected",
+        "interaction_state": "pending",
+        "interaction_version": 1,
+        "handoff_state": "not_applicable",
+        "handoff_id": null,
+        "turn_id": "turn-A",
+        "turn_version": 5,
+        "control_id": null,
+        "error": {
+          "code": "interaction_actor_forbidden",
+          "category": "authorization",
+          "retryable": false,
+          "side_effect_status": "none",
+          "user_message": "This actor is not authorized to answer the interaction.",
+          "occurred_at": "2026-07-19T05:04:02Z"
+        },
+        "received_at": null,
+        "committed_at": null
+      }
+    },
+    {
+      "name": "conflict",
+      "document": {
+        "contract": "zylos.interaction-answer-result",
+        "contract_version": "1.0",
+        "trace_id": "trace-answer-result-conflict",
+        "interaction_id": "interaction-provider-1",
+        "answer_id": "answer-card-action-A",
+        "idempotency_key": "zid:v1:interaction:c91cd6cb96f48ba048b4ca0914a6edf0faa271da6a491daafa5f27664472fa3a",
+        "status": "conflict",
+        "interaction_state": "answer_committed",
+        "interaction_version": 2,
+        "handoff_state": "not_applicable",
+        "handoff_id": null,
+        "turn_id": "turn-A",
+        "turn_version": 6,
+        "control_id": null,
+        "error": {
+          "code": "idempotency_conflict",
+          "category": "conflict",
+          "retryable": false,
+          "side_effect_status": "none",
+          "user_message": "The answer key was already used with different content.",
+          "occurred_at": "2026-07-19T05:04:03Z"
+        },
+        "received_at": null,
+        "committed_at": null
+      }
+    }
+  ],
+  "handoffs": [
+    {
+      "name": "pending",
+      "record": {
+        "handoff_id": "handoff-A",
+        "interaction_id": "interaction-provider-1",
+        "answer_id": "answer-card-action-A",
+        "parent_type": "provider_turn",
+        "state": "pending",
+        "provider_attempt_id": "provider-attempt-A",
+        "handoff_attempt_id": null,
+        "handoff_attempt_no": null,
+        "lease_epoch": 7,
+        "claimed_by": null,
+        "claimed_at": null,
+        "last_send_started_at": null,
+        "provider_acked_at": null,
+        "handoff_deadline_at": "2026-07-19T05:05:00Z",
+        "reason_code": null,
+        "error": null,
+        "side_effect_status": "none"
+      }
+    },
+    {
+      "name": "delivering",
+      "record": {
+        "handoff_id": "handoff-A",
+        "interaction_id": "interaction-provider-1",
+        "answer_id": "answer-card-action-A",
+        "parent_type": "provider_turn",
+        "state": "delivering",
+        "provider_attempt_id": "provider-attempt-A",
+        "handoff_attempt_id": "handoff-attempt-1",
+        "handoff_attempt_no": 1,
+        "lease_epoch": 7,
+        "claimed_by": "executor-A",
+        "claimed_at": "2026-07-19T05:04:02Z",
+        "last_send_started_at": null,
+        "provider_acked_at": null,
+        "handoff_deadline_at": "2026-07-19T05:05:00Z",
+        "reason_code": null,
+        "error": null,
+        "side_effect_status": "none"
+      }
+    },
+    {
+      "name": "retry_wait",
+      "record": {
+        "handoff_id": "handoff-A",
+        "interaction_id": "interaction-provider-1",
+        "answer_id": "answer-card-action-A",
+        "parent_type": "provider_turn",
+        "state": "retry_wait",
+        "provider_attempt_id": "provider-attempt-A",
+        "handoff_attempt_id": "handoff-attempt-1",
+        "handoff_attempt_no": 1,
+        "lease_epoch": 7,
+        "claimed_by": "executor-A",
+        "claimed_at": "2026-07-19T05:04:02Z",
+        "last_send_started_at": null,
+        "provider_acked_at": null,
+        "handoff_deadline_at": "2026-07-19T05:05:00Z",
+        "reason_code": "pre_send_transient_failure",
+        "error": {
+          "code": "provider_context_invalid",
+          "category": "provider",
+          "retryable": true,
+          "side_effect_status": "none",
+          "user_message": "The provider handler was unavailable before answer delivery started.",
+          "occurred_at": "2026-07-19T05:04:03Z"
+        },
+        "side_effect_status": "none"
+      }
+    },
+    {
+      "name": "accepted",
+      "record": {
+        "handoff_id": "handoff-A",
+        "interaction_id": "interaction-provider-1",
+        "answer_id": "answer-card-action-A",
+        "parent_type": "provider_turn",
+        "state": "accepted",
+        "provider_attempt_id": "provider-attempt-A",
+        "handoff_attempt_id": "handoff-attempt-1",
+        "handoff_attempt_no": 1,
+        "lease_epoch": 7,
+        "claimed_by": "executor-A",
+        "claimed_at": "2026-07-19T05:04:02Z",
+        "last_send_started_at": "2026-07-19T05:04:03Z",
+        "provider_acked_at": "2026-07-19T05:04:04Z",
+        "handoff_deadline_at": "2026-07-19T05:05:00Z",
+        "reason_code": "handler_accepted",
+        "error": null,
+        "side_effect_status": "known"
+      }
+    },
+    {
+      "name": "delivery_unknown",
+      "record": {
+        "handoff_id": "handoff-A",
+        "interaction_id": "interaction-provider-1",
+        "answer_id": "answer-card-action-A",
+        "parent_type": "provider_turn",
+        "state": "delivery_unknown",
+        "provider_attempt_id": "provider-attempt-A",
+        "handoff_attempt_id": "handoff-attempt-1",
+        "handoff_attempt_no": 1,
+        "lease_epoch": 7,
+        "claimed_by": "executor-A",
+        "claimed_at": "2026-07-19T05:04:02Z",
+        "last_send_started_at": "2026-07-19T05:04:03Z",
+        "provider_acked_at": null,
+        "handoff_deadline_at": "2026-07-19T05:05:00Z",
+        "reason_code": "send_started_ack_missing",
+        "error": {
+          "code": "interaction_answer_delivery_unknown",
+          "category": "provider",
+          "retryable": false,
+          "side_effect_status": "unknown",
+          "user_message": "The answer may have reached the provider, but acknowledgement is unknown.",
+          "occurred_at": "2026-07-19T05:04:05Z"
+        },
+        "side_effect_status": "unknown"
+      }
+    },
+    {
+      "name": "rejected",
+      "record": {
+        "handoff_id": "handoff-A",
+        "interaction_id": "interaction-provider-1",
+        "answer_id": "answer-card-action-A",
+        "parent_type": "provider_turn",
+        "state": "rejected",
+        "provider_attempt_id": "provider-attempt-A",
+        "handoff_attempt_id": "handoff-attempt-1",
+        "handoff_attempt_no": 1,
+        "lease_epoch": 7,
+        "claimed_by": "executor-A",
+        "claimed_at": "2026-07-19T05:04:02Z",
+        "last_send_started_at": "2026-07-19T05:04:03Z",
+        "provider_acked_at": "2026-07-19T05:04:04Z",
+        "handoff_deadline_at": "2026-07-19T05:05:00Z",
+        "reason_code": "provider_no_longer_waiting",
+        "error": {
+          "code": "provider_context_invalid",
+          "category": "provider",
+          "retryable": false,
+          "side_effect_status": "known",
+          "user_message": "The provider no longer accepts this interaction answer.",
+          "occurred_at": "2026-07-19T05:04:04Z"
+        },
+        "side_effect_status": "known"
+      }
+    },
+    {
+      "name": "cancelled",
+      "record": {
+        "handoff_id": "handoff-A",
+        "interaction_id": "interaction-provider-1",
+        "answer_id": "answer-card-action-A",
+        "parent_type": "provider_turn",
+        "state": "cancelled",
+        "provider_attempt_id": "provider-attempt-A",
+        "handoff_attempt_id": null,
+        "handoff_attempt_no": null,
+        "lease_epoch": 7,
+        "claimed_by": null,
+        "claimed_at": null,
+        "last_send_started_at": null,
+        "provider_acked_at": null,
+        "handoff_deadline_at": "2026-07-19T05:05:00Z",
+        "reason_code": "parent_stopped",
+        "error": null,
+        "side_effect_status": "none"
+      }
+    }
+  ],
+  "transition_rules": {
+    "interaction": {
+      "pending": ["answer_committed", "expired", "cancelled"],
+      "answer_committed": ["answer_delivering", "cancelled"],
+      "answer_delivering": ["answered", "rejected", "delivery_unknown", "answer_committed", "cancelled"],
+      "delivery_unknown": ["answered", "rejected", "cancelled"],
+      "answered": [],
+      "rejected": [],
+      "expired": [],
+      "cancelled": []
+    },
+    "handoff": {
+      "pending": ["delivering", "cancelled"],
+      "delivering": ["accepted", "rejected", "retry_wait", "delivery_unknown", "cancelled"],
+      "retry_wait": ["delivering", "cancelled"],
+      "delivery_unknown": ["accepted", "rejected", "cancelled"],
+      "accepted": [],
+      "rejected": [],
+      "cancelled": []
+    }
+  },
+  "transition_examples": [
+    {
+      "name": "send_before_ack_crash",
+      "machine": "interaction",
+      "transition": {
+        "from": "answer_delivering",
+        "to": "delivery_unknown",
+        "sendStarted": true
+      },
+      "expected": "allowed"
+    },
+    {
+      "name": "unknown_ack_proven",
+      "machine": "handoff",
+      "transition": {
+        "from": "delivery_unknown",
+        "to": "accepted",
+        "acknowledgementProven": true
+      },
+      "expected": "allowed"
+    },
+    {
+      "name": "unknown_ack_unproven",
+      "machine": "handoff",
+      "transition": {
+        "from": "delivery_unknown",
+        "to": "accepted",
+        "acknowledgementProven": false
+      },
+      "expected": "prohibited"
+    },
+    {
+      "name": "post_send_cancel_prohibited",
+      "machine": "handoff",
+      "transition": {
+        "from": "delivering",
+        "to": "cancelled",
+        "sendStarted": true
+      },
+      "expected": "prohibited"
+    },
+    {
+      "name": "post_send_retry_prohibited",
+      "machine": "handoff",
+      "transition": {
+        "from": "delivering",
+        "to": "retry_wait",
+        "sendStarted": true,
+        "safeToRetry": true
+      },
+      "expected": "prohibited"
+    },
+    {
+      "name": "provider_rejected",
+      "machine": "interaction",
+      "transition": {
+        "from": "answer_delivering",
+        "to": "rejected",
+        "sendStarted": true
+      },
+      "expected": "allowed"
+    },
+    {
+      "name": "pre_send_cancelled",
+      "machine": "handoff",
+      "transition": {
+        "from": "delivering",
+        "to": "cancelled",
+        "sendStarted": false
+      },
+      "expected": "allowed"
+    },
+    {
+      "name": "late_ack_after_cancel_prohibited",
+      "machine": "handoff",
+      "transition": {
+        "from": "cancelled",
+        "to": "accepted",
+        "acknowledgementProven": true
+      },
+      "expected": "prohibited"
+    }
+  ]
+}

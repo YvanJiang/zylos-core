@@ -1,9 +1,7 @@
 FROM node:22-slim
 
-# tmux is a hard `zylos init` prerequisite (init exits non-zero without it),
-# matching the production image. The golden-init bake (below) needs it.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends bash curl git tmux \
+  && apt-get install -y --no-install-recommends bash curl git \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /repo

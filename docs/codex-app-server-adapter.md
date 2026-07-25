@@ -1,0 +1,222 @@
+# Codex app-server adapter evidence
+
+This document records the provider-specific boundary implemented for runtime migration issues 10
+and 14.
+It does not change the provider-neutral Core contracts or the migration consensus.
+
+## Transport boundary
+
+Each executor-service adapter instance supervises one locked-down `codex app-server` process group
+and multiplexes logical conversation executors over its newline-delimited bidirectional protocol.
+Before app-server starts, the adapter disables hooks, code-mode hosting, and multi-agent execution
+at the process layer. Image generation remains enabled and is admitted only through its fixed
+app-server item lifecycle and Core-owned bounded artifact path. The adapter deliberately preserves
+the effective Codex MCP, plugin, and app configuration, so every server that was already
+`enabled=true` remains available; servers disabled by the user's configuration stay disabled.
+The child, connection, in-memory thread, request IDs, and active turn handles are not durable
+authority. Core's persisted lineage, turn, attempt, lease, interaction, and handoff records remain
+authoritative.
+
+The normal Codex path contains no per-turn CLI child, `exec --json`, `exec resume`, transport
+fallback, feature flag, or dual-mode route.
+
+Platform-original ingress is detached by Core before it reaches this adapter.
+The user-facing dispatch turn completes immediately, while a durable background
+task owns a fresh execution conversation, Codex thread, provider attempt, and
+workspace lease. This adapter therefore keeps Codex collaboration/subagents
+disabled: responsiveness comes from Core scheduling rather than an unfenced
+provider-native child.
+
+## Fixed-version protocol evidence
+
+The implementation was audited against:
+
+- local `codex-cli 0.144.5`;
+- locally generated experimental TypeScript and JSON Schema from
+  `codex app-server generate-ts --experimental` and
+  `codex app-server generate-json-schema --experimental`;
+- the official Codex app-server README and protocol source at tag `rust-v0.144.5`, commit
+  `87db9bc18ba5bc82c1cb4e4381b44f693ee35623`.
+
+The stdio connection performs `initialize`, waits for its response, and then sends `initialized`.
+It enables `experimentalApi`, disables request attestation, and advertises
+`mcpServerOpenaiFormElicitation=false` because Core has no provider-neutral representation for
+that private form. New lineages use `thread/start`; the returned thread ID is durably bound before
+`turn/start`. Persisted lineages use `thread/resume` once per new connection before starting a
+turn.
+
+## Provider-neutral normalization
+
+Private app-server method and item names remain inside the adapter:
+
+| App-server input | Provider-neutral result |
+|---|---|
+| fenced `turn/started` | provider-neutral started signal; Core atomically authors `starting -> running` with `provider_started` |
+| `item/agentMessage/delta` and completed agent message | `text_delta` and `text_snapshot` |
+| command and file lifecycle | `tool_started`, `tool_progress`, `tool_finished`; item IDs, progress methods, and fixed-version statuses are fenced by type |
+| MCP tool lifecycle | `tool_started`, optional `tool_progress`, and `tool_finished`; normal MCP items do not cause an unsupported-capability recovery |
+| image-generation lifecycle | `tool_started` and `tool_finished`; completion requires the fenced completed notification plus a bounded valid PNG result, even when a compatible proxy leaves the item status as `generating` |
+| dynamic, collaboration, web, or provider-hook lifecycle | capability failure; these paths remain disabled because they are outside the authorized MCP exception |
+| completed turn | adapter iterator completion; Core authors the canonical completed state |
+| failed/interrupted turn, error notification, or lost connection | typed provider failure; Core authors the canonical failure or recovery state |
+| fenced token-usage and moderation telemetry | intentionally omitted because the public normalized-event contract has no usage/score event and private provider scores must not escape the adapter |
+| command/file approval | one-shot `accept` only after the current durable permission and workspace fences; otherwise a durable `tool_approval` interaction, with the same workspace fence repeated before an approved handoff is sent |
+| permissions approval | empty turn-scoped denial followed by capability failure; the adapter never creates a turn/session filesystem or network grant |
+| single-question `requestUserInput` | durable `question` or fixed `choice` interaction with answer constraints preserved |
+| MCP tool-approval elicitation | automatically answered with one-shot `accept` and no Core interaction; this is the explicit 2026-07-23 fluidity-over-isolation decision |
+| other supported MCP form elicitation | durable `question` or fixed `choice` interaction; malformed or unsupported forms fail closed |
+
+Whitespace-only agent-message deltas are retained per provider item but are not emitted as standalone
+normalized events, because public text events must be displayable. The adapter prefixes that buffered
+whitespace to the next displayable delta; a completed agent-message snapshot remains authoritative and
+replaces any still-buffered fragment. This preserves provider text and offsets without turning a legal
+streaming boundary into a persistence failure or recovery transition.
+
+User-supplied answers are accepted only through Core's durable interaction-answer and handoff
+records. The
+adapter verifies the current connection, provider request, thread, turn, Core turn, attempt, lease,
+and handoff claim before writing a response. Preparation is side-effect free. Core persists the
+exact handoff send-start fence before invoking the prepared one-shot send. A handoff is acknowledged
+only after its answer was written and the matching `serverRequest/resolved` notification arrives.
+Server request IDs are never reusable within one connection, including after acknowledgement.
+The fixed app-server protocol exposes no read-only, idempotent lookup that can prove acceptance for
+one prior handoff attempt, so its recovery query truthfully returns `unknown`; Core does not infer
+acceptance from connection or in-memory request state and does not resend the answer.
+
+## Workspace access and write fencing
+
+`sandbox: "workspace-write"` is a trusted adapter-construction declaration of the logical access
+that Core must serialize; it is not forwarded as the provider sandbox. Core therefore acquires a
+writable workspace lease at the normalized configured cwd, while every new, resumed, and started
+Codex turn is forced to `read-only` plus `on-request`, with the user reviewer. The turn override is
+repeated even after a persisted thread is resumed. A deployment-authorized exception may set
+`CODEX_SANDBOX_MODE=danger-full-access` together with `CODEX_APPROVAL_POLICY=never`; only that exact
+pair is forwarded to every thread and turn. The exception keeps Core's coarse writable workspace
+lease but deliberately removes the provider's synchronous pre-action write fence. Other writable
+configurations whose approval policy is not `on-request` are rejected. A request cannot self-report
+read-only access.
+
+Writable execution fails closed unless Core supplies `assertWorkspaceWrite`. Before a one-shot
+command/file approval, the adapter passes the exact connection, conversation, Core turn, lineage,
+executor instance, provider attempt, durable workspace lease, provider thread/turn/item/approval,
+environment, cwd, and bounded write paths back to Core. Core reopens those facts from SQLite and
+requires the current executor owner, unexpired executor and workspace leases, matching holder and
+epochs, the durably bound provider thread, a null environment, the canonical workspace cwd, and
+write paths contained by the workspace root. Only then may the official client return
+`{"decision":"accept"}` for that request. It never returns `acceptForSession`, an exec-policy or
+network amendment, a session scope, or a filesystem/network permission profile. It declines every
+command request with non-null `additionalPermissions` before authorization. A stale or
+mismatched approval receives `decline` before the shared connection is retired into the existing
+uncertain-recovery boundary.
+
+The run is registered with the shared-connection failure latch before thread load or durable
+binding. If the failing fence came from Core persistence, the adapter preserves that failure marker
+instead of converting the current run to a generic provider error; the executor service then marks
+the expired workspace uncertain, persists the recovery notification, and waits for its delivery
+before isolation and ownership release. Other runs affected by retiring the shared connection still
+receive the normal provider-loss recovery signal.
+
+App-server provides a blocking pre-action boundary for built-in command and file-change approvals.
+The read-only OS sandbox is the enforcement layer that prevents the built-in shell and apply-patch
+paths from writing before that response. An empty thread-level `mcp_servers` object is deliberately
+not sent: Codex 0.144.5 merges that object with inherited configuration instead of replacing it.
+The adapter now relies on that inheritance so effective enabled MCP and plugin-provided servers are
+loaded normally. Hooks, code mode, browser, computer use, web search, collaboration/subagents, and
+permission-request tools remain disabled outside MCP. Image generation is explicitly enabled. Its
+started and completed notifications remain fenced to
+the current connection/thread/turn/attempt; writable runs reopen the Core workspace lease at both
+boundaries. A completed result is decoded only within the configured size bound, must be a
+canonical PNG, and is persisted atomically under
+`$ZYLOS_DIR/runtime/artifacts/codex-image-generation/<sha256>.png`. A non-null provider
+`savedPath` must be a regular, non-symlink file inside the current workspace and match the returned
+PNG bytes. Tool events contain only bounded artifact metadata and never the base64 result.
+Both legacy and v2/fanout/collaboration-mode multi-agent feature keys are disabled so an inherited
+local configuration cannot reopen those unrelated execution surfaces. An unexpected hook,
+dynamic/collaboration/web item, dynamic tool server request, permission-profile request, or
+malformed MCP elicitation is refused and retires the
+connection; its item-start notification is only contradiction evidence, never claimed as the
+pre-action fence.
+
+The public normalized tool-event and delivery-command contracts do not yet carry a typed media
+artifact. The current implementation therefore completes only the Codex/Core internal image
+artifact lifecycle. Feishu/Lark image rendering and upload require a separate provider-neutral
+artifact/media delivery contract and are not inferred from a local path or added in this repository.
+
+Official 0.144.5 source does contain a conditional blocking seam for a model-initiated MCP tool
+when every server/tool uses prompt approval, review reaches app-server, no hook, Guardian, or cache
+auto-allows the call, and the elicitation feature remains enabled. The 2026-07-23 decision does not
+claim this as a security fence: Zylos automatically accepts tool-approval elicitation, and servers
+configured for automatic approval can execute without any server request. The resulting MCP access
+may bypass Core workspace leases, the provider sandbox, and protected-action approval. The
+client-initiated `mcpServer/tool/call` RPC remains unreachable through Zylos's private sender. The
+version-specific source and fixture audit is recorded in
+[`codex-app-server-0.144.5-fence-research.md`](./codex-app-server-0.144.5-fence-research.md).
+
+The remaining app-server RPCs with independent side effects (`thread/shellCommand`, `command/exec`,
+`process/spawn`, `fs/writeFile`, configuration/plugin mutation, direct MCP calls, and their control
+methods) are client-initiated APIs. They are unreachable because Zylos exposes no raw RPC surface
+and its private sender has an explicit call-site allowlist limited to initialize, thread
+start/resume, turn start/interrupt, and the exact server-request responses above.
+
+Multi-question, secret, provider-auto-resolving, and fixed-choice-plus-Other `requestUserInput`
+requests, malformed or unsupported non-approval MCP elicitation, unknown server requests, duplicate request IDs,
+unsupported item or notification types, incomplete fixed-version request shapes, duplicate or
+unfinished tool lifecycles, cross-tool progress, unrenderable approval details, and stale or
+mismatched traffic fail closed.
+Connection loss before an answer cancels still-pending interactions; a committed handoff whose send
+has not started is atomically cancelled with its interaction, audit, projection, and outbox state.
+Both paths move the turn to `recovering`. Loss after a response may have been sent is recorded as
+`delivery_unknown`. Neither case is automatically replayed. The provider-failure latch covers both
+durable-interaction persistence and the window after `turn/start` is written but before its response
+arrives, so an uncertain writer lease is retained. Fenced provider error or terminal notifications
+also drive that durable failure path when Core is suspended in `waiting_user`; a completed turn with
+an outstanding server request or unfinished tool is treated as invalid/uncertain rather than
+success. The supervised child's stderr
+is drained without persistence and stdio errors fail the fenced connection rather than escaping as
+unhandled stream errors. Fatal run-scoped protocol/capability failures retire the shared connection.
+On POSIX, the app-server leader is launched in a detached process group; loss of protocol control
+signals that exact group with `SIGTERM`, escalates to `SIGKILL`, and waits for both leader `close`
+and process-group disappearance. The termination, escalation, and group-observation timers remain
+referenced so service-process exit cannot bypass that isolation barrier. A replacement connection
+is not started while any member of the prior group can still be observed. JSON-RPC request IDs are
+keyed with their protocol type intact, so numeric `1` and string `"1"` cannot share a fence. Each
+connection's late-traffic fence collections have a fixed bound; reaching it retires the connection
+before any tombstone can be evicted and uncertain active work enters recovery.
+
+## Control and reconnect
+
+Stop, timeout, and steer share the provider-neutral adapter `interrupt` seam and use
+`turn/interrupt` for the exact current thread/turn/attempt/lease fence. Timeout retains the writer
+lease until the matching provider terminal notification confirms that the turn stopped. A fenced
+terminal tombstone covers the race in which that notification wins immediately before the timeout
+interrupt lookup. Confirmation is bounded to five seconds; missing or uncertain confirmation
+leaves the lease held, persists a `side_effect_unknown` provider-stop incident, and enqueues a
+high-priority manual-recovery notice. Turn interrupts do not kill the shared app-server process and
+do not discard the persisted lineage. A protocol or stdio failure terminates the lost shared
+connection under supervision. Uncertain running work enters `recovering` with its writer lease held,
+rather than `failed` with an immediately reusable lease. Process exit proves isolation only after
+the supervised group is gone; an iterator return or app-server leader exit alone cannot release
+Codex authority. After the retired process group is confirmed gone, a later safe turn creates a new
+connection and reloads its persisted thread before use; active work is never replayed automatically.
+
+## Verification boundary
+
+Deterministic tests inject the child process and stdio streams and cover handshake ordering,
+single-process multiplexing, thread binding/resume/reconnect, provider-start and text/tool
+normalization, every supported bidirectional interaction family, provider acknowledgement and
+request-ID tombstones, bounded and confirmed timeout interruption, terminal race tombstones,
+transport loss, stale request/answer/output fences, bounded PNG artifacts, image status
+compatibility, saved-path containment, base64 redaction, process-group escalation, and the rule that
+neither a surviving group nor an iterator return can release recovering authority. The
+current app-server protocol returns all questions in
+one JSON-RPC response, while Core requires each question to have a unique interaction and forbids
+answering the next blocking ordinal before provider acknowledgement of the previous one. Until the
+interaction authority defines a batch handoff that preserves both rules, multi-question requests
+are rejected instead of fabricating an acknowledgement or collapsing distinct questions.
+
+Real local verification requires an authenticated Codex
+installation and exercises only safe read-only prompts and explicit negative/interrupt protocol
+paths; approval, user-input, and MCP elicitation require a controlled provider/tool fixture before
+they can be asserted end to end without creating external side effects. The fixed target,
+prerequisites, machine-readable runner, completed matrix, unrun cases, and residual risks are
+recorded in [`codex-app-server-real-integration.md`](./codex-app-server-real-integration.md).

@@ -73,8 +73,8 @@ Runtime data (logs, databases, config) goes in `~/zylos/<skill-name>/`, NOT in t
 
 ```
 ~/zylos/
-├── activity-monitor/    # activity-monitor skill data
-│   └── activity.log
+├── runtime/             # provider-neutral executor diagnostics
+│   └── diagnostics/
 ├── comm-bridge/         # comm-bridge skill data
 │   └── c4.db
 ├── http/                # http skill data

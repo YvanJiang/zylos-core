@@ -1,10 +1,16 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { describe, it } from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { updateNextRunTime, processCompletedTasks, handleStaleRunningTasks, TASK_TIMEOUT } from '../daemon-tasks.js';
+import {
+  updateNextRunTime,
+  processCompletedTasks,
+  recordMissedNoticeTerminalRejection,
+  scheduleMissedNoticeRetry,
+} from '../daemon-tasks.js';
 import { now } from '../database.js';
 
 async function withDb(fn) {
@@ -43,10 +49,7 @@ function insertTask(db, overrides = {}) {
     next_run_at: currentTime + 3600,
     priority: 3,
     status: 'pending',
-    require_idle: 0,
     miss_threshold: 300,
-    reply_channel: null,
-    reply_endpoint: null,
     created_at: currentTime,
     updated_at: currentTime,
     last_error: null,
@@ -54,13 +57,13 @@ function insertTask(db, overrides = {}) {
   const task = { ...defaults, ...overrides };
   db.prepare(`
     INSERT INTO tasks (id, name, prompt, type, cron_expression, interval_seconds, timezone,
-      next_run_at, priority, status, require_idle, miss_threshold,
-      reply_channel, reply_endpoint, created_at, updated_at, last_error)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      next_run_at, priority, status, miss_threshold,
+      created_at, updated_at, last_error)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     task.id, task.name, task.prompt, task.type, task.cron_expression, task.interval_seconds,
-    task.timezone, task.next_run_at, task.priority, task.status, task.require_idle,
-    task.miss_threshold, task.reply_channel, task.reply_endpoint,
+    task.timezone, task.next_run_at, task.priority, task.status,
+    task.miss_threshold,
     task.created_at, task.updated_at, task.last_error
   );
   return task;
@@ -107,28 +110,34 @@ describe('updateNextRunTime', () => {
     });
   });
 
-  it('uses task timezone for cron calculation', async () => {
-    const originalTz = process.env.TZ;
-    try {
-      process.env.TZ = 'UTC';
+  for (const scenario of [
+    {
+      label: 'before Shanghai and UTC 09:00',
+      reference: '2026-07-21T00:30:00.000Z',
+      expected: { shanghai: 1784595600, utc: 1784624400 },
+    },
+    {
+      label: 'after Shanghai but before UTC 09:00',
+      reference: '2026-07-21T02:00:00.000Z',
+      expected: { shanghai: 1784682000, utc: 1784624400 },
+    },
+  ]) {
+    it(`uses task timezone for cron calculation ${scenario.label}`, async () => {
       await withDb((db) => {
         const task1 = insertTask(db, { id: 'task-utc', type: 'recurring', cron_expression: '0 9 * * *', timezone: 'UTC', status: 'completed' });
         const task2 = insertTask(db, { id: 'task-sh', type: 'recurring', cron_expression: '0 9 * * *', timezone: 'Asia/Shanghai', status: 'completed' });
+        const fromDate = new Date(scenario.reference);
 
-        updateNextRunTime(db, task1);
-        updateNextRunTime(db, task2);
+        updateNextRunTime(db, task1, { fromDate });
+        updateNextRunTime(db, task2, { fromDate });
 
         const utcRow = db.prepare('SELECT next_run_at FROM tasks WHERE id = ?').get('task-utc');
         const shRow = db.prepare('SELECT next_run_at FROM tasks WHERE id = ?').get('task-sh');
 
-        // Shanghai 9am is 8 hours earlier in UTC than UTC 9am
-        assert.ok(shRow.next_run_at < utcRow.next_run_at,
-          `Shanghai 9am (${shRow.next_run_at}) should be before UTC 9am (${utcRow.next_run_at})`);
+        assert.deepEqual({ shanghai: shRow.next_run_at, utc: utcRow.next_run_at }, scenario.expected);
       });
-    } finally {
-      if (originalTz === undefined) { delete process.env.TZ; } else { process.env.TZ = originalTz; }
-    }
-  });
+    });
+  }
 });
 
 // ---- processCompletedTasks ----
@@ -195,86 +204,114 @@ describe('processCompletedTasks', () => {
   });
 });
 
-// ---- handleStaleRunningTasks ----
-
-describe('handleStaleRunningTasks', () => {
-  it('marks stale one-time task as failed', async () => {
-    await withDb((db) => {
-      const staleTime = now() - TASK_TIMEOUT - 60;
-      insertTask(db, { type: 'one-time', cron_expression: null, status: 'running', updated_at: staleTime });
-
-      // Insert a history entry
-      const task = db.prepare('SELECT id FROM tasks LIMIT 1').get();
-      db.prepare('INSERT INTO task_history (task_id, executed_at, status) VALUES (?, ?, ?)')
-        .run(task.id, staleTime, 'started');
-
-      handleStaleRunningTasks(db);
-
-      const updated = db.prepare('SELECT status, last_error FROM tasks WHERE id = ?').get(task.id);
-      assert.equal(updated.status, 'failed');
-      assert.equal(updated.last_error, 'Task timed out');
-
-      const history = db.prepare('SELECT status FROM task_history WHERE task_id = ?').get(task.id);
-      assert.equal(history.status, 'timeout');
+describe('scheduler daemon failure backoff', () => {
+  it('durably advances only queue-full notice attempts with exponential backoff', async () => {
+    await withDb((database) => {
+      const task = insertTask(database, { id: 'queue-full-backoff' });
+      const first = scheduleMissedNoticeRetry(database, task, { code: 'queue_full' }, {
+        now: () => 1000,
+      });
+      assert.deepEqual(first, {
+        recorded: true, attempt: 2, retry_at: 1005, delay_seconds: 5,
+      });
+      assert.deepEqual(database.prepare(`
+        SELECT missed_notice_attempt, missed_notice_retry_at, status
+        FROM tasks WHERE id = ?
+      `).get(task.id), {
+        missed_notice_attempt: 2,
+        missed_notice_retry_at: 1005,
+        status: 'pending',
+      });
+      assert.equal(scheduleMissedNoticeRetry(database, task, { code: 'not_retryable' }), null);
     });
   });
 
-  it('marks stale recurring task as completed (for rescheduling)', async () => {
-    await withDb((db) => {
-      const staleTime = now() - TASK_TIMEOUT - 60;
-      insertTask(db, { type: 'recurring', cron_expression: '0 9 * * *', status: 'running', updated_at: staleTime });
-
-      const task = db.prepare('SELECT id FROM tasks LIMIT 1').get();
-      db.prepare('INSERT INTO task_history (task_id, executed_at, status) VALUES (?, ?, ?)')
-        .run(task.id, staleTime, 'started');
-
-      handleStaleRunningTasks(db);
-
-      const updated = db.prepare('SELECT status, last_error FROM tasks WHERE id = ?').get(task.id);
-      assert.equal(updated.status, 'completed');
-      assert.equal(updated.last_error, 'Task timed out');
+  it('terminalizes a non-retryable missed-notice rejection without a polling loop', async () => {
+    await withDb((database) => {
+      const task = insertTask(database, {
+        id: 'non-retryable-notice', next_run_at: 100, missed_notice_attempt: 1,
+      });
+      assert.equal(recordMissedNoticeTerminalRejection(database, task, {
+        status: 'rejected', turn_id: null,
+        error: { code: 'idempotency_conflict', user_message: 'Occurrence payload conflict.' },
+      }, { now: () => 1000 }), true);
+      assert.deepEqual(database.prepare(`
+        SELECT status, current_occurrence_id, current_turn_id,
+               last_core_state, last_error FROM tasks WHERE id = ?
+      `).get(task.id), {
+        status: 'failed',
+        current_occurrence_id: 'non-retryable-notice:100:missed-notice:1',
+        current_turn_id: null,
+        last_core_state: 'failed',
+        last_error: 'Occurrence payload conflict.',
+      });
+      assert.deepEqual(database.prepare(`
+        SELECT occurrence_id, turn_id, status, error FROM task_history WHERE task_id = ?
+      `).get(task.id), {
+        occurrence_id: 'non-retryable-notice:100:missed-notice:1',
+        turn_id: null, status: 'failed', error: 'Occurrence payload conflict.',
+      });
+      assert.equal(recordMissedNoticeTerminalRejection(database, task, {
+        status: 'rejected', turn_id: null,
+        error: { code: 'idempotency_conflict', user_message: 'Occurrence payload conflict.' },
+      }, { now: () => 1001 }), false);
+      assert.equal(
+        database.prepare('SELECT COUNT(*) AS count FROM task_history WHERE task_id = ?')
+          .get(task.id).count,
+        1,
+      );
     });
   });
 
-  it('ignores recently updated running tasks', async () => {
-    await withDb((db) => {
-      insertTask(db, { type: 'one-time', cron_expression: null, status: 'running', updated_at: now() });
+  it('keeps a missed occurrence pending but sleeps after persistent Core notice failure', async () => {
+    const originalZylosDir = process.env.ZYLOS_DIR;
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scheduler-loop-'));
+    let child;
+    try {
+      process.env.ZYLOS_DIR = tmpDir;
+      const cacheBuster = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const { getDb } = await import(new URL(`../database.js?${cacheBuster}`, import.meta.url));
+      const database = getDb();
+      insertTask(database, {
+        id: 'persistent-notice-failure',
+        type: 'recurring',
+        cron_expression: '0 9 * * *',
+        next_run_at: now() - 600,
+        miss_threshold: 1,
+      });
+      database.close();
 
-      handleStaleRunningTasks(db);
+      child = spawn(process.execPath, [path.resolve('skills/scheduler/scripts/daemon.js')], {
+        cwd: path.resolve('.'),
+        env: { ...process.env, ZYLOS_DIR: tmpDir, TZ: 'UTC' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let output = '';
+      child.stdout.on('data', (chunk) => { output += chunk.toString(); });
+      child.stderr.on('data', (chunk) => { output += chunk.toString(); });
+      await new Promise((resolve) => setTimeout(resolve, 750));
 
-      const task = db.prepare('SELECT status FROM tasks LIMIT 1').get();
-      assert.equal(task.status, 'running');  // should not be touched
-    });
-  });
+      assert.equal(child.exitCode, null, output);
+      const failures = output.match(/Failed to persist missed-task notice/g) ?? [];
+      assert.equal(failures.length, 1, output);
 
-  it('ignores non-running tasks', async () => {
-    await withDb((db) => {
-      const staleTime = now() - TASK_TIMEOUT - 60;
-      insertTask(db, { status: 'pending', updated_at: staleTime });
-
-      handleStaleRunningTasks(db);
-
-      const task = db.prepare('SELECT status FROM tasks LIMIT 1').get();
-      assert.equal(task.status, 'pending');
-    });
-  });
-
-  it('handles multiple stale tasks with different types', async () => {
-    await withDb((db) => {
-      const staleTime = now() - TASK_TIMEOUT - 60;
-      insertTask(db, { id: 'task-ot', type: 'one-time', cron_expression: null, status: 'running', updated_at: staleTime });
-      insertTask(db, { id: 'task-rc', type: 'recurring', cron_expression: '0 9 * * *', status: 'running', updated_at: staleTime });
-      insertTask(db, { id: 'task-iv', type: 'interval', cron_expression: null, interval_seconds: 3600, status: 'running', updated_at: staleTime });
-
-      handleStaleRunningTasks(db);
-
-      const ot = db.prepare('SELECT status FROM tasks WHERE id = ?').get('task-ot');
-      const rc = db.prepare('SELECT status FROM tasks WHERE id = ?').get('task-rc');
-      const iv = db.prepare('SELECT status FROM tasks WHERE id = ?').get('task-iv');
-
-      assert.equal(ot.status, 'failed');     // one-time → failed
-      assert.equal(rc.status, 'completed');  // recurring → completed (will be rescheduled)
-      assert.equal(iv.status, 'completed');  // interval → completed (will be rescheduled)
-    });
+      const reopened = new (await import('better-sqlite3')).default(
+        path.join(tmpDir, 'scheduler', 'scheduler.db'),
+      );
+      assert.equal(reopened.prepare('SELECT status FROM tasks WHERE id = ?')
+        .get('persistent-notice-failure').status, 'pending');
+      reopened.close();
+    } finally {
+      if (child && child.exitCode === null) {
+        child.kill('SIGKILL');
+        await new Promise((resolve) => child.once('close', resolve));
+      }
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      if (originalZylosDir === undefined) {
+        delete process.env.ZYLOS_DIR;
+      } else {
+        process.env.ZYLOS_DIR = originalZylosDir;
+      }
+    }
   });
 });

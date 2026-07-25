@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.zylos.ai/public/v1/inbound-result.schema.json",
+  "title": "Zylos authoritative inbound result v1",
+  "type": "object",
+  "required": [
+    "contract",
+    "contract_version",
+    "trace_id",
+    "inbound_event_id",
+    "idempotency_key",
+    "status",
+    "conversation_id",
+    "turn_id",
+    "lineage_id",
+    "control_id",
+    "turn_version",
+    "lineage_resolution_state",
+    "deduplicated",
+    "error",
+    "committed_at"
+  ],
+  "properties": {
+    "contract": { "const": "zylos.inbound-result" },
+    "contract_version": { "type": "string", "pattern": "^1\\.(0|[1-9][0-9]*)$" },
+    "trace_id": { "$ref": "#/$defs/opaque_id" },
+    "inbound_event_id": { "$ref": "#/$defs/opaque_id" },
+    "idempotency_key": { "$ref": "#/$defs/opaque_id" },
+    "status": { "enum": ["accepted", "rejected"] },
+    "dispatch_status": { "const": "background_dispatched" },
+    "background_task_id": { "$ref": "#/$defs/opaque_id" },
+    "background_execution_turn_id": { "$ref": "#/$defs/opaque_id" },
+    "conversation_id": { "$ref": "#/$defs/nullable_id" },
+    "turn_id": { "$ref": "#/$defs/nullable_id" },
+    "lineage_id": { "$ref": "#/$defs/nullable_id" },
+    "control_id": { "$ref": "#/$defs/nullable_id" },
+    "turn_version": { "oneOf": [{ "type": "integer", "minimum": 1 }, { "type": "null" }] },
+    "lineage_resolution_state": { "enum": ["bound", "pending_recovery", "not_applicable"] },
+    "deduplicated": { "type": "boolean" },
+    "error": { "oneOf": [{ "$ref": "#/$defs/error" }, { "type": "null" }] },
+    "committed_at": { "oneOf": [{ "$ref": "#/$defs/rfc3339" }, { "type": "null" }] }
+  },
+  "oneOf": [
+    {
+      "title": "accepted executable turn with bound lineage",
+      "properties": {
+        "status": { "const": "accepted" },
+        "conversation_id": { "$ref": "#/$defs/opaque_id" },
+        "turn_id": { "$ref": "#/$defs/opaque_id" },
+        "lineage_id": { "$ref": "#/$defs/opaque_id" },
+        "control_id": { "type": "null" },
+        "turn_version": { "type": "integer", "minimum": 1 },
+        "lineage_resolution_state": { "const": "bound" },
+        "error": { "type": "null" },
+        "committed_at": { "$ref": "#/$defs/rfc3339" }
+      }
+    },
+    {
+      "title": "accepted control",
+      "properties": {
+        "status": { "const": "accepted" },
+        "conversation_id": { "$ref": "#/$defs/opaque_id" },
+        "turn_id": { "type": "null" },
+        "lineage_id": { "type": "null" },
+        "control_id": { "$ref": "#/$defs/opaque_id" },
+        "turn_version": { "type": "null" },
+        "lineage_resolution_state": { "const": "not_applicable" },
+        "error": { "type": "null" },
+        "committed_at": { "$ref": "#/$defs/rfc3339" }
+      }
+    },
+    {
+      "title": "accepted turn pending lineage recovery",
+      "properties": {
+        "status": { "const": "accepted" },
+        "conversation_id": { "$ref": "#/$defs/opaque_id" },
+        "turn_id": { "$ref": "#/$defs/opaque_id" },
+        "lineage_id": { "type": "null" },
+        "control_id": { "type": "null" },
+        "turn_version": { "type": "integer", "minimum": 1 },
+        "lineage_resolution_state": { "const": "pending_recovery" },
+        "error": { "type": "null" },
+        "committed_at": { "$ref": "#/$defs/rfc3339" }
+      }
+    },
+    {
+      "title": "persisted queue-full failed turn",
+      "properties": {
+        "status": { "const": "rejected" },
+        "conversation_id": { "$ref": "#/$defs/opaque_id" },
+        "turn_id": { "$ref": "#/$defs/opaque_id" },
+        "lineage_id": { "$ref": "#/$defs/opaque_id" },
+        "control_id": { "type": "null" },
+        "turn_version": { "type": "integer", "minimum": 1 },
+        "lineage_resolution_state": { "const": "bound" },
+        "error": { "allOf": [{ "$ref": "#/$defs/error" }, { "properties": { "code": { "const": "queue_full" } } }] },
+        "committed_at": { "$ref": "#/$defs/rfc3339" }
+      }
+    },
+    {
+      "title": "non-queue-full rejection with nullable or persisted Core identity",
+      "properties": {
+        "status": { "const": "rejected" },
+        "error": {
+          "allOf": [
+            { "$ref": "#/$defs/error" },
+            { "not": { "properties": { "code": { "const": "queue_full" } }, "required": ["code"] } }
+          ]
+        }
+      }
+    }
+  ],
+  "allOf": [
+    {
+      "if": {
+        "anyOf": [
+          { "required": ["dispatch_status"] },
+          { "required": ["background_task_id"] },
+          { "required": ["background_execution_turn_id"] }
+        ]
+      },
+      "then": {
+        "required": [
+          "dispatch_status",
+          "background_task_id",
+          "background_execution_turn_id"
+        ],
+        "properties": {
+          "status": { "const": "accepted" },
+          "dispatch_status": { "const": "background_dispatched" }
+        }
+      }
+    }
+  ],
+  "additionalProperties": true,
+  "x-zylos-deduplicated-result": "Return the original Core IDs, result, and committed_at; only response trace_id and deduplicated may differ.",
+  "$defs": {
+    "opaque_id": { "type": "string", "minLength": 1, "pattern": "^[^\\u0000-\\u001f\\u007f]+$" },
+    "nullable_id": { "oneOf": [{ "$ref": "#/$defs/opaque_id" }, { "type": "null" }] },
+    "rfc3339": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$" },
+    "error": {
+      "type": "object",
+      "required": ["code", "category", "retryable", "side_effect_status", "user_message", "occurred_at"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "category": { "enum": ["validation", "authentication", "authorization", "conflict", "capacity", "provider", "channel", "storage", "internal"] },
+        "retryable": { "type": "boolean" },
+        "side_effect_status": { "enum": ["none", "known", "unknown"] },
+        "user_message": { "type": "string", "minLength": 1 },
+        "detail_ref": { "$ref": "#/$defs/opaque_id" },
+        "occurred_at": { "$ref": "#/$defs/rfc3339" }
+      },
+      "additionalProperties": true
+    }
+  }
+}

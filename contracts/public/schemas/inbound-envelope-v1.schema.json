@@ -1,0 +1,219 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.zylos.ai/public/v1/inbound-envelope.schema.json",
+  "title": "Zylos standard inbound envelope v1",
+  "type": "object",
+  "required": [
+    "contract",
+    "contract_version",
+    "inbound_event_id",
+    "idempotency_key",
+    "trace_id",
+    "occurred_at",
+    "received_at",
+    "region",
+    "tenant_id",
+    "channel",
+    "bot_id",
+    "chat_type",
+    "chat_id",
+    "native_thread_or_topic_id",
+    "message_id",
+    "actor",
+    "content",
+    "reply",
+    "source"
+  ],
+  "properties": {
+    "contract": { "const": "zylos.inbound-envelope" },
+    "contract_version": { "type": "string", "pattern": "^1\\.(0|[1-9][0-9]*)$" },
+    "inbound_event_id": { "$ref": "#/$defs/opaque_id" },
+    "idempotency_key": { "$ref": "#/$defs/opaque_id" },
+    "trace_id": { "$ref": "#/$defs/opaque_id" },
+    "occurred_at": { "$ref": "#/$defs/rfc3339" },
+    "received_at": { "$ref": "#/$defs/rfc3339" },
+    "region": { "$ref": "#/$defs/opaque_id" },
+    "tenant_id": { "$ref": "#/$defs/opaque_id" },
+    "channel": { "$ref": "#/$defs/opaque_id" },
+    "bot_id": { "$ref": "#/$defs/opaque_id" },
+    "chat_type": { "enum": ["dm", "group", "thread", "synthetic"] },
+    "chat_id": { "$ref": "#/$defs/opaque_id" },
+    "native_thread_or_topic_id": {
+      "oneOf": [
+        { "$ref": "#/$defs/opaque_id" },
+        { "type": "null" }
+      ]
+    },
+    "message_id": { "$ref": "#/$defs/opaque_id" },
+    "actor": { "$ref": "#/$defs/actor" },
+    "content": { "$ref": "#/$defs/content" },
+    "reply": { "$ref": "#/$defs/reply" },
+    "source": { "$ref": "#/$defs/source" },
+    "schedule": { "$ref": "#/$defs/schedule" },
+    "legacy": { "$ref": "#/$defs/legacy" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "chat_type": { "const": "thread" } }, "required": ["chat_type"] },
+      "then": { "properties": { "native_thread_or_topic_id": { "$ref": "#/$defs/opaque_id" } } },
+      "else": { "properties": { "native_thread_or_topic_id": { "type": "null" } } }
+    },
+    {
+      "if": { "properties": { "source": { "properties": { "kind": { "const": "scheduler" } }, "required": ["kind"] } }, "required": ["source"] },
+      "then": {
+        "required": ["schedule"],
+        "properties": {
+          "actor": { "properties": { "type": { "const": "scheduler" } } }
+        },
+        "allOf": [{
+          "if": {
+            "properties": {
+              "schedule": {
+                "properties": { "bound_conversation": { "const": true } },
+                "required": ["bound_conversation"]
+              }
+            },
+            "required": ["schedule"]
+          },
+          "then": {
+            "properties": {
+              "channel": { "not": { "const": "scheduler" } },
+              "chat_type": { "not": { "const": "synthetic" } }
+            }
+          },
+          "else": {
+            "properties": {
+              "channel": { "const": "scheduler" },
+              "chat_type": { "const": "synthetic" },
+              "native_thread_or_topic_id": { "type": "null" }
+            }
+          }
+        }],
+        "not": { "required": ["legacy"] }
+      }
+    },
+    {
+      "if": { "properties": { "source": { "properties": { "kind": { "const": "legacy_compat" } }, "required": ["kind"] } }, "required": ["source"] },
+      "then": {
+        "required": ["legacy"],
+        "properties": { "actor": { "properties": { "type": { "const": "system" } } } },
+        "not": { "required": ["schedule"] }
+      }
+    },
+    {
+      "if": { "properties": { "source": { "properties": { "kind": { "const": "platform_original" } }, "required": ["kind"] } }, "required": ["source"] },
+      "then": {
+        "properties": {
+          "channel": { "not": { "const": "scheduler" } },
+          "actor": { "properties": { "type": { "const": "user" } } }
+        },
+        "not": { "anyOf": [{ "required": ["schedule"] }, { "required": ["legacy"] }] }
+      }
+    }
+  ],
+  "additionalProperties": true,
+  "x-zylos-semantic-constraints": {
+    "scheduler_synthetic_chat_id": "scheduler:<bot_id>:<task_id>",
+    "scheduler_bound_conversation": "when true, preserve the full non-synthetic conversation identity",
+    "reply_changes_conversation_identity": false,
+    "idempotency_key": "recompute_after_schema_validation"
+  },
+  "$defs": {
+    "opaque_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "rfc3339": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "actor": {
+      "type": "object",
+      "required": ["type", "actor_id", "authenticated", "roles"],
+      "properties": {
+        "type": { "enum": ["user", "scheduler", "system"] },
+        "actor_id": { "$ref": "#/$defs/opaque_id" },
+        "authenticated": { "type": "boolean" },
+        "roles": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["member", "group_owner", "tenant_admin", "bot_owner", "bot_admin"] }
+        }
+      },
+      "additionalProperties": true
+    },
+    "attachment": {
+      "type": "object",
+      "required": ["attachment_id", "media_type", "name", "content_ref"],
+      "properties": {
+        "attachment_id": { "$ref": "#/$defs/opaque_id" },
+        "media_type": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "content_ref": { "$ref": "#/$defs/opaque_id" }
+      },
+      "additionalProperties": true
+    },
+    "content": {
+      "type": "object",
+      "required": ["kind", "text", "attachments"],
+      "properties": {
+        "kind": { "enum": ["text", "rich_text", "file", "mixed"] },
+        "text": { "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+        "attachments": { "type": "array", "items": { "$ref": "#/$defs/attachment" } }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "enum": ["text", "rich_text", "mixed"] } } },
+          "then": { "properties": { "text": { "type": "string", "minLength": 1 } } }
+        },
+        {
+          "if": { "properties": { "kind": { "enum": ["file", "mixed"] } } },
+          "then": { "properties": { "attachments": { "minItems": 1 } } }
+        }
+      ],
+      "additionalProperties": true
+    },
+    "reply": {
+      "type": "object",
+      "required": ["root_message_id", "parent_message_id", "reply_to_message_id"],
+      "properties": {
+        "root_message_id": { "oneOf": [{ "$ref": "#/$defs/opaque_id" }, { "type": "null" }] },
+        "parent_message_id": { "oneOf": [{ "$ref": "#/$defs/opaque_id" }, { "type": "null" }] },
+        "reply_to_message_id": { "oneOf": [{ "$ref": "#/$defs/opaque_id" }, { "type": "null" }] }
+      },
+      "additionalProperties": true
+    },
+    "source": {
+      "type": "object",
+      "required": ["kind", "source_ref"],
+      "properties": {
+        "kind": { "enum": ["platform_original", "scheduler", "legacy_compat"] },
+        "source_ref": { "oneOf": [{ "$ref": "#/$defs/opaque_id" }, { "type": "null" }] }
+      },
+      "additionalProperties": true
+    },
+    "schedule": {
+      "type": "object",
+      "required": ["schedule_id", "task_id", "occurrence_id", "bound_conversation"],
+      "properties": {
+        "schedule_id": { "$ref": "#/$defs/opaque_id" },
+        "task_id": { "$ref": "#/$defs/opaque_id" },
+        "occurrence_id": { "$ref": "#/$defs/opaque_id" },
+        "bound_conversation": { "type": "boolean" },
+        "notification_text": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "legacy": {
+      "type": "object",
+      "required": ["legacy_record_id", "legacy_state", "migration_batch_id"],
+      "properties": {
+        "legacy_record_id": { "$ref": "#/$defs/opaque_id" },
+        "legacy_state": { "$ref": "#/$defs/opaque_id" },
+        "migration_batch_id": { "$ref": "#/$defs/opaque_id" }
+      },
+      "additionalProperties": true
+    }
+  }
+}

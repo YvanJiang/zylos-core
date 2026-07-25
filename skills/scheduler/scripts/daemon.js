@@ -4,16 +4,29 @@
  * Main orchestrator for autonomous task execution
  */
 
-import { getDb, cleanupHistory, now } from './database.js';
-import { getNextRun } from './cron-utils.js';
-import { sendViaC4, readStatusFile } from './runtime.js';
-import { formatTime } from './time-utils.js';
+import { getDb, cleanupHistory, migrateLegacyTaskScopes, now } from './database.js';
+import {
+  dispatchMissedScheduledTaskNotice,
+  dispatchScheduledTask,
+  recoverLegacyRunningTasksFromCore,
+} from './runtime.js';
+import { decideScheduledOccurrence } from '../../../runtime/scheduler/scheduler-queue.js';
+import { readExecutorObservability } from '../../../runtime/scheduler/scheduler-observability.js';
 import { loadTimezone } from './tz.js';
-import { updateNextRunTime as _updateNextRunTime, processCompletedTasks as _processCompletedTasks, handleStaleRunningTasks as _handleStaleRunningTasks, TASK_TIMEOUT } from './daemon-tasks.js';
+import {
+  processCompletedTasks as _processCompletedTasks,
+  reconcileRunningTasks,
+  recordMissedNoticeTerminalRejection,
+  recordScheduledAdmission,
+  scheduleMissedNoticeRetry,
+  updateNextRunTime as _updateNextRunTime,
+} from './daemon-tasks.js';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 const CHECK_INTERVAL = 5000;  // 5 seconds
 const CLEANUP_INTERVAL = 3600000;  // 1 hour
-const OFFLINE_LOG_INTERVAL = 30000;  // 30 seconds
+const ZYLOS_DIR = process.env.ZYLOS_DIR || join(homedir(), 'zylos');
 
 let db;
 let running = true;
@@ -36,85 +49,36 @@ function getNextPendingTask() {
     SELECT * FROM tasks
     WHERE status = 'pending'
     AND next_run_at <= ?
+    AND (missed_notice_retry_at IS NULL OR missed_notice_retry_at <= ?)
     ORDER BY priority ASC, next_run_at ASC
     LIMIT 1
-  `).get(currentTime);
+  `).get(currentTime, currentTime);
 }
 
 /**
- * Check if the active agent runtime is alive.
- * @returns {boolean} True if runtime is running (busy or idle state)
- */
-function isRuntimeAlive() {
-  const status = readStatusFile();
-  if (!status) return false;
-  return status.state === 'busy' || status.state === 'idle';
-}
-
-/**
- * Dispatch a task to Claude via C4 comm-bridge
+ * Admit a task into the durable Core conversation queue.
  */
 function dispatchTask(task) {
   console.log(`[${new Date().toISOString()}] Dispatching task: ${task.id} (${task.name})`);
 
-  // Atomically claim the task (only if still pending)
-  const claim = db.prepare(`
-    UPDATE tasks
-    SET status = 'running', updated_at = ?
-    WHERE id = ? AND status = 'pending'
-  `).run(now(), task.id);
-
-  if (claim.changes === 0) {
-    console.log(`[${new Date().toISOString()}] Task ${task.id} already claimed/modified, skipping`);
+  let admission;
+  try {
+    admission = dispatchScheduledTask(task);
+  } catch (error) {
+    console.error(`Failed to admit task ${task.id}:`, error.message);
+    // Leave the local occurrence pending. A later attempt uses the same Core
+    // occurrence ID and exact envelope, so acceptance is safely replayable.
     return false;
   }
-
-  // Create history entry
-  db.prepare(`
-    INSERT INTO task_history (task_id, executed_at, status)
-    VALUES (?, ?, 'started')
-  `).run(task.id, now());
-
-  // Build prompt with completion instruction
-  const prompt = `[Scheduled Task: ${task.id}] ${task.prompt}
-
----- After completing this task, run: ~/zylos/.claude/skills/scheduler/scripts/cli.js done ${task.id}`;
-
-  // Send via C4 Communication Bridge
-  const success = sendViaC4(prompt, {
-    priority: task.priority,
-    requireIdle: task.require_idle === 1,
-    replyChannel: task.reply_channel,
-    replyEndpoint: task.reply_endpoint
-  });
-
-  if (!success) {
-    console.error(`Failed to dispatch task ${task.id}`);
-
-    // Revert to pending
-    db.prepare(`
-      UPDATE tasks
-      SET status = 'pending', last_error = 'Failed to dispatch message', updated_at = ?
-      WHERE id = ?
-    `).run(now(), task.id);
-
-    // Mark task_history as failed (latest entry only)
-    const historyEntry = db.prepare(`
-      SELECT id FROM task_history
-      WHERE task_id = ? AND status = 'started'
-      ORDER BY executed_at DESC LIMIT 1
-    `).get(task.id);
-
-    if (historyEntry) {
-      db.prepare(`
-        UPDATE task_history
-        SET status = 'failed', completed_at = ?
-        WHERE id = ?
-      `).run(now(), historyEntry.id);
-    }
+  const recorded = recordScheduledAdmission(db, task, admission);
+  if (admission.status === 'rejected') {
+    console.error(`Task ${task.id} was rejected by the durable queue: ${admission.error.user_message}`);
+    return false;
   }
-
-  return success;
+  if (!recorded) {
+    console.log(`[${new Date().toISOString()}] Task ${task.id} already claimed/modified, skipping`);
+  }
+  return recorded;
 }
 
 function updateNextRunTime(task) {
@@ -125,10 +89,34 @@ function processCompletedTasks() {
   _processCompletedTasks(db);
 }
 
+function missedTaskNotice(task) {
+  return `Scheduled task "${task.name}" missed its occurrence and was skipped to avoid catch-up replay.`;
+}
+
+function persistMissedTaskNotice(task) {
+  const notice = missedTaskNotice(task);
+  try {
+    const admission = dispatchMissedScheduledTaskNotice(task, notice);
+    if (admission.status === 'rejected') {
+      console.error(`Missed-task notice for ${task.id} was rejected by the durable queue: ${admission.error.user_message}`);
+      if (admission.error.code === 'queue_full') {
+        scheduleMissedNoticeRetry(db, task, admission.error);
+      } else {
+        recordMissedNoticeTerminalRejection(db, task, admission);
+      }
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.error(`Failed to persist missed-task notice for ${task.id}: ${error.message}`);
+    return false;
+  }
+}
+
 /**
  * Check for missed tasks (past due but still pending)
- * - Tasks overdue < miss_threshold: try to dispatch if runtime alive
- * - Tasks overdue > miss_threshold: skip to next scheduled time
+ * - Recurring and interval occurrences beyond miss_threshold are skipped once.
+ * - All other work enters the durable Core queue without a runtime-alive gate.
  */
 function handleMissedTasks() {
   const currentTime = now();
@@ -140,32 +128,39 @@ function handleMissedTasks() {
     WHERE status = 'pending'
     AND type IN ('recurring', 'interval')
     AND next_run_at < ?
-  `).all(recentMissedThreshold);
+    AND (missed_notice_retry_at IS NULL OR missed_notice_retry_at <= ?)
+  `).all(recentMissedThreshold, currentTime);
 
   for (const task of missedTasks) {
-    const overdueSeconds = currentTime - task.next_run_at;
-    const threshold = task.miss_threshold || 300;  // Default 5 minutes
+    const decision = decideScheduledOccurrence({
+      schedule_type: task.type,
+      scheduled_for: new Date(task.next_run_at * 1_000).toISOString(),
+      now: new Date(currentTime * 1_000).toISOString(),
+      miss_threshold_ms: (task.miss_threshold || 300) * 1_000,
+    });
 
-    if (overdueSeconds > threshold) {
-      // Overdue beyond threshold: skip to next schedule
-      console.log(`[${new Date().toISOString()}] Task ${task.id} (${task.name}) missed by ${overdueSeconds}s (threshold: ${threshold}s), skipping to next schedule`);
+    if (decision.status === 'skipped') {
+      // The occurrence is stale; move to the next schedule without catch-up replay.
+      console.log(`[${new Date().toISOString()}] Task ${task.id} (${task.name}) missed its occurrence; recording only the next schedule.`);
+      if (!persistMissedTaskNotice(task)) continue;
+      db.prepare(`
+        UPDATE tasks
+        SET last_error = 'Missed scheduled occurrence was skipped to avoid catch-up replay.', updated_at = ?
+        WHERE id = ?
+      `).run(currentTime, task.id);
       updateNextRunTime({
         ...task,
         status: 'completed'
       });
     } else {
-      // Within threshold: try to dispatch if runtime is alive
-      if (isRuntimeAlive()) {
-        console.log(`[${new Date().toISOString()}] Late-dispatching missed task ${task.id} (${task.name}), ${Math.round(overdueSeconds/60)}min overdue`);
-        dispatchTask(task);
-      }
-      // If runtime not alive, leave it pending - will try again next check
+      dispatchTask(task);
     }
   }
 }
 
-function handleStaleRunningTasks() {
-  _handleStaleRunningTasks(db);
+async function reconcileCoreState() {
+  const snapshot = await readExecutorObservability({ zylosDir: ZYLOS_DIR });
+  return reconcileRunningTasks(db, snapshot);
 }
 
 /**
@@ -175,56 +170,38 @@ async function mainLoop() {
   console.log(`[${new Date().toISOString()}] Scheduler V2 started (TZ: ${process.env.TZ})`);
   console.log(`Check interval: ${CHECK_INTERVAL}ms`);
 
-  // Clean up stale running tasks on startup
-  console.log(`[${new Date().toISOString()}] Checking for stale running tasks...`);
-  handleStaleRunningTasks();
-
   let lastCleanup = Date.now();
-  let lastOfflineLog = 0;
 
   while (running) {
     try {
-      // Check if runtime is alive
-      if (!isRuntimeAlive()) {
-        const msNow = Date.now();
-        if (msNow - lastOfflineLog >= OFFLINE_LOG_INTERVAL) {
-          console.log(`[${new Date().toISOString()}] Waiting for agent runtime (offline or stopped)...`);
-          lastOfflineLog = msNow;
-        }
-        await sleep(CHECK_INTERVAL);
-        continue;
-      }
-
-      // Log transition from offline to online
-      if (lastOfflineLog > 0) {
-        console.log(`[${new Date().toISOString()}] Agent runtime detected, scheduler active`);
-        lastOfflineLog = 0;
-      }
-
-      // Get next pending task
+      // The durable Core queue accepts work during maintenance or overload; execution claims later.
       const task = getNextPendingTask();
 
-      // Dispatch if task is due and runtime is alive
+      // Persist a due occurrence regardless of transient executor availability.
       if (task) {
         const currentTime = now();
-        const overdueSeconds = currentTime - task.next_run_at;
-        const threshold = task.miss_threshold || 300;
+        const decision = decideScheduledOccurrence({
+          schedule_type: task.type,
+          scheduled_for: new Date(task.next_run_at * 1_000).toISOString(),
+          now: new Date(currentTime * 1_000).toISOString(),
+          miss_threshold_ms: (task.miss_threshold || 300) * 1_000,
+        });
 
-        // Check if task is overdue beyond its miss_threshold
-        if (overdueSeconds > threshold) {
+        if (decision.status === 'skipped') {
           // Skip this task
-          console.log(`[${new Date().toISOString()}] Task ${task.id} (${task.name}) overdue by ${overdueSeconds}s (threshold: ${threshold}s), skipping`);
-
-          if (task.type === 'one-time') {
-            // One-time tasks: mark as failed
-            db.prepare(`
-              UPDATE tasks
-              SET status = 'failed', last_error = 'Missed execution window', updated_at = ?
-              WHERE id = ?
-            `).run(currentTime, task.id);
-          } else {
-            // Recurring/interval tasks: schedule next run
-            updateNextRunTime(task);
+          console.log(`[${new Date().toISOString()}] Task ${task.id} (${task.name}) missed its occurrence; avoiding catch-up replay.`);
+          if (persistMissedTaskNotice(task)) {
+            if (task.type === 'one-time') {
+              // One-time tasks: mark as failed
+              db.prepare(`
+                UPDATE tasks
+                SET status = 'failed', last_error = 'Missed execution window', updated_at = ?
+                WHERE id = ?
+              `).run(currentTime, task.id);
+            } else {
+              // Recurring/interval tasks: schedule next run
+              updateNextRunTime(task);
+            }
           }
         } else {
           // Within threshold: dispatch normally
@@ -232,14 +209,14 @@ async function mainLoop() {
         }
       }
 
+      // Only authoritative Core terminal states complete local occurrences.
+      await reconcileCoreState();
+
       // Process completed tasks (update recurring schedules)
       processCompletedTasks();
 
       // Handle missed tasks
       handleMissedTasks();
-
-      // Handle stale running tasks (orphaned due to compaction/crash)
-      handleStaleRunningTasks();
 
       // Periodic cleanup of old history
       if (Date.now() - lastCleanup > CLEANUP_INTERVAL) {
@@ -275,6 +252,8 @@ process.on('SIGTERM', () => {
 
 // Start the scheduler
 db = getDb();
+migrateLegacyTaskScopes(db);
+recoverLegacyRunningTasksFromCore(db);
 mainLoop().then(() => {
   console.log('Scheduler stopped');
   if (db) db.close();

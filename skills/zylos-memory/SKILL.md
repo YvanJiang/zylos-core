@@ -4,16 +4,18 @@ description: >-
   Core memory system. Maintains persistent memory across sessions via tiered
   markdown files following the Inside Out model. Handles Memory Sync (processing
   conversations into structured memory), session rotation, consolidation, and
-  context-aware state saving. Must be launched via a runtime-appropriate
-  background subagent mechanism — do not invoke with the Skill tool.
+  context-aware state saving. Runs inside the current Core-owned detached task;
+  it must not create a second provider-native background agent.
 disable-model-invocation: true
 user-invocable: false
 ---
 
 # Memory System
 
-Maintains persistent memory across sessions via tiered markdown files.
-This skill must be run via a runtime-appropriate background subagent mechanism. For Claude, use the Task tool (`subagent_type: general-purpose`, `model: sonnet`, `run_in_background: true`). For Codex, prefer the session's native subagent tools `spawn_agent`/`wait_agent` (host session tools — they do not appear in `codex --help`) with a Codex-supported model; do not hardcode `sonnet`.
+Maintains persistent memory across sessions via tiered markdown files. The
+current provider execution is already a durable Core-owned background task.
+Run Memory Sync in that task and do not create a provider-native child merely
+to detach it again.
 
 ## Architecture
 
@@ -44,54 +46,43 @@ When triggered, run it before handling queued user messages.
 
 ### Trigger Paths
 
-1. Session init: if C4 unsummarized count is over threshold, launch memory sync.
-2. Scheduled context check: if context usage is high, launch memory sync.
+Memory sync is explicit and scoped to the current task/conversation. It may be
+requested by the user or by a canonical Core lifecycle interaction. Do not infer
+a trigger from provider files, terminal state, or a global conversation backlog.
 
-Both launch a background subagent using the current runtime's supported subagent mechanism with this file's Sync Flow as the prompt.
+### Execution Ownership
 
-### Codex Background Execution
-
-In Codex, use the session's native subagent tools: `spawn_agent` to
-launch the sync subagent and `wait_agent` to collect its result. These are
-host session tools — they do not appear in `codex --help`. For a single
-long-running command, an async exec session (`exec_command` +
-`write_stdin`) also works. Bare `nohup ... &` does NOT survive the
-tool-call boundary and must never be used for sync. Never use PM2 for
-sync — do not create PM2 services, run `pm2 start ... codex exec ...`, or
-fork an extra `codex exec` sidecar: one-shot sync processes leave stopped
-services piling up in the PM2 list. If the session exposes no native
-background-agent capability, run the sync inline as a last resort and note
-that in the handoff/status.
+Keep sync work attached to the current Core background task. A long-running
+command may use an async exec session only when its result is collected before
+the task ends. Bare `nohup ... &`, PM2 sidecars, an extra `codex exec`, and
+provider-native subagents are not durable task ownership and must not be used
+for sync.
 
 ### Sync Flow
 
 1. Rotate session log if needed:
    `node ~/zylos/.claude/skills/zylos-memory/scripts/rotate-session.js`
-2. Fetch unsummarized conversations from C4:
-   `node ~/zylos/.claude/skills/comm-bridge/scripts/c4-fetch.js --unsummarized`
-   If output says "No unsummarized conversations.", skip to step 5
-   (still save current state). Otherwise, note the `end_id` from the
-   `[Unsummarized Range]` line.
-3. Read memory files (`identity.md`, `state.md`, `references.md`, user profiles, `reference/*`, `sessions/current.md`).
-4. Extract and classify updates from conversations into the correct files.
-5. Write memory updates (always — even without new conversations,
+2. Read the current authorized conversation/task context and memory files
+   (`identity.md`, `state.md`, `references.md`, user profiles, `reference/*`,
+   `sessions/current.md`). Never scan other conversations or choose a latest
+   provider session.
+3. Extract and classify updates from the current scoped context into the correct files.
+4. Write memory updates (always,
    update `state.md` and `sessions/current.md` with current context).
-6. Audit `references.md` against its content rules
+5. Audit `references.md` against its content rules
    (`references/references-file-format.md`): relocate rule-violating
    entries to their routed destination (`reference/decisions.md`,
    `archive/`, or a pointer to the config file) instead of leaving or
    appending them. If the file exceeds the 8KB warn threshold
    (`memory-status.js` reports WARN), trim until it is back under.
-7. Audit `state.md` against its content rules
+6. Audit `state.md` against its content rules
    (`references/state-format.md`): relocate rule-violating content to its
    routed destination (`reference/projects.md`, `reference/decisions.md`,
    `archive/`, or a pointer to the on-demand file that already holds it)
    instead of leaving or appending it. If the file exceeds the 10KB warn
    threshold (`memory-status.js` reports WARN), trim until it is back
    under.
-8. Create checkpoint (only if conversations were fetched in step 2):
-   `node ~/zylos/.claude/skills/comm-bridge/scripts/c4-checkpoint.js create <end_id> --summary "SUMMARY"`
-9. Confirm completion.
+7. Confirm completion in the current task only.
 
 ## Classification Rules
 
@@ -136,10 +127,6 @@ worked example in `examples/`:
 - `memory-status.js`: quick health summary.
   Use when you need a fast manual check of core file sizes and budget status.
   If it reports `OVER`, run `consolidate.js` and perform the needed cleanup.
-
-C4 scripts used by sync flow (provided by comm-bridge skill):
-- `c4-fetch.js --unsummarized`: fetch unsummarized conversations and range.
-- `c4-checkpoint.js create <end_id> --summary "..."`: create sync checkpoint.
 
 ## Consolidation Review
 

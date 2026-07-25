@@ -11,7 +11,7 @@ describe('PM2 ecosystem restart helpers', () => {
       exec: (cmd, opts) => calls.push({ cmd, opts }),
     });
 
-    restartFromEcosystem(['activity-monitor', 'c4-dispatcher'], {
+    restartFromEcosystem(['zylos-executor', 'scheduler'], {
       ecosystemPath: '/tmp/ecosystem.config.cjs',
       stdio: 'inherit',
       save: true,
@@ -19,11 +19,11 @@ describe('PM2 ecosystem restart helpers', () => {
 
     assert.deepStrictEqual(calls, [
       {
-        cmd: 'pm2 start "/tmp/ecosystem.config.cjs" --only "activity-monitor" --update-env 2>/dev/null',
+        cmd: 'pm2 start "/tmp/ecosystem.config.cjs" --only "zylos-executor" --update-env 2>/dev/null',
         opts: { stdio: 'inherit' },
       },
       {
-        cmd: 'pm2 start "/tmp/ecosystem.config.cjs" --only "c4-dispatcher" --update-env 2>/dev/null',
+        cmd: 'pm2 start "/tmp/ecosystem.config.cjs" --only "scheduler" --update-env 2>/dev/null',
         opts: { stdio: 'inherit' },
       },
       {
@@ -42,7 +42,7 @@ describe('PM2 ecosystem restart helpers', () => {
     });
 
     assert.throws(
-      () => restartFromEcosystem(['activity-monitor'], { ecosystemPath: '/missing/ecosystem.config.cjs' }),
+      () => restartFromEcosystem(['zylos-executor'], { ecosystemPath: '/missing/ecosystem.config.cjs' }),
       /ecosystem config not found/
     );
   });
@@ -108,7 +108,7 @@ describe('PM2 ecosystem restart helpers', () => {
       },
     });
 
-    restartManagedProcess('activity-monitor', {
+    restartManagedProcess('zylos-executor', {
       ecosystemPath: '/tmp/core-ecosystem.config.cjs',
       stdio: 'inherit',
       fallbackToPlainRestartOnError: true,
@@ -116,15 +116,15 @@ describe('PM2 ecosystem restart helpers', () => {
 
     assert.deepStrictEqual(calls, [
       {
-        cmd: 'pm2 start "/tmp/core-ecosystem.config.cjs" --only "activity-monitor" --update-env 2>/dev/null',
+        cmd: 'pm2 start "/tmp/core-ecosystem.config.cjs" --only "zylos-executor" --update-env 2>/dev/null',
         opts: { stdio: 'inherit' },
       },
       {
-        cmd: 'pm2 delete "activity-monitor" 2>/dev/null',
+        cmd: 'pm2 delete "zylos-executor" 2>/dev/null',
         opts: { stdio: 'inherit' },
       },
       {
-        cmd: 'pm2 start "/tmp/core-ecosystem.config.cjs" --only "activity-monitor" --update-env 2>/dev/null',
+        cmd: 'pm2 start "/tmp/core-ecosystem.config.cjs" --only "zylos-executor" --update-env 2>/dev/null',
         opts: { stdio: 'inherit' },
       },
     ]);

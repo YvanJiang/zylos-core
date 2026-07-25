@@ -4,7 +4,6 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { parse, stringify } from 'smol-toml';
-import { SIDE_EFFECT_NAMES, buildChain } from '../../skills/activity-monitor/scripts/shard-registry.js';
 
 const SESSION_START = 'SessionStart';
 const CODEX_EVENT_KEYS = {
@@ -17,7 +16,6 @@ const CODEX_EVENT_KEYS = {
 };
 
 const DEFAULT_TRUST_TIMEOUT_MS = 15_000;
-const DEFAULT_HOOK_TIMEOUT_SECONDS = 25;
 
 function sha256(text) {
   return crypto.createHash('sha256').update(text).digest('hex');
@@ -74,46 +72,19 @@ export function codexGlobalConfigPath(homeDir = os.homedir()) {
 }
 
 export function coreSessionStartCommand(zylosDir) {
-  const script = path.join(
-    path.resolve(zylosDir),
-    '.claude',
-    'skills',
-    'activity-monitor',
-    'scripts',
-    'session-start-orchestrator.js'
-  );
-  return `node ${script}`;
+  void zylosDir;
+  return null;
 }
 
-/**
- * One command per injection shard plus the two side-effect steps, in chain
- * order. Codex injects hook output in CONFIG order (measured — the opposite
- * of Claude Code's completion order), so the array order here IS the
- * injection order there; the flag chain still runs as a second, redundant
- * guarantee with identical semantics on both runtimes.
- */
 export function coreSessionStartCommands(zylosDir) {
-  const base = coreSessionStartCommand(zylosDir);
-  const { chain } = buildChain({ zylosDir });
-  const names = [
-    ...chain.map(shard => shard.name),
-    SIDE_EFFECT_NAMES.foreground,
-    SIDE_EFFECT_NAMES.startPrompt,
-  ];
-  return names.map(name => `${base} --shard ${name}`);
+  void zylosDir;
+  return Object.freeze([]);
 }
 
 export function isCoreCodexHook(command, zylosDir) {
-  if (!command) return false;
-  const script = path.join(
-    path.resolve(zylosDir),
-    '.claude',
-    'skills',
-    'activity-monitor',
-    'scripts',
-    'session-start-orchestrator.js'
-  );
-  return command.includes(script) || command.includes('session-start-orchestrator.js');
+  void command;
+  void zylosDir;
+  return false;
 }
 
 export function readCodexHooksConfig(filePath) {
@@ -148,17 +119,9 @@ export function installCoreCodexHook({ zylosDir }) {
   const before = stableJson(config);
 
   const commands = coreSessionStartCommands(zylosDir);
-  const desiredHooks = commands.map(command => ({
-    type: 'command',
-    command,
-    timeout: DEFAULT_HOOK_TIMEOUT_SECONDS,
-  }));
 
-  // Reconcile: strip every core-managed hook (including the retired no-arg
-  // orchestrator command and stale shard sets), keep non-core groups intact,
-  // then install the full desired shard command set as one group. Config
-  // order is injection order on Codex, so the group must stay contiguous
-  // and chain-ordered.
+  // Core no longer installs provider-session hooks. Strip obsolete owned hooks
+  // while preserving unrelated user hook groups.
   const existing = Array.isArray(config.hooks[SESSION_START]) ? config.hooks[SESSION_START] : [];
   const preserved = existing
     .map((group) => {
@@ -167,7 +130,9 @@ export function installCoreCodexHook({ zylosDir }) {
     })
     .filter(group => !Array.isArray(group?.hooks) || group.hooks.length > 0);
 
-  config.hooks[SESSION_START] = [...preserved, { hooks: desiredHooks }];
+  if (preserved.length > 0) config.hooks[SESSION_START] = preserved;
+  else delete config.hooks[SESSION_START];
+  if (Object.keys(config.hooks).length === 0) delete config.hooks;
 
   const changed = stableJson(config) !== before;
   if (changed) {

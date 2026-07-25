@@ -1,0 +1,176 @@
+[
+  {
+    "repository": "zylos-core",
+    "file": "runtime/migration/legacy-lifecycle-artifacts.js",
+    "rules": ["retired_terminal_multiplexer", "terminal_observation_authority", "retired_activity_authority"],
+    "allowed_importers": [
+      "runtime/migration/installed-executor-upgrade.js",
+      "test/executor-service-lifecycle.test.js",
+      "test/installed-executor-upgrade.test.js",
+      "test/installer-init-executor-lifecycle.test.js"
+    ],
+    "kind": "one_time_cleanup",
+    "purpose": "Remove exact retired runtime artifacts and hook registrations during the one-time atomic upgrade."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "runtime/migration/installed-executor-upgrade.js",
+    "rules": ["retired_route_alias"],
+    "allowed_importers": [
+      "runtime/executor/daemon.js",
+      "scripts/bootstrap-executor-lifecycle.js",
+      "test/durable-migration-artifacts.test.js",
+      "test/exact-base-legacy-source.test.js",
+      "test/installed-executor-upgrade.test.js"
+    ],
+    "kind": "migration_record",
+    "purpose": "Record and prove the retired executor route remains inactive through upgrade and rollback."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "runtime/migration/retired-pm2-identities.js",
+    "rules": ["retired_activity_authority"],
+    "allowed_importers": [
+      "runtime/executor/start-fence.js",
+      "runtime/migration/installed-executor-upgrade.js",
+      "scripts/installed-runtime-inventory.js",
+      "test/retired-pm2-identities.test.js"
+    ],
+    "kind": "migration_record",
+    "purpose": "Fence exact retired supervisor registrations without dispatching or executing them."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "skills/scheduler/scripts/migration/retired-controls.js",
+    "rules": ["retired_idle_gate"],
+    "allowed_importers": ["skills/scheduler/scripts/database.js"],
+    "kind": "one_time_cleanup",
+    "purpose": "Clear retired scheduler control columns and pause rows that require canonical reconfiguration."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "cli/lib/__tests__/codex-hooks.test.js",
+    "rules": ["retired_activity_authority"],
+    "kind": "negative_proof",
+    "purpose": "Prove Codex hook migration removes retired hook commands and installs only current hooks."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "cli/lib/__tests__/self-upgrade.test.js",
+    "rules": ["retired_activity_authority"],
+    "kind": "negative_proof",
+    "purpose": "Prove self-upgrade rejects and removes retired lifecycle registrations."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "cli/lib/__tests__/sync-settings-hooks.test.js",
+    "rules": ["retired_activity_authority"],
+    "kind": "negative_proof",
+    "purpose": "Prove settings synchronization deletes retired hook commands without restoring them."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "skills/scheduler/scripts/__tests__/core-reconciliation.test.js",
+    "rules": ["retired_idle_gate"],
+    "kind": "negative_proof",
+    "purpose": "Prove old scheduler rows are fenced for explicit Core-owned reconciliation."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "skills/scheduler/scripts/__tests__/database.test.js",
+    "rules": ["retired_idle_gate"],
+    "kind": "negative_proof",
+    "purpose": "Prove database migration clears retired scheduler controls and cannot select them afterward."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "test/base-to-executor-bootstrap.test.js",
+    "rules": ["retired_activity_authority"],
+    "kind": "negative_proof",
+    "purpose": "Prove exact-base bootstrap replaces retired lifecycle services with the executor service."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "test/exact-base-legacy-source.test.js",
+    "rules": ["retired_activity_authority", "retired_idle_gate"],
+    "kind": "negative_proof",
+    "purpose": "Prove the exact legacy baseline is recognized only as migration input and never normal authority."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "test/executor-service-lifecycle.test.js",
+    "rules": ["retired_terminal_multiplexer", "retired_activity_authority"],
+    "kind": "negative_proof",
+    "purpose": "Prove executor lifecycle cleanup removes retired services and runtime artifacts."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "test/executor-start-fence.test.js",
+    "rules": ["retired_activity_authority"],
+    "kind": "negative_proof",
+    "purpose": "Prove executor start is refused while any exact retired supervisor registration remains."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "test/five-repo-retired-runtime-gate.test.js",
+    "rules": ["terminal_input_authority", "provider_session_scope", "terminal_observation_authority", "retired_activity_authority", "retired_idle_gate", "retired_route_alias", "process_liveness_authority"],
+    "kind": "negative_proof",
+    "purpose": "Inject every prohibited authority into fixtures and prove the five-repository gate rejects it."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "test/installed-executor-upgrade.test.js",
+    "rules": ["retired_activity_authority", "retired_route_alias", "process_liveness_authority"],
+    "kind": "negative_proof",
+    "purpose": "Prove installed upgrade cleanup removes retired registrations before executor activation."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "test/installer-init-executor-lifecycle.test.js",
+    "rules": ["retired_terminal_multiplexer", "terminal_input_authority", "terminal_observation_authority", "retired_activity_authority"],
+    "kind": "negative_proof",
+    "purpose": "Prove installer and init cannot select retired terminal or lifecycle execution routes."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "test/runtime-c4-normal-callers.test.js",
+    "rules": ["terminal_input_authority", "retired_activity_authority"],
+    "kind": "negative_proof",
+    "purpose": "Prove normal C4 callers use durable delivery commands and never terminal-input routing."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "test/runtime-c4-source-boundary.test.js",
+    "rules": ["terminal_input_authority", "retired_activity_authority"],
+    "kind": "negative_proof",
+    "purpose": "Prove the C4 source boundary contains no retired dispatch or terminal-input implementation."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "test/runtime-normal-path-static.test.js",
+    "rules": ["retired_terminal_multiplexer", "terminal_input_authority", "provider_session_scope", "terminal_observation_authority", "retired_activity_authority", "retired_idle_gate", "retired_route_alias"],
+    "kind": "negative_proof",
+    "purpose": "Prove normal product paths and package contents contain none of the retired runtime authorities."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "test/runtime-upgrade-coordinator.test.js",
+    "rules": ["retired_route_alias"],
+    "kind": "negative_proof",
+    "purpose": "Prove upgrade coordination never revives the retired executor route."
+  },
+  {
+    "repository": "zylos-core",
+    "file": "test/runtime-provider-neutral-health.test.js",
+    "rules": ["retired_terminal_multiplexer", "terminal_input_authority", "terminal_observation_authority", "retired_activity_authority"],
+    "kind": "negative_proof",
+    "purpose": "Prove health derives only from provider-neutral Core state and never terminal artifacts."
+  },
+  {
+    "repository": "luna-pet",
+    "file": "test/smoke-test.js",
+    "rules": ["retired_terminal_multiplexer"],
+    "kind": "negative_proof",
+    "purpose": "Prove Luna presentation source contains no retired terminal-multiplexer terminology."
+  }
+]

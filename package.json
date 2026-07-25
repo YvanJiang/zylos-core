@@ -5,14 +5,25 @@
   "description": "Autonomous AI Agent Infrastructure",
   "main": "cli/zylos.js",
   "bin": {
-    "zylos": "./cli/zylos.js"
+    "zylos": "./cli/launcher.js"
   },
   "scripts": {
-    "postinstall": "node scripts/postinstall.js || true",
+    "postinstall": "node scripts/postinstall.js",
     "pretest": "node scripts/install-skill-deps.js",
     "test": "npm run test:jest && npm run test:node",
     "test:jest": "node --experimental-vm-modules node_modules/.bin/jest",
-    "test:node": "node scripts/run-node-tests.js"
+    "test:node": "node scripts/run-node-tests.js",
+    "test:integration:claude-sdk": "node scripts/install-skill-deps.js && node scripts/verify-claude-sdk-real-integration.js --require-live",
+    "pretest:integration:codex-app-server:real": "node scripts/install-skill-deps.js",
+    "test:integration:codex-app-server:real": "node scripts/e2e/codex-app-server-real-integration.js",
+    "test:integration:codex-app-server:native-smoke": "node scripts/e2e/codex-app-server-native-smoke.js",
+    "test:integration:codex-app-server:interaction:command": "node scripts/e2e/codex-app-server-interaction-probe.js command_approval",
+    "test:integration:codex-app-server:interaction:file": "node scripts/e2e/codex-app-server-interaction-probe.js file_approval",
+    "test:integration:codex-app-server:interaction:input": "node scripts/e2e/codex-app-server-interaction-probe.js request_user_input",
+    "pretest:acceptance:cross-system-fault-injection": "node scripts/install-skill-deps.js",
+    "test:acceptance:cross-system-fault-injection": "node scripts/verify-cross-system-fault-injection.js",
+    "test:contracts:five-repo": "node scripts/verify-five-repo-contracts.js",
+    "test:release:retired-runtime": "node --experimental-vm-modules node_modules/.bin/jest --runInBand test/five-repo-retired-runtime-gate.test.js test/runtime-normal-path-static.test.js && node scripts/verify-five-repo-retired-runtime.js"
   },
   "repository": {
     "type": "git",
@@ -30,6 +41,7 @@
     "node": ">=20.20.0"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.215",
     "dotenv": "^16.4.7",
     "js-yaml": "^4.1.1",
     "smol-toml": "^1.6.1"

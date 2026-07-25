@@ -13,7 +13,7 @@ const {
   step10_ensureCodexConfig,
 } = await import('../self-upgrade.js');
 const { generateMigrationHints, applyMigrationHints } = await import('../self-upgrade.js');
-const { deployManifestTemplate } = await import('../runtime/tmux-env.js');
+const { deployManifestTemplate } = await import('../runtime/runtime-env-manifest.js');
 const { activateFreshSplitInstructions } = await import('../runtime/instruction-builder.js');
 
 function fixtureZylosDir() {
@@ -57,7 +57,7 @@ describe('self-upgrade finalizer handoff', () => {
     });
   });
 
-  it('runs post-install steps with restored state and returns upgrade metadata', () => {
+  it('never runs the legacy installed finalizer', () => {
     const calls = [];
     const result = runSelfUpgradeFinalize({
       schemaVersion: 1,
@@ -82,20 +82,14 @@ describe('self-upgrade finalizer handoff', () => {
       ],
     });
 
-    assert.equal(result.success, true);
-    assert.equal(result.from, '0.4.12');
-    assert.equal(result.to, '0.4.13');
-    assert.equal(result.backupDir, '/tmp/backup');
-    assert.equal(result.steps.length, 1);
-    assert.deepEqual(calls, [{
-      tempDir: '/tmp/new-core',
-      backupDir: '/tmp/backup',
-      servicesWereRunning: ['activity-monitor'],
-      mode: 'merge',
-    }]);
+    assert.equal(result.success, false);
+    assert.equal(result.failedStep, 0);
+    assert.equal(result.durableRuntimeOwner, true);
+    assert.deepEqual(calls, []);
   });
 
-  it('fails without rollback when a post-install step fails', () => {
+  it('does not invoke legacy failure or rollback steps', () => {
+    let invoked = false;
     const result = runSelfUpgradeFinalize({
       schemaVersion: 1,
       tempDir: '/tmp/new-core',
@@ -105,13 +99,16 @@ describe('self-upgrade finalizer handoff', () => {
       to: '0.4.13',
     }, {
       steps: [
-        () => ({ step: 5, name: 'sync_core_skills', status: 'failed', error: 'sync failed' }),
+        () => {
+          invoked = true;
+          return { step: 5, name: 'sync_core_skills', status: 'failed', error: 'sync failed' };
+        },
       ],
     });
 
     assert.equal(result.success, false);
-    assert.equal(result.failedStep, 5);
-    assert.equal(result.error, 'sync failed');
+    assert.equal(result.failedStep, 0);
+    assert.equal(invoked, false);
     assert.deepEqual(result.rollback, { performed: false, steps: [] });
   });
 });
@@ -464,7 +461,7 @@ describe('self-upgrade hook migration hints', () => {
     return { tmpDir, templatesDir, zylosDir };
   }
 
-  it('generates removed_hook for retired core SessionStart hooks absent from the template', () => {
+  it('does not dispatch retired SessionStart cleanup through normal self-upgrade hints', () => {
     const { tmpDir, templatesDir, zylosDir } = writeSettingsPair({
       templateSettings: {
         hooks: {
@@ -494,10 +491,9 @@ describe('self-upgrade hook migration hints', () => {
 
     const hints = generateMigrationHints(templatesDir, { zylosDir });
 
-    assert.ok(hints.some(hint =>
-      hint.type === 'removed_hook' &&
-      hint.command.includes('session-start-inject.js')
-    ));
+    assert.equal(hints.some(hint =>
+      hint.type === 'removed_hook' && hint.command.includes('session-start-inject.js')
+    ), false);
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -999,7 +995,7 @@ describe('step7 manifest deploy (real step7_syncInstructions)', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it('works end-to-end through runSelfUpgradeFinalize with real POST_INSTALL_STEPS', () => {
+  it('keeps instruction migration utilities callable without the disabled legacy finalizer', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-step7-'));
     const zylosDir = path.join(tmpDir, 'zylos');
     const templatesDir = path.join(tmpDir, 'pkg', 'templates');
@@ -1010,15 +1006,7 @@ describe('step7 manifest deploy (real step7_syncInstructions)', () => {
 
     const wrappedStep7 = (ctx) => step7_syncInstructions({ ...ctx, zylosDir, packageRoot: path.join(tmpDir, 'no-fallback') });
 
-    const result = runSelfUpgradeFinalize({
-      schemaVersion: 1,
-      tempDir: path.join(tmpDir, 'pkg'),
-      from: '0.4.12',
-      to: '0.4.13',
-    }, { steps: [wrappedStep7] });
-
-    assert.equal(result.success, true);
-    const step7Result = result.steps.find(s => s.step === 7);
+    const step7Result = wrappedStep7({ tempDir: path.join(tmpDir, 'pkg') });
     assert.ok(step7Result);
     assert.ok(step7Result.message.includes('manifest: created'));
     assert.ok(step7Result.message.includes('PENDING MIGRATION'));

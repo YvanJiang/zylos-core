@@ -7,6 +7,8 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { validateOpaqueId } from '../../../contracts/public/index.js';
+import { retireLegacySchedulerControls } from './migration/retired-controls.js';
 
 // Data goes to ~/zylos/scheduler/, code stays in skills directory
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
@@ -15,6 +17,16 @@ const DB_PATH = path.join(DATA_DIR, 'scheduler.db');
 const HISTORY_RETENTION_DAYS = 30;
 
 let db = null;
+
+export function getSchedulerScope() {
+  return Object.freeze({
+    region: validateOpaqueId('scheduler scope region', process.env.ZYLOS_REGION ?? 'global'),
+    tenant_id: validateOpaqueId(
+      'scheduler scope tenant_id', process.env.ZYLOS_TENANT_ID ?? 'default',
+    ),
+    bot_id: validateOpaqueId('scheduler scope bot_id', process.env.ZYLOS_BOT_ID ?? 'zylos'),
+  });
+}
 
 export function getDb() {
   if (!db) {
@@ -54,13 +66,15 @@ function initSchema() {
       priority INTEGER DEFAULT 3 CHECK(priority BETWEEN 1 AND 3),
       status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'completed', 'failed', 'paused')),
 
-      -- Execution Control
-      require_idle INTEGER DEFAULT 0,           -- 0/1: whether task requires idle state
       miss_threshold INTEGER DEFAULT 300,       -- seconds: skip if overdue by more than this
 
-      -- Reply Configuration
-      reply_channel TEXT DEFAULT NULL,          -- reply channel (e.g., 'telegram')
-      reply_endpoint TEXT DEFAULT NULL,         -- reply endpoint (e.g., user ID)
+      -- Complete durable Core conversation identity, or NULL for a synthetic schedule conversation
+      bound_conversation_json TEXT DEFAULT NULL,
+
+      -- Stable Core scope captured at task creation/migration; never recomputed per retry
+      scope_region TEXT NOT NULL DEFAULT 'global',
+      scope_tenant_id TEXT NOT NULL DEFAULT 'default',
+      scope_bot_id TEXT NOT NULL DEFAULT 'zylos',
 
       -- Retry Logic (reserved, not currently used)
       -- Implicit retry is handled via miss_threshold: tasks stay pending
@@ -75,7 +89,20 @@ function initSchema() {
 
       -- Error Tracking
       last_error TEXT,
-      failed_at INTEGER
+      failed_at INTEGER,
+
+      -- Durable Core occurrence projection
+      current_occurrence_id TEXT,
+      current_turn_id TEXT,
+      last_core_state TEXT,
+      core_wait_reason TEXT,
+      missed_notice_attempt INTEGER NOT NULL DEFAULT 1
+        CHECK(missed_notice_attempt > 0),
+      missed_notice_retry_at INTEGER,
+      requires_reconfiguration INTEGER NOT NULL DEFAULT 0
+        CHECK(requires_reconfiguration IN (0, 1)),
+      requires_occurrence_advance INTEGER NOT NULL DEFAULT 0
+        CHECK(requires_occurrence_advance IN (0, 1))
     );
 
     -- Critical indexes for performance
@@ -87,6 +114,8 @@ function initSchema() {
     CREATE TABLE IF NOT EXISTS task_history (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       task_id TEXT NOT NULL,
+      occurrence_id TEXT,
+      turn_id TEXT,
       executed_at INTEGER NOT NULL,
       completed_at INTEGER,
       status TEXT NOT NULL CHECK(status IN ('started', 'success', 'failed', 'timeout')),
@@ -107,6 +136,51 @@ function initSchema() {
     );
   `);
 
+  const taskColumns = new Set(db.prepare('PRAGMA table_info(tasks)').all().map(({ name }) => name));
+  for (const [name, definition] of [
+    ['bound_conversation_json', 'TEXT DEFAULT NULL'],
+    ['current_occurrence_id', 'TEXT DEFAULT NULL'],
+    ['current_turn_id', 'TEXT DEFAULT NULL'],
+    ['last_core_state', 'TEXT DEFAULT NULL'],
+    ['core_wait_reason', 'TEXT DEFAULT NULL'],
+    ['missed_notice_attempt', 'INTEGER NOT NULL DEFAULT 1'],
+    ['missed_notice_retry_at', 'INTEGER DEFAULT NULL'],
+    ['requires_reconfiguration', 'INTEGER NOT NULL DEFAULT 0'],
+    ['requires_occurrence_advance', 'INTEGER NOT NULL DEFAULT 0'],
+    ['scope_region', 'TEXT DEFAULT NULL'],
+    ['scope_tenant_id', 'TEXT DEFAULT NULL'],
+    ['scope_bot_id', 'TEXT DEFAULT NULL'],
+  ]) {
+    if (!taskColumns.has(name)) db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${definition}`);
+  }
+  retireLegacySchedulerControls(db, taskColumns);
+  const historyColumns = new Set(
+    db.prepare('PRAGMA table_info(task_history)').all().map(({ name }) => name),
+  );
+  for (const name of ['occurrence_id', 'turn_id']) {
+    if (!historyColumns.has(name)) {
+      db.exec(`ALTER TABLE task_history ADD COLUMN ${name} TEXT DEFAULT NULL`);
+    }
+  }
+}
+
+/** Capture old tasks' Core scope only in the scheduler daemon environment. */
+export function migrateLegacyTaskScopes(database = db) {
+  if (!database) throw new Error('scheduler database is not open');
+  const missing = database.prepare(`
+    SELECT 1 FROM tasks
+    WHERE scope_region IS NULL OR scope_tenant_id IS NULL OR scope_bot_id IS NULL
+    LIMIT 1
+  `).get();
+  if (!missing) return 0;
+  const scope = getSchedulerScope();
+  return database.prepare(`
+    UPDATE tasks
+    SET scope_region = COALESCE(scope_region, ?),
+        scope_tenant_id = COALESCE(scope_tenant_id, ?),
+        scope_bot_id = COALESCE(scope_bot_id, ?)
+    WHERE scope_region IS NULL OR scope_tenant_id IS NULL OR scope_bot_id IS NULL
+  `).run(scope.region, scope.tenant_id, scope.bot_id).changes;
 }
 
 // Clean up old history entries (older than HISTORY_RETENTION_DAYS)

@@ -1,105 +1,97 @@
-/**
- * Runtime Monitor
- * Monitors Claude's execution state and handles inter-process communication
- */
-
-import { execFileSync } from 'child_process';
-import { readFileSync, existsSync } from 'fs';
 import { homedir } from 'os';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { join } from 'path';
+import { existsSync } from 'fs';
+import Database from 'better-sqlite3';
+
+import { acceptScheduledOccurrence } from '../../../runtime/scheduler/scheduler-queue.js';
+import { validateOpaqueId } from '../../../contracts/public/index.js';
+import { recoverLegacyRunningTasks } from './daemon-tasks.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || join(homedir(), 'zylos');
-const STATUS_FILE = join(ZYLOS_DIR, 'activity-monitor', 'agent-status.json');
+const CORE_DATABASE_PATH = join(ZYLOS_DIR, 'comm-bridge', 'c4.db');
 
-/**
- * Read agent status from ~/zylos/activity-monitor/agent-status.json
- * @returns {object|null} Status object or null if unavailable
- */
-export function readStatusFile() {
+function timestampFromSeconds(seconds) {
+  return new Date(seconds * 1_000).toISOString();
+}
+
+function taskOccurrence(task, { notificationText = null } = {}) {
+  const scheduledAt = timestampFromSeconds(task.next_run_at);
+  let boundConversation = null;
+  if (task.bound_conversation_json !== null && task.bound_conversation_json !== undefined) {
+    try {
+      boundConversation = JSON.parse(task.bound_conversation_json);
+    } catch {
+      throw new TypeError(`Task ${task.id} has invalid bound_conversation_json`);
+    }
+  }
+  const missedNoticeAttempt = task.missed_notice_attempt ?? 1;
+  if (!Number.isSafeInteger(missedNoticeAttempt) || missedNoticeAttempt < 1) {
+    throw new TypeError(`Task ${task.id} has invalid missed_notice_attempt`);
+  }
+  return {
+    schedule_id: task.id,
+    task_id: task.id,
+    occurrence_id: notificationText === null
+      ? `${task.id}:${task.next_run_at}`
+      : `${task.id}:${task.next_run_at}:missed-notice:${missedNoticeAttempt}`,
+    prompt: notificationText ?? `[Scheduled Task: ${task.id}] ${task.prompt}`,
+    occurred_at: scheduledAt,
+    // A retry after a scheduler crash must reproduce the exact same envelope.
+    received_at: scheduledAt,
+    region: validateOpaqueId('task.scope_region', task.scope_region),
+    tenant_id: validateOpaqueId('task.scope_tenant_id', task.scope_tenant_id),
+    bot_id: validateOpaqueId('task.scope_bot_id', task.scope_bot_id),
+    bound_conversation: boundConversation,
+    ...(notificationText === null ? {} : { notification_text: notificationText }),
+  };
+}
+
+export function enqueueScheduledTask(database, task, {
+  now = () => new Date().toISOString(),
+  generateId,
+  maxQueuedTurns,
+} = {}) {
+  const options = { now, ...(generateId ? { generateId } : {}), ...(maxQueuedTurns ? { maxQueuedTurns } : {}) };
+  return acceptScheduledOccurrence(database, taskOccurrence(task), options);
+}
+
+export function enqueueMissedScheduledTaskNotice(database, task, notificationText, {
+  now = () => new Date().toISOString(),
+  generateId,
+  maxQueuedTurns,
+} = {}) {
+  const options = { now, ...(generateId ? { generateId } : {}), ...(maxQueuedTurns ? { maxQueuedTurns } : {}) };
+  return acceptScheduledOccurrence(database, taskOccurrence(task, { notificationText }), options);
+}
+
+export function dispatchScheduledTask(task, options = {}) {
+  const database = new Database(options.databasePath ?? CORE_DATABASE_PATH);
   try {
-    if (!existsSync(STATUS_FILE)) return null;
-    const content = readFileSync(STATUS_FILE, 'utf-8');
-    return JSON.parse(content);
-  } catch (error) {
-    return null;
+    return enqueueScheduledTask(database, task, options);
+  } finally {
+    database.close();
   }
 }
 
-/**
- * Find the c4-receive.js path, trying production location first, then development
- * @returns {string} Path to c4-receive.js
- */
-function findC4ReceivePath() {
-  // Method 1: Production location (priority for efficiency in deployed environment)
-  const productionPath = join(homedir(), 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
-  if (existsSync(productionPath)) {
-    return productionPath;
+export function dispatchMissedScheduledTaskNotice(task, notificationText, options = {}) {
+  const database = new Database(options.databasePath ?? CORE_DATABASE_PATH);
+  try {
+    return enqueueMissedScheduledTaskNotice(database, task, notificationText, options);
+  } finally {
+    database.close();
   }
-
-  // Method 2: Development location (fallback for source tree testing)
-  // Current file: .../skills/scheduler/scripts/runtime.js
-  // Target file:  .../skills/comm-bridge/scripts/c4-receive.js
-  const currentFile = fileURLToPath(import.meta.url);
-  const skillsDir = join(dirname(currentFile), '..', '..');
-  const devPath = join(skillsDir, 'comm-bridge', 'scripts', 'c4-receive.js');
-
-  if (existsSync(devPath)) {
-    return devPath;
-  }
-
-  // If both fail, return production path (will fail with clear error message)
-  return productionPath;
 }
 
-/**
- * Send a message to Claude via C4 Communication Bridge
- * @param {string} message - Message to send
- * @param {object} options - Dispatch options
- * @param {number} options.priority - Message priority 1-3 (default: 3)
- * @param {boolean} options.blockQueueUntilIdle - Whether to wait for sustained idle
- *   and hold subsequent dispatch until execution settles (default: false)
- * @param {boolean} options.requireIdle - Legacy alias for blockQueueUntilIdle
- * @param {string} options.replyChannel - Reply channel (e.g., 'telegram')
- * @param {string} options.replyEndpoint - Reply endpoint (e.g., user ID)
- * @returns {boolean} True if successful
- */
-export function sendViaC4(message, options = {}) {
-  const {
-    priority = 3,
-    blockQueueUntilIdle = false,
-    requireIdle = false,
-    replyChannel = null,
-    replyEndpoint = null
-  } = options;
-
+export function recoverLegacyRunningTasksFromCore(schedulerDatabase, options = {}) {
+  const databasePath = options.databasePath ?? CORE_DATABASE_PATH;
+  // Startup recovery is read-only with respect to Core. Never create a second
+  // empty Core database merely because the configured path is absent.
+  const database = existsSync(databasePath)
+    ? new Database(databasePath, { readonly: true, fileMustExist: true })
+    : new Database(':memory:');
   try {
-    const c4ReceivePath = findC4ReceivePath();
-
-    // Build c4-receive.js command arguments
-    const args = [c4ReceivePath];
-
-    // Source and reply configuration from task's reply settings
-    if (replyChannel) {
-      args.push('--channel', replyChannel);
-      if (replyEndpoint) {
-        args.push('--endpoint', replyEndpoint);
-      }
-    } else {
-      args.push('--no-reply');
-    }
-
-    if (blockQueueUntilIdle || requireIdle) {
-      args.push('--block-queue-until-idle');
-    }
-
-    args.push('--priority', String(priority), '--content', message);
-
-    // Use execFileSync to avoid shell injection - passes arguments directly
-    execFileSync('node', args, { stdio: 'pipe', timeout: 10000 });
-    return true;
-  } catch (error) {
-    console.error('Failed to send via C4:', error.message);
-    return false;
+    return recoverLegacyRunningTasks(schedulerDatabase, database, options);
+  } finally {
+    database.close();
   }
 }
