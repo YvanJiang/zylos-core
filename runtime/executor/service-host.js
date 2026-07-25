@@ -11,6 +11,12 @@ const READ_ONLY_ACTIONS = new Set([
   'health',
   'resolve_interaction',
 ]);
+const PEER_DISCONNECT_ERROR_CODES = new Set([
+  'ECONNABORTED',
+  'ECONNRESET',
+  'ENOTCONN',
+  'EPIPE',
+]);
 
 function reportPollError(error) {
   console.error('[zylos-executor] Background poll failed.', error);
@@ -244,6 +250,10 @@ export function createExecutorServiceHost({
   const server = net.createServer((socket) => {
     controlSockets.add(socket);
     socket.once('close', () => controlSockets.delete(socket));
+    // A control action may finish after its timed-out caller has closed the connection.
+    socket.on('error', (error) => {
+      if (!PEER_DISCONNECT_ERROR_CODES.has(error?.code)) throw error;
+    });
     socket.setEncoding('utf8');
     let data = '';
     let handled = false;
