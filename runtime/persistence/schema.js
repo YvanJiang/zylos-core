@@ -1880,10 +1880,99 @@ const OUTBOX_COLUMNS = Object.freeze([
   'updated_at',
 ]);
 
+const LEGACY_OPERATOR_RECONCILIATION_COLUMNS = Object.freeze([
+  'reconciliation_id',
+  'request_hash',
+  'outbox_id',
+  'delivery_attempt_id',
+  'delivery_attempt_no',
+  'outbox_lease_epoch',
+  'decision',
+  'previous_status',
+  'terminal_status',
+  'actor_id',
+  'authorization_ref',
+  'reason',
+  'evidence_json',
+  'evidence_hash',
+  'replacement_outbox_id',
+  'committed_at',
+]);
+
 function addColumnIfMissing(database, tableName, columnName, definition) {
   const columns = database.prepare(`PRAGMA table_info(${tableName})`).all();
   if (columns.some(({ name }) => name === columnName)) return;
   database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+}
+
+function requireExactColumns(database, tableName, expectedColumns) {
+  const actualColumns = database.prepare(`PRAGMA table_info(${tableName})`).all()
+    .map(({ name }) => name);
+  if (
+    actualColumns.length !== expectedColumns.length
+    || expectedColumns.some((columnName) => !actualColumns.includes(columnName))
+  ) {
+    throw new Error(`Cannot safely migrate unexpected ${tableName} schema.`);
+  }
+}
+
+function migrateLegacyOperatorReconciliations(database) {
+  const legacyColumns = database.prepare(
+    "PRAGMA table_info('runtime_outbox_reconciliations')",
+  ).all().map(({ name }) => name);
+  if (
+    legacyColumns.length === 0
+    || legacyColumns.includes('reconciliation_epoch')
+  ) {
+    return;
+  }
+  requireExactColumns(
+    database,
+    'runtime_outbox_reconciliations',
+    LEGACY_OPERATOR_RECONCILIATION_COLUMNS,
+  );
+
+  const migrate = database.transaction(() => {
+    database.exec(`
+      DROP TRIGGER IF EXISTS runtime_outbox_reconciliation_update_immutable;
+      DROP TRIGGER IF EXISTS runtime_outbox_reconciliation_delete_immutable;
+    `);
+    const operatorColumns = database.prepare(
+      "PRAGMA table_info('runtime_outbox_operator_reconciliations')",
+    ).all();
+    if (operatorColumns.length === 0) {
+      database.exec(`
+        ALTER TABLE runtime_outbox_reconciliations
+          RENAME TO runtime_outbox_operator_reconciliations;
+      `);
+      return;
+    }
+
+    requireExactColumns(
+      database,
+      'runtime_outbox_operator_reconciliations',
+      LEGACY_OPERATOR_RECONCILIATION_COLUMNS,
+    );
+    const columns = LEGACY_OPERATOR_RECONCILIATION_COLUMNS.join(', ');
+    const existingCount = database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_outbox_operator_reconciliations
+    `).get().count;
+    const legacyCount = database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_outbox_reconciliations
+    `).get().count;
+    database.exec(`
+      INSERT INTO runtime_outbox_operator_reconciliations (${columns})
+        SELECT ${columns} FROM runtime_outbox_reconciliations;
+      DROP TABLE runtime_outbox_reconciliations;
+    `);
+    const migratedCount = database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_outbox_operator_reconciliations
+    `).get().count;
+    if (migratedCount !== existingCount + legacyCount) {
+      throw new Error('Legacy operator reconciliation migration lost audit rows.');
+    }
+  });
+  migrate.immediate();
 }
 
 function migrateOperationsReconciliationIntents(database) {
@@ -2588,6 +2677,7 @@ export function initializeRuntimePersistence(database) {
   database.pragma('journal_mode = WAL');
   database.pragma('busy_timeout = 5000');
   database.pragma('foreign_keys = ON');
+  migrateLegacyOperatorReconciliations(database);
   database.exec(RUNTIME_SCHEMA);
   addColumnIfMissing(database, 'runtime_turns', 'attempt_id', 'TEXT');
   addColumnIfMissing(

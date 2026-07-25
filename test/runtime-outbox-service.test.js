@@ -220,6 +220,90 @@ afterEach(() => {
 });
 
 describe('durable outbox service', () => {
+  test('upgrades the legacy operator reconciliation table without losing its audit rows', () => {
+    const database = openTestDatabase();
+    database.exec(`
+      CREATE TABLE runtime_outbox_reconciliations (
+        reconciliation_id TEXT PRIMARY KEY,
+        request_hash TEXT NOT NULL UNIQUE,
+        outbox_id TEXT NOT NULL,
+        delivery_attempt_id TEXT NOT NULL,
+        delivery_attempt_no INTEGER NOT NULL CHECK (delivery_attempt_no > 0),
+        outbox_lease_epoch INTEGER NOT NULL CHECK (outbox_lease_epoch > 0),
+        decision TEXT NOT NULL CHECK (decision = 'platform_readback_no_effect'),
+        previous_status TEXT NOT NULL,
+        terminal_status TEXT NOT NULL CHECK (terminal_status = 'superseded'),
+        actor_id TEXT NOT NULL,
+        authorization_ref TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        evidence_hash TEXT NOT NULL,
+        replacement_outbox_id TEXT,
+        committed_at TEXT NOT NULL,
+        UNIQUE (outbox_id, delivery_attempt_id, delivery_attempt_no, outbox_lease_epoch)
+      );
+      INSERT INTO runtime_outbox_reconciliations (
+        reconciliation_id, request_hash, outbox_id, delivery_attempt_id,
+        delivery_attempt_no, outbox_lease_epoch, decision, previous_status,
+        terminal_status, actor_id, authorization_ref, reason, evidence_json,
+        evidence_hash, replacement_outbox_id, committed_at
+      ) VALUES (
+        'legacy-reconciliation-1', 'legacy-request-hash', 'legacy-outbox-1',
+        'legacy-delivery-attempt-1', 1, 1, 'platform_readback_no_effect',
+        'delivery_unknown', 'superseded', 'legacy-operator',
+        'legacy-authorization', 'confirmed by exact platform readback',
+        '{"kind":"platform_readback_no_effect"}', 'legacy-evidence-hash',
+        'legacy-replacement-1', '2026-07-24T04:00:00Z'
+      );
+    `);
+
+    createOutboxService({
+      database,
+      serviceInstanceId: 'legacy-operator-reconciliation-upgrade-owner',
+      now: () => '2026-07-25T04:00:00Z',
+      generateId: deterministicIds('legacy-operator-reconciliation-upgrade-owner'),
+    });
+
+    expect(database.prepare(`
+      SELECT reconciliation_id, request_hash, outbox_id, delivery_attempt_id,
+        delivery_attempt_no, outbox_lease_epoch, decision, previous_status,
+        terminal_status, actor_id, authorization_ref, reason, evidence_json,
+        evidence_hash, replacement_outbox_id, committed_at
+      FROM runtime_outbox_operator_reconciliations
+    `).get()).toEqual({
+      reconciliation_id: 'legacy-reconciliation-1',
+      request_hash: 'legacy-request-hash',
+      outbox_id: 'legacy-outbox-1',
+      delivery_attempt_id: 'legacy-delivery-attempt-1',
+      delivery_attempt_no: 1,
+      outbox_lease_epoch: 1,
+      decision: 'platform_readback_no_effect',
+      previous_status: 'delivery_unknown',
+      terminal_status: 'superseded',
+      actor_id: 'legacy-operator',
+      authorization_ref: 'legacy-authorization',
+      reason: 'confirmed by exact platform readback',
+      evidence_json: '{"kind":"platform_readback_no_effect"}',
+      evidence_hash: 'legacy-evidence-hash',
+      replacement_outbox_id: 'legacy-replacement-1',
+      committed_at: '2026-07-24T04:00:00Z',
+    });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM runtime_outbox_reconciliations
+    `).get()).toEqual({ count: 0 });
+    expect(database.prepare(`
+      PRAGMA table_info('runtime_outbox_reconciliations')
+    `).all().map(({ name }) => name)).toContain('reconciliation_epoch');
+    expect(() => database.prepare(`
+      UPDATE runtime_outbox_operator_reconciliations
+      SET reason = 'changed'
+      WHERE reconciliation_id = 'legacy-reconciliation-1'
+    `).run()).toThrow('outbox reconciliation audit is immutable');
+    expect(database.pragma('foreign_key_check')).toEqual([]);
+    expect(database.pragma('integrity_check', { simple: true })).toBe('ok');
+    database.close();
+  });
+
   test('legacy outbox migration leaves reconciliation foreign keys bound to the rebuilt table', () => {
     const database = openTestDatabase();
     createExactBaseDeliveringOutbox(database);
