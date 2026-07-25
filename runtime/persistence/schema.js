@@ -133,6 +133,7 @@ const RUNTIME_SCHEMA = `
     wait_reason TEXT,
     wait_detail_json TEXT,
     enqueued_at TEXT NOT NULL,
+    available_at TEXT,
     PRIMARY KEY (conversation_id, queue_sequence)
   );
 
@@ -166,6 +167,57 @@ const RUNTIME_SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS runtime_background_tasks_state
     ON runtime_background_tasks(state, created_at, background_task_id);
+
+  CREATE TABLE IF NOT EXISTS runtime_input_groups (
+    input_group_id TEXT PRIMARY KEY,
+    origin_conversation_id TEXT NOT NULL
+      REFERENCES runtime_conversations(conversation_id),
+    actor_id TEXT NOT NULL,
+    routing_intent_key TEXT NOT NULL,
+    routing_intent_json TEXT NOT NULL,
+    background_task_id TEXT NOT NULL UNIQUE
+      REFERENCES runtime_background_tasks(background_task_id) ON DELETE CASCADE,
+    execution_turn_id TEXT NOT NULL UNIQUE
+      REFERENCES runtime_turns(turn_id) ON DELETE CASCADE,
+    state TEXT NOT NULL CHECK (state IN ('collecting', 'sealed', 'cancelled')),
+    member_count INTEGER NOT NULL CHECK (member_count > 0),
+    opened_at TEXT NOT NULL,
+    last_member_at TEXT NOT NULL,
+    collect_until TEXT NOT NULL,
+    max_collect_until TEXT NOT NULL,
+    sealed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+      (state = 'sealed' AND sealed_at IS NOT NULL)
+      OR (state != 'sealed' AND sealed_at IS NULL)
+    )
+  );
+
+  CREATE INDEX IF NOT EXISTS runtime_input_groups_collecting
+    ON runtime_input_groups (
+      origin_conversation_id, actor_id, state, collect_until, input_group_id
+    );
+
+  CREATE TABLE IF NOT EXISTS runtime_input_group_members (
+    input_group_id TEXT NOT NULL
+      REFERENCES runtime_input_groups(input_group_id) ON DELETE CASCADE,
+    member_ordinal INTEGER NOT NULL CHECK (member_ordinal > 0),
+    origin_conversation_id TEXT NOT NULL
+      REFERENCES runtime_conversations(conversation_id),
+    inbound_event_id TEXT NOT NULL UNIQUE
+      REFERENCES runtime_inbound_events(inbound_event_id) ON DELETE CASCADE,
+    dispatch_turn_id TEXT NOT NULL UNIQUE
+      REFERENCES runtime_turns(turn_id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL,
+    actor_json TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    content_json TEXT NOT NULL,
+    reply_json TEXT NOT NULL,
+    committed_at TEXT NOT NULL,
+    PRIMARY KEY (input_group_id, member_ordinal),
+    UNIQUE (input_group_id, message_id)
+  );
 
   CREATE UNIQUE INDEX IF NOT EXISTS runtime_turns_one_active_per_conversation
     ON runtime_turns(conversation_id)
@@ -518,6 +570,15 @@ const RUNTIME_SCHEMA = `
     UPDATE runtime_background_tasks
     SET side_effect_status = NEW.side_effect_status
     WHERE execution_turn_id = NEW.turn_id;
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS runtime_input_group_turn_cancel
+  AFTER UPDATE OF state ON runtime_turns
+  WHEN NEW.state IN ('stopped', 'cancelled', 'interrupted', 'failed', 'timed_out')
+  BEGIN
+    UPDATE runtime_input_groups
+    SET state = 'cancelled', updated_at = NEW.committed_at
+    WHERE execution_turn_id = NEW.turn_id AND state = 'collecting';
   END;
 
   CREATE TABLE IF NOT EXISTS runtime_execution_recoveries (
@@ -1847,6 +1908,7 @@ export function initializeRuntimePersistence(database) {
   );
   addColumnIfMissing(database, 'runtime_turn_queue', 'wait_reason', 'TEXT');
   addColumnIfMissing(database, 'runtime_turn_queue', 'wait_detail_json', 'TEXT');
+  addColumnIfMissing(database, 'runtime_turn_queue', 'available_at', 'TEXT');
   addColumnIfMissing(database, 'runtime_executor_service_instances', 'revoked_at', 'TEXT');
   addColumnIfMissing(
     database,

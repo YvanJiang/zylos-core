@@ -304,14 +304,22 @@ must never infer the latest message or fall back to a parent chat. Each delivery
 attempt is fenced by a UTC-instant lease and an immutable full command snapshot;
 expired or altered claims cannot authorize rendering, delivery, or results.
 
-`acceptNormalInbound` detaches each authenticated platform message into a
-Core-owned background task. Its dispatch turn completes immediately and returns
-`dispatch_status`, `background_task_id`, and `background_execution_turn_id` as
-additive inbound-result fields. The background execution uses a fresh provider
-session and delivers its result through the original durable target. The C4
-channel bridge uses the same detached ingress. Scheduler, migration, and focused
-provider probes use the explicit `acceptQueuedInbound` seam where legacy FIFO
-behavior remains required. See
+`acceptNormalInbound` detaches authenticated platform messages into Core-owned
+background work. Feishu user messages use a durable trailing-edge input group:
+the first message opens one background task, supplements from the same actor and
+routing intent extend its 10-second quiet window, and the executor cannot claim
+the task before the durable deadline. The group is capped at 20 members and a
+120-second open window. Every source message still has its own inbound event,
+idempotency result, audit record, and completed dispatch turn.
+
+The dispatch result returns `dispatch_status`, `background_task_id`, and
+`background_execution_turn_id`; grouped Feishu messages also return the five
+`input_group_*` fields. Provider input is materialized from ordered durable
+members only when the group is sealed for execution. The background execution
+uses a fresh provider session and delivers its result through the original
+durable target. The C4 channel bridge uses the same detached ingress. Scheduler,
+migration, and focused provider probes use the explicit `acceptQueuedInbound`
+seam where legacy FIFO behavior remains required. See
 [Detached background dispatch](docs/detached-background-dispatch.md).
 
 ---

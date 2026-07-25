@@ -269,6 +269,47 @@ function validateTurn(path, value, options) {
   requireNullableOpaqueId(`${path}.recovery_of_turn_id`, value.recovery_of_turn_id, options);
   requireEnum(`${path}.side_effect_status`, value.side_effect_status, SIDE_EFFECT_STATUSES, options);
   requireErrorOrNull(`${path}.error`, value.error, options);
+  const inputGroupFields = [
+    'input_group_id',
+    'input_group_state',
+    'input_group_member_count',
+    'input_group_supplement_count',
+    'input_group_collect_until',
+  ];
+  const presentInputGroupFields = inputGroupFields.filter((field) => (
+    Object.hasOwn(value, field)
+  ));
+  if (presentInputGroupFields.length > 0) {
+    requireFields(path, value, inputGroupFields, options);
+    requireOpaqueId(`${path}.input_group_id`, value.input_group_id, options);
+    requireEnum(
+      `${path}.input_group_state`,
+      value.input_group_state,
+      ['input_settling', 'sealed', 'cancelled'],
+      options,
+    );
+    requireInteger(`${path}.input_group_member_count`, value.input_group_member_count, {
+      min: 1,
+      ...options,
+    });
+    requireInteger(
+      `${path}.input_group_supplement_count`,
+      value.input_group_supplement_count,
+      { min: 0, ...options },
+    );
+    requireTimestamp(
+      `${path}.input_group_collect_until`,
+      value.input_group_collect_until,
+      options,
+    );
+    if (value.input_group_supplement_count !== value.input_group_member_count - 1) {
+      rejectRuntimeContract(
+        'validation_error',
+        `${path} input group counts are inconsistent.`,
+        options,
+      );
+    }
+  }
 }
 
 function validateInteraction(path, value, options) {

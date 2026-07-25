@@ -125,9 +125,14 @@ export function readQueuedTaskStatus(database, executionTurnId, observedAt) {
     throw new TypeError('observedAt must be an RFC3339 timestamp');
   }
   const current = database.prepare(`
-    SELECT task.origin_conversation_id, queue.wait_reason, queue.wait_detail_json
+    SELECT task.origin_conversation_id, queue.wait_reason, queue.wait_detail_json,
+      input_group.input_group_id, input_group.state AS input_group_state,
+      input_group.member_count AS input_group_member_count,
+      input_group.collect_until AS input_group_collect_until
     FROM runtime_background_tasks AS task
     LEFT JOIN runtime_turn_queue AS queue ON queue.turn_id = task.execution_turn_id
+    LEFT JOIN runtime_input_groups AS input_group
+      ON input_group.background_task_id = task.background_task_id
     WHERE task.execution_turn_id = ?
   `).get(executionTurnId);
   if (!current) return null;
@@ -180,6 +185,16 @@ export function readQueuedTaskStatus(database, executionTurnId, observedAt) {
     }))),
     queued_count: queuedCount,
     workspace_blocker_state: readWorkspaceBlockerState(database, current),
+    input_group_id: current.input_group_id ?? null,
+    input_group_state: current.input_group_state === 'collecting'
+      ? 'input_settling'
+      : (current.input_group_state ?? null),
+    input_group_member_count: current.input_group_member_count ?? null,
+    input_group_supplement_count: current.input_group_member_count === null
+      || current.input_group_member_count === undefined
+      ? null
+      : current.input_group_member_count - 1,
+    input_group_collect_until: current.input_group_collect_until ?? null,
   });
 }
 

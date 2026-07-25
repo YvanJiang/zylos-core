@@ -30,6 +30,11 @@
     "dispatch_status": { "const": "background_dispatched" },
     "background_task_id": { "$ref": "#/$defs/opaque_id" },
     "background_execution_turn_id": { "$ref": "#/$defs/opaque_id" },
+    "input_group_id": { "$ref": "#/$defs/opaque_id" },
+    "input_group_action": { "enum": ["opened", "appended"] },
+    "input_group_member_count": { "type": "integer", "minimum": 1 },
+    "input_group_supplement_count": { "type": "integer", "minimum": 0 },
+    "input_group_collect_until": { "$ref": "#/$defs/rfc3339" },
     "conversation_id": { "$ref": "#/$defs/nullable_id" },
     "turn_id": { "$ref": "#/$defs/nullable_id" },
     "lineage_id": { "$ref": "#/$defs/nullable_id" },
@@ -124,6 +129,33 @@
           "dispatch_status",
           "background_task_id",
           "background_execution_turn_id"
+        ],
+        "properties": {
+          "status": { "const": "accepted" },
+          "dispatch_status": { "const": "background_dispatched" }
+        }
+      }
+    },
+    {
+      "if": {
+        "anyOf": [
+          { "required": ["input_group_id"] },
+          { "required": ["input_group_action"] },
+          { "required": ["input_group_member_count"] },
+          { "required": ["input_group_supplement_count"] },
+          { "required": ["input_group_collect_until"] }
+        ]
+      },
+      "then": {
+        "required": [
+          "dispatch_status",
+          "background_task_id",
+          "background_execution_turn_id",
+          "input_group_id",
+          "input_group_action",
+          "input_group_member_count",
+          "input_group_supplement_count",
+          "input_group_collect_until"
         ],
         "properties": {
           "status": { "const": "accepted" },

@@ -62,6 +62,7 @@ function acceptDetached(database, suffix, text, timestamp) {
   return acceptNormalInbound(database, normalEnvelope(suffix, text), {
     now: () => timestamp,
     generateId: deterministicIds(`inbound-${suffix}`),
+    inputCoalescingPolicy: { enabled: false },
   });
 }
 
@@ -102,6 +103,7 @@ describe('Core-owned detached background dispatch', () => {
     const foreign = acceptNormalInbound(database, foreignEnvelope, {
       now: () => '2026-07-23T00:40:02Z',
       generateId: deterministicIds('inbound-queue-summary-foreign'),
+      inputCoalescingPolicy: { enabled: false },
     });
     let startFirst;
     let startForeign;
@@ -252,6 +254,7 @@ describe('Core-owned detached background dispatch', () => {
     const blocker = acceptNormalInbound(database, blockerEnvelope, {
       now: () => '2026-07-23T00:55:00Z',
       generateId: deterministicIds('inbound-queue-summary-uncertain-blocker'),
+      inputCoalescingPolicy: { enabled: false },
     });
     const blockerTask = readBackgroundTask(database, blocker.background_task_id);
     let clock = '2026-07-23T00:55:00Z';
@@ -365,6 +368,7 @@ describe('Core-owned detached background dispatch', () => {
     const blocker = acceptNormalInbound(database, blockerEnvelope, {
       now: () => '2026-07-23T00:56:00Z',
       generateId: deterministicIds('inbound-queue-summary-active-blocker'),
+      inputCoalescingPolicy: { enabled: false },
     });
     const blockerTask = readBackgroundTask(database, blocker.background_task_id);
     const workspaceAccess = {

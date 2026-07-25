@@ -356,6 +356,10 @@ function collectTurns(database) {
     SELECT turn_id, side_effect_status, error_json
     FROM runtime_provider_stop_incidents
   `).all().map((row) => [row.turn_id, row]));
+  const inputGroupByTurn = new Map(database.prepare(`
+    SELECT execution_turn_id, input_group_id, state, member_count, collect_until
+    FROM runtime_input_groups
+  `).all().map((row) => [row.execution_turn_id, row]));
   const items = rows.map((row) => {
     const attempts = attemptsByTurn.get(row.turn_id) ?? [];
     const latestEventRow = latestEventByTurn.get(row.turn_id);
@@ -375,6 +379,7 @@ function collectTurns(database) {
       error?.side_effect_status,
     );
     const recoveryOfTurnId = latestEvent?.payload?.recovery_of_turn_id ?? null;
+    const inputGroup = inputGroupByTurn.get(row.turn_id);
     return publicItem({
       turn_id: row.turn_id,
       conversation_id: row.conversation_id,
@@ -388,6 +393,15 @@ function collectTurns(database) {
       recovery_of_turn_id: recoveryOfTurnId,
       side_effect_status: sideEffectStatus,
       error,
+      ...(inputGroup === undefined ? {} : {
+        input_group_id: inputGroup.input_group_id,
+        input_group_state: inputGroup.state === 'collecting'
+          ? 'input_settling'
+          : inputGroup.state,
+        input_group_member_count: inputGroup.member_count,
+        input_group_supplement_count: inputGroup.member_count - 1,
+        input_group_collect_until: inputGroup.collect_until,
+      }),
     });
   });
   return Object.freeze({ complete: true, items: Object.freeze(items), error: null });

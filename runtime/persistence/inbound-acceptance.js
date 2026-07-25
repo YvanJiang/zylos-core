@@ -18,6 +18,15 @@ import {
   initializeMainProjection,
   stageMainProjection,
 } from './main-projection.js';
+import {
+  findAppendableInputGroup,
+  initialInputGroupDeadline,
+  insertInputGroupMember,
+  nextInputGroupDeadline,
+  resolveInputCoalescingPolicy,
+  resolveInputRoutingIntent,
+  shouldCoalesceInbound,
+} from './input-coalescing.js';
 import { initializeRuntimePersistence } from './schema.js';
 import {
   acceptPermissionCommandInTransaction,
@@ -473,6 +482,272 @@ function resolveNormalLineage(database, envelope, conversationId, committedAt, g
   return { ...lineage, recovery: null, pending_turn: null };
 }
 
+function appendDetachedInputGroupInTransaction(database, {
+  envelope,
+  originConversationId,
+  originLineage,
+  inputGroup,
+  inputCoalescingPolicy,
+  payloadHash,
+  committedAt,
+  generateId,
+}) {
+  const dispatchTurnId = generateId('turn');
+  database.prepare(`
+    UPDATE runtime_conversations
+    SET last_queue_sequence = last_queue_sequence + 1
+    WHERE conversation_id = ?
+  `).run(originConversationId);
+  const dispatchQueueSequence = database.prepare(`
+    SELECT last_queue_sequence
+    FROM runtime_conversations
+    WHERE conversation_id = ?
+  `).get(originConversationId).last_queue_sequence;
+
+  database.prepare(`
+    INSERT INTO runtime_inbound_events (
+      inbound_event_id, idempotency_key, conversation_id, message_id,
+      payload_hash, envelope_json, received_at, committed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    envelope.inbound_event_id,
+    envelope.idempotency_key,
+    originConversationId,
+    envelope.message_id,
+    payloadHash,
+    JSON.stringify(envelope),
+    envelope.received_at,
+    committedAt,
+  );
+  database.prepare(`
+    INSERT INTO runtime_turns (
+      turn_id, conversation_id, lineage_id, inbound_event_id, state,
+      turn_version, queue_sequence, provider_input_json, created_at, committed_at
+    ) VALUES (?, ?, ?, ?, 'received', 1, ?, NULL, ?, ?)
+  `).run(
+    dispatchTurnId,
+    originConversationId,
+    originLineage.lineage_id,
+    envelope.inbound_event_id,
+    dispatchQueueSequence,
+    committedAt,
+    committedAt,
+  );
+  database.prepare(`
+    INSERT INTO runtime_turn_queue (
+      conversation_id, queue_sequence, turn_id, status, wait_reason, enqueued_at
+    ) VALUES (?, ?, ?, 'queued', NULL, ?)
+  `).run(
+    originConversationId,
+    dispatchQueueSequence,
+    dispatchTurnId,
+    committedAt,
+  );
+
+  const receivedEvent = buildLifecycleEvent({
+    eventId: generateId('event'),
+    traceId: envelope.trace_id,
+    conversationId: originConversationId,
+    turnId: dispatchTurnId,
+    lineageId: originLineage.lineage_id,
+    eventSequence: 1,
+    turnVersion: 1,
+    phase: 'received',
+    occurredAt: envelope.occurred_at,
+    persistedAt: committedAt,
+    fromState: null,
+    reasonCode: 'inbound_committed',
+    causationEventId: null,
+  });
+  const dispatchedEvent = buildLifecycleEvent({
+    eventId: generateId('event'),
+    traceId: envelope.trace_id,
+    conversationId: originConversationId,
+    turnId: dispatchTurnId,
+    lineageId: originLineage.lineage_id,
+    eventSequence: 2,
+    turnVersion: 2,
+    phase: 'completed',
+    occurredAt: committedAt,
+    persistedAt: committedAt,
+    fromState: 'received',
+    reasonCode: 'background_dispatched',
+    causationEventId: receivedEvent.event_id,
+  });
+  for (const event of [receivedEvent, dispatchedEvent]) {
+    validateNormalizedEvent(event);
+    database.prepare(`
+      INSERT INTO runtime_normalized_events (
+        event_id, turn_id, event_sequence, turn_version, event_json, persisted_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      event.event_id,
+      dispatchTurnId,
+      event.event_sequence,
+      event.turn_version,
+      JSON.stringify(event),
+      committedAt,
+    );
+  }
+  database.prepare(`
+    UPDATE runtime_turns
+    SET state = 'completed', turn_version = 2, committed_at = ?
+    WHERE turn_id = ? AND state = 'received' AND turn_version = 1
+  `).run(committedAt, dispatchTurnId);
+  database.prepare(`
+    UPDATE runtime_turn_queue
+    SET status = 'completed'
+    WHERE turn_id = ? AND status = 'queued'
+  `).run(dispatchTurnId);
+
+  const memberCount = inputGroup.member_count + 1;
+  const collectUntil = nextInputGroupDeadline(
+    inputGroup,
+    committedAt,
+    inputCoalescingPolicy,
+    memberCount,
+  );
+  insertInputGroupMember(database, {
+    inputGroupId: inputGroup.input_group_id,
+    memberOrdinal: memberCount,
+    originConversationId,
+    inboundEventId: envelope.inbound_event_id,
+    dispatchTurnId,
+    envelope,
+    committedAt,
+  });
+  const groupUpdate = database.prepare(`
+    UPDATE runtime_input_groups
+    SET member_count = ?, last_member_at = ?, collect_until = ?, updated_at = ?
+    WHERE input_group_id = ? AND state = 'collecting'
+      AND member_count = ? AND julianday(collect_until) > julianday(?)
+  `).run(
+    memberCount,
+    committedAt,
+    collectUntil,
+    committedAt,
+    inputGroup.input_group_id,
+    inputGroup.member_count,
+    committedAt,
+  );
+  if (groupUpdate.changes !== 1) {
+    throw new Error('The collecting input group lost its append fence.');
+  }
+  database.prepare(`
+    UPDATE runtime_turn_queue
+    SET available_at = ?,
+      wait_reason = CASE WHEN wait_reason = 'maintenance'
+        THEN wait_reason ELSE 'input_settling' END
+    WHERE turn_id = ? AND status = 'queued'
+  `).run(collectUntil, inputGroup.execution_turn_id);
+
+  const executionTurn = database.prepare(`
+    SELECT turn_id, conversation_id, lineage_id, turn_version
+    FROM runtime_turns
+    WHERE turn_id = ? AND state = 'queued'
+  `).get(inputGroup.execution_turn_id);
+  if (!executionTurn) {
+    throw new Error('The collecting input group execution turn is no longer queued.');
+  }
+  const previousEvent = database.prepare(`
+    SELECT event_id, event_sequence
+    FROM runtime_normalized_events
+    WHERE turn_id = ?
+    ORDER BY event_sequence DESC
+    LIMIT 1
+  `).get(inputGroup.execution_turn_id);
+  const groupEvent = buildLifecycleEvent({
+    eventId: generateId('event'),
+    traceId: envelope.trace_id,
+    conversationId: executionTurn.conversation_id,
+    turnId: executionTurn.turn_id,
+    lineageId: executionTurn.lineage_id,
+    eventSequence: previousEvent.event_sequence + 1,
+    turnVersion: executionTurn.turn_version + 1,
+    phase: 'queued',
+    occurredAt: committedAt,
+    persistedAt: committedAt,
+    fromState: 'queued',
+    reasonCode: 'input_group_appended',
+    causationEventId: previousEvent.event_id,
+  });
+  groupEvent.payload.input_group_id = inputGroup.input_group_id;
+  groupEvent.payload.member_count = memberCount;
+  groupEvent.payload.supplement_count = memberCount - 1;
+  groupEvent.payload.collect_until = collectUntil;
+  validateNormalizedEvent(groupEvent);
+  database.prepare(`
+    INSERT INTO runtime_normalized_events (
+      event_id, turn_id, event_sequence, turn_version, event_json, persisted_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+  `).run(
+    groupEvent.event_id,
+    groupEvent.turn_id,
+    groupEvent.event_sequence,
+    groupEvent.turn_version,
+    JSON.stringify(groupEvent),
+    committedAt,
+  );
+  const turnUpdate = database.prepare(`
+    UPDATE runtime_turns
+    SET turn_version = ?, committed_at = ?
+    WHERE turn_id = ? AND state = 'queued' AND turn_version = ?
+  `).run(
+    groupEvent.turn_version,
+    committedAt,
+    executionTurn.turn_id,
+    executionTurn.turn_version,
+  );
+  if (turnUpdate.changes !== 1) {
+    throw new Error('The collecting input group lost its queued turn fence.');
+  }
+  stageMainProjection(
+    database,
+    { turn_id: executionTurn.turn_id },
+    groupEvent,
+    { generateId },
+  );
+
+  const result = {
+    contract: 'zylos.inbound-result',
+    contract_version: '1.0',
+    trace_id: envelope.trace_id,
+    inbound_event_id: envelope.inbound_event_id,
+    idempotency_key: envelope.idempotency_key,
+    status: 'accepted',
+    conversation_id: originConversationId,
+    turn_id: dispatchTurnId,
+    lineage_id: originLineage.lineage_id,
+    control_id: null,
+    turn_version: 2,
+    lineage_resolution_state: 'bound',
+    deduplicated: false,
+    error: null,
+    committed_at: committedAt,
+    dispatch_status: 'background_dispatched',
+    background_task_id: inputGroup.background_task_id,
+    background_execution_turn_id: inputGroup.execution_turn_id,
+    input_group_id: inputGroup.input_group_id,
+    input_group_action: 'appended',
+    input_group_member_count: memberCount,
+    input_group_supplement_count: memberCount - 1,
+    input_group_collect_until: collectUntil,
+  };
+  validateInboundResult(result);
+  database.prepare(`
+    INSERT INTO runtime_inbound_idempotency (
+      idempotency_key, inbound_event_id, payload_hash, first_result_json, committed_at
+    ) VALUES (?, ?, ?, ?, ?)
+  `).run(
+    envelope.idempotency_key,
+    envelope.inbound_event_id,
+    payloadHash,
+    JSON.stringify(result),
+    committedAt,
+  );
+  return result;
+}
+
 function acceptDetachedInboundInTransaction(database, {
   envelope,
   originConversationId,
@@ -481,6 +756,7 @@ function acceptDetachedInboundInTransaction(database, {
   blockingUpgrade,
   initialDeliveryOperation,
   generateId,
+  inputCoalescingPolicy,
 }) {
   const originLineage = resolveOrCreateDefaultLineage(
     database,
@@ -489,6 +765,34 @@ function acceptDetachedInboundInTransaction(database, {
     committedAt,
     generateId,
   );
+  const routingIntent = inputCoalescingPolicy === null
+    ? null
+    : resolveInputRoutingIntent(database, envelope);
+  const inputGroup = routingIntent === null
+    ? null
+    : findAppendableInputGroup(database, {
+      originConversationId,
+      actorId: envelope.actor.actor_id,
+      routingIntent,
+      committedAt,
+      maxMembers: inputCoalescingPolicy.maxMembers,
+    });
+  if (inputGroup !== null) {
+    return appendDetachedInputGroupInTransaction(database, {
+      envelope,
+      originConversationId,
+      originLineage,
+      inputGroup,
+      inputCoalescingPolicy,
+      payloadHash,
+      committedAt,
+      generateId,
+    });
+  }
+  const inputGroupId = inputCoalescingPolicy === null ? null : generateId('input-group');
+  const deadline = inputCoalescingPolicy === null
+    ? null
+    : initialInputGroupDeadline(committedAt, inputCoalescingPolicy);
   const backgroundTaskId = generateId('background-task');
   const dispatchTurnId = generateId('turn');
   const executionConversationId = generateId('conversation');
@@ -670,19 +974,23 @@ function acceptDetachedInboundInTransaction(database, {
     executionConversationId,
     executionLineageId,
     executionInboundEventId,
-    JSON.stringify(envelope.content),
+    inputGroupId === null ? JSON.stringify(envelope.content) : null,
     committedAt,
     committedAt,
   );
   database.prepare(`
     INSERT INTO runtime_turn_queue (
-      conversation_id, queue_sequence, turn_id, status, wait_reason, enqueued_at
-    ) VALUES (?, 1, ?, 'queued', ?, ?)
+      conversation_id, queue_sequence, turn_id, status, wait_reason,
+      enqueued_at, available_at
+    ) VALUES (?, 1, ?, 'queued', ?, ?, ?)
   `).run(
     executionConversationId,
     executionTurnId,
-    blockingUpgrade === null ? null : 'maintenance',
+    blockingUpgrade === null
+      ? (inputGroupId === null ? null : 'input_settling')
+      : 'maintenance',
     committedAt,
+    deadline?.collectUntil ?? null,
   );
   bindPermissionToAcceptedTurnInTransaction(database, {
     turnId: executionTurnId,
@@ -720,7 +1028,7 @@ function acceptDetachedInboundInTransaction(database, {
     persistedAt: committedAt,
     fromState: 'received',
     reasonCode: blockingUpgrade === null
-      ? 'background_task_queued'
+      ? (inputGroupId === null ? 'background_task_queued' : 'input_settling')
       : 'maintenance',
     causationEventId: executionReceivedEvent.event_id,
   });
@@ -754,6 +1062,40 @@ function acceptDetachedInboundInTransaction(database, {
     executionTurnId,
     committedAt,
   );
+  if (inputGroupId !== null) {
+    database.prepare(`
+      INSERT INTO runtime_input_groups (
+        input_group_id, origin_conversation_id, actor_id,
+        routing_intent_key, routing_intent_json,
+        background_task_id, execution_turn_id, state, member_count,
+        opened_at, last_member_at, collect_until, max_collect_until,
+        sealed_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'collecting', 1, ?, ?, ?, ?, NULL, ?, ?)
+    `).run(
+      inputGroupId,
+      originConversationId,
+      envelope.actor.actor_id,
+      routingIntent.key,
+      JSON.stringify(routingIntent.value),
+      backgroundTaskId,
+      executionTurnId,
+      committedAt,
+      committedAt,
+      deadline.collectUntil,
+      deadline.maxCollectUntil,
+      committedAt,
+      committedAt,
+    );
+    insertInputGroupMember(database, {
+      inputGroupId,
+      memberOrdinal: 1,
+      originConversationId,
+      inboundEventId: envelope.inbound_event_id,
+      dispatchTurnId,
+      envelope,
+      committedAt,
+    });
+  }
 
   const deliveryCommand = buildInitialDeliveryCommand({
     envelope,
@@ -764,7 +1106,9 @@ function acceptDetachedInboundInTransaction(database, {
     committedAt,
     generateId,
     phase: 'received',
-    text: `Background task dispatched: ${backgroundTaskId}`,
+    text: inputGroupId === null
+      ? `Background task dispatched: ${backgroundTaskId}`
+      : '已收到',
     terminal: false,
     operation: initialDeliveryOperation,
   });
@@ -789,12 +1133,14 @@ function acceptDetachedInboundInTransaction(database, {
     committedAt,
     committedAt,
   );
-  stageMainProjection(
-    database,
-    { turn_id: executionTurnId },
-    executionQueuedEvent,
-    { generateId },
-  );
+  if (inputGroupId === null) {
+    stageMainProjection(
+      database,
+      { turn_id: executionTurnId },
+      executionQueuedEvent,
+      { generateId },
+    );
+  }
 
   const result = {
     contract: 'zylos.inbound-result',
@@ -815,6 +1161,13 @@ function acceptDetachedInboundInTransaction(database, {
     dispatch_status: 'background_dispatched',
     background_task_id: backgroundTaskId,
     background_execution_turn_id: executionTurnId,
+    ...(inputGroupId === null ? {} : {
+      input_group_id: inputGroupId,
+      input_group_action: 'opened',
+      input_group_member_count: 1,
+      input_group_supplement_count: 0,
+      input_group_collect_until: deadline.collectUntil,
+    }),
   };
   validateInboundResult(result);
   database.prepare(`
@@ -840,6 +1193,7 @@ function acceptInbound(
     maxQueuedTurns = DEFAULT_MAX_QUEUED_TURNS,
     initialDeliveryOperation = 'create_main',
     executionMode = 'detached',
+    inputCoalescingPolicy = {},
     permissionMaxTimedDurationMs = DEFAULT_PERMISSION_MAX_TIMED_DURATION_MS,
     permissionConfirmationTimeoutMs = DEFAULT_PERMISSION_CONFIRMATION_TIMEOUT_MS,
   } = {},
@@ -884,6 +1238,9 @@ function acceptInbound(
   const permissionCommand = parsePermissionCommand(validated.forwarded, {
     maxTimedDurationMs: permissionMaxTimedDurationMs,
   });
+  const resolvedInputCoalescingPolicy = resolveInputCoalescingPolicy(
+    inputCoalescingPolicy,
+  );
 
   const commit = database.transaction(() => {
     const existingIdempotency = database.prepare(`
@@ -993,6 +1350,12 @@ function acceptInbound(
         blockingUpgrade,
         initialDeliveryOperation,
         generateId,
+        inputCoalescingPolicy: shouldCoalesceInbound(
+          validated.forwarded,
+          resolvedInputCoalescingPolicy,
+        )
+          ? resolvedInputCoalescingPolicy
+          : null,
       });
     }
 

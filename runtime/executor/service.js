@@ -1867,7 +1867,8 @@ export function createExecutorService({
       error.code = 'background_task_target_mismatch';
       throw error;
     }
-    const queued = task.state === 'queued' && task.queue_status === 'queued';
+    const queued = ['queued', 'input_settling'].includes(task.state)
+      && task.queue_status === 'queued';
     const result = await stop({
       conversation_id: task.execution_conversation_id,
       stop_id: request.stop_id,
