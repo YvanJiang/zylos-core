@@ -923,25 +923,61 @@ describe('executor prerequisite ownership', () => {
     fs.writeFileSync(scheduler, '');
     fs.writeFileSync(webConsole, '');
     const spawned = [];
+    const childrenByPid = new Map();
+    const liveGroups = new Set();
+    let nextPid = 91_000;
 
     class ChildFixture extends EventEmitter {
+      constructor(pid) {
+        super();
+        this.pid = pid;
+      }
       exitCode = null;
       signalCode = null;
       kill(signal) {
         this.signalCode = signal;
-        setImmediate(() => this.emit('close', null, signal));
+        liveGroups.delete(this.pid);
+        setImmediate(() => {
+          this.emit('exit', null, signal);
+          this.emit('close', null, signal);
+        });
         return true;
       }
     }
+    const identity = (pid, command = process.execPath) => ({
+      pid,
+      ppid: pid === process.pid ? process.ppid : process.pid,
+      pgid: pid,
+      uid: process.getuid?.() ?? 0,
+      start_token: `fixture:${pid}`,
+      command: [command],
+    });
     const owner = createExecutorPrerequisiteOwner({
       zylosDir: state.directory,
       releasePath,
       spawnFn: (command, args, options) => {
         spawned.push({ command, args, options });
-        const child = new ChildFixture();
-        setImmediate(() => child.emit('spawn'));
+        const child = new ChildFixture(nextPid++);
+        childrenByPid.set(child.pid, child);
+        liveGroups.add(child.pid);
+        setImmediate(() => {
+          child.emit('spawn');
+          setImmediate(() => {
+            child.emit('message', {
+              contract: 'zylos.prerequisite-child@1',
+              type: 'ready',
+              service: args[0] === scheduler ? 'scheduler' : 'web-console',
+              pid: child.pid,
+            });
+          });
+        });
         return child;
       },
+      inspectProcessFn: (pid) => identity(pid),
+      probePortFn: async () => ({ available: true, code: null }),
+      signalProcessGroupFn: (pgid, signal) => childrenByPid.get(pgid)?.kill(signal),
+      processGroupIsAliveFn: (pgid) => liveGroups.has(pgid),
+      waitForProcessGroupExitFn: async (pgid) => !liveGroups.has(pgid),
     });
 
     await expect(owner.start()).resolves.toMatchObject({
@@ -949,6 +985,9 @@ describe('executor prerequisite ownership', () => {
       services: ['scheduler', 'web-console'],
     });
     expect(spawned.map(({ args }) => args[0])).toEqual([scheduler, webConsole]);
+    expect(spawned.every(({ options }) => (
+      options.detached === true && options.stdio.at(-1) === 'ipc'
+    ))).toBe(true);
     expect(JSON.stringify(spawned)).not.toMatch(/activity-monitor|c4-dispatcher|tmux/);
     await owner.close();
     expect(owner.health()).toMatchObject({ ok: true, services: [] });
