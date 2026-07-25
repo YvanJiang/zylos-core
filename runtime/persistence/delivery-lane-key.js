@@ -23,6 +23,16 @@ export function createDeliveryLaneKeyFromIdentity({ target, turnId, aggregateTyp
       );
     }
   }
+  if (
+    Object.hasOwn(target, 'reply_target_message_id')
+    || Object.hasOwn(target, 'mention_actor_id')
+  ) {
+    identity.push([
+      'response_target',
+      target.reply_target_message_id,
+      target.mention_actor_id,
+    ]);
+  }
   return canonicalizeJson(identity);
 }
 

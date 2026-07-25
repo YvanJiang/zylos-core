@@ -6,7 +6,6 @@ import {
   createContractError,
   createIdempotencyKey,
   createPayloadHash,
-  DELIVERY_COMMAND_CURRENT_VERSION,
   resolveIdempotencyReplay,
   validateDeliveryCommand,
   validateDeliveryMapping,
@@ -18,6 +17,7 @@ import {
   initializeMainProjection,
   stageMainProjection,
 } from './main-projection.js';
+import { resolveDeliveryCommandVersionForTarget } from './delivery-target-identity.js';
 import { initializeRuntimePersistence } from './schema.js';
 import {
   acceptPermissionCommandInTransaction,
@@ -134,6 +134,11 @@ export function buildInitialDeliveryCommand({
 }) {
   const outboxId = generateId('outbox');
   const deliveryId = generateId('delivery');
+  const isMessageResponse = envelope.source.kind === 'platform_original'
+    || (
+      envelope.source.kind === 'scheduler'
+      && envelope.schedule?.bound_conversation === true
+    );
   const target = {
     region: envelope.region,
     tenant_id: envelope.tenant_id,
@@ -148,10 +153,20 @@ export function buildInitialDeliveryCommand({
     native_thread_reply_target_message_id: envelope.chat_type === 'thread'
       ? envelope.message_id
       : null,
+    ...(envelope.channel === 'feishu' && isMessageResponse ? {
+      reply_target_message_id: envelope.message_id,
+      mention_actor_id: (
+        envelope.source.kind === 'platform_original'
+        && envelope.actor.type === 'user'
+        && ['group', 'thread'].includes(envelope.chat_type)
+      )
+        ? envelope.actor.actor_id
+        : null,
+    } : {}),
   };
   return {
     contract: 'zylos.delivery-command',
-    contract_version: DELIVERY_COMMAND_CURRENT_VERSION,
+    contract_version: resolveDeliveryCommandVersionForTarget(target),
     outbox_id: outboxId,
     delivery_id: deliveryId,
     trace_id: traceId,

@@ -133,6 +133,46 @@
       }
     },
     {
+      "name": "authenticated_service_actor",
+      "document": {
+        "contract": "zylos.inbound-envelope",
+        "contract_version": "1.0",
+        "inbound_event_id": "evt-agent-001",
+        "idempotency_key": "zid:v1:inbound:66217b1bb158b853f621967cc593d51a8eb0d75f79155a4a8b2b7900d2bc1b90",
+        "trace_id": "trace-agent-001",
+        "occurred_at": "2026-07-23T02:00:00Z",
+        "received_at": "2026-07-23T02:00:01Z",
+        "region": "cn",
+        "tenant_id": "tenant-cn-001",
+        "channel": "feishu",
+        "bot_id": "cli_bot_001",
+        "chat_type": "group",
+        "chat_id": "oc_group_001",
+        "native_thread_or_topic_id": null,
+        "message_id": "om_agent_001",
+        "actor": {
+          "type": "service",
+          "actor_id": "ou_peer_agent_001",
+          "authenticated": true,
+          "roles": []
+        },
+        "content": {
+          "kind": "text",
+          "text": "@Zylos inspect the deployment.",
+          "attachments": []
+        },
+        "reply": {
+          "root_message_id": null,
+          "parent_message_id": null,
+          "reply_to_message_id": null
+        },
+        "source": {
+          "kind": "platform_original",
+          "source_ref": "feishu:event:evt-agent-001"
+        }
+      }
+    },
+    {
       "name": "reply_preserves_group_conversation",
       "document": {
         "contract": "zylos.inbound-envelope",

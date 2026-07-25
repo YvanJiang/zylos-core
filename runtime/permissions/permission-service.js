@@ -5,7 +5,6 @@ import {
   createContractError,
   createIdempotencyKey,
   createPayloadHash,
-  DELIVERY_COMMAND_CURRENT_VERSION,
   validateDeliveryCommand,
   validateInteractionAnswerAgainstRequest,
   validateInteractionAnswerResult,
@@ -13,6 +12,7 @@ import {
   validateInteractionRequest,
   validateNormalizedEvent,
 } from '../../contracts/public/index.js';
+import { resolveDeliveryCommandVersionForTarget } from '../persistence/delivery-target-identity.js';
 import { initializeRuntimePersistence } from '../persistence/schema.js';
 
 export const DEFAULT_PERMISSION_MAX_TIMED_DURATION_MS = 30 * 24 * 60 * 60 * 1_000;
@@ -182,6 +182,15 @@ function deliveryTargetFromEnvelope(envelope) {
     native_thread_reply_target_message_id: envelope.chat_type === 'thread'
       ? envelope.message_id
       : null,
+    ...(envelope.channel === 'feishu' ? {
+      reply_target_message_id: envelope.message_id,
+      mention_actor_id: (
+        envelope.actor.type === 'user'
+        && ['group', 'thread'].includes(envelope.chat_type)
+      )
+        ? envelope.actor.actor_id
+        : null,
+    } : {}),
   };
 }
 
@@ -199,7 +208,7 @@ function enqueueSecurityNotice(database, {
   const deliveryId = generateId('delivery');
   const command = {
     contract: 'zylos.delivery-command',
-    contract_version: DELIVERY_COMMAND_CURRENT_VERSION,
+    contract_version: resolveDeliveryCommandVersionForTarget(target),
     outbox_id: outboxId,
     delivery_id: deliveryId,
     trace_id: envelope.trace_id,

@@ -177,6 +177,7 @@ describe('acceptNormalInbound', () => {
     });
     expect(validateDeliveryCommand(command).forwarded).toEqual(command);
     expect(command).toMatchObject({
+      contract_version: '1.2',
       aggregate_type: 'turn_main',
       aggregate_id: result.turn_id,
       operation: 'create_main',
@@ -194,8 +195,48 @@ describe('acceptNormalInbound', () => {
         binding_state: 'bound',
         mapping_version: 1,
       },
+      target: {
+        reply_target_message_id: normalEnvelope().message_id,
+        mention_actor_id: null,
+      },
     });
 
+    database.close();
+  });
+
+  test('quotes a group bot trigger without asking the channel to mention the bot', () => {
+    const database = openTestDatabase();
+    const envelope = structuredClone(inboundFixture.valid.find(
+      ({ name }) => name === 'group_main_conversation',
+    ).document);
+    envelope.actor = {
+      type: 'service',
+      actor_id: 'cli_peer_agent_001',
+      authenticated: true,
+      roles: [],
+    };
+    envelope.channel = 'feishu';
+    envelope.idempotency_key = createIdempotencyKey('inbound', {
+      region: envelope.region,
+      tenant_id: envelope.tenant_id,
+      channel: envelope.channel,
+      bot_id: envelope.bot_id,
+      inbound_event_id: envelope.inbound_event_id,
+    });
+
+    const result = acceptNormalInbound(database, envelope, deterministicOptions());
+    const command = JSON.parse(database.prepare(`
+      SELECT command_json
+      FROM runtime_outbox
+      WHERE turn_id = ?
+    `).get(result.turn_id).command_json);
+
+    expect(command.contract_version).toBe('1.2');
+    expect(command.target).toMatchObject({
+      chat_type: 'group',
+      reply_target_message_id: envelope.message_id,
+      mention_actor_id: null,
+    });
     database.close();
   });
 

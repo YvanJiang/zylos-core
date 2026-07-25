@@ -9,6 +9,7 @@ import {
 } from '../../contracts/public/index.js';
 import { initializeRuntimePersistence } from '../persistence/schema.js';
 import { acceptQueuedInbound } from '../persistence/inbound-acceptance.js';
+import { resolveDeliveryCommandVersionForTarget } from '../persistence/delivery-target-identity.js';
 import { createExecutorStore } from '../persistence/executor-store.js';
 import {
   acceptScheduledOccurrence,
@@ -95,6 +96,11 @@ function buildForcedDrainNoticeCommand({ upgradeId, turn, envelope, committedAt,
   }
   const outboxId = generateId('outbox');
   const deliveryId = generateId('delivery');
+  const isMessageResponse = envelope.source.kind === 'platform_original'
+    || (
+      envelope.source.kind === 'scheduler'
+      && envelope.schedule?.bound_conversation === true
+    );
   const target = {
     region: envelope.region,
     tenant_id: envelope.tenant_id,
@@ -105,9 +111,20 @@ function buildForcedDrainNoticeCommand({ upgradeId, turn, envelope, committedAt,
     native_thread_or_topic_id: envelope.native_thread_or_topic_id,
     native_thread_root_message_id: nativeThread ? envelope.reply.root_message_id : null,
     native_thread_reply_target_message_id: nativeThread ? envelope.message_id : null,
+    ...(envelope.channel === 'feishu' && isMessageResponse ? {
+      reply_target_message_id: envelope.message_id,
+      mention_actor_id: (
+        envelope.source.kind === 'platform_original'
+        && envelope.actor.type === 'user'
+        && ['group', 'thread'].includes(envelope.chat_type)
+      )
+        ? envelope.actor.actor_id
+        : null,
+    } : {}),
   };
   const command = {
-    contract: 'zylos.delivery-command', contract_version: '1.1',
+    contract: 'zylos.delivery-command',
+    contract_version: resolveDeliveryCommandVersionForTarget(target),
     outbox_id: outboxId, delivery_id: deliveryId,
     trace_id: generateId('delivery-trace'),
     delivery_attempt_id: generateId('delivery-attempt'), delivery_attempt_no: 1,

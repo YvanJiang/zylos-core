@@ -52,6 +52,10 @@ legacy sources. A system scheduler task uses the synthetic identity
 conversation's normal FIFO. Legacy compatibility alone uses the exact
 `legacy-c4:<legacy_record_id>` exception.
 
+Authenticated platform actors are either `user` or `service`. A service actor represents an
+application/bot identity and must carry an empty role list; it can submit ordinary work but can
+never inherit human membership, owner, or administrator privileges.
+
 `validateInboundResult` enforces the authoritative result matrix for a normal bound turn,
 control, pending lineage recovery, persisted queue-full failure, and nullable or persisted
 non-queue-full rejection.
@@ -139,7 +143,7 @@ shape is published as `schemas/delivery-command-v1.schema.json`; the JavaScript 
 authoritative for idempotency recomputation, target capability checks, and the operation matrix.
 The public version/target vocabulary is exported as `DELIVERY_COMMAND_CURRENT_VERSION`,
 `DELIVERY_COMMAND_VERSIONS`, `DELIVERY_TARGET_FIELDS_V1_0`, and
-`DELIVERY_TARGET_FIELDS_V1_1`.
+`DELIVERY_TARGET_FIELDS_V1_1`, and `DELIVERY_TARGET_FIELDS_V1_2`.
 
 Version 1.0 remains compatible for non-thread delivery. Version 1.1 adds required nullable target
 fields `native_thread_root_message_id` and `native_thread_reply_target_message_id`. A 1.1 native
@@ -147,6 +151,13 @@ thread requires non-null conversation, root-message, and reply-target anchors; a
 synthetic target carries both new fields explicitly as null. A 1.0 native-thread `create_main`,
 `send_text`, or `send_fallback`, and a 1.1 target with missing or inconsistent anchors, fails closed
 with `unsupported_capability`.
+
+Version 1.2 adds nullable `reply_target_message_id` and `mention_actor_id`. Core sets the reply
+target to the exact authenticated platform message for every message-triggered response. For a
+group or native-thread message from a human actor, `mention_actor_id` is that authenticated actor;
+for a service/bot actor it is null. DM and synthetic targets never carry a mention. Channel
+renderers must use the reply API when the reply target is non-null and must not replace it with a
+chat ID or inferred latest message.
 
 `native_thread_or_topic_id` is conversation identity only. Renderers must use exactly
 `native_thread_reply_target_message_id` for a platform reply API and use the root message ID to

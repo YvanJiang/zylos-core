@@ -654,7 +654,7 @@ describe('runtime interaction order, authorization, and timeout', () => {
   });
 
   test.each([
-    ['direct-message', 'authenticated_dm_with_attachment', '1.0'],
+    ['direct-message', 'authenticated_dm_with_attachment', '1.2'],
     ['native-thread', 'native_thread_or_topic', '1.1'],
   ])('executor service retains the %s timeout lane when app-server cannot confirm provider stop', async (
     laneKind,

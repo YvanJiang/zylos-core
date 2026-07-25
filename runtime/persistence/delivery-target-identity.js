@@ -62,10 +62,16 @@ export function assertDurableDeliveryTarget({
 
 export function resolveDeliveryCommandVersionForTarget(target) {
   if (
+    Object.hasOwn(target, 'reply_target_message_id')
+    || Object.hasOwn(target, 'mention_actor_id')
+  ) {
+    return DELIVERY_COMMAND_CURRENT_VERSION;
+  }
+  if (
     Object.hasOwn(target, 'native_thread_root_message_id')
     || Object.hasOwn(target, 'native_thread_reply_target_message_id')
   ) {
-    return DELIVERY_COMMAND_CURRENT_VERSION;
+    return '1.1';
   }
   return '1.0';
 }

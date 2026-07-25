@@ -26,6 +26,7 @@ describe('zylos.inbound-envelope v1.0', () => {
       'authenticated_dm_with_attachment',
       'group_main_conversation',
       'native_thread_or_topic',
+      'authenticated_service_actor',
       'reply_preserves_group_conversation',
       'scheduler_synthetic_conversation',
       'scheduler_bound_group_conversation',
@@ -51,6 +52,24 @@ describe('zylos.inbound-envelope v1.0', () => {
         expect(error.contractError.code).toBe(fixture.error_code);
       }
     }
+  });
+
+  test('accepts authenticated platform service actors without human roles', () => {
+    const human = inboundEnvelopeFixture.valid.find(
+      ({ name }) => name === 'group_main_conversation',
+    ).document;
+    const service = structuredClone(human);
+    service.actor = {
+      type: 'service',
+      actor_id: 'cli_peer_agent_001',
+      authenticated: true,
+      roles: [],
+    };
+
+    expect(validateInboundEnvelope(service).forwarded).toEqual(service);
+
+    service.actor.roles = ['member'];
+    expect(() => validateInboundEnvelope(service)).toThrow(ContractKernelError);
   });
 });
 

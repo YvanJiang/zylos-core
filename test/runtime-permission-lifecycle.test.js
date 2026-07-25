@@ -165,7 +165,7 @@ describe('permission command recognition', () => {
     database.close();
   });
 
-  test('keeps security notices on the explicit delivery v1.1 native-thread anchors', () => {
+  test('keeps non-Feishu security notices on their existing native-thread anchors', () => {
     const database = openDatabase();
     const result = acceptNormalInbound(database, envelope(
       'native-thread-safe',

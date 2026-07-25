@@ -3,6 +3,7 @@ import {
   DELIVERY_RESULT_STATUSES,
   DELIVERY_TARGET_FIELDS_V1_0,
   DELIVERY_TARGET_FIELDS_V1_1,
+  DELIVERY_TARGET_FIELDS_V1_2,
   MAPPING_BINDING_AUTHORITIES,
   MAPPING_BINDING_STATES,
   MAPPING_RECOVERY_REASONS,
@@ -218,6 +219,80 @@ function validateTarget(value, { contractMinor, operation, occurredAt }) {
       occurredAt,
     );
     for (const fieldName of DELIVERY_TARGET_FIELDS_V1_1.slice(-2)) {
+      if (Object.hasOwn(value, fieldName)) {
+        validateNullableOpaqueId(`target.${fieldName}`, value[fieldName], occurredAt);
+      }
+    }
+  }
+
+  const requiresV12ResponseTarget = contractMinor >= 2;
+  if (requiresV12ResponseTarget) {
+    for (const fieldName of DELIVERY_TARGET_FIELDS_V1_2.slice(-2)) {
+      if (!Object.hasOwn(value, fieldName)) {
+        rejectUnsupportedDeliveryTarget(
+          `target.${fieldName} is required by zylos.delivery-command@1.2.`,
+          occurredAt,
+        );
+      }
+      validateNullableOpaqueId(`target.${fieldName}`, value[fieldName], occurredAt);
+    }
+
+    if (
+      ['dm', 'synthetic'].includes(value.chat_type)
+      && value.mention_actor_id !== null
+    ) {
+      rejectUnsupportedDeliveryTarget(
+        'target.mention_actor_id must be null for DM and synthetic delivery.',
+        occurredAt,
+      );
+    }
+    if (
+      value.chat_type !== 'synthetic'
+      && value.reply_target_message_id === null
+    ) {
+      rejectUnsupportedDeliveryTarget(
+        'A non-synthetic delivery 1.2 command requires an exact reply-target message.',
+        occurredAt,
+      );
+    }
+    if (
+      value.mention_actor_id !== null
+      && value.reply_target_message_id === null
+    ) {
+      rejectUnsupportedDeliveryTarget(
+        'A mention target requires an exact reply-target message.',
+        occurredAt,
+      );
+    }
+    if (
+      value.reply_target_message_id !== null
+      && value.reply_target_message_id === value.chat_id
+    ) {
+      rejectUnsupportedDeliveryTarget(
+        'The chat ID cannot be used as the platform reply message target.',
+        occurredAt,
+      );
+    }
+    if (
+      value.chat_type === 'thread'
+      && value.reply_target_message_id !== value.native_thread_reply_target_message_id
+    ) {
+      rejectUnsupportedDeliveryTarget(
+        'The general reply target must equal the native-thread reply target.',
+        occurredAt,
+      );
+    }
+    if (
+      value.chat_type === 'synthetic'
+      && value.reply_target_message_id !== null
+    ) {
+      rejectUnsupportedDeliveryTarget(
+        'target.reply_target_message_id must be null for synthetic delivery.',
+        occurredAt,
+      );
+    }
+  } else {
+    for (const fieldName of DELIVERY_TARGET_FIELDS_V1_2.slice(-2)) {
       if (Object.hasOwn(value, fieldName)) {
         validateNullableOpaqueId(`target.${fieldName}`, value[fieldName], occurredAt);
       }

@@ -112,6 +112,8 @@ describe('normal C4 callers use durable Core contracts', () => {
       acceptedEnvelope.content.task_summary,
       'Compatibility channel greeting',
     );
+    assert.equal(Object.hasOwn(command.target, 'reply_target_message_id'), false);
+    assert.equal(Object.hasOwn(command.target, 'mention_actor_id'), false);
 
     const replay = run(receiveCli, args, env);
     assert.equal(replay.status, 0, replay.stderr);
@@ -128,6 +130,47 @@ describe('normal C4 callers use durable Core contracts', () => {
     assert.equal(database.prepare(
       'SELECT COUNT(*) AS count FROM runtime_background_tasks',
     ).get().count, 1);
+    database.close();
+  });
+
+  test('compatibility ingress preserves an authenticated service actor without human roles', () => {
+    const { zylosDir, env } = fixture();
+    const accepted = run(receiveCli, [
+      '--channel', 'feishu',
+      '--endpoint', 'group-agent-a2a',
+      '--chat-type', 'group',
+      '--message-id', 'bot-message-a2a',
+      '--actor-id', 'cli_peer_agent_001',
+      '--actor-type', 'service',
+      '--occurred-at', '2026-07-23T02:00:00.000Z',
+      '--content', 'peer agent request',
+      '--json',
+    ], env);
+    assert.equal(accepted.status, 0, accepted.stderr);
+    const acceptedResult = JSON.parse(accepted.stdout.trim().split('\n').at(-1));
+    assert.equal(acceptedResult.action, 'background_dispatched');
+    assert.equal(typeof acceptedResult.background_execution_turn_id, 'string');
+
+    const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
+    const envelope = JSON.parse(database.prepare(`
+      SELECT envelope_json
+      FROM runtime_inbound_events
+      WHERE inbound_event_id = ?
+    `).get('bot-message-a2a').envelope_json);
+    const command = JSON.parse(database.prepare(`
+      SELECT command_json
+      FROM runtime_outbox
+      WHERE turn_id = ?
+    `).get(acceptedResult.background_execution_turn_id).command_json);
+
+    assert.deepEqual(envelope.actor, {
+      type: 'service',
+      actor_id: 'cli_peer_agent_001',
+      authenticated: true,
+      roles: [],
+    });
+    assert.equal(command.target.reply_target_message_id, 'bot-message-a2a');
+    assert.equal(command.target.mention_actor_id, null);
     database.close();
   });
 
