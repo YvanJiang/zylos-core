@@ -172,6 +172,21 @@ function retryableFailure(command, resultAt) {
   };
 }
 
+function permanentFailure(command, resultAt, code = 'delivery_readback_mismatch') {
+  return {
+    ...retryableFailure(command, resultAt),
+    status: 'permanent_failure',
+    error: {
+      code,
+      category: 'channel',
+      retryable: false,
+      side_effect_status: 'none',
+      user_message: 'The platform readback did not match the requested update.',
+      occurred_at: resultAt,
+    },
+  };
+}
+
 function readDeliveryAuthority(database, outboxId) {
   return {
     outbox: database.prepare(`
@@ -1725,6 +1740,129 @@ describe('durable outbox service', () => {
         text: 'latest progress',
         terminal: true,
       },
+    });
+
+    database.close();
+  });
+
+  test('keeps later projections on the last delivered predecessor after ordinary updates dead-letter', async () => {
+    const database = openTestDatabase();
+    const accepted = acceptNormalInbound(database, normalEnvelope('dead-letter-predecessor'), {
+      now: () => '2026-07-19T09:15:00Z',
+      generateId: deterministicIds('inbound-dead-letter-predecessor'),
+    });
+    let currentTime = '2026-07-19T09:15:00Z';
+    const rendered = [];
+    const renderer = {
+      async deliver(command) {
+        rendered.push(structuredClone(command));
+        if (command.operation === 'update_main' && !command.render_model.terminal) {
+          return permanentFailure(command, currentTime);
+        }
+        return deliveredResult(command, currentTime);
+      },
+    };
+    const outbox = createOutboxService({
+      database,
+      renderer,
+      serviceInstanceId: 'delivery-service-dead-letter-predecessor',
+      now: () => currentTime,
+      generateId: deterministicIds('delivery-dead-letter-predecessor'),
+      throttleMs: 0,
+    });
+    await expect(outbox.dispatchNext()).resolves.toMatchObject({
+      status: 'applied',
+      outbox_status: 'delivered',
+    });
+    const createCommand = rendered[0];
+    const platformMessageId = `platform-${createCommand.delivery_attempt_id}`;
+    const generateProjectionId = deterministicIds('projection-dead-letter-predecessor');
+
+    for (const [version, text] of [[3, 'first running'], [4, 'second running']]) {
+      currentTime = `2026-07-19T09:15:0${version}.000Z`;
+      stageMainProjection(database, { turn_id: accepted.turn_id }, projectionEvent(accepted, {
+        version,
+        kind: 'text_snapshot',
+        phase: 'running',
+        payload: { text, end_offset: text.length },
+        persistedAt: currentTime,
+      }), { generateId: generateProjectionId, throttleMs: 0 });
+      await expect(outbox.dispatchNext()).resolves.toMatchObject({
+        status: 'applied',
+        outbox_status: 'dead_letter',
+      });
+    }
+
+    currentTime = '2026-07-19T09:15:05.000Z';
+    stageMainProjection(database, { turn_id: accepted.turn_id }, projectionEvent(accepted, {
+      version: 5,
+      kind: 'turn_state_changed',
+      phase: 'completed',
+      payload: {
+        from_state: 'running',
+        to_state: 'completed',
+        reason_code: 'provider_completed',
+      },
+      persistedAt: currentTime,
+    }), { generateId: generateProjectionId, throttleMs: 0 });
+    await expect(outbox.dispatchNext()).resolves.toMatchObject({
+      status: 'applied',
+      outbox_status: 'delivered',
+    });
+
+    expect(rendered.map((command) => ({
+      operation: command.operation,
+      terminal: command.render_model.terminal,
+      targetPlatformMessageId: command.target_platform_message_id,
+      predecessorDeliveryId: command.predecessor_delivery_id,
+    }))).toEqual([
+      {
+        operation: 'create_main',
+        terminal: false,
+        targetPlatformMessageId: null,
+        predecessorDeliveryId: null,
+      },
+      {
+        operation: 'update_main',
+        terminal: false,
+        targetPlatformMessageId: platformMessageId,
+        predecessorDeliveryId: createCommand.delivery_id,
+      },
+      {
+        operation: 'update_main',
+        terminal: false,
+        targetPlatformMessageId: platformMessageId,
+        predecessorDeliveryId: createCommand.delivery_id,
+      },
+      {
+        operation: 'update_main',
+        terminal: true,
+        targetPlatformMessageId: platformMessageId,
+        predecessorDeliveryId: createCommand.delivery_id,
+      },
+    ]);
+    expect(database.prepare(`
+      SELECT operation, status
+      FROM (
+        SELECT json_extract(command_json, '$.operation') AS operation, status,
+          aggregate_version
+        FROM runtime_outbox
+        WHERE turn_id = ?
+      )
+      ORDER BY aggregate_version
+    `).all(accepted.turn_id)).toEqual([
+      { operation: 'create_main', status: 'delivered' },
+      { operation: 'update_main', status: 'dead_letter' },
+      { operation: 'update_main', status: 'dead_letter' },
+      { operation: 'update_main', status: 'delivered' },
+    ]);
+    expect(database.prepare(`
+      SELECT last_delivery_id, platform_message_id
+      FROM runtime_delivery_lanes
+      WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({
+      last_delivery_id: rendered.at(-1).delivery_id,
+      platform_message_id: platformMessageId,
     });
 
     database.close();
