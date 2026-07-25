@@ -1022,6 +1022,43 @@ const RUNTIME_SCHEMA = `
     PRIMARY KEY (outbox_id, outbox_lease_epoch)
   );
 
+  CREATE TABLE IF NOT EXISTS runtime_outbox_reconciliations (
+    reconciliation_id TEXT PRIMARY KEY,
+    outbox_id TEXT NOT NULL REFERENCES runtime_outbox(outbox_id) ON DELETE CASCADE,
+    reconciliation_epoch INTEGER NOT NULL CHECK (reconciliation_epoch > 0),
+    state TEXT NOT NULL CHECK (state IN (
+      'claimed',
+      'confirmed',
+      'replacement_authorized',
+      'replacement_fenced',
+      'failed',
+      'resolved'
+    )),
+    lease_owner TEXT NOT NULL,
+    lease_expires_at TEXT NOT NULL,
+    lease_expires_epoch_ms INTEGER NOT NULL,
+    delivery_attempt_id TEXT NOT NULL,
+    delivery_attempt_no INTEGER NOT NULL CHECK (delivery_attempt_no > 0),
+    outbox_lease_epoch INTEGER NOT NULL CHECK (outbox_lease_epoch > 0),
+    delivery_lease_owner TEXT NOT NULL,
+    command_json TEXT NOT NULL,
+    command_hash TEXT NOT NULL,
+    target_platform_message_id TEXT NOT NULL,
+    pre_action_fenced_at TEXT NOT NULL,
+    evidence_json TEXT,
+    evidence_recorded_at TEXT,
+    replacement_fenced_at TEXT,
+    result_json TEXT,
+    resolved_at TEXT,
+    last_error_code TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (outbox_id, reconciliation_epoch)
+  );
+
+  CREATE INDEX IF NOT EXISTS runtime_outbox_reconciliations_by_outbox
+    ON runtime_outbox_reconciliations(outbox_id, reconciliation_epoch DESC);
+
   CREATE TABLE IF NOT EXISTS runtime_delivery_lanes (
     lane_key TEXT PRIMARY KEY,
     turn_id TEXT NOT NULL UNIQUE REFERENCES runtime_turns(turn_id),
@@ -1536,10 +1573,19 @@ function hasLegacyAggregateVersionConstraint(database) {
 
 function migrateLegacyOutboxConstraint(database) {
   if (!hasLegacyAggregateVersionConstraint(database)) return;
+  const reconciliationCount = database.prepare(`
+    SELECT COUNT(*) AS count FROM runtime_outbox_reconciliations
+  `).get().count;
+  if (reconciliationCount !== 0) {
+    throw new Error(
+      'Legacy outbox migration cannot discard durable delivery reconciliation records.',
+    );
+  }
   const migrate = database.transaction(() => {
     database.exec(`
       DROP TABLE IF EXISTS runtime_projection_snapshots;
       DROP TABLE IF EXISTS runtime_delivery_lanes;
+      DROP TABLE IF EXISTS runtime_outbox_reconciliations;
       ALTER TABLE runtime_outbox RENAME TO runtime_outbox_issue07;
       ${OUTBOX_V2_SCHEMA}
       INSERT INTO runtime_outbox (${OUTBOX_COLUMNS.join(', ')})

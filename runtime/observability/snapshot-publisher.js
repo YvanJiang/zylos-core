@@ -473,10 +473,19 @@ function collectWorkspaceLeases(database) {
 function collectOutbox(database, generatedAt) {
   const rows = database.prepare(`
     SELECT outbox.status, outbox.command_json, outbox.created_at,
-      outbox.lease_expires_at,
-      lease_expires_epoch_ms, pre_action_fenced_at
+      outbox.lease_expires_at, outbox.lease_expires_epoch_ms,
+      outbox.pre_action_fenced_at, outbox.last_error_json,
+      reconciliation.state AS reconciliation_state,
+      reconciliation.last_error_code AS reconciliation_error_code
     FROM runtime_outbox AS outbox
     LEFT JOIN runtime_turns AS turn ON turn.turn_id = outbox.turn_id
+    LEFT JOIN runtime_outbox_reconciliations AS reconciliation
+      ON reconciliation.outbox_id = outbox.outbox_id
+      AND reconciliation.reconciliation_epoch = (
+        SELECT MAX(candidate.reconciliation_epoch)
+        FROM runtime_outbox_reconciliations AS candidate
+        WHERE candidate.outbox_id = outbox.outbox_id
+      )
     WHERE outbox.status IN (
       'pending', 'delivering', 'retry_wait', 'dead_letter', 'delivery_unknown'
     )
@@ -489,14 +498,14 @@ function collectOutbox(database, generatedAt) {
   const grouped = new Map();
   for (const row of rows) {
     const command = parseJson(row.command_json, 'outbox command');
+    const lastError = parseJson(row.last_error_json, 'outbox last error');
     const channel = command?.target?.channel;
     requireNonEmptyString('outbox channel', channel);
-    const status = row.status === 'delivering'
+    const staleDelivering = row.status === 'delivering'
       && row.pre_action_fenced_at !== null
       && row.lease_expires_epoch_ms !== null
-      && row.lease_expires_epoch_ms <= Date.parse(generatedAt)
-      ? 'delivery_unknown'
-      : row.status;
+      && row.lease_expires_epoch_ms <= Date.parse(generatedAt);
+    const status = staleDelivering ? 'delivery_unknown' : row.status;
     const key = `${channel}\u0000${status}`;
     const age = Math.max(
       0,
@@ -508,6 +517,40 @@ function collectOutbox(database, generatedAt) {
       count: 0,
       oldest_age_seconds: 0,
     };
+    if (status === 'delivery_unknown') {
+      const reconciliationState = row.reconciliation_state
+        ?? (
+          staleDelivering
+            ? command.operation === 'update_main' ? 'required' : 'not_reconcilable'
+            : 'not_applicable'
+        );
+      const errorCode = row.reconciliation_error_code
+        ?? lastError?.code
+        ?? (
+          staleDelivering
+            ? command.operation === 'update_main'
+              ? 'delivery_reconciliation_required'
+              : 'delivery_side_effect_unknown_fail_closed'
+            : 'delivery_claim_authority_unverifiable'
+        );
+      const staleAge = staleDelivering
+        ? Math.max(0, Math.floor(
+          (Date.parse(generatedAt) - row.lease_expires_epoch_ms) / 1000,
+        ))
+        : 0;
+      current.stale_delivering_age_seconds = Math.max(
+        current.stale_delivering_age_seconds ?? 0,
+        staleAge,
+      );
+      current.reconciliation_state = current.reconciliation_state === undefined
+        || current.reconciliation_state === reconciliationState
+        ? reconciliationState
+        : 'multiple';
+      current.error_code = current.error_code === undefined
+        || current.error_code === errorCode
+        ? errorCode
+        : 'multiple_delivery_errors';
+    }
     current.count += 1;
     current.oldest_age_seconds = Math.max(current.oldest_age_seconds, age);
     grouped.set(key, current);

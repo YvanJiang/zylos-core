@@ -178,11 +178,33 @@ An expired non-idempotent pre-send claim remains fenced from automatic replay an
 provider-neutral outbox `delivery_unknown`, which degrades Core health pending reconciliation.
 Only an owner whose durable sink proves exact same-`delivery_id` idempotency may reclaim that
 expired claim; replay must return the original effect or fail on conflicting content.
+Feishu `update_main` is the narrower reconciliation exception because it names one immutable
+platform message and replacing that message's content does not create a second message. Core
+claims an expired fenced update with a separate reconciliation epoch and lease, records an exact
+platform-read evidence document (`platform_message_id`, observation/update timestamps, and
+observed/expected canonical content hashes), and then chooses one of two paths:
+
+- equal content whose platform update time is at or after the original pre-action fence is
+  confirmed without another platform write;
+- different content authorizes one exact-target replacement only after Core durably advances the
+  reconciliation row through `replacement_authorized` to `replacement_fenced`.
+
+The final delivery result must still echo the original command, delivery attempt, lease epoch,
+mapping, and target. Core applies that result with CAS, resolves the audit row, updates the
+mapping/lane, and materializes the next staged projection in one transaction. A stale or failed
+reconciliation remains fenced. `create_main`, `send_text`, and `send_fallback` never enter this
+state machine when their side effect is unknown, because a read cannot prove that repeating those
+operations would not create a duplicate external effect.
 When opening an older database, Core quarantines every in-flight delivery that lacks an immutable
 snapshot matching its exact attempt, owner, full command, and hash. The upgrade never creates a
 replacement snapshot from that mutable legacy row and never automatically replays its possible
 external effect. A current expired claim is reclaimable only from its verified original snapshot;
 the next attempt is derived from that snapshot rather than from the mutable outbox projection.
+
+An outbox observability item in `delivery_unknown` may add
+`stale_delivering_age_seconds`, `reconciliation_state`, and `error_code`. The state distinguishes
+an update that is `required` or actively reconciled from a non-reconcilable create/send and a
+quarantined claim; grouped mixed diagnostics are reported explicitly rather than hidden.
 
 - `create_main` and `send_text` have no platform target or predecessor;
 - `update_main` names both the exact platform message and predecessor delivery;

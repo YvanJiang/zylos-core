@@ -75,6 +75,17 @@ const OUTBOX_STATUSES = Object.freeze([
   'dead_letter',
   'delivery_unknown',
 ]);
+const OUTBOX_RECONCILIATION_STATES = Object.freeze([
+  'required',
+  'claimed',
+  'confirmed',
+  'replacement_authorized',
+  'replacement_fenced',
+  'failed',
+  'not_reconcilable',
+  'not_applicable',
+  'multiple',
+]);
 
 export const OBSERVABILITY_SNAPSHOT_V1_SCHEMA = deepFreeze({
   contract: 'zylos.observability-snapshot',
@@ -348,6 +359,33 @@ function validateOutbox(path, value, options) {
       min: 0,
       ...options,
     });
+    const diagnosticFields = [
+      'stale_delivering_age_seconds',
+      'reconciliation_state',
+      'error_code',
+    ];
+    if (diagnosticFields.some((fieldName) => Object.hasOwn(item, fieldName))) {
+      requireFields(itemPath, item, diagnosticFields, options);
+      if (item.status !== 'delivery_unknown') {
+        rejectRuntimeContract(
+          'validation_error',
+          `${itemPath} reconciliation diagnostics require delivery_unknown status.`,
+          options,
+        );
+      }
+      requireInteger(
+        `${itemPath}.stale_delivering_age_seconds`,
+        item.stale_delivering_age_seconds,
+        { min: 0, ...options },
+      );
+      requireEnum(
+        `${itemPath}.reconciliation_state`,
+        item.reconciliation_state,
+        OUTBOX_RECONCILIATION_STATES,
+        options,
+      );
+      requireOpaqueId(`${itemPath}.error_code`, item.error_code, options);
+    }
   }, options);
   requireFields(path, value, ['retry_count', 'dead_letter_count'], options);
   requireInteger(`${path}.retry_count`, value.retry_count, { min: 0, ...options });
