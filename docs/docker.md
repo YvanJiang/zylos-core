@@ -55,7 +55,10 @@ docker logs -f zylos
 ```
 
 The Compose healthcheck runs `zylos status`, so an operating PM2 daemon without
-a valid Core health response is not considered healthy.
+a valid, complete Core health response is not considered ready. A complete
+service may be operationally ready while its durable health remains `degraded`;
+`zylos status` reports both values and still rejects maintenance, draining,
+reconciliation, incomplete, or offline states.
 
 ## Environment variables
 

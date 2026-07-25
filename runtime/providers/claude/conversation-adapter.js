@@ -40,6 +40,15 @@ const CORE_MANAGED_CONTINUITY_ARGUMENTS = Object.freeze(new Set([
   'resume-session-at',
   'session-id',
 ]));
+const CORE_MANAGED_WORKSPACE_ARGUMENTS = Object.freeze(new Set([
+  'add-dir',
+  'additional-directories',
+  'managed-settings',
+  'no-sandbox',
+  'sandbox',
+  'setting-sources',
+  'settings',
+]));
 const PROVIDER_READ_ONLY_TOOLS = Object.freeze(new Set([
   'Glob',
   'Grep',
@@ -47,6 +56,91 @@ const PROVIDER_READ_ONLY_TOOLS = Object.freeze(new Set([
   'WebFetch',
   'WebSearch',
 ]));
+const PROVIDER_WRITE_PATH_FIELDS = Object.freeze({
+  Edit: Object.freeze(['file_path']),
+  MultiEdit: Object.freeze(['file_path']),
+  NotebookEdit: Object.freeze(['notebook_path']),
+  Write: Object.freeze(['file_path']),
+});
+const GENERIC_WRITE_PATH_FIELDS = Object.freeze(new Set([
+  'destination_path',
+  'directory',
+  'file_path',
+  'filePath',
+  'notebook_path',
+  'output_path',
+  'path',
+  'target_path',
+]));
+
+function workspaceIdentity(context) {
+  const workspace = context?.workspace;
+  const workspaceRoot = workspace?.workspace_root;
+  const workspaceGeneration = workspace?.workspace_generation;
+  const bindingKind = workspace?.binding_kind;
+  if (typeof workspaceRoot !== 'string' || workspaceRoot.length === 0) {
+    throw new TypeError('Claude execution requires a Core-selected workspace root.');
+  }
+  if (!Number.isSafeInteger(workspaceGeneration) || workspaceGeneration < 0) {
+    throw new TypeError('Claude execution requires a valid workspace generation.');
+  }
+  if (typeof bindingKind !== 'string' || bindingKind.length === 0) {
+    throw new TypeError('Claude execution requires a workspace binding kind.');
+  }
+  return Object.freeze({
+    bindingKind,
+    workspaceGeneration,
+    workspaceRoot,
+    workspaceId: workspace?.workspace_id ?? null,
+  });
+}
+
+function createWorkspaceWriteFence(executor, toolName, input) {
+  const fields = PROVIDER_WRITE_PATH_FIELDS[toolName] ?? [];
+  const writePaths = [];
+  const visited = new WeakSet();
+  function collect(value) {
+    if (!value || typeof value !== 'object' || visited.has(value)) return;
+    visited.add(value);
+    if (Array.isArray(value)) {
+      for (const item of value) collect(item);
+      return;
+    }
+    for (const [key, child] of Object.entries(value)) {
+      if (
+        GENERIC_WRITE_PATH_FIELDS.has(key)
+        && typeof child === 'string'
+        && child.length > 0
+      ) {
+        writePaths.push(child);
+      } else {
+        collect(child);
+      }
+    }
+  }
+  collect(input);
+  return Object.freeze({
+    action_kind: 'claude_tool_write',
+    tool_name: toolName,
+    cwd: executor.workspaceRoot,
+    write_paths: Object.freeze([...new Set(writePaths)]),
+    path_fields_required: fields.length > 0,
+    sandbox_enforced: true,
+    workspace_generation: executor.workspaceGeneration,
+    workspace_id: executor.workspaceId,
+  });
+}
+
+function workspaceIdentityMismatch() {
+  const error = new Error(
+    'The Claude resident session is bound to a different workspace generation.',
+  );
+  error.code = 'workspace_generation_mismatch';
+  error.category = 'validation';
+  error.retryable = false;
+  error.side_effect_status = 'none';
+  return error;
+}
 
 function selectEnvironment(environment, allowlist = DEFAULT_ENVIRONMENT_ALLOWLIST) {
   const selected = {};
@@ -387,7 +481,9 @@ async function requestToolPermission(executor, toolName, input, sdkContext) {
       };
     }
     try {
-      const assertion = activeTurn.controls.assertWorkspaceWrite();
+      const assertion = activeTurn.controls.assertWorkspaceWrite(
+        createWorkspaceWriteFence(executor, toolName, input),
+      );
       if (assertion && typeof assertion.then === 'function') await assertion;
     } catch (error) {
       settleTurn(activeTurn, { error });
@@ -483,7 +579,11 @@ export async function enforceWorkspaceFenceBeforeTool(executor, input) {
     if (typeof activeTurn.controls.assertWorkspaceWrite !== 'function') {
       throw new Error('Core workspace write fencing is unavailable for this provider attempt.');
     }
-    await activeTurn.controls.assertWorkspaceWrite();
+    await activeTurn.controls.assertWorkspaceWrite(createWorkspaceWriteFence(
+      executor,
+      input.tool_name,
+      input.tool_input,
+    ));
     return {};
   } catch (error) {
     settleTurn(activeTurn, { error });
@@ -566,6 +666,7 @@ function createResidentExecutor({
   providerNativeId,
   query,
   queryOptions,
+  workspace,
   now,
   onEnded,
 }) {
@@ -589,6 +690,10 @@ function createResidentExecutor({
     lastUsedAt: now(),
     lineageId,
     switchWaiters: [],
+    bindingKind: workspace.bindingKind,
+    workspaceGeneration: workspace.workspaceGeneration,
+    workspaceId: workspace.workspaceId,
+    workspaceRoot: workspace.workspaceRoot,
   };
   executor.notifySwitchable = () => {
     if (
@@ -616,7 +721,7 @@ function createResidentExecutor({
 
   executor.start = () => {
     if (executor.query) return;
-    const options = { ...executor.queryOptions };
+    const options = { ...executor.queryOptions, cwd: executor.workspaceRoot };
     if (executor.sessionId !== null) options.resume = executor.sessionId;
     options.canUseTool = (toolName, input, sdkContext) => requestToolPermission(
       executor,
@@ -765,11 +870,17 @@ export function createClaudeConversationAdapter({
     }
   }
   for (const option of Object.keys(queryOptions.extraArgs ?? {})) {
+    const normalizedOption = normalizeCliArgument(option);
     if (
       /^-(?:r.+|c.+)$/i.test(option)
-      || CORE_MANAGED_CONTINUITY_ARGUMENTS.has(normalizeCliArgument(option))
+      || CORE_MANAGED_CONTINUITY_ARGUMENTS.has(normalizedOption)
     ) {
       throw new TypeError(`queryOptions.extraArgs.${option} is managed by Core lineage authority`);
+    }
+    if (CORE_MANAGED_WORKSPACE_ARGUMENTS.has(normalizedOption)) {
+      throw new TypeError(
+        `queryOptions.extraArgs.${option} is managed by Core workspace authority`,
+      );
     }
   }
   if (queryOptions.executableArgs !== undefined && !Array.isArray(queryOptions.executableArgs)) {
@@ -779,12 +890,18 @@ export function createClaudeConversationAdapter({
     if (typeof argument !== 'string') {
       throw new TypeError(`queryOptions.executableArgs[${index}] must be a string`);
     }
+    const normalizedArgument = normalizeCliArgument(argument);
     if (
       /^-(?:r.+|c.+)$/i.test(argument)
-      || CORE_MANAGED_CONTINUITY_ARGUMENTS.has(normalizeCliArgument(argument))
+      || CORE_MANAGED_CONTINUITY_ARGUMENTS.has(normalizedArgument)
     ) {
       throw new TypeError(
         `queryOptions.executableArgs[${index}] is managed by Core lineage authority`,
+      );
+    }
+    if (CORE_MANAGED_WORKSPACE_ARGUMENTS.has(normalizedArgument)) {
+      throw new TypeError(
+        `queryOptions.executableArgs[${index}] is managed by Core workspace authority`,
       );
     }
   }
@@ -792,6 +909,51 @@ export function createClaudeConversationAdapter({
     (key) => typeof key !== 'string' || key.length === 0,
   )) {
     throw new TypeError('environmentAllowlist must contain non-empty strings');
+  }
+  if (queryOptions.additionalDirectories !== undefined) {
+    throw new TypeError('queryOptions.additionalDirectories is managed by Core workspace authority');
+  }
+  if (
+    queryOptions.settings !== undefined
+    || queryOptions.managedSettings !== undefined
+    || queryOptions.settingSources?.length > 0
+  ) {
+    throw new TypeError('queryOptions filesystem settings are managed by Core workspace authority');
+  }
+  if (
+    queryOptions.sandbox !== undefined
+    && (
+      queryOptions.sandbox === null
+      || typeof queryOptions.sandbox !== 'object'
+      || Array.isArray(queryOptions.sandbox)
+    )
+  ) {
+    throw new TypeError('queryOptions.sandbox must be an object');
+  }
+  const requestedSandbox = queryOptions.sandbox ?? {};
+  if (
+    requestedSandbox.filesystem !== undefined
+    && (
+      requestedSandbox.filesystem === null
+      || typeof requestedSandbox.filesystem !== 'object'
+      || Array.isArray(requestedSandbox.filesystem)
+    )
+  ) {
+    throw new TypeError('queryOptions.sandbox.filesystem must be an object');
+  }
+  const sandboxFilesystem = requestedSandbox.filesystem ?? {};
+  if (
+    requestedSandbox.enabled === false
+    || requestedSandbox.failIfUnavailable === false
+    || requestedSandbox.allowUnsandboxedCommands === true
+    || requestedSandbox.enableWeakerNestedSandbox === true
+    || requestedSandbox.enableWeakerNetworkIsolation === true
+    || requestedSandbox.allowAppleEvents === true
+    || Object.keys(requestedSandbox.ignoreViolations ?? {}).length > 0
+    || (requestedSandbox.excludedCommands?.length ?? 0) > 0
+    || (sandboxFilesystem.allowWrite?.length ?? 0) > 0
+  ) {
+    throw new TypeError('queryOptions.sandbox cannot weaken Core workspace isolation');
   }
   const environment = queryOptions.env ?? process.env;
   const frozenEnvironment = Object.freeze({ ...environment });
@@ -818,12 +980,33 @@ export function createClaudeConversationAdapter({
   if (!resolvedEnvironment || typeof resolvedEnvironment !== 'object') {
     throw new TypeError('resolveEnvironment must return an environment object');
   }
+  const {
+    cwd: _callerCwd,
+    sandbox: _callerSandbox,
+    ...callerQueryOptions
+  } = queryOptions;
   const safeQueryOptions = {
-    ...queryOptions,
+    ...callerQueryOptions,
     env: {
       ...selectEnvironment(resolvedEnvironment, environmentAllowlist),
       CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
     },
+    sandbox: {
+      ...requestedSandbox,
+      enabled: true,
+      failIfUnavailable: true,
+      allowUnsandboxedCommands: false,
+      enableWeakerNestedSandbox: false,
+      enableWeakerNetworkIsolation: false,
+      allowAppleEvents: false,
+      filesystem: {
+        ...sandboxFilesystem,
+        allowWrite: [],
+      },
+      ignoreViolations: {},
+      excludedCommands: [],
+    },
+    settingSources: [],
   };
   const executors = new Map();
   let lifecycle = 'open';
@@ -838,9 +1021,21 @@ export function createClaudeConversationAdapter({
     if (controls.interactionPolicy && typeof controls.persistInteraction !== 'function') {
       throw new TypeError('controls.persistInteraction must be a function for durable interactions');
     }
+    const workspace = workspaceIdentity(context);
     let executor = executors.get(context.conversation_id);
     if (executor?.closing) {
       throw new Error('The Claude conversation query is closing or failed to close.');
+    }
+    if (
+      executor
+      && (
+        executor.bindingKind !== workspace.bindingKind
+        || executor.workspaceId !== workspace.workspaceId
+        || executor.workspaceRoot !== workspace.workspaceRoot
+        || executor.workspaceGeneration !== workspace.workspaceGeneration
+      )
+    ) {
+      throw workspaceIdentityMismatch();
     }
     if (executor?.ended) {
       try {
@@ -883,6 +1078,7 @@ export function createClaudeConversationAdapter({
         providerNativeId: context.provider_native_id,
         query,
         queryOptions: safeQueryOptions,
+        workspace,
         now,
         onEnded(endedExecutor) {
           if (executors.get(context.conversation_id) === endedExecutor) {
@@ -1253,9 +1449,7 @@ export function createClaudeConversationAdapter({
   }
 
   function getWorkspaceAccess() {
-    if (typeof safeQueryOptions.cwd !== 'string' || safeQueryOptions.cwd.length === 0) return null;
     return Object.freeze({
-      root: safeQueryOptions.cwd,
       mode: 'writable',
       read_only_enforced: false,
       authority: 'provider_sandbox',

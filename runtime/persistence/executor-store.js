@@ -37,8 +37,14 @@ import { initializeRuntimePersistence } from './schema.js';
 import { createRetentionCleanup } from './retention-cleanup.js';
 import {
   createWorkspaceLeaseCoordinator,
+  normalizeReadyWorkspaceRoot,
   normalizeWorkspaceRoot,
 } from '../workspace/lease-coordinator.js';
+import {
+  bindLineageWorkspaceInTransaction as bindConversationLineageWorkspaceInTransaction,
+  getConversationWorkspaceBinding,
+  getLineageWorkspaceBinding,
+} from '../workspace/conversation-workspace-provisioner.js';
 import { BLOCKING_UPGRADE_STATES_SQL } from '../migration/upgrade-state.js';
 
 const RELEASE_FENCE_PREDICATE_SQL = `
@@ -381,6 +387,31 @@ function commitTurnEvent(database, {
   persistEvent(database, turn, event, generateId);
 }
 
+function commitTurnEventWithoutStateUpdate(database, {
+  turn,
+  event,
+  fence,
+  staleMessage,
+  generateId,
+}) {
+  const updated = database.prepare(`
+    UPDATE runtime_turns
+    SET turn_version = ?, committed_at = ?
+    WHERE turn_id = ? AND state = ?
+      AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+  `).run(
+    event.turn_version,
+    event.persisted_at,
+    turn.turn_id,
+    turn.state,
+    fence.attempt_id,
+    fence.attempt_no,
+    fence.lease_epoch,
+  );
+  if (updated.changes !== 1) conflict('stale_attempt', staleMessage);
+  persistEvent(database, turn, event, generateId);
+}
+
 function transitionInTransaction(database, {
   turnId,
   fromState,
@@ -632,8 +663,12 @@ export function createExecutorStore({
   workspaceLeaseDurationMs = 10_000,
   interactionTimeoutMs = 10 * 60_000,
   retentionCleanupSleep,
+  legacyWorkspaceRoot = null,
 }) {
   initializeRuntimePersistence(database);
+  const normalizedLegacyWorkspaceRoot = legacyWorkspaceRoot === null
+    ? null
+    : normalizeWorkspaceRoot(legacyWorkspaceRoot);
   const workspaceLeases = createWorkspaceLeaseCoordinator({
     database,
     serviceInstanceId,
@@ -647,6 +682,142 @@ export function createExecutorStore({
     generateId,
     ...(retentionCleanupSleep === undefined ? {} : { sleep: retentionCleanupSleep }),
   });
+
+  function isDetachedExecutionConversation(conversationId) {
+    return database.prepare(`
+      SELECT 1
+      FROM runtime_background_tasks
+      WHERE execution_conversation_id = ?
+      LIMIT 1
+    `).get(conversationId) !== undefined;
+  }
+
+  function resolveConversationWorkspaceBinding(conversationId, {
+    legacyWorkspaceRoot,
+  } = {}) {
+    if (typeof conversationId !== 'string' || conversationId.length === 0) {
+      throw new TypeError('conversationId must be a non-empty string');
+    }
+    const binding = getConversationWorkspaceBinding(database, conversationId);
+    if (binding === null) {
+      if (isDetachedExecutionConversation(conversationId)) {
+        return Object.freeze({
+          status: 'workspace_wait',
+          claimable: false,
+          binding_kind: 'conversation',
+          conversation_id: conversationId,
+          workspace_id: null,
+          workspace_root: null,
+          workspace_generation: null,
+          workspace_state: 'missing',
+          wait_reason: 'workspace_binding_missing',
+          wait_detail: Object.freeze({
+            binding_kind: 'conversation',
+            workspace_state: 'missing',
+            failure_code: 'workspace_binding_missing',
+          }),
+        });
+      }
+      if (typeof legacyWorkspaceRoot !== 'string' || legacyWorkspaceRoot.length === 0) {
+        throw new TypeError('legacyWorkspaceRoot must identify the compatibility workspace');
+      }
+      return Object.freeze({
+        status: 'ready',
+        claimable: true,
+        binding_kind: 'legacy_shared',
+        conversation_id: conversationId,
+        workspace_id: null,
+        workspace_root: normalizeWorkspaceRoot(legacyWorkspaceRoot),
+        workspace_generation: 0,
+        workspace_state: 'legacy_shared',
+        wait_reason: null,
+        wait_detail: null,
+      });
+    }
+    const generationValid = Number.isSafeInteger(binding.generation) && binding.generation > 0;
+    const identityValid = typeof binding.workspace_id === 'string'
+      && binding.workspace_id.length > 0
+      && binding.conversation_id === conversationId;
+    let canonicalRoot = null;
+    if (binding.state === 'ready' && typeof binding.workspace_root === 'string') {
+      try {
+        canonicalRoot = normalizeReadyWorkspaceRoot(binding.workspace_root);
+      } catch {
+        canonicalRoot = null;
+      }
+    }
+    if (
+      !generationValid
+      || !identityValid
+      || binding.claimable !== (binding.state === 'ready')
+      || binding.state === 'ready' && canonicalRoot === null
+    ) {
+      return Object.freeze({
+        status: 'workspace_wait',
+        claimable: false,
+        binding_kind: 'conversation',
+        conversation_id: conversationId,
+        workspace_id: identityValid ? binding.workspace_id : null,
+        workspace_root: null,
+        workspace_generation: generationValid ? binding.generation : null,
+        workspace_state: binding.state,
+        wait_reason: 'workspace_failed',
+        wait_detail: Object.freeze({
+          binding_kind: 'conversation',
+          workspace_id: identityValid ? binding.workspace_id : null,
+          workspace_generation: generationValid ? binding.generation : null,
+          workspace_state: binding.state,
+          failure_code: 'workspace_binding_invalid',
+        }),
+      });
+    }
+    const decision = {
+      status: binding.state === 'ready' ? 'ready' : 'workspace_wait',
+      claimable: binding.state === 'ready',
+      binding_kind: 'conversation',
+      conversation_id: conversationId,
+      workspace_id: binding.workspace_id,
+      workspace_root: canonicalRoot,
+      workspace_generation: binding.generation,
+      workspace_state: binding.state,
+      wait_reason: binding.wait_reason,
+      wait_detail: binding.wait_reason === null ? null : Object.freeze({
+        binding_kind: 'conversation',
+        workspace_id: binding.workspace_id,
+        workspace_generation: binding.generation,
+        workspace_state: binding.state,
+      }),
+    };
+    return Object.freeze(decision);
+  }
+
+  function attachWorkspaceBindingFence(workspace, workspaceAccess) {
+    if (workspace === null || workspace === undefined || workspace?.status === 'wait') {
+      return workspace;
+    }
+    return Object.freeze({
+      ...workspace,
+      binding_kind: workspaceAccess?.binding_kind ?? 'legacy_shared',
+      workspace_id: workspaceAccess?.workspace_id ?? null,
+      workspace_generation: workspaceAccess?.workspace_generation ?? 0,
+      workspace_state: workspaceAccess?.workspace_state ?? 'legacy_shared',
+    });
+  }
+
+  function assertWorkspaceAccessMatchesBinding(workspaceAccess, currentBinding) {
+    if (
+      workspaceAccess?.binding_kind !== currentBinding.binding_kind
+      || workspaceAccess?.workspace_id !== currentBinding.workspace_id
+      || workspaceAccess?.workspace_root !== currentBinding.workspace_root
+      || workspaceAccess?.workspace_generation !== currentBinding.workspace_generation
+      || workspaceAccess?.workspace_state !== currentBinding.workspace_state
+    ) {
+      conflict(
+        'workspace_generation_mismatch',
+        'The conversation workspace binding changed after executor reservation.',
+      );
+    }
+  }
 
   function assertResidentOwner(conversationId, expectedEpoch = null) {
     if (provider !== 'claude') return;
@@ -1363,7 +1534,25 @@ export function createExecutorStore({
         && recovery.candidate_lineage_id !== null
         && recovery.candidate_provider === provider
         && recovery.candidate_provider_native_id !== null;
-      if (!canAttemptNative) {
+      const lineageWorkspace = recovery.candidate_lineage_id === null
+        ? null
+        : getLineageWorkspaceBinding(database, recovery.candidate_lineage_id);
+      const candidateWorkspaceBinding = lineageWorkspace !== null
+        && lineageWorkspace.conversation_id === recovery.conversation_id
+        ? Object.freeze({
+          workspace_root: lineageWorkspace.workspace_root,
+          workspace_generation: lineageWorkspace.generation,
+        })
+        : !isDetachedExecutionConversation(recovery.conversation_id)
+          && normalizedLegacyWorkspaceRoot !== null
+          ? Object.freeze({
+            workspace_root: normalizedLegacyWorkspaceRoot,
+            workspace_generation: null,
+          })
+          : null;
+      const canAttemptProviderNative = canAttemptNative
+        && (provider !== 'codex' || candidateWorkspaceBinding !== null);
+      if (!canAttemptProviderNative) {
         const claimed = database.prepare(`
           UPDATE runtime_reply_mapping_recoveries
           SET state = 'native_recovery_not_applicable',
@@ -1434,6 +1623,9 @@ export function createExecutorStore({
           lineage_id: recovery.candidate_lineage_id,
           provider: recovery.candidate_provider,
           provider_native_id: recovery.candidate_provider_native_id,
+          ...(provider === 'codex'
+            ? { workspace_binding: candidateWorkspaceBinding }
+            : {}),
         },
       };
     });
@@ -1841,7 +2033,10 @@ export function createExecutorStore({
       WHERE turn.turn_id = ? AND turn.state = 'queued' AND queue.status = 'queued'
     `).get(turnId);
     if (!queued) return null;
-    const waitDetail = {
+    const waitReason = typeof wait?.wait_reason === 'string' && wait.wait_reason.length > 0
+      ? wait.wait_reason
+      : 'workspace_lease';
+    const waitDetail = wait?.wait_detail ?? {
       workspace_root: wait.workspace_root,
       mode: wait.mode,
       conflicting_workspace_root: wait.conflicting_workspace_root,
@@ -1852,14 +2047,14 @@ export function createExecutorStore({
     };
     const waitDetailJson = JSON.stringify(waitDetail);
     if (
-      queued.wait_reason === 'workspace_lease'
+      queued.wait_reason === waitReason
       && queued.wait_detail_json === waitDetailJson
     ) {
       return {
         status: 'workspace_wait',
         conversation_id: queued.conversation_id,
         turn_id: queued.turn_id,
-        wait_reason: 'workspace_lease',
+        wait_reason: waitReason,
         wait_detail: waitDetail,
       };
     }
@@ -1875,7 +2070,7 @@ export function createExecutorStore({
         payload: {
           from_state: 'queued',
           to_state: 'queued',
-          reason_code: 'workspace_lease',
+          reason_code: waitReason,
         },
       },
       occurredAt,
@@ -1888,9 +2083,9 @@ export function createExecutorStore({
     `).run(event.turn_version, occurredAt, turnId, turn.turn_version);
     const queueUpdate = database.prepare(`
       UPDATE runtime_turn_queue
-      SET wait_reason = 'workspace_lease', wait_detail_json = ?
+      SET wait_reason = ?, wait_detail_json = ?
       WHERE turn_id = ? AND status = 'queued'
-    `).run(waitDetailJson, turnId);
+    `).run(waitReason, waitDetailJson, turnId);
     if (turnUpdate.changes !== 1 || queueUpdate.changes !== 1) {
       conflict('stale_attempt', 'The workspace-wait projection changed concurrently.');
     }
@@ -1899,7 +2094,7 @@ export function createExecutorStore({
       status: 'workspace_wait',
       conversation_id: queued.conversation_id,
       turn_id: queued.turn_id,
-      wait_reason: 'workspace_lease',
+      wait_reason: waitReason,
       wait_detail: waitDetail,
     };
   }
@@ -2056,6 +2251,11 @@ export function createExecutorStore({
           candidates.push(candidate);
           continue;
         }
+        if (workspaceAccess.claimable === false) {
+          const wait = markWorkspaceWaitInTransaction(candidate.turn_id, workspaceAccess, now());
+          if (wait) workspaceWaits.push(wait);
+          continue;
+        }
         if (provider === 'claude') {
           const resident = isResidentConversation(candidate.conversation_id);
           const checkedAt = now();
@@ -2081,7 +2281,7 @@ export function createExecutorStore({
       if (provider !== 'claude') {
         const selected = candidates[0];
         const workspaceAccess = workspaceAccessByConversation?.get(selected.conversation_id);
-        const workspace = workspaceAccess ? workspaceLeases.acquire({
+        let workspace = workspaceAccess ? workspaceLeases.acquire({
           workspace_root: workspaceAccess.workspace_root,
           mode: workspaceAccess.mode,
           holder_conversation_id: selected.conversation_id,
@@ -2090,6 +2290,7 @@ export function createExecutorStore({
         if (workspace?.status === 'wait') {
           return markWorkspaceWaitInTransaction(selected.turn_id, workspace, now());
         }
+        workspace = attachWorkspaceBindingFence(workspace, workspaceAccess);
         return {
           status: 'ready',
           conversation_id: selected.conversation_id,
@@ -2153,7 +2354,7 @@ export function createExecutorStore({
       }
       if (selected) {
         const workspaceAccess = workspaceAccessByConversation?.get(selected.conversation_id);
-        const workspace = workspaceAccess ? workspaceLeases.acquire({
+        let workspace = workspaceAccess ? workspaceLeases.acquire({
           workspace_root: workspaceAccess.workspace_root,
           mode: workspaceAccess.mode,
           holder_conversation_id: selected.conversation_id,
@@ -2162,6 +2363,7 @@ export function createExecutorStore({
         if (workspace?.status === 'wait') {
           return markWorkspaceWaitInTransaction(selected.turn_id, workspace, now());
         }
+        workspace = attachWorkspaceBindingFence(workspace, workspaceAccess);
         const usedAt = now();
         database.prepare(`
           UPDATE runtime_executor_residents
@@ -2219,6 +2421,7 @@ export function createExecutorStore({
 
   function claimNextQueuedTurn({
     conversationId = null,
+    legacyWorkspaceRoot = null,
     requireResident = false,
     workspaceAccess = null,
     workspaceLease = null,
@@ -2297,6 +2500,54 @@ export function createExecutorStore({
 
       const claimedAt = now();
       const current = loadTurn(database, turn.turn_id);
+      if (
+        isDetachedExecutionConversation(current.conversation_id)
+        && workspaceAccess?.binding_kind !== 'conversation'
+      ) {
+        const currentBinding = resolveConversationWorkspaceBinding(current.conversation_id);
+        if (currentBinding.claimable === false) {
+          return markWorkspaceWaitInTransaction(current.turn_id, currentBinding, claimedAt);
+        }
+        conflict(
+          'workspace_access_required',
+          'Detached execution cannot be claimed without its ready conversation workspace fence.',
+        );
+      }
+      if (workspaceAccess?.binding_kind !== undefined) {
+        const currentBinding = resolveConversationWorkspaceBinding(
+          current.conversation_id,
+          { legacyWorkspaceRoot },
+        );
+        if (currentBinding.claimable === false) {
+          return markWorkspaceWaitInTransaction(current.turn_id, currentBinding, claimedAt);
+        }
+        assertWorkspaceAccessMatchesBinding(workspaceAccess, currentBinding);
+        if (currentBinding.binding_kind === 'conversation') {
+          const existingLineageBinding = getLineageWorkspaceBinding(
+            database,
+            current.lineage_id,
+          );
+          if (
+            existingLineageBinding !== null
+            && (
+              existingLineageBinding.workspace_id !== currentBinding.workspace_id
+              || existingLineageBinding.conversation_id !== current.conversation_id
+              || existingLineageBinding.workspace_root !== currentBinding.workspace_root
+              || existingLineageBinding.generation !== currentBinding.workspace_generation
+            )
+          ) {
+            conflict(
+              'workspace_generation_mismatch',
+              'The durable lineage is bound to a different workspace generation.',
+            );
+          }
+          bindConversationLineageWorkspaceInTransaction(database, {
+            lineageId: current.lineage_id,
+            conversationId: current.conversation_id,
+            boundAt: claimedAt,
+          });
+        }
+      }
       const retryAttempt = (current.state === 'recovering'
         ? database.prepare(`
           SELECT retry_backoff_ms, next_retry_at, error_json
@@ -2332,7 +2583,7 @@ export function createExecutorStore({
       ) {
         conflict('stale_attempt', 'The queued turn lost its resident executor reservation.');
       }
-      const workspace = workspaceLease === null
+      let workspace = workspaceLease === null
         ? (workspaceAccess === null ? null : workspaceLeases.acquire({
           workspace_root: workspaceAccess.workspace_root,
           mode: workspaceAccess.mode,
@@ -2343,6 +2594,7 @@ export function createExecutorStore({
       if (workspace?.status === 'wait') {
         return markWorkspaceWaitInTransaction(current.turn_id, workspace, claimedAt);
       }
+      workspace = attachWorkspaceBindingFence(workspace, workspaceAccess);
       if (
         workspace !== null
         && (
@@ -2419,12 +2671,7 @@ export function createExecutorStore({
         current.attempt_no,
         current.lease_epoch,
       );
-      const queueUpdate = database.prepare(`
-        UPDATE runtime_turn_queue
-        SET status = 'claimed', wait_reason = NULL, wait_detail_json = NULL
-        WHERE turn_id = ? AND status = 'queued'
-      `).run(current.turn_id);
-      if (turnUpdate.changes !== 1 || queueUpdate.changes !== 1) {
+      if (turnUpdate.changes !== 1) {
         conflict('stale_attempt', 'The durable queue entry was claimed concurrently.');
       }
       database.prepare(`
@@ -2469,14 +2716,21 @@ export function createExecutorStore({
           occurredAt: claimedAt,
           generateId,
         });
-        commitTurnEvent(database, {
+        commitTurnEventWithoutStateUpdate(database, {
           turn: loadTurn(database, current.turn_id),
           event: retryEvent,
           fence,
-          nextState: 'recovering',
           staleMessage: 'The retry attempt start lost its provider attempt fence.',
           generateId,
         });
+      }
+      const queueUpdate = database.prepare(`
+        UPDATE runtime_turn_queue
+        SET status = 'claimed', wait_reason = NULL, wait_detail_json = NULL
+        WHERE turn_id = ? AND status = 'queued'
+      `).run(current.turn_id);
+      if (queueUpdate.changes !== 1) {
+        conflict('stale_attempt', 'The durable queue entry was claimed concurrently.');
       }
       transitionInTransaction(database, {
         turnId: current.turn_id,
@@ -2549,6 +2803,33 @@ export function createExecutorStore({
         conflict('illegal_transition', `Provider retry is invalid while turn is ${turn.state}.`);
       }
       recordProviderEventActivityInTransaction(turnContext, occurredAt);
+      const retryNo = turnContext.attempt.attempt_no;
+      const nextRetryAt = new Date(Date.parse(occurredAt) + backoffMs).toISOString();
+      const attemptUpdate = database.prepare(`
+        UPDATE runtime_provider_attempts
+        SET state = 'retry_wait', side_effect_status = 'none', error_json = ?,
+          retry_backoff_ms = ?, next_retry_at = ?, updated_at = ?
+        WHERE turn_id = ? AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
+          AND service_instance_id = ? AND state IN ('starting', 'running')
+      `).run(
+        JSON.stringify(error),
+        backoffMs,
+        nextRetryAt,
+        occurredAt,
+        turn.turn_id,
+        turnContext.attempt.attempt_id,
+        turnContext.attempt.attempt_no,
+        turnContext.attempt.lease_epoch,
+        serviceInstanceId,
+      );
+      const queueUpdate = database.prepare(`
+        UPDATE runtime_turn_queue
+        SET status = 'queued', wait_reason = 'provider_retry'
+        WHERE turn_id = ? AND status = 'claimed'
+      `).run(turn.turn_id);
+      if (attemptUpdate.changes !== 1 || queueUpdate.changes !== 1) {
+        conflict('stale_attempt', 'The provider retry schedule changed concurrently.');
+      }
       transitionInTransaction(database, {
         turnId: turn.turn_id,
         fromState: turn.state,
@@ -2561,7 +2842,6 @@ export function createExecutorStore({
         reasonCode: 'provider_retry_scheduled',
       });
       turn = loadTurn(database, turn.turn_id);
-      const retryNo = turnContext.attempt.attempt_no;
       const event = buildEvent({
         turn,
         lastEvent: loadLastEvent(database, turn.turn_id),
@@ -2590,29 +2870,6 @@ export function createExecutorStore({
         staleMessage: 'The retry schedule lost its provider attempt fence.',
         generateId,
       });
-      const nextRetryAt = new Date(Date.parse(occurredAt) + backoffMs).toISOString();
-      const attemptUpdate = database.prepare(`
-        UPDATE runtime_provider_attempts
-        SET state = 'retry_wait', side_effect_status = 'none', error_json = ?,
-          retry_backoff_ms = ?, next_retry_at = ?, updated_at = ?
-        WHERE turn_id = ? AND attempt_id = ? AND attempt_no = ? AND lease_epoch = ?
-          AND service_instance_id = ? AND state IN ('starting', 'running')
-      `).run(
-        JSON.stringify(error),
-        backoffMs,
-        nextRetryAt,
-        occurredAt,
-        turn.turn_id,
-        turnContext.attempt.attempt_id,
-        turnContext.attempt.attempt_no,
-        turnContext.attempt.lease_epoch,
-        serviceInstanceId,
-      );
-      const queueUpdate = database.prepare(`
-        UPDATE runtime_turn_queue
-        SET status = 'queued', wait_reason = 'provider_retry'
-        WHERE turn_id = ? AND status = 'claimed'
-      `).run(turn.turn_id);
       if (turnContext.workspace) workspaceLeases.release(turnContext.workspace);
       const leaseUpdate = database.prepare(`
         UPDATE runtime_executor_leases
@@ -2629,7 +2886,7 @@ export function createExecutorStore({
         turnContext.attempt.attempt_no,
         turnContext.attempt.lease_epoch,
       );
-      if (attemptUpdate.changes !== 1 || queueUpdate.changes !== 1 || leaseUpdate.changes !== 1) {
+      if (leaseUpdate.changes !== 1) {
         conflict('stale_attempt', 'The provider retry schedule changed concurrently.');
       }
       return Object.freeze({
@@ -5237,43 +5494,61 @@ export function createExecutorStore({
     const workspace = workspaceLeases.assertWritable(turnContext.workspace);
     if (approvalFence === undefined) return workspace;
     if (!approvalFence || typeof approvalFence !== 'object' || Array.isArray(approvalFence)) {
-      conflict('provider_context_invalid', 'A Codex write approval requires a complete fence.');
+      conflict('provider_context_invalid', 'A provider write approval requires a complete fence.');
     }
-    const approvalWorkspace = approvalFence.workspace;
-    const providerAttempt = approvalFence.provider_attempt;
-    if (
-      !['item/commandExecution/requestApproval', 'item/fileChange/requestApproval']
-        .includes(approvalFence.action_kind)
-      || typeof approvalFence.connection_id !== 'string'
-      || approvalFence.connection_id.length === 0
-      || approvalFence.conversation_id !== turn.conversation_id
-      || approvalFence.core_turn_id !== turn.turn_id
-      || approvalFence.lineage_id !== turn.lineage_id
-      || approvalFence.executor_instance_id !== turnContext.executor_instance_id
-      || approvalFence.provider_thread_id !== turn.provider_native_id
-      || typeof approvalFence.provider_turn_id !== 'string'
-      || approvalFence.provider_turn_id.length === 0
-      || typeof approvalFence.provider_item_id !== 'string'
-      || approvalFence.provider_item_id.length === 0
-      || approvalFence.provider_approval_id !== null
-        && (typeof approvalFence.provider_approval_id !== 'string'
-          || approvalFence.provider_approval_id.length === 0)
-      || approvalFence.environment_id !== null
-      || !providerAttempt
-      || !sameFence(providerAttempt, turnContext.attempt)
-      || !approvalWorkspace
-      || approvalWorkspace.workspace_lease_id !== workspace.workspace_lease_id
-      || approvalWorkspace.workspace_root !== workspace.workspace_root
-      || approvalWorkspace.mode !== 'writable'
-      || approvalWorkspace.holder_service_instance_id !== serviceInstanceId
-      || approvalWorkspace.holder_conversation_id !== turn.conversation_id
-      || approvalWorkspace.holder_turn_id !== turn.turn_id
-      || approvalWorkspace.lease_epoch !== workspace.lease_epoch
-    ) {
-      conflict(
-        'provider_context_invalid',
-        'The Codex write approval does not match its durable turn, owner, or workspace fence.',
-      );
+    const claudeWrite = approvalFence.action_kind === 'claude_tool_write';
+    if (claudeWrite) {
+      if (
+        provider !== 'claude'
+        || approvalFence.sandbox_enforced !== true
+        || typeof approvalFence.tool_name !== 'string'
+        || approvalFence.tool_name.length === 0
+        || approvalFence.workspace_id !== (turnContext.workspace.workspace_id ?? null)
+        || approvalFence.workspace_generation
+          !== (turnContext.workspace.workspace_generation ?? 0)
+      ) {
+        conflict(
+          'provider_context_invalid',
+          'The Claude write does not match its sandboxed workspace generation.',
+        );
+      }
+    } else {
+      const approvalWorkspace = approvalFence.workspace;
+      const providerAttempt = approvalFence.provider_attempt;
+      if (
+        !['item/commandExecution/requestApproval', 'item/fileChange/requestApproval']
+          .includes(approvalFence.action_kind)
+        || typeof approvalFence.connection_id !== 'string'
+        || approvalFence.connection_id.length === 0
+        || approvalFence.conversation_id !== turn.conversation_id
+        || approvalFence.core_turn_id !== turn.turn_id
+        || approvalFence.lineage_id !== turn.lineage_id
+        || approvalFence.executor_instance_id !== turnContext.executor_instance_id
+        || approvalFence.provider_thread_id !== turn.provider_native_id
+        || typeof approvalFence.provider_turn_id !== 'string'
+        || approvalFence.provider_turn_id.length === 0
+        || typeof approvalFence.provider_item_id !== 'string'
+        || approvalFence.provider_item_id.length === 0
+        || approvalFence.provider_approval_id !== null
+          && (typeof approvalFence.provider_approval_id !== 'string'
+            || approvalFence.provider_approval_id.length === 0)
+        || approvalFence.environment_id !== null
+        || !providerAttempt
+        || !sameFence(providerAttempt, turnContext.attempt)
+        || !approvalWorkspace
+        || approvalWorkspace.workspace_lease_id !== workspace.workspace_lease_id
+        || approvalWorkspace.workspace_root !== workspace.workspace_root
+        || approvalWorkspace.mode !== 'writable'
+        || approvalWorkspace.holder_service_instance_id !== serviceInstanceId
+        || approvalWorkspace.holder_conversation_id !== turn.conversation_id
+        || approvalWorkspace.holder_turn_id !== turn.turn_id
+        || approvalWorkspace.lease_epoch !== workspace.lease_epoch
+      ) {
+        conflict(
+          'provider_context_invalid',
+          'The Codex write approval does not match its durable turn, owner, or workspace fence.',
+        );
+      }
     }
     let canonicalCwd;
     try {
@@ -5281,26 +5556,32 @@ export function createExecutorStore({
         base: workspace.workspace_root,
       });
     } catch {
-      conflict('provider_context_invalid', 'The Codex write approval has an invalid working directory.');
+      conflict('provider_context_invalid', 'The provider write has an invalid working directory.');
     }
     if (canonicalCwd !== workspace.workspace_root) {
-      conflict('provider_context_invalid', 'The Codex write approval changed its workspace cwd.');
+      conflict('provider_context_invalid', 'The provider write changed its workspace cwd.');
     }
-    if (!Array.isArray(approvalFence.write_paths) || approvalFence.write_paths.length === 0) {
-      conflict('provider_context_invalid', 'The Codex write approval has no bounded write path.');
+    if (
+      !Array.isArray(approvalFence.write_paths)
+      || (
+        (!claudeWrite || approvalFence.path_fields_required === true)
+        && approvalFence.write_paths.length === 0
+      )
+    ) {
+      conflict('provider_context_invalid', 'The provider write has no bounded write path.');
     }
     for (const writePath of approvalFence.write_paths) {
       let canonicalWritePath;
       try {
         canonicalWritePath = normalizeWorkspaceRoot(writePath, { base: workspace.workspace_root });
       } catch {
-        conflict('provider_context_invalid', 'The Codex write approval has an invalid write path.');
+        conflict('provider_context_invalid', 'The provider write has an invalid write path.');
       }
       if (
         canonicalWritePath !== workspace.workspace_root
         && !canonicalWritePath.startsWith(`${workspace.workspace_root}${path.sep}`)
       ) {
-        conflict('provider_context_invalid', 'The Codex write approval escaped its workspace root.');
+        conflict('provider_context_invalid', 'The provider write escaped its workspace root.');
       }
     }
     const checkedAt = now();
@@ -5336,7 +5617,7 @@ export function createExecutorStore({
       || !attempt
       || !['starting', 'running', 'waiting_user'].includes(attempt.state)
     ) {
-      conflict('stale_attempt', 'The Codex write approval lost its current writer ownership.');
+      conflict('stale_attempt', 'The provider write lost its current writer ownership.');
     }
     return Object.freeze({
       status: 'current',
@@ -5344,8 +5625,8 @@ export function createExecutorStore({
       turn_id: turn.turn_id,
       executor_instance_id: turnContext.executor_instance_id,
       provider_native_id: turn.provider_native_id,
-      provider_turn_id: approvalFence.provider_turn_id,
-      provider_item_id: approvalFence.provider_item_id,
+      provider_turn_id: approvalFence.provider_turn_id ?? null,
+      provider_item_id: approvalFence.provider_item_id ?? null,
       workspace_lease_id: workspace.workspace_lease_id,
       workspace_lease_epoch: workspace.lease_epoch,
       checked_at: checkedAt,
@@ -9291,6 +9572,48 @@ export function createExecutorStore({
       const reconciledAtMs = Date.parse(reconciledAt);
       for (const candidate of candidates) {
         if (candidate.state === 'recovering') {
+          const expiredForeignLease = candidate.lease_owner !== null
+            && candidate.lease_owner !== serviceInstanceId
+            && candidate.lease_expires_at !== null
+            && candidate.lease_expires_at <= reconciledAt;
+          if (
+            candidate.queue_status === 'claimed'
+            && expiredForeignLease
+            && candidate.has_blocking_interaction !== 1
+          ) {
+            const turnContext = {
+              turn_id: candidate.turn_id,
+              conversation_id: candidate.conversation_id,
+              executor_instance_id: candidate.executor_instance_id,
+              attempt: {
+                attempt_id: candidate.attempt_id,
+                attempt_no: candidate.attempt_no,
+                lease_epoch: candidate.lease_epoch,
+              },
+            };
+            const error = createContractError({
+              code: 'side_effect_unknown',
+              category: 'provider',
+              retryable: false,
+              sideEffectStatus: 'unknown',
+              userMessage: 'A recovering provider attempt outlived its executor lease.',
+              occurredAt: reconciledAt,
+            });
+            const recovery = persistExecutionRecoveryDecisionInTransaction(
+              turnContext,
+              error,
+              reconciledAt,
+              recoveryKind,
+              { requireActiveLease: false },
+            );
+            results.push({
+              turn_id: candidate.turn_id,
+              status: 'waiting_decision',
+              recovery_id: recovery.recovery_id,
+              interaction_id: recovery.interaction_id,
+            });
+            continue;
+          }
           if (
             candidate.queue_status === 'claimed'
             && candidate.lease_owner === null
@@ -9787,6 +10110,7 @@ export function createExecutorStore({
     recordProviderRuntimeEvidence,
     recordSteerReconciliationOutcome,
     recordStopProviderOutcome,
+    resolveConversationWorkspaceBinding,
     expireInteraction,
     finishWorkspaceBackgroundWork,
     listPendingInteractionDeadlines,

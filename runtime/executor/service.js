@@ -9,6 +9,7 @@ import { createRuntimeSnapshotPublisher } from '../observability/snapshot-publis
 import { findAnyBlockingRuntimeUpgrade } from '../migration/upgrade-state.js';
 import { createPermissionService } from '../permissions/permission-service.js';
 import { createExecutorStore } from '../persistence/executor-store.js';
+import { createConversationWorkspaceProvisioner } from '../workspace/conversation-workspace-provisioner.js';
 import { resolveProviderWorkspaceAccess } from '../workspace/lease-coordinator.js';
 
 function defaultGenerateId(kind) {
@@ -128,6 +129,7 @@ export function createExecutorService({
   residentLeaseDurationMs = 60_000,
   residentHeartbeatIntervalMs = 20_000,
   workspaceRoot = process.cwd(),
+  conversationWorkspaceOptions = null,
   workspaceLeaseDurationMs = 10_000,
   workspaceHeartbeatIntervalMs = Math.min(3_000, workspaceLeaseDurationMs / 3),
   scheduleResidentHeartbeat = setInterval,
@@ -172,6 +174,15 @@ export function createExecutorService({
   }
   if (typeof generateId !== 'function') {
     throw new TypeError('generateId must be a function');
+  }
+  if (
+    conversationWorkspaceOptions !== null
+    && (
+      typeof conversationWorkspaceOptions !== 'object'
+      || Array.isArray(conversationWorkspaceOptions)
+    )
+  ) {
+    throw new TypeError('conversationWorkspaceOptions must be an object or null');
   }
   if ((releaseRef === null) !== (upgradeId === null)) {
     throw new TypeError('releaseRef and upgradeId must be provided together');
@@ -297,7 +308,15 @@ export function createExecutorService({
     residentLeaseDurationMs,
     workspaceLeaseDurationMs,
     interactionTimeoutMs,
+    legacyWorkspaceRoot: workspaceRoot,
   });
+  const conversationWorkspaceProvisioner = conversationWorkspaceOptions === null
+    ? null
+    : createConversationWorkspaceProvisioner({
+      ...conversationWorkspaceOptions,
+      database,
+    });
+  conversationWorkspaceProvisioner?.reconcile();
   const startedAt = serviceStartedAt ?? now();
   const adapterProvider = adapter.provider ?? provider;
   if (adapterProvider !== provider) {
@@ -1232,10 +1251,15 @@ export function createExecutorService({
             committedControlStatus(activeRun) !== null
             || activeRun.durableSettled
             || activeRuns.get(turnContext.turn_id) !== activeRun
-            || approvalFence.provider_thread_id !== activeRun.currentProviderNativeId
+            || (
+              approvalFence.action_kind !== 'claude_tool_write'
+              && approvalFence.provider_thread_id !== activeRun.currentProviderNativeId
+            )
           )
         ) {
-          const error = new Error('The Codex approval no longer matches the active provider run.');
+          const error = new Error(
+            'The provider write approval no longer matches the active provider run.',
+          );
           error.code = 'stale_attempt';
           throw error;
         }
@@ -1309,15 +1333,67 @@ export function createExecutorService({
     });
   }
 
+  function projectProviderWorkspace(workspace) {
+    if (workspace === null) return null;
+    if (provider !== 'codex' || workspace.workspace_generation !== 0) {
+      return Object.freeze({ ...workspace });
+    }
+    const {
+      workspace_generation: legacyGeneration,
+      ...providerWorkspace
+    } = workspace;
+    if (legacyGeneration !== 0) {
+      throw new Error('Legacy workspace generation projection lost its sentinel.');
+    }
+    return Object.freeze(providerWorkspace);
+  }
+
   function reserveWithWorkspace({ markCapacityWait = true } = {}) {
+    function resolveWorkspaceAccess(candidate) {
+      let binding = store.resolveConversationWorkspaceBinding(
+        candidate.conversation_id,
+        { legacyWorkspaceRoot: workspaceRoot },
+      );
+      if (
+        conversationWorkspaceProvisioner !== null
+        && binding.binding_kind === 'conversation'
+        && ['requested', 'provisioning'].includes(binding.workspace_state)
+      ) {
+        let provisioningError = null;
+        try {
+          conversationWorkspaceProvisioner.ensure(candidate.conversation_id);
+        } catch (error) {
+          provisioningError = error;
+        }
+        binding = store.resolveConversationWorkspaceBinding(
+          candidate.conversation_id,
+          { legacyWorkspaceRoot: workspaceRoot },
+        );
+        if (
+          provisioningError !== null
+          && binding.workspace_state === 'requested'
+        ) {
+          throw provisioningError;
+        }
+      }
+      if (binding.claimable === false) return binding;
+      return resolveProviderWorkspaceAccess(adapter, {
+        conversation_id: candidate.conversation_id,
+        turn_id: candidate.turn_id ?? null,
+        provider,
+      }, {
+        authoritativeRoot: binding.workspace_root,
+        bindingKind: binding.binding_kind,
+        defaultRoot: workspaceRoot,
+        workspaceGeneration: binding.workspace_generation,
+        workspaceId: binding.workspace_id,
+        workspaceState: binding.workspace_state,
+      });
+    }
     const workspaceAccessByConversation = new Map(
       store.listWorkspaceReservationCandidates().map((candidate) => [
         candidate.conversation_id,
-        resolveProviderWorkspaceAccess(adapter, {
-          conversation_id: candidate.conversation_id,
-          turn_id: candidate.turn_id,
-          provider,
-        }, { defaultRoot: workspaceRoot }),
+        resolveWorkspaceAccess(candidate),
       ]),
     );
     return {
@@ -1327,6 +1403,7 @@ export function createExecutorService({
         workspaceAccessByConversation,
       }),
       workspaceAccessByConversation,
+      resolveWorkspaceAccess,
     };
   }
 
@@ -1443,13 +1520,14 @@ export function createExecutorService({
     try {
       turnContext = store.claimNextQueuedTurn({
         conversationId: reservation.conversation_id,
+        legacyWorkspaceRoot: workspaceRoot,
         requireResident: provider === 'claude',
         workspaceAccess: reserved.workspaceAccessByConversation.get(
           reservation.conversation_id,
-        ) ?? resolveProviderWorkspaceAccess(adapter, {
+        ) ?? reserved.resolveWorkspaceAccess({
           conversation_id: reservation.conversation_id,
-          provider,
-        }, { defaultRoot: workspaceRoot }),
+          turn_id: null,
+        }),
         workspaceLease: reservation.workspace ?? null,
       });
     } catch (error) {
@@ -1523,9 +1601,7 @@ export function createExecutorService({
         provider_native_id: turnContext.provider_native_id,
         trace_id: turnContext.trace_id,
         executor_instance_id: turnContext.executor_instance_id,
-        workspace: turnContext.workspace === null
-          ? null
-          : Object.freeze({ ...turnContext.workspace }),
+        workspace: projectProviderWorkspace(turnContext.workspace),
         input: turnContext.input,
         interaction: Object.freeze({
           authorized_subjects: Object.freeze(

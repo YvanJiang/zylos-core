@@ -141,7 +141,13 @@ afterEach(async () => {
   }
 });
 
-test.each(['EPIPE', 'ECONNRESET', 'ECONNABORTED', 'ENOTCONN'])(
+test.each([
+  'EPIPE',
+  'ECONNRESET',
+  'ECONNABORTED',
+  'ENOTCONN',
+  'ERR_STREAM_WRITE_AFTER_END',
+])(
   'keeps the executor host alive when a timed-out client causes late-response %s',
   async (peerDisconnectErrorCode) => {
     const scenario = await triggerLateResponse([peerDisconnectErrorCode]);

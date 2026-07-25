@@ -46,10 +46,25 @@ function normalizeHealth(response) {
       && executor.service_instance_id !== snapshot.core_service_instance_id)) {
     return { ok: false, error: 'executor_health_invalid' };
   }
+  const service = snapshot.service;
+  let readinessError;
+  if (!['healthy', 'degraded'].includes(service.health)) {
+    readinessError = `executor_${service.health}`;
+  } else if (service.complete !== true) {
+    readinessError = 'executor_health_incomplete';
+  } else if (service.maintenance === true) {
+    readinessError = 'executor_maintenance';
+  } else if (service.draining === true) {
+    readinessError = 'executor_draining';
+  } else if (service.reconciling === true) {
+    readinessError = 'executor_reconciling';
+  }
   return {
-    ok: snapshot.service.health === 'healthy',
-    error: snapshot.service.health === 'healthy' ? undefined : `executor_${snapshot.service.health}`,
-    health: snapshot.service.health,
+    ok: service.health === 'healthy',
+    ready: readinessError === undefined,
+    readinessError,
+    error: service.health === 'healthy' ? undefined : `executor_${service.health}`,
+    health: service.health,
     provider: executor?.provider,
     serviceInstanceId: snapshot.core_service_instance_id,
     snapshot,

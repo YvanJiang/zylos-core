@@ -17,6 +17,12 @@ The child, connection, in-memory thread, request IDs, and active turn handles ar
 authority. Core's persisted lineage, turn, attempt, lease, interaction, and handoff records remain
 authoritative.
 
+One supervised app-server connection is shared by all logical Codex threads, but
+its process cwd is only a controlled compatibility default. Every execution
+uses the durable `context.workspace.workspace_root` supplied by Core as its run
+cwd. Concurrent sibling conversations can therefore share the connection
+without sharing a workspace root.
+
 The normal Codex path contains no per-turn CLI child, `exec --json`, `exec resume`, transport
 fallback, feature flag, or dual-mode route.
 
@@ -43,7 +49,11 @@ It enables `experimentalApi`, disables request attestation, and advertises
 `mcpServerOpenaiFormElicitation=false` because Core has no provider-neutral representation for
 that private form. New lineages use `thread/start`; the returned thread ID is durably bound before
 `turn/start`. Persisted lineages use `thread/resume` once per new connection before starting a
-turn.
+turn. `thread/start`, `thread/resume`, and `turn/start` all carry the same
+run-specific workspace root. The adapter retains a thread-to-workspace binding
+across app-server reconnects and rejects a persisted thread if either its root
+or its optional positive integer `workspace_generation` changes. Per-connection
+loaded-thread state is a map to that binding, not a thread-ID-only set.
 
 ## Provider-neutral normalization
 
@@ -86,20 +96,40 @@ acceptance from connection or in-memory request state and does not resend the an
 ## Workspace access and write fencing
 
 `sandbox: "workspace-write"` is a trusted adapter-construction declaration of the logical access
-that Core must serialize; it is not forwarded as the provider sandbox. Core therefore acquires a
-writable workspace lease at the normalized configured cwd, while every new, resumed, and started
-Codex turn is forced to `read-only` plus `on-request`, with the user reviewer. The turn override is
-repeated even after a persisted thread is resumed. A deployment-authorized exception may set
+that Core must serialize; it is not forwarded as the provider sandbox. `getWorkspaceAccess()` owns
+only that mode/enforcement declaration. Its configured root remains a controlled compatibility
+default for lease discovery; it is never allowed to override a detached
+execution's durable `context.workspace`. Native lineage recovery also requires
+Core to supply the exact durable lineage workspace root and generation; it has
+no adapter-local cwd fallback. Every new, resumed, and started Codex turn is
+forced to `read-only` plus `on-request`, with the user reviewer. The turn override is repeated even
+after a persisted thread is resumed. A deployment-authorized exception may set
 `CODEX_SANDBOX_MODE=danger-full-access` together with `CODEX_APPROVAL_POLICY=never`; only that exact
-pair is forwarded to every thread and turn. The exception keeps Core's coarse writable workspace
-lease but deliberately removes the provider's synchronous pre-action write fence. Other writable
-configurations whose approval policy is not `on-request` are rejected. A request cannot self-report
-read-only access.
+pair is forwarded to every thread and turn. The exception still requires the
+durable run binding and Core's coarse writable workspace lease, but deliberately
+removes the provider's synchronous pre-action write fence and is not OS
+containment. Other writable configurations whose approval policy is not
+`on-request` are rejected. A request cannot self-report read-only access.
+
+The execution context workspace fence is validated in one place before a
+connection can start. Its required shape is:
+
+- `workspace_root`: existing canonical real directory; nonexistent roots and
+  symlink aliases fail closed;
+- `workspace_lease_id`: non-empty string;
+- `mode`: exactly the adapter-declared `writable` or `read_only` mode;
+- `holder_conversation_id` and `holder_turn_id`: exact matches for the current
+  execution context;
+- `lease_epoch`: positive safe integer;
+- optional `workspace_generation`: positive safe integer.
+
+Other durable lease fields, including the service holder and expiry, remain
+opaque Core facts and are forwarded unchanged in approval fences.
 
 Writable execution fails closed unless Core supplies `assertWorkspaceWrite`. Before a one-shot
 command/file approval, the adapter passes the exact connection, conversation, Core turn, lineage,
 executor instance, provider attempt, durable workspace lease, provider thread/turn/item/approval,
-environment, cwd, and bounded write paths back to Core. Core reopens those facts from SQLite and
+environment, run-specific cwd, and bounded write paths back to Core. Core reopens those facts from SQLite and
 requires the current executor owner, unexpired executor and workspace leases, matching holder and
 epochs, the durably bound provider thread, a null environment, the canonical workspace cwd, and
 write paths contained by the workspace root. Only then may the official client return
@@ -130,6 +160,10 @@ canonical PNG, and is persisted atomically under
 `$ZYLOS_DIR/runtime/artifacts/codex-image-generation/<sha256>.png`. A non-null provider
 `savedPath` must be a regular, non-symlink file inside the current workspace and match the returned
 PNG bytes. Tool events contain only bounded artifact metadata and never the base64 result.
+Command cwd, file-change paths and move targets, approval-fence write paths,
+and image `savedPath` values are all resolved against the run root. Absolute
+escapes, `..` escapes, and escapes through an existing symlink ancestor fail
+closed. No check falls back to the shared app-server process cwd.
 Both legacy and v2/fanout/collaboration-mode multi-agent feature keys are disabled so an inherited
 local configuration cannot reopen those unrelated execution surfaces. An unexpected hook,
 dynamic/collaboration/web item, dynamic tool server request, permission-profile request, or
@@ -202,11 +236,12 @@ connection and reloads its persisted thread before use; active work is never rep
 ## Verification boundary
 
 Deterministic tests inject the child process and stdio streams and cover handshake ordering,
-single-process multiplexing, thread binding/resume/reconnect, provider-start and text/tool
+single-process multiplexing across sibling workspace roots, immutable
+thread/root/generation binding across resume/reconnect, provider-start and text/tool
 normalization, every supported bidirectional interaction family, provider acknowledgement and
 request-ID tombstones, bounded and confirmed timeout interruption, terminal race tombstones,
 transport loss, stale request/answer/output fences, bounded PNG artifacts, image status
-compatibility, saved-path containment, base64 redaction, process-group escalation, and the rule that
+compatibility, saved-path and symlink containment, base64 redaction, process-group escalation, and the rule that
 neither a surviving group nor an iterator return can release recovering authority. The
 current app-server protocol returns all questions in
 one JSON-RPC response, while Core requires each question to have a unique interaction and forbids

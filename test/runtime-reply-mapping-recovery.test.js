@@ -1189,6 +1189,10 @@ describe('reply mapping provisional-lineage recovery', () => {
     deliverUntilTurn(database, pending.turn_id, 'native-concurrent-notice');
     const firstRun = serviceA.runNext();
     const nativeRequest = await nativeStarted.promise;
+    expect(nativeRequest.candidate.workspace_binding).toEqual({
+      workspace_root: fs.realpathSync.native(process.cwd()),
+      workspace_generation: null,
+    });
     await expect(serviceB.runNext()).resolves.toMatchObject({
       status: 'completed',
       turn_id: unrelated.turn_id,

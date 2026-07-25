@@ -74,6 +74,16 @@ const context = {
     authorized_subjects: [{ type: 'actor', actor_id: 'barrier-user' }],
     allowed_sources: ['operations_control'],
   },
+  workspace: {
+    workspace_lease_id: 'barrier-workspace-lease',
+    workspace_root: process.cwd(),
+    workspace_generation: 1,
+    mode: 'writable',
+    holder_service_instance_id: 'barrier-service',
+    holder_conversation_id: 'barrier-conversation',
+    holder_turn_id: 'barrier-core-turn',
+    lease_epoch: 1,
+  },
   attempt: { attempt_id: 'barrier-attempt', attempt_no: 1, lease_epoch: 1 },
 };
 

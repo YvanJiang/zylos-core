@@ -14,7 +14,10 @@ import {
   createExecutorServiceHost,
   requestExecutorService,
 } from '../runtime/executor/service-host.js';
-import { runExecutorDaemon } from '../runtime/executor/daemon.js';
+import {
+  prepareConversationWorkspaceOptions,
+  runExecutorDaemon,
+} from '../runtime/executor/daemon.js';
 import { createExecutorPrerequisiteOwner } from '../runtime/executor/prerequisite-owner.js';
 import {
   cleanupObsoleteLifecycleArtifacts,
@@ -77,6 +80,17 @@ function inertAdapter(provider = 'claude') {
 }
 
 describe('executor service lifecycle host', () => {
+  test('rejects a symlinked runtime parent for conversation workspace control paths', () => {
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-workspace-parent-'));
+    const redirectedRuntime = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-workspace-redirect-'));
+    directories.push(zylosDir, redirectedRuntime);
+    fs.symlinkSync(redirectedRuntime, path.join(zylosDir, 'runtime'), 'dir');
+
+    expect(() => prepareConversationWorkspaceOptions(zylosDir))
+      .toThrow('Conversation workspace control path must be a real directory');
+    expect(fs.readdirSync(redirectedRuntime)).toEqual([]);
+  });
+
   test('dispatches a second executor run without awaiting a long first run', async () => {
     const state = fixture();
     let releaseFirst;
@@ -200,6 +214,48 @@ describe('executor service lifecycle host', () => {
       });
     await host.closed;
     expect(fs.existsSync(state.socketPath)).toBe(false);
+  });
+
+  test('accepts bounded health responses larger than the control request limit', async () => {
+    const state = fixture();
+    const padding = 'x'.repeat(96 * 1024);
+    const service = {
+      start: jest.fn(),
+      runNext: jest.fn(async () => ({ status: 'idle' })),
+      publishObservabilitySnapshot: jest.fn(() => ({
+        contract: 'zylos.observability-snapshot',
+        padding,
+      })),
+      close: jest.fn(async () => {}),
+    };
+    const host = createExecutorServiceHost({
+      database: state.database,
+      adapter: inertAdapter(),
+      provider: 'codex',
+      serviceInstanceId: 'service-fixture-large-health',
+      socketPath: state.socketPath,
+      workspaceRoot: state.directory,
+      pollIntervalMs: 10_000,
+      createService: () => service,
+    });
+    hosts.push(host);
+    await host.start();
+
+    await expect(requestExecutorService(state.socketPath, { action: 'health' }))
+      .resolves.toMatchObject({
+        ok: true,
+        result: {
+          executor: { service_instance_id: 'service-fixture-large-health' },
+          snapshot: { padding },
+        },
+      });
+    await expect(requestExecutorService(
+      state.socketPath,
+      { action: 'health' },
+      { maxResponseBytes: 64 * 1024 },
+    )).rejects.toMatchObject({ code: 'EMSGSIZE' });
+    await expect(requestExecutorService(state.socketPath, { action: 'health' }))
+      .resolves.toMatchObject({ ok: true });
   });
 
   test('resolves and submits channel interactions through the running executor owner', async () => {
@@ -695,6 +751,81 @@ describe('executor service lifecycle host', () => {
 });
 
 describe('executor daemon resource ownership', () => {
+  test('reconciles stale prerequisites before opening SQLite and starts children after upgrade probing', async () => {
+    const state = fixture();
+    const events = [];
+    const database = { close: () => events.push('database-close') };
+    let hostOptions;
+    const owner = {
+      async acquire() { events.push('prerequisites-acquire'); },
+      async start() { events.push('prerequisites-start'); },
+      health() { return { ok: true }; },
+      async close() { events.push('prerequisites-close'); },
+    };
+    const host = {
+      closed: Promise.resolve(),
+      async start() { events.push('host-start'); },
+      async close() {
+        events.push('host-close');
+        await hostOptions.onClose();
+      },
+    };
+
+    const daemon = await runExecutorDaemon({
+      zylosDir: state.directory,
+      Database: function DatabaseFixture() {
+        events.push('database-open');
+        return database;
+      },
+      createPrerequisiteOwner: () => owner,
+      hasResumableUpgrade: () => {
+        events.push('upgrade-probe');
+        return false;
+      },
+      createAdapter: () => {
+        events.push('adapter-create');
+        return inertAdapter();
+      },
+      createHost: (options) => {
+        hostOptions = options;
+        return host;
+      },
+    });
+
+    expect(events).toEqual([
+      'prerequisites-acquire',
+      'database-open',
+      'upgrade-probe',
+      'prerequisites-start',
+      'adapter-create',
+      'host-start',
+    ]);
+    expect(hostOptions.conversationWorkspaceOptions).toMatchObject({
+      workspaceStoreRoot: fs.realpathSync.native(path.join(
+        state.directory,
+        'runtime',
+        'conversation-workspaces',
+      )),
+      baseSnapshotRoot: fs.realpathSync.native(path.join(
+        state.directory,
+        'runtime',
+        'conversation-workspace-base-v1',
+      )),
+      baseSnapshotRef: 'zylos-empty-conversation-workspace@1',
+      snapshotFiles: [],
+    });
+    expect(fs.statSync(hostOptions.conversationWorkspaceOptions.workspaceStoreRoot).mode & 0o777)
+      .toBe(0o700);
+    expect(fs.statSync(hostOptions.conversationWorkspaceOptions.baseSnapshotRoot).mode & 0o777)
+      .toBe(0o500);
+    await daemon.close();
+    expect(events.slice(-3)).toEqual([
+      'host-close',
+      'prerequisites-close',
+      'database-close',
+    ]);
+  });
+
   test('exits for supervisor restart after a resumed rollback restores the old release', async () => {
     const state = fixture();
     const events = [];
@@ -771,10 +902,19 @@ describe('executor daemon resource ownership', () => {
       Database: function DatabaseFixture() { return database; },
       hasResumableUpgrade: () => { throw new Error('upgrade probe unavailable'); },
       createAdapter: () => { throw new Error('normal adapter must not be created'); },
-      createPrerequisiteOwner: () => { throw new Error('prerequisites must not start'); },
+      createPrerequisiteOwner: () => ({
+        async acquire() { events.push('prerequisites-acquire'); },
+        async start() { throw new Error('prerequisites must not start'); },
+        health() { return { ok: true }; },
+        async close() { events.push('prerequisites-close'); },
+      }),
       createHost: () => { throw new Error('normal host must not be created'); },
     })).rejects.toThrow('upgrade probe unavailable');
-    expect(events).toEqual(['database-close']);
+    expect(events).toEqual([
+      'prerequisites-acquire',
+      'database-close',
+      'prerequisites-close',
+    ]);
   });
 
   test('does not start executor prerequisites without the one-time reconciliation fence', async () => {
@@ -789,7 +929,7 @@ describe('executor daemon resource ownership', () => {
       createPrerequisiteOwner: () => { throw new Error('prerequisites must not start'); },
       createHost: () => { throw new Error('normal host must not be created'); },
     })).rejects.toThrow('one-time runtime reconciliation');
-    expect(events).toEqual(['database-close']);
+    expect(events).toEqual([]);
   });
 
   test('recovers a committed upgrade until postcommit cleanup is durable', async () => {
@@ -834,7 +974,12 @@ describe('executor daemon resource ownership', () => {
     const daemon = await runExecutorDaemon({
       zylosDir: state.directory, Database: function DatabaseFixture() { return database; },
       createAdapter: () => inertAdapter(),
-      createPrerequisiteOwner: () => ({ async start() {}, health() { return { ok: true }; }, async close() {} }),
+      createPrerequisiteOwner: () => ({
+        async acquire() {},
+        async start() {},
+        health() { return { ok: true }; },
+        async close() {},
+      }),
       createHost: () => host,
     });
     expect(events).toEqual(['host-start']);
@@ -860,6 +1005,7 @@ describe('executor daemon resource ownership', () => {
       createAdapter: () => inertAdapter(),
       createUpgradeHandler: () => async () => ({ state: 'committed' }),
       createPrerequisiteOwner: () => ({
+        async acquire() { events.push('prerequisites-acquire'); },
         async start() { events.push('prerequisites-start'); },
         health() { return { ok: true }; },
         async close() { events.push('prerequisites-close'); },
@@ -872,7 +1018,7 @@ describe('executor daemon resource ownership', () => {
 
     await daemon.close();
     expect(events).toEqual([
-      'prerequisites-start', 'host-start', 'host-close',
+      'prerequisites-acquire', 'prerequisites-start', 'host-start', 'host-close',
       'prerequisites-close', 'database-close',
     ]);
   });
@@ -897,6 +1043,7 @@ describe('executor daemon resource ownership', () => {
       }),
       createUpgradeHandler: () => async () => ({ state: 'committed' }),
       createPrerequisiteOwner: () => ({
+        async acquire() {},
         async start() {},
         health() { return { ok: true }; },
         async close() {},

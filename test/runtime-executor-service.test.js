@@ -881,6 +881,68 @@ describe('runtime executor service', () => {
     database.close();
   });
 
+  test('fails closed when a recovering foreign attempt outlives its executor lease', () => {
+    const database = openTestDatabase();
+    const accepted = acceptQueuedTurn(database, 'recovering-foreign-lease-expired');
+    const foreignStore = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-recovering-foreign-owner',
+      now: () => '2026-07-19T07:01:00Z',
+      generateId: deterministicIds('recovering-foreign-owner'),
+    });
+    const foreignContext = foreignStore.claimNextQueuedTurn();
+    foreignStore.transitionTurn(foreignContext, 'starting', 'running');
+    database.prepare(`
+      UPDATE runtime_turns
+      SET state = 'recovering'
+      WHERE turn_id = ? AND state = 'running'
+    `).run(accepted.turn_id);
+
+    const reconcilingStore = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-service-recovering-foreign-reconciler',
+      now: () => '2026-07-19T07:01:11Z',
+      generateId: deterministicIds('recovering-foreign-reconciler'),
+    });
+    expect(reconcilingStore.reconcileNonterminalTurns(
+      [],
+      'sweep_reconciliation',
+    )).toMatchObject({
+      inspected: 1,
+      healthy: 0,
+      waiting_decision: 1,
+      results: [{ turn_id: accepted.turn_id, status: 'waiting_decision' }],
+    });
+    expect(database.prepare(`
+      SELECT recovery_kind, state, side_effect_status
+      FROM runtime_execution_recoveries
+      WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({
+      recovery_kind: 'sweep_reconciliation',
+      state: 'waiting_decision',
+      side_effect_status: 'unknown',
+    });
+    expect(database.prepare(`
+      SELECT status, wait_reason
+      FROM runtime_turn_queue
+      WHERE turn_id = ?
+    `).get(accepted.turn_id)).toEqual({
+      status: 'claimed',
+      wait_reason: 'execution_recovery_decision',
+    });
+    expect(database.prepare(`
+      SELECT state, side_effect_status
+      FROM runtime_provider_attempts
+      WHERE attempt_id = ?
+    `).get(foreignContext.attempt.attempt_id)).toEqual({
+      state: 'recovering',
+      side_effect_status: 'unknown',
+    });
+    database.close();
+  });
+
   test('safely retries one turn at most three times with new attempts and lease epochs', async () => {
     const database = openTestDatabase();
     const accepted = acceptQueuedTurn(database, 'safe-provider-retry');
@@ -2255,6 +2317,10 @@ describe('runtime executor service', () => {
         workspace: {
           workspace_lease_id: 'workspace-lease-executor-1',
           workspace_root: process.cwd(),
+          binding_kind: 'legacy_shared',
+          workspace_id: null,
+          workspace_generation: 0,
+          workspace_state: 'legacy_shared',
           mode: 'writable',
           status: 'current',
           holder_service_instance_id: 'executor-service-A',

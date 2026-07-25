@@ -27,6 +27,9 @@ import {
   parsePermissionCommand,
 } from '../permissions/permission-service.js';
 import { findBlockingRuntimeUpgrade } from '../migration/upgrade-state.js';
+import {
+  requestConversationWorkspaceInTransaction,
+} from '../workspace/conversation-workspace-provisioner.js';
 
 export const INBOUND_ENVELOPE_KNOWN_FIELDS = Object.freeze([
   'contract',
@@ -769,6 +772,11 @@ function acceptDetachedInboundInTransaction(database, {
     executionTurnId,
     committedAt,
   );
+  requestConversationWorkspaceInTransaction(database, {
+    workspaceId: generateId('conversation-workspace'),
+    conversationId: executionConversationId,
+    requestedAt: committedAt,
+  });
 
   const deliveryCommand = buildInitialDeliveryCommand({
     envelope,

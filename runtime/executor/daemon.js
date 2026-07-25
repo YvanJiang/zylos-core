@@ -16,6 +16,52 @@ import { createExecutorPrerequisiteOwner } from './prerequisite-owner.js';
 import { assertExecutorStartFence } from './start-fence.js';
 
 const require = createRequire(new URL('../../skills/comm-bridge/package.json', import.meta.url));
+const CONVERSATION_WORKSPACE_BASE_REF = 'zylos-empty-conversation-workspace@1';
+
+function ensureControlledDirectory(directory, mode, { enforceMode = true } = {}) {
+  try {
+    const existing = fs.lstatSync(directory);
+    if (existing.isSymbolicLink() || !existing.isDirectory()) {
+      throw new Error(`Conversation workspace control path must be a real directory: ${directory}`);
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+    fs.mkdirSync(directory, { mode });
+    const created = fs.lstatSync(directory);
+    if (created.isSymbolicLink() || !created.isDirectory()) {
+      throw new Error(`Conversation workspace control path was replaced: ${directory}`);
+    }
+  }
+  if (enforceMode) fs.chmodSync(directory, mode);
+  const canonicalDirectory = fs.realpathSync.native(directory);
+  if (canonicalDirectory !== path.resolve(directory)) {
+    throw new Error(`Conversation workspace control path escaped its canonical parent: ${directory}`);
+  }
+  return canonicalDirectory;
+}
+
+export function prepareConversationWorkspaceOptions(zylosDir) {
+  const canonicalZylosRoot = fs.realpathSync.native(zylosDir);
+  const runtimeRoot = ensureControlledDirectory(
+    path.join(canonicalZylosRoot, 'runtime'),
+    0o700,
+    { enforceMode: false },
+  );
+  const workspaceStoreRoot = ensureControlledDirectory(
+    path.join(runtimeRoot, 'conversation-workspaces'),
+    0o700,
+  );
+  const baseSnapshotRoot = ensureControlledDirectory(
+    path.join(runtimeRoot, 'conversation-workspace-base-v1'),
+    0o500,
+  );
+  return Object.freeze({
+    workspaceStoreRoot,
+    baseSnapshotRoot,
+    baseSnapshotRef: CONVERSATION_WORKSPACE_BASE_REF,
+    snapshotFiles: Object.freeze([]),
+  });
+}
 
 function readConfig(zylosDir) {
   const configPath = path.join(zylosDir, '.zylos', 'config.json');
@@ -38,7 +84,7 @@ export function resolveCodexExecutionPolicy(environment = process.env) {
 export function createConfiguredProviderAdapter({ provider, zylosDir, environment = process.env }) {
   if (provider === 'claude') {
     return createClaudeConversationAdapter({
-      queryOptions: { cwd: zylosDir, env: environment },
+      queryOptions: { env: environment },
     });
   }
   if (provider === 'codex') {
@@ -118,27 +164,42 @@ export async function runExecutorDaemon({
   dotenv.config({ path: path.join(zylosDir, '.env'), override: false });
   const config = readConfig(zylosDir);
   const provider = process.env.ZYLOS_RUNTIME || config.runtime || 'claude';
-  const databasePath = path.join(zylosDir, 'comm-bridge', 'c4.db');
-  fs.mkdirSync(path.dirname(databasePath), { recursive: true });
-  const database = new Database(databasePath);
   const currentReleasePath = path.resolve(import.meta.dirname, '..', '..');
   const currentPackage = JSON.parse(fs.readFileSync(
     path.join(currentReleasePath, 'package.json'), 'utf8',
   ));
+  if (createUpgradeHandler !== null && typeof createUpgradeHandler !== 'function') {
+    throw new TypeError('createUpgradeHandler must be a function or null');
+  }
+  if (typeof hasResumableUpgrade !== 'function') {
+    throw new TypeError('hasResumableUpgrade must be a function');
+  }
+  assertExecutorStartFence({ zylosDir });
+  const prerequisiteOwner = createPrerequisiteOwner({
+    zylosDir,
+    releasePath: currentReleasePath,
+  });
+  try {
+    await prerequisiteOwner.acquire();
+  } catch (error) {
+    await prerequisiteOwner.close().catch(() => {});
+    throw error;
+  }
+  const databasePath = path.join(zylosDir, 'comm-bridge', 'c4.db');
+  fs.mkdirSync(path.dirname(databasePath), { recursive: true });
+  let database;
+  try {
+    database = new Database(databasePath);
+  } catch (error) {
+    await prerequisiteOwner.close().catch(() => {});
+    throw error;
+  }
   let databaseClosed = false;
   const closeDatabase = () => {
     if (databaseClosed) return;
     databaseClosed = true;
     database.close();
   };
-  if (createUpgradeHandler !== null && typeof createUpgradeHandler !== 'function') {
-    closeDatabase();
-    throw new TypeError('createUpgradeHandler must be a function or null');
-  }
-  if (typeof hasResumableUpgrade !== 'function') {
-    closeDatabase();
-    throw new TypeError('hasResumableUpgrade must be a function');
-  }
   const upgradeHandlerOptions = {
     database,
     Database,
@@ -174,10 +235,12 @@ export async function runExecutorDaemon({
     }
   } catch (error) {
     closeDatabase();
+    await prerequisiteOwner.close().catch(() => {});
     throw error;
   }
   if (resumed !== null) {
     closeDatabase();
+    await prerequisiteOwner.close();
     return Object.freeze({
       close: () => Promise.resolve(),
       closed: Promise.resolve(),
@@ -189,12 +252,10 @@ export async function runExecutorDaemon({
     });
   }
   let host = null;
-  let prerequisiteOwner = null;
   try {
-    assertExecutorStartFence({ zylosDir });
-    prerequisiteOwner = createPrerequisiteOwner({ zylosDir, releasePath: currentReleasePath });
     await prerequisiteOwner.start();
     const adapter = createAdapter({ provider, zylosDir, environment: process.env });
+    const conversationWorkspaceOptions = prepareConversationWorkspaceOptions(zylosDir);
     host = createHost({
       database,
       adapter,
@@ -203,6 +264,7 @@ export async function runExecutorDaemon({
       hostId,
       socketPath: path.join(zylosDir, 'runtime', 'executor-service.sock'),
       workspaceRoot: zylosDir,
+      conversationWorkspaceOptions,
       maxConcurrentRuns,
       releaseRef: process.env.ZYLOS_RELEASE_REF || null,
       upgradeId: process.env.ZYLOS_UPGRADE_ID || null,

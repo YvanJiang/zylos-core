@@ -8,6 +8,7 @@ import { describe, expect, jest, test } from '@jest/globals';
 import {
   EXECUTOR_SERVICE_NAME,
   executorServiceSocketPath,
+  getExecutorServiceHealth,
   restartExecutorService,
   removeExecutorServiceRegistration,
   reconcileExecutorService,
@@ -20,6 +21,7 @@ import { resolveCliEntry } from '../cli/launcher.js';
 import { resolveActiveRelease } from '../runtime/executor/launcher.js';
 import { runtimeCommand } from '../cli/commands/runtime.js';
 import { classifyExecutorUpgradeControlFailure } from '../cli/commands/component.js';
+import { showStatus } from '../cli/commands/service.js';
 
 function health(instanceId, status = 'healthy', provider = 'codex') {
   return {
@@ -29,7 +31,16 @@ function health(instanceId, status = 'healthy', provider = 'codex') {
       snapshot: {
         contract: 'zylos.observability-snapshot',
         core_service_instance_id: instanceId,
-        service: { health: status, service_instance_id: instanceId },
+        service: {
+          complete: true,
+          health: status,
+          maintenance: false,
+          draining: false,
+          reconciling: false,
+          service_instance_id: instanceId,
+          host_id: 'host-fixture',
+          started_at: '2026-07-24T00:00:00.000Z',
+        },
       },
     },
   };
@@ -58,6 +69,77 @@ function pm2Fixture(commands, { registered = true, foreign = false } = {}) {
 }
 
 describe('executor lifecycle CLI boundary', () => {
+  test('reports durable degradation while keeping a complete idle service ready', async () => {
+    const result = await getExecutorServiceHealth({
+      zylosDir: '/tmp/zylos-cli-fixture',
+      requestFn: async () => health('executor-degraded', 'degraded'),
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      ready: true,
+      health: 'degraded',
+      error: 'executor_degraded',
+    });
+  });
+
+  test('status exits successfully for ready degraded Core without hiding degradation', async () => {
+    const lines = [];
+    const setExitCode = jest.fn();
+    const result = await showStatus({
+      zylosDir: '/tmp/zylos-cli-fixture',
+      getHealth: async () => ({
+        ok: false,
+        ready: true,
+        health: 'degraded',
+        error: 'executor_degraded',
+        snapshot: health('executor-degraded', 'degraded').result.snapshot,
+      }),
+      write: (line) => lines.push(line),
+      setExitCode,
+    });
+
+    expect(result).toMatchObject({ ready: true, health: 'degraded' });
+    expect(lines.join('\n')).toContain('Health: DEGRADED');
+    expect(lines.join('\n')).toContain('Readiness: READY');
+    expect(setExitCode).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['incomplete', { complete: false }, 'health_incomplete'],
+    ['maintenance', { maintenance: true }, 'maintenance'],
+    ['draining', { draining: true }, 'draining'],
+    ['reconciling', { reconciling: true }, 'reconciling'],
+    ['offline', { health: 'offline' }, 'offline'],
+  ])('status rejects %s Core even when its control response is valid', async (
+    _scenario,
+    state,
+    expectedReason,
+  ) => {
+    const response = health('executor-busy');
+    Object.assign(response.result.snapshot.service, state);
+    const normalized = await getExecutorServiceHealth({
+      zylosDir: '/tmp/zylos-cli-fixture',
+      requestFn: async () => response,
+    });
+    const lines = [];
+    const setExitCode = jest.fn();
+
+    await showStatus({
+      zylosDir: '/tmp/zylos-cli-fixture',
+      getHealth: async () => normalized,
+      write: (line) => lines.push(line),
+      setExitCode,
+    });
+
+    expect(normalized).toMatchObject({
+      ready: false,
+      readinessError: `executor_${expectedReason}`,
+    });
+    expect(lines.join('\n')).toContain('Readiness: NOT READY');
+    expect(setExitCode).toHaveBeenCalledWith(1);
+  });
+
   test('classifies a control timeout as an unknown durable outcome without a fake failed step', () => {
     const timeout = Object.assign(new Error('timed out'), {
       code: 'ETIMEDOUT', outcome: 'unknown',

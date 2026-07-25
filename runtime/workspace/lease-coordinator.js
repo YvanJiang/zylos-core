@@ -43,6 +43,25 @@ export function normalizeWorkspaceRoot(root, { base = process.cwd() } = {}) {
   return path.resolve(canonicalExisting, ...missingSegments);
 }
 
+export function normalizeReadyWorkspaceRoot(root) {
+  if (typeof root !== 'string' || !path.isAbsolute(root)) {
+    throw new TypeError('ready workspace root must be an absolute path');
+  }
+  const resolved = path.resolve(root);
+  if (resolved === path.parse(resolved).root) {
+    throw new TypeError('ready workspace root must not be the filesystem root');
+  }
+  const stat = fs.lstatSync(resolved);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new TypeError('ready workspace root must be a non-symlink directory');
+  }
+  const canonical = fs.realpathSync.native(resolved);
+  if (canonical !== resolved) {
+    throw new TypeError('ready workspace root must already be canonical');
+  }
+  return canonical;
+}
+
 export function workspaceRootsOverlap(left, right) {
   const leftRoot = normalizeWorkspaceRoot(left);
   const rightRoot = normalizeWorkspaceRoot(right);
@@ -51,7 +70,14 @@ export function workspaceRootsOverlap(left, right) {
     || rightRoot.startsWith(`${leftRoot}${path.sep}`);
 }
 
-export function resolveProviderWorkspaceAccess(adapter, context, { defaultRoot } = {}) {
+export function resolveProviderWorkspaceAccess(adapter, context, {
+  authoritativeRoot = null,
+  bindingKind,
+  defaultRoot,
+  workspaceGeneration,
+  workspaceId,
+  workspaceState,
+} = {}) {
   if (!adapter || typeof adapter !== 'object') {
     throw new TypeError('adapter must be an object');
   }
@@ -67,16 +93,36 @@ export function resolveProviderWorkspaceAccess(adapter, context, { defaultRoot }
   if (descriptor !== null && (typeof descriptor !== 'object' || Array.isArray(descriptor))) {
     throw new TypeError('adapter.getWorkspaceAccess must return an object or null');
   }
-  const root = typeof descriptor?.root === 'string' && descriptor.root.length > 0
-    ? descriptor.root
-    : defaultRoot;
+  const root = typeof authoritativeRoot === 'string' && authoritativeRoot.length > 0
+    ? authoritativeRoot
+    : (typeof descriptor?.root === 'string' && descriptor.root.length > 0
+      ? descriptor.root
+      : defaultRoot);
   const enforcedReadOnly = descriptor?.mode === 'read_only'
     && descriptor.read_only_enforced === true
     && descriptor.authority === 'provider_sandbox';
-  return Object.freeze({
+  const access = {
     workspace_root: normalizeWorkspaceRoot(root, { base: defaultRoot }),
     mode: enforcedReadOnly ? 'read_only' : 'writable',
     read_only_enforced: enforcedReadOnly,
+  };
+  if (
+    authoritativeRoot === null
+    && bindingKind === undefined
+    && workspaceGeneration === undefined
+    && workspaceId === undefined
+    && workspaceState === undefined
+  ) {
+    return Object.freeze(access);
+  }
+  return Object.freeze({
+    ...access,
+    binding_kind: bindingKind ?? 'legacy_shared',
+    workspace_generation: workspaceGeneration ?? 0,
+    workspace_id: workspaceId ?? null,
+    workspace_state: workspaceState ?? (
+      bindingKind === 'legacy_shared' ? 'legacy_shared' : null
+    ),
   });
 }
 

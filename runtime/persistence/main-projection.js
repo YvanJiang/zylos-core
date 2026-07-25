@@ -198,16 +198,6 @@ function supersedeOrdinaryPending(database, laneKey, updatedAt) {
   }
 }
 
-function latestLanePredecessor(database, laneKey) {
-  return database.prepare(`
-    SELECT delivery_id
-    FROM runtime_outbox
-    WHERE lane_key = ? AND status != 'superseded'
-    ORDER BY aggregate_version DESC, created_at DESC, outbox_id DESC
-    LIMIT 1
-  `).get(laneKey)?.delivery_id ?? null;
-}
-
 function findDeadLetteredInitialCreate(database, laneKey) {
   const candidates = database.prepare(`
     SELECT delivery_id, command_json
@@ -280,7 +270,7 @@ export function materializeNextStagedMainProjection(
   };
   const predecessorDeliveryId = textMode
     ? null
-    : (fallback ? failedCreate.delivery_id : latestLanePredecessor(database, laneKey));
+    : (fallback ? failedCreate.delivery_id : lane.last_delivery_id);
   const notBefore = critical || fallback || lane.last_delivered_at === null
     ? snapshot.created_at
     : laterTimestamp(

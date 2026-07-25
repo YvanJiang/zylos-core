@@ -607,9 +607,18 @@ export function createExecutorPrerequisiteOwner({
     await waitForChildReady(child, descriptor, startTimeoutMs);
   }
 
+  async function acquire() {
+    if (closing) {
+      throw new Error('Executor prerequisite owner is closing.');
+    }
+    if (ownerRecord !== null) return health();
+    await acquireOwnership();
+    return health();
+  }
+
   async function start() {
     if (started) return health();
-    await acquireOwnership();
+    await acquire();
     try {
       await assertWebConsolePortAvailable();
       for (const descriptor of descriptors()) await spawnDescriptor(descriptor);
@@ -676,5 +685,5 @@ export function createExecutorPrerequisiteOwner({
     }
   }
 
-  return Object.freeze({ close, health, start });
+  return Object.freeze({ acquire, close, health, start });
 }

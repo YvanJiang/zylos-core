@@ -12,7 +12,12 @@ import {
 import { createOutboxService } from '../runtime/delivery/outbox-service.js';
 import { createExecutorService } from '../runtime/executor/service.js';
 import { createPermissionService } from '../runtime/permissions/permission-service.js';
-import { acceptNormalInbound } from '../runtime/persistence/inbound-acceptance.js';
+import { createExecutorStore } from '../runtime/persistence/executor-store.js';
+import {
+  acceptNormalInbound,
+  acceptQueuedInbound,
+} from '../runtime/persistence/inbound-acceptance.js';
+import { createConversationWorkspaceProvisioner } from '../runtime/workspace/conversation-workspace-provisioner.js';
 import { deliveredResult } from './helpers/delivered-result.js';
 
 const inboundFixture = JSON.parse(fs.readFileSync(
@@ -26,6 +31,22 @@ function openTestDatabase() {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-detached-background-'));
   temporaryDirectories.push(directory);
   return new Database(path.join(directory, 'c4.db'));
+}
+
+function conversationWorkspaceOptions(database, namespace) {
+  const directory = path.dirname(database.name);
+  const workspaceStoreRoot = path.join(directory, 'conversation-workspaces');
+  const baseSnapshotRoot = path.join(directory, 'conversation-workspace-base');
+  fs.mkdirSync(workspaceStoreRoot, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(baseSnapshotRoot, { recursive: true, mode: 0o700 });
+  return {
+    workspaceStoreRoot,
+    baseSnapshotRoot,
+    baseSnapshotRef: 'empty:detached-background',
+    snapshotFiles: [],
+    now: () => '2026-07-24T00:00:00Z',
+    generateId: deterministicIds(`workspace-provisioner-${namespace}`),
+  };
 }
 
 function deterministicIds(namespace) {
@@ -115,6 +136,7 @@ describe('Core-owned detached background dispatch', () => {
       serviceInstanceId: 'executor-queue-summary',
       now: () => '2026-07-23T00:40:03Z',
       generateId: deterministicIds('executor-queue-summary'),
+      conversationWorkspaceOptions: conversationWorkspaceOptions(database, 'queue-summary'),
       adapter: {
         getWorkspaceAccess() {
           return {
@@ -237,6 +259,238 @@ describe('Core-owned detached background dispatch', () => {
         text: expectedText,
       },
     });
+    database.close();
+  });
+
+  test('does not let a cross-origin uncertain workspace block an isolated conversation', async () => {
+    const database = openTestDatabase();
+    const workspaceRoot = fs.realpathSync.native(path.dirname(database.name));
+    const blockerEnvelope = normalEnvelope(
+      'queue-summary-uncertain-blocker',
+      'Private recovery work from another chat',
+    );
+    blockerEnvelope.chat_id = 'chat-dm-private-recovery';
+    const blocker = acceptNormalInbound(database, blockerEnvelope, {
+      now: () => '2026-07-23T00:55:00Z',
+      generateId: deterministicIds('inbound-queue-summary-uncertain-blocker'),
+    });
+    const blockerTask = readBackgroundTask(database, blocker.background_task_id);
+    const blockerBinding = createConversationWorkspaceProvisioner({
+      database,
+      ...conversationWorkspaceOptions(database, 'queue-summary-uncertain-blocker'),
+    }).ensure(blockerTask.execution_conversation_id);
+    let clock = '2026-07-23T00:55:00Z';
+    const oldStore = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-queue-summary-orphaned',
+      now: () => clock,
+      generateId: deterministicIds('executor-queue-summary-orphaned'),
+      leaseDurationMs: 1_000,
+      workspaceLeaseDurationMs: 1_000,
+    });
+    const workspaceAccess = {
+      binding_kind: 'conversation',
+      claimable: true,
+      workspace_id: blockerBinding.workspace_id,
+      workspace_root: blockerBinding.workspace_root,
+      workspace_generation: blockerBinding.generation,
+      workspace_state: blockerBinding.state,
+      mode: 'writable',
+    };
+    const reservation = oldStore.reserveNextExecutor({
+      maxResidentExecutorsPerBot: 1,
+      workspaceAccessByConversation: new Map([[
+        blockerTask.execution_conversation_id,
+        workspaceAccess,
+      ]]),
+    });
+    const blockerContext = oldStore.claimNextQueuedTurn({
+      conversationId: blockerTask.execution_conversation_id,
+      workspaceAccess,
+      workspaceLease: reservation.workspace,
+    });
+    oldStore.transitionTurn(blockerContext, 'starting', 'running');
+    oldStore.transitionTurn(blockerContext, 'running', 'recovering', {
+      reasonCode: 'workspace_lease_expired',
+      recovery: {
+        waitForDecision: true,
+        error: {
+          code: 'workspace_lease_expired',
+          category: 'conflict',
+          retryable: false,
+          side_effect_status: 'unknown',
+          user_message: 'Workspace ownership became uncertain during provider execution.',
+        },
+      },
+    });
+
+    const waiting = acceptDetached(
+      database,
+      'queue-summary-uncertain-waiter',
+      'Generate a customer image',
+      '2026-07-23T00:55:01Z',
+    );
+    clock = '2026-07-23T00:55:02Z';
+    const observedRoots = [];
+    const service = createExecutorService({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-queue-summary-restarted',
+      now: () => clock,
+      generateId: deterministicIds('executor-queue-summary-restarted'),
+      workspaceRoot,
+      conversationWorkspaceOptions: conversationWorkspaceOptions(
+        database,
+        'queue-summary-restarted',
+      ),
+      adapter: {
+        getWorkspaceAccess() {
+          return {
+            root: workspaceRoot,
+            mode: 'writable',
+            read_only_enforced: false,
+            authority: 'provider_sandbox',
+          };
+        },
+        async *execute(context) {
+          observedRoots.push(context.workspace.workspace_root);
+          yield {
+            kind: 'text_snapshot',
+            payload: { text: 'isolated workspace completed', end_offset: 28 },
+            provider_native_id: null,
+          };
+        },
+        async close() {
+          return [];
+        },
+      },
+    });
+
+    await expect(service.runNext()).resolves.toMatchObject({
+      status: 'completed',
+      turn_id: waiting.background_execution_turn_id,
+    });
+    expect(observedRoots).toHaveLength(1);
+    expect(observedRoots[0]).not.toBe(workspaceRoot);
+    expect(database.prepare(`
+      SELECT state
+      FROM runtime_workspace_leases
+      WHERE holder_conversation_id = ?
+    `).get(blockerTask.execution_conversation_id)).toEqual({ state: 'uncertain' });
+    const projection = database.prepare(`
+      SELECT render_model_json
+      FROM runtime_projection_snapshots
+      WHERE turn_id = ?
+      ORDER BY aggregate_version DESC
+      LIMIT 1
+    `).get(waiting.background_execution_turn_id);
+    const text = JSON.parse(projection.render_model_json).text;
+
+    expect(text).toContain('isolated workspace completed');
+    expect(text).not.toContain('Private recovery work from another chat');
+
+    await expect(service.close()).rejects.toThrow(
+      /did not prove isolation for recovering turn/,
+    );
+    database.close();
+  });
+
+  test('projects a privacy-safe active legacy-root blocker for an isolated child workspace', () => {
+    const database = openTestDatabase();
+    const workspaceRoot = fs.realpathSync.native(path.dirname(database.name));
+    const blockerEnvelope = normalEnvelope(
+      'queue-summary-active-blocker',
+      'Private active work from another chat',
+    );
+    blockerEnvelope.chat_id = 'chat-dm-private-active';
+    const blocker = acceptQueuedInbound(database, blockerEnvelope, {
+      now: () => '2026-07-23T00:56:00Z',
+      generateId: deterministicIds('inbound-queue-summary-active-blocker'),
+    });
+    const workspaceAccess = {
+      binding_kind: 'legacy_shared',
+      claimable: true,
+      workspace_id: null,
+      workspace_root: workspaceRoot,
+      workspace_generation: 0,
+      workspace_state: 'legacy_shared',
+      mode: 'writable',
+    };
+    const holderStore = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-queue-summary-active-holder',
+      now: () => '2026-07-23T00:56:00Z',
+      generateId: deterministicIds('executor-queue-summary-active-holder'),
+      workspaceLeaseDurationMs: 60_000,
+    });
+    const holderReservation = holderStore.reserveNextExecutor({
+      maxResidentExecutorsPerBot: 1,
+      workspaceAccessByConversation: new Map([[
+        blocker.conversation_id,
+        workspaceAccess,
+      ]]),
+    });
+    const holderContext = holderStore.claimNextQueuedTurn({
+      conversationId: blocker.conversation_id,
+      legacyWorkspaceRoot: workspaceRoot,
+      workspaceAccess,
+      workspaceLease: holderReservation.workspace,
+    });
+    holderStore.transitionTurn(holderContext, 'starting', 'running');
+
+    const waiting = acceptDetached(
+      database,
+      'queue-summary-active-waiter',
+      'Prepare another deliverable',
+      '2026-07-23T00:56:01Z',
+    );
+    const waitingTask = readBackgroundTask(database, waiting.background_task_id);
+    const waitingBinding = createConversationWorkspaceProvisioner({
+      database,
+      ...conversationWorkspaceOptions(database, 'queue-summary-active-waiter'),
+    }).ensure(waitingTask.execution_conversation_id);
+    const waitingAccess = {
+      binding_kind: 'conversation',
+      claimable: true,
+      workspace_id: waitingBinding.workspace_id,
+      workspace_root: waitingBinding.workspace_root,
+      workspace_generation: waitingBinding.generation,
+      workspace_state: waitingBinding.state,
+      mode: 'writable',
+    };
+    const waitingStore = createExecutorStore({
+      database,
+      provider: 'codex',
+      serviceInstanceId: 'executor-queue-summary-active-waiter',
+      now: () => '2026-07-23T00:56:01Z',
+      generateId: deterministicIds('executor-queue-summary-active-waiter'),
+      workspaceLeaseDurationMs: 60_000,
+    });
+    expect(waitingStore.reserveNextExecutor({
+      maxResidentExecutorsPerBot: 1,
+      workspaceAccessByConversation: new Map([[
+        waitingTask.execution_conversation_id,
+        waitingAccess,
+      ]]),
+    })).toMatchObject({
+      status: 'workspace_wait',
+      turn_id: waiting.background_execution_turn_id,
+      wait_detail: { recovery_required: false },
+    });
+
+    const projection = database.prepare(`
+      SELECT render_model_json
+      FROM runtime_projection_snapshots
+      WHERE turn_id = ?
+      ORDER BY aggregate_version DESC
+      LIMIT 1
+    `).get(waiting.background_execution_turn_id);
+    const text = JSON.parse(projection.render_model_json).text;
+    expect(text).toContain('Another task is currently using this workspace.');
+    expect(text).not.toContain('Running tasks:\n- None');
+    expect(text).not.toContain('Private active work from another chat');
     database.close();
   });
 
@@ -367,6 +621,7 @@ describe('Core-owned detached background dispatch', () => {
       serviceInstanceId: 'executor-detached-concurrent',
       now: () => '2026-07-23T01:01:00Z',
       generateId: deterministicIds('executor-detached-concurrent'),
+      conversationWorkspaceOptions: conversationWorkspaceOptions(database, 'detached-concurrent'),
     });
 
     const firstRun = service.runNext();
@@ -461,6 +716,7 @@ describe('Core-owned detached background dispatch', () => {
       serviceInstanceId: 'executor-detached-interaction',
       now: () => '2026-07-23T01:31:00Z',
       generateId: deterministicIds('executor-detached-interaction'),
+      conversationWorkspaceOptions: conversationWorkspaceOptions(database, 'detached-interaction'),
     });
 
     const waiting = await service.runNext();
@@ -551,7 +807,7 @@ describe('Core-owned detached background dispatch', () => {
     database.close();
   });
 
-  test('keeps conflicting background writers fenced without blocking later input acceptance', async () => {
+  test('runs detached background writers in distinct conversation workspaces', async () => {
     const database = openTestDatabase();
     const first = acceptDetached(
       database,
@@ -563,8 +819,10 @@ describe('Core-owned detached background dispatch', () => {
     let releaseFirst;
     const firstStarted = new Promise((resolve) => { markFirstStarted = resolve; });
     const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+    const observedRoots = [];
     const adapter = {
       async *execute(context) {
+        observedRoots.push(context.workspace.workspace_root);
         if (context.input.text === 'first writer') {
           markFirstStarted();
           await firstGate;
@@ -583,6 +841,7 @@ describe('Core-owned detached background dispatch', () => {
       serviceInstanceId: 'executor-detached-writers',
       now: () => '2026-07-23T02:01:00Z',
       generateId: deterministicIds('executor-detached-writers'),
+      conversationWorkspaceOptions: conversationWorkspaceOptions(database, 'detached-writers'),
     });
 
     const firstRun = service.runNext();
@@ -599,21 +858,18 @@ describe('Core-owned detached background dispatch', () => {
       conversation_id: first.conversation_id,
     });
     await expect(service.runNext()).resolves.toMatchObject({
-      status: 'workspace_wait',
-      turn_id: second.background_execution_turn_id,
-      wait_reason: 'workspace_lease',
-    });
-    expect(readBackgroundTask(database, second.background_task_id)).toMatchObject({
-      state: 'queued',
-      execution_turn_state: 'queued',
-    });
-
-    releaseFirst();
-    await firstRun;
-    await expect(service.runNext()).resolves.toMatchObject({
       status: 'completed',
       turn_id: second.background_execution_turn_id,
     });
+    expect(readBackgroundTask(database, second.background_task_id)).toMatchObject({
+      state: 'completed',
+      execution_turn_state: 'completed',
+    });
+    expect(observedRoots).toHaveLength(2);
+    expect(observedRoots[0]).not.toBe(observedRoots[1]);
+
+    releaseFirst();
+    await firstRun;
     await service.close();
     database.close();
   });
@@ -697,6 +953,7 @@ describe('Core-owned detached background dispatch', () => {
       serviceInstanceId: 'executor-detached-unknown',
       now: () => '2026-07-23T03:01:00Z',
       generateId: deterministicIds('executor-detached-unknown'),
+      conversationWorkspaceOptions: conversationWorkspaceOptions(database, 'detached-unknown'),
     });
 
     await expect(service.runNext()).resolves.toMatchObject({
@@ -735,6 +992,7 @@ describe('Core-owned detached background dispatch', () => {
       serviceInstanceId: 'executor-detached-cancel',
       now: () => '2026-07-23T04:01:00Z',
       generateId: deterministicIds('executor-detached-cancel'),
+      conversationWorkspaceOptions: conversationWorkspaceOptions(database, 'detached-cancel'),
     });
 
     expect(service.getBackgroundTask(accepted.background_task_id)).toMatchObject({
